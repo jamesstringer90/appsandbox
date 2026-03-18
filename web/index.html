@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>App Sandbox</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- New VM Configuration -->
+<section id="config-section">
+    <h2 class="collapsible" onclick="toggleSection('config-section')"><span class="collapse-arrow" id="config-section-arrow">&#x25BC;</span> New VM Configuration</h2>
+    <div id="config-section-body" class="section-body">
+    <div class="form-grid">
+        <label for="vm-name">VM Name:</label>
+        <div class="form-row">
+            <input type="text" id="vm-name" value="MyVM" class="input-md">
+            <span class="field-warn" id="vm-name-warn"></span>
+        </div>
+
+        <label for="os-type">OS Type:</label>
+        <div class="form-row">
+            <select id="os-type">
+                <option value="Windows" selected>Windows</option>
+                <option value="Linux">Linux</option>
+            </select>
+        </div>
+
+        <label>OS Image:</label>
+        <div class="image-row">
+            <input type="text" id="image-path" placeholder="Path to ISO or VHDX...">
+            <button id="btn-browse" onclick="sendCmd('browseImage')">Browse...</button>
+            <span class="or-separator">OR</span>
+            <label style="text-align:left">Template:</label>
+            <div class="template-dropdown" id="template-dropdown">
+                <div class="template-dropdown-selected" id="template-dropdown-selected">(None)</div>
+                <div class="template-dropdown-list" id="template-dropdown-list"></div>
+                <input type="hidden" id="template-select" value="">
+            </div>
+        </div>
+
+        <label for="hdd-size">HDD Size:</label>
+        <div class="form-row">
+            <input type="number" id="hdd-size" value="64" min="1" class="input-sm"> GB
+            <span class="host-info" id="host-hdd"></span>
+        </div>
+
+        <label for="ram-size">RAM Size:</label>
+        <div class="form-row">
+            <input type="number" id="ram-size" value="16384" min="512" class="input-sm"> MB
+            <span class="host-info" id="host-ram"></span>
+        </div>
+
+        <label for="cpu-cores">CPU Cores:</label>
+        <div class="form-row">
+            <input type="number" id="cpu-cores" value="8" min="1" class="input-sm">
+            <span class="host-info" id="host-cpu"></span>
+        </div>
+
+        <label for="gpu-mode">GPU:</label>
+        <div class="form-row">
+            <select id="gpu-mode">
+                <option value="0">None</option>
+                <option value="1" selected>Default GPU</option>
+            </select>
+        </div>
+
+        <label for="net-mode">Network:</label>
+        <div class="form-row">
+            <select id="net-mode" onchange="onNetModeChange()">
+                <option value="0">None</option>
+                <option value="1">NAT</option>
+                <option value="2" selected>External</option>
+                <option value="3">Internal</option>
+            </select>
+            <label style="text-align:left">Adapter:</label>
+            <select id="net-adapter"></select>
+        </div>
+
+        <label>Username:</label>
+        <div class="cred-row">
+            <input type="text" id="admin-user" value="User" class="input-md">
+            <span class="field-warn" id="admin-user-warn"></span>
+        </div>
+
+        <label>Password:</label>
+        <div class="cred-row">
+            <input type="password" id="admin-pass" value="test123">
+            <label>Confirm:</label>
+            <input type="password" id="admin-confirm" value="test123">
+            <span class="toggle-pass" onmousedown="showPassword()" onmouseup="hidePassword()" onmouseleave="hidePassword()">&#x1F441;</span>
+        </div>
+
+        <label>Options:</label>
+        <div class="form-row">
+            <label><input type="checkbox" id="test-mode" checked> Test Mode</label>
+            <span class="host-info">(disables Secure Boot — required for test-signed VDD driver)</span>
+        </div>
+    </div>
+
+    <div class="action-buttons">
+        <button id="btn-create" class="primary" disabled onclick="onCreateVm()">Create new VM</button>
+        <button id="btn-create-template" disabled onclick="onCreateTemplate()">Build new Template using ISO</button>
+    </div>
+    </div>
+</section>
+
+<!-- Virtual Machines -->
+<section id="vm-section">
+    <h2>Virtual Machines</h2>
+    <div class="vm-table-wrap">
+        <table id="vm-table">
+            <thead><tr>
+                <th>Name</th>
+                <th>OS</th>
+                <th>Status</th>
+                <th>Agent</th>
+                <th>CPU</th>
+                <th>RAM (MB)</th>
+                <th>HDD (GB)</th>
+                <th>GPU</th>
+                <th>Network</th>
+                <th class="icon-col">&#x25B6;&#xFE0F;</th>
+                <th class="icon-col">&#x1F5A5;&#xFE0F;</th>
+                <th class="icon-col" title="IDD Display">&#x1F4FA;</th>
+                <th class="icon-col">&#x23FB;</th>
+                <th class="icon-col">&#x2715;&#xFE0F;</th>
+                <th class="icon-col">&#x1F5D1;&#xFE0F;</th>
+                <th class="icon-col">&#x270F;&#xFE0F;</th>
+            </tr></thead>
+            <tbody id="vm-tbody"></tbody>
+        </table>
+    </div>
+</section>
+
+<!-- Log -->
+<section id="log-section">
+    <h2 class="collapsible" onclick="toggleSection('log-section')"><span class="collapse-arrow" id="log-section-arrow">&#x25BC;</span> Log</h2>
+    <div id="log-panel"></div>
+</section>
+
+<!-- Confirm modal -->
+<div class="modal-overlay" id="modal-overlay">
+    <div class="modal">
+        <h3 id="modal-title">Confirm</h3>
+        <p id="modal-message"></p>
+        <label style="display:none; font-size:12px; color:var(--text-dim); cursor:pointer; margin-bottom:8px;">
+            <input type="checkbox" id="modal-dont-show"> Don't show this again
+        </label>
+        <div class="modal-buttons">
+            <button onclick="modalResolve(false)">Cancel</button>
+            <button class="danger" onclick="modalResolve(true)" id="modal-confirm-btn">Delete</button>
+        </div>
+    </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
