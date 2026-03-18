@@ -3,11 +3,11 @@
  *
  * Runs as SYSTEM, spawned by the agent service. Listens on AF_HYPERV
  * socket (GUID :0004) for the host IDD display to connect. Handles the
- * host→guest clipboard direction:
- *   - On FORMAT_LIST from host: stores format metadata
- *   - On FORMAT_DATA_RESP from host: applies data to guest clipboard
- *   - On WM_CLIPBOARDUPDATE (host→guest echo): sends FORMAT_DATA_REQ
- *     back to host for delayed rendering
+ * host→guest clipboard direction using delayed rendering:
+ *   - On FORMAT_LIST from host: stores format metadata, requests data
+ *     via FORMAT_DATA_REQ one format at a time
+ *   - On FORMAT_DATA_RESP from host: accumulates data, applies all
+ *     formats to guest clipboard once complete
  *
  * Guest→host clipboard is handled separately by appsandbox-clipboard-reader.exe
  * (USER, GUID :0005).

@@ -1338,7 +1338,7 @@ static void report_displays(SOCKET notify)
     if (notify != INVALID_SOCKET) send_line(notify, msg);
 }
 
-/* ---- IDD connect: respawn input helper in console session ---- */
+/* ---- IDD connect: respawn helpers in console session ---- */
 
 static void handle_idd_connect(SOCKET client)
 {
