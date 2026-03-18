@@ -1691,6 +1691,17 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
             /* Disable Hyper-V Video after logoff (may have been re-enabled) */
             ensure_hyperv_video_disabled(INVALID_SOCKET);
         }
+        if (event_type == WTS_SESSION_LOGON || event_type == WTS_SESSION_UNLOCK) {
+            DWORD sid = sn ? sn->dwSessionId : WTSGetActiveConsoleSessionId();
+            agent_log("Session %s detected (session %lu), respawning clipboard helpers.",
+                       event_type == WTS_SESSION_LOGON ? "logon" : "unlock", sid);
+            kill_clipboard_helper();
+            if (sid != 0xFFFFFFFF)
+                spawn_clipboard_in_session(sid);
+            kill_clipboard_reader();
+            if (sid != 0xFFFFFFFF)
+                spawn_clipboard_reader_in_session(sid);
+        }
         return NO_ERROR;
     }
 
