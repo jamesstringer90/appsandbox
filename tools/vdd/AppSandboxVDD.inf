@@ -1,0 +1,77 @@
+;
+; AppSandboxVDD.inf - IddCx Virtual Display Driver for AppSandbox
+;
+; Installs a UMDF2 indirect display driver that creates a single
+; 1920x1080 virtual monitor for GPU-PV VM frame capture.
+;
+
+[Version]
+PnpLockdown = 1
+Signature = "$Windows NT$"
+ClassGUID = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Class = Display
+ClassVer = 2.0
+Provider = %ManufacturerName%
+CatalogFile = AppSandboxVDD.cat
+DriverVer = ; TODO: set DriverVer in stampinf property pages
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%DeviceName% = AppSandboxVDD_Install, Root\AppSandboxVDD
+
+[SourceDisksFiles]
+AppSandboxVDD.dll = 1
+
+[SourceDisksNames]
+1 = %DiskName%
+
+; =================== UMDF Device ==================================
+
+[AppSandboxVDD_Install.NT]
+CopyFiles = UMDriverCopy
+
+[AppSandboxVDD_Install.NT.hw]
+AddReg = AppSandboxVDD_HWAddReg
+
+[AppSandboxVDD_HWAddReg]
+HKR,, "UpperFilters",  %REG_MULTI_SZ%, "IndirectKmd"
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "AppSandboxVDDGroup"
+
+[AppSandboxVDD_Install.NT.Services]
+AddService = WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[AppSandboxVDD_Install.NT.Wdf]
+UmdfService = AppSandboxVDD,AppSandboxVDD_WdfInstall
+UmdfServiceOrder = AppSandboxVDD
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+
+[AppSandboxVDD_WdfInstall]
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary = %12%\UMDF\AppSandboxVDD.dll
+UmdfExtensions = IddCx0102
+
+[WUDFRD_ServiceInstall]
+DisplayName = %WudfRdDisplayName%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[DestinationDirs]
+UMDriverCopy = 12,UMDF ; copy to drivers\umdf
+
+[UMDriverCopy]
+AppSandboxVDD.dll
+
+; =================== Strings ==================================
+
+[Strings]
+ManufacturerName = "AppSandbox"
+DiskName = "AppSandbox VDD Installation Disk"
+WudfRdDisplayName = "Windows Driver Foundation - User-mode Driver Framework Reflector"
+DeviceName = "AppSandbox Virtual Display Adapter"
+
+REG_MULTI_SZ  = 0x00010000
+REG_SZ        = 0x00000000
