@@ -10,7 +10,7 @@
 typedef struct {
     wchar_t share_name[128];      /* Plan9 share name (e.g. "AppSandbox.Drv.0") */
     wchar_t host_path[MAX_PATH];  /* Host directory to share */
-    wchar_t guest_path[MAX_PATH]; /* Where p9client copies to on guest */
+    wchar_t guest_path[MAX_PATH]; /* Where agent p9copy copies to on guest */
     wchar_t file_filter[4096];    /* Semicolon-separated filenames (empty = copy all) */
 } GpuDriverShare;
 

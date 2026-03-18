@@ -1,10 +1,16 @@
 /*
- * appsandbox-clipboard.exe — Guest-side clipboard sync helper for AppSandbox.
+ * appsandbox-clipboard.exe — Guest-side clipboard writer for AppSandbox.
  *
- * Runs in the interactive console session (Session 1+), spawned by the
- * agent service via CreateProcessAsUser. Listens on AF_HYPERV socket
- * (service GUID :0004) for clipboard messages from the host and syncs
- * clipboard data bidirectionally.
+ * Runs as SYSTEM, spawned by the agent service. Listens on AF_HYPERV
+ * socket (GUID :0004) for the host IDD display to connect. Handles the
+ * host→guest clipboard direction:
+ *   - On FORMAT_LIST from host: stores format metadata
+ *   - On FORMAT_DATA_RESP from host: applies data to guest clipboard
+ *   - On WM_CLIPBOARDUPDATE (host→guest echo): sends FORMAT_DATA_REQ
+ *     back to host for delayed rendering
+ *
+ * Guest→host clipboard is handled separately by appsandbox-clipboard-reader.exe
+ * (USER, GUID :0005).
  *
  * Logs to C:\Windows\AppSandbox\clipboard.log (beside agent.log).
  */

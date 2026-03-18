@@ -8,7 +8,8 @@
  * Also handles GPU driver file copy via embedded 9P client (p9copy)
  * when the host sends gpu_query_response with share metadata.
  *
- * Supports: ping, shutdown, restart, gpu_copy.
+ * Supports: ping, shutdown, restart, gpu_copy, gpu_query_response,
+ *           gpu_none, idd_connect.
  *
  * Usage:
  *   appsandbox-agent.exe --install   Install and start the service

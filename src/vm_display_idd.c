@@ -1,9 +1,11 @@
 /*
  * vm_display_idd.c -- Host-side IDD frame receiver + D3D11 renderer.
  *
- * Connects to the guest VM over an AF_HYPERV socket (service GUID :0002),
- * receives frames using the AppSandbox frame protocol, and renders them
- * into a D3D11 window via a fullscreen textured quad.
+ * Connects to the guest VM over AF_HYPERV sockets:
+ *   :0002  Frame channel — receives frames, renders via D3D11 textured quad
+ *   :0003  Input channel — forwards keyboard/mouse events to guest
+ *   :0004  Clipboard writer — sends host clipboard to guest (host→guest)
+ *   :0005  Clipboard reader — receives guest clipboard from reader (guest→host)
  *
  * Pure C, compiled as C.
  */
@@ -244,7 +246,7 @@ struct VmDisplayIdd {
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
 
     /* Input forwarding */
-    volatile SOCKET input_socket;   /* frame socket, shared with recv thread */
+    volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
     BOOL           mouse_in;        /* TRUE while cursor is inside the render area */
     BOOL           tracking;        /* TrackMouseEvent active */
 
@@ -258,7 +260,7 @@ struct VmDisplayIdd {
     HWND           log_list_hwnd;   /* listbox inside log window */
     HWND           render_hwnd;     /* child window for D3D11 rendering */
 
-    /* Clipboard sync (eager fetch on recv thread, no delayed rendering) */
+    /* Clipboard writer channel (:0004 — host→guest, delayed rendering) */
     volatile SOCKET  clip_socket;
     volatile LONG    clip_suppress;
     HANDLE           clip_recv_thread;
