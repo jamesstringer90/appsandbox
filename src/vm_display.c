@@ -483,7 +483,6 @@ static DWORD rdp_advise_events(IUnknown *rdp_control, VmDisplay *display,
     }
 
     *out_sink = sink;
-    ui_log(L"RDP events: sink advised (cookie=%lu)", cookie);
     return cookie;
 }
 
@@ -570,7 +569,6 @@ static void STDMETHODCALLTYPE CB_OnConnectionCompleted(
     HRESULT hr;
 
     d->pipe_callback_fired = TRUE;
-    ui_log(L"RDP pipe connected for \"%s\" (pNetStream=%p)", d->vm->name, (void *)pNetStream);
 
     if (!d->rdp_dispatch) {
         ui_log(L"RDP pipe connected but rdp_dispatch is NULL — cannot proceed");
@@ -948,10 +946,7 @@ static DWORD WINAPI display_thread_proc(LPVOID param)
 
     /* Probe pipe existence without consuming the connection.
        WaitNamedPipeW(path, 0) returns immediately: TRUE = pipe exists, FALSE = not found. */
-    if (WaitNamedPipeW(pipe_path, 0))
-        ui_log(L"RDP pipe exists: %s", pipe_path);
-    else
-        ui_log(L"RDP pipe NOT found: %s (error %lu)", pipe_path, GetLastError());
+    WaitNamedPipeW(pipe_path, 0);
 
     d->pipe_callback_fired = FALSE;
     d->pipe_timeout_logged = FALSE;
@@ -960,8 +955,6 @@ static DWORD WINAPI display_thread_proc(LPVOID param)
     hr = d->connector->lpVtbl->StartConnect(d->connector, pipe_path);
     if (FAILED(hr))
         ui_log(L"Error: StartConnect failed (0x%08X) for %s", hr, pipe_path);
-    else
-        ui_log(L"RDP StartConnect OK for %s (waiting for callback...)", pipe_path);
 
 show_window:
     /* Start polling RDP Connected state */
