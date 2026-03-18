@@ -31,7 +31,7 @@ typedef struct {
     int     network_mode;         /* NET_NONE, NET_NAT, etc. */
     wchar_t admin_user[128];      /* Guest local admin username */
     wchar_t admin_pass[128];      /* Guest local admin password */
-    wchar_t resources_iso_path[MAX_PATH]; /* ISO with autounattend + p9client */
+    wchar_t resources_iso_path[MAX_PATH]; /* ISO with autounattend + agent + helpers */
     GpuDriverShareList gpu_shares;         /* Plan9 shares for GPU driver files */
     BOOL    is_template;              /* TRUE = template creation (no GPU/network) */
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */

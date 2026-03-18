@@ -876,7 +876,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L",\"1\":{\"Type\":\"Iso\",\"Path\":\"%s\"}", iso_esc);
     }
 
-    /* Optional resources ISO at SCSI slot 2 (autounattend + p9client) */
+    /* Optional resources ISO at SCSI slot 2 (autounattend + agent + helpers) */
     res_section[0] = L'\0';
     if (config->resources_iso_path[0] != L'\0') {
         escape_json_path(config->resources_iso_path, res_esc, MAX_PATH * 2);
@@ -1003,7 +1003,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L"}");
     }
 
-    /* Plan9 shares — GPU driver directories + manifest for p9client copy.
+    /* Plan9 shares — GPU driver directories for agent p9copy.
        Skip for template VMs (no GPU assigned during template creation). */
     plan9_section[0] = L'\0';
     if (config->gpu_mode == GPU_DEFAULT && !config->is_template) {

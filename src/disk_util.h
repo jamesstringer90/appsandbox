@@ -15,11 +15,10 @@ HRESULT vhdx_create_differencing(const wchar_t *child_path, const wchar_t *paren
    After merge, child_path can be deleted. */
 HRESULT vhdx_merge(const wchar_t *child_path);
 
-/* Create a resources ISO containing autounattend.xml and p9client.exe
-   for unattended Windows install with GPU-PV. At each boot, p9client
-   reads the manifest share and copies GPU driver files from Plan9 shares
-   to the correct guest locations.
-   res_dir: directory containing p9client.exe.
+/* Create a resources ISO containing autounattend.xml, agent, and helper
+   executables for unattended Windows install with GPU-PV. GPU driver
+   file copy is handled by the agent service's embedded 9P client (p9copy).
+   res_dir: directory containing the agent and helper executables.
    The password is wiped from memory after use. */
 HRESULT iso_create_resources(const wchar_t *iso_path,
                               const wchar_t *vm_name,
