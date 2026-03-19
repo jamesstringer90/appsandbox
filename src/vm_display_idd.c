@@ -445,7 +445,7 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
     va_list ap;
     LRESULT count;
 
-    if (!d || !d->log_list_hwnd) return;
+    if (!d || !d->log_list_hwnd || d->stop) return;
 
     va_start(ap, fmt);
     vswprintf_s(buf, 512, fmt, ap);
@@ -2359,7 +2359,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             RemoveClipboardFormatListener(hwnd);
 
-            /* Stop recv thread */
+            /* Stop recv threads */
             d->stop = TRUE;
 
             /* Wait for clipboard writer recv thread (:0004) */
