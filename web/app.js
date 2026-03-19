@@ -37,7 +37,7 @@ window.chrome.webview.addEventListener('message', function(event) {
     var msg = event.data;
     switch (msg.type) {
         case 'fullState':     onFullState(msg); break;
-        case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); break;
+        case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); break;
         case 'vmStateChanged': onVmStateChanged(msg); break;
         case 'snapListChanged': renderSnapTable(msg.snapshots); break;
         case 'log':           appendLog(msg.message); break;
@@ -54,6 +54,7 @@ window.chrome.webview.addEventListener('message', function(event) {
 function onFullState(msg) {
     vms = msg.vms || [];
     renderVmTable();
+    revalidateVmName();
     if (msg.hostInfo) updateHostInfo(msg.hostInfo);
     if (msg.adapters) populateAdapters(msg.adapters, msg.defaultAdapter);
     if (msg.templates) populateTemplates(msg.templates);
@@ -224,9 +225,11 @@ document.getElementById('image-path').addEventListener('input', function() {
     updateCreateButtons();
 });
 
-document.getElementById('vm-name').addEventListener('input', function() {
-    document.getElementById('vm-name-warn').textContent = validateVmName(this.value.trim()) || '';
-});
+function revalidateVmName() {
+    var name = document.getElementById('vm-name').value.trim();
+    document.getElementById('vm-name-warn').textContent = validateVmName(name) || '';
+}
+document.getElementById('vm-name').addEventListener('input', revalidateVmName);
 document.getElementById('admin-user').addEventListener('input', function() {
     document.getElementById('admin-user-warn').textContent = validateUsername(this.value.trim()) || '';
 });
