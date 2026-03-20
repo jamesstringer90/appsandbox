@@ -493,6 +493,10 @@ function startInlineEdit(row, col, td) {
     if (!vm || vm.running) return;
 
     var oldValue;
+    /* Lock cell width before swapping content to prevent column resize */
+    var cellWidth = td.getBoundingClientRect().width;
+    td.style.width = cellWidth + 'px';
+    td.style.maxWidth = cellWidth + 'px';
     td.classList.add('editing');
 
     if (col === 7) {
@@ -501,22 +505,24 @@ function startInlineEdit(row, col, td) {
         sel.innerHTML = '<option value="0">None</option><option value="1">Default GPU</option>';
         sel.value = String(vm.gpuMode);
         sel.onchange = function() { commitInlineEdit(); };
-        sel.onblur = function() { commitInlineEdit(); };
+        sel.onblur = function() { setTimeout(commitInlineEdit, 100); };
         td.textContent = '';
         td.appendChild(sel);
-        sel.focus();
         editingCell = { row: row, col: col, element: sel };
+        sel.focus();
+        setTimeout(function() { try { sel.showPicker(); } catch(e) {} }, 0);
     } else if (col === 8) {
         /* Network combo */
         var sel = document.createElement('select');
         sel.innerHTML = '<option value="0">None</option><option value="1">NAT</option><option value="2">External</option><option value="3">Internal</option>';
         sel.value = String(vm.networkMode);
         sel.onchange = function() { commitInlineEdit(); };
-        sel.onblur = function() { commitInlineEdit(); };
+        sel.onblur = function() { setTimeout(commitInlineEdit, 100); };
         td.textContent = '';
         td.appendChild(sel);
-        sel.focus();
         editingCell = { row: row, col: col, element: sel };
+        sel.focus();
+        setTimeout(function() { try { sel.showPicker(); } catch(e) {} }, 0);
     } else {
         /* Text/number input */
         var inp = document.createElement('input');

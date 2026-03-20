@@ -350,12 +350,16 @@ th.icon-col, td.icon-col {
 .status-stopped { color: var(--text-dim); }
 
 /* Inline editing */
+td.editing { overflow: hidden; box-sizing: border-box; }
 td.editing input,
 td.editing select {
     width: 100%;
+    min-width: 0;
+    max-width: 100%;
     height: 20px;
     padding: 1px 4px;
     font-size: 12px;
+    box-sizing: border-box;
 }
 
 /* Snapshot table */
