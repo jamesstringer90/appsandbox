@@ -172,6 +172,38 @@ static BOOL encode_unattend_password(const wchar_t *pass, wchar_t *b64_out, int 
     return TRUE;
 }
 
+/* Map language tag to LCID:KLID format for InputLocale */
+static const wchar_t *lang_to_input_locale(const wchar_t *lang)
+{
+    static const struct { const wchar_t *tag; const wchar_t *klid; } map[] = {
+        { L"en-US", L"0409:00000409" }, { L"en-GB", L"0809:00000809" },
+        { L"de-DE", L"0407:00000407" }, { L"fr-FR", L"040c:0000040c" },
+        { L"fr-CA", L"0c0c:00001009" }, { L"es-ES", L"0c0a:0000040a" },
+        { L"es-MX", L"080a:0000080a" }, { L"it-IT", L"0410:00000410" },
+        { L"pt-BR", L"0416:00000416" }, { L"pt-PT", L"0816:00000816" },
+        { L"ja-JP", L"0411:00000411" }, { L"ko-KR", L"0412:00000412" },
+        { L"zh-CN", L"0804:00000804" }, { L"zh-TW", L"0404:00000404" },
+        { L"ru-RU", L"0419:00000419" }, { L"pl-PL", L"0415:00000415" },
+        { L"nl-NL", L"0413:00000413" }, { L"sv-SE", L"041d:0000041d" },
+        { L"nb-NO", L"0414:00000414" }, { L"da-DK", L"0406:00000406" },
+        { L"fi-FI", L"040b:0000040b" }, { L"cs-CZ", L"0405:00000405" },
+        { L"hu-HU", L"040e:0000040e" }, { L"tr-TR", L"041f:0000041f" },
+        { L"ar-SA", L"0401:00000401" }, { L"he-IL", L"040d:0000040d" },
+        { L"th-TH", L"041e:0000041e" }, { L"uk-UA", L"0422:00000422" },
+        { L"ro-RO", L"0418:00000418" }, { L"el-GR", L"0408:00000408" },
+        { L"bg-BG", L"0402:00020402" }, { L"hr-HR", L"041a:0000041a" },
+        { L"sk-SK", L"041b:0000041b" }, { L"sl-SI", L"0424:00000424" },
+        { L"et-EE", L"0425:00000425" }, { L"lv-LV", L"0426:00000426" },
+        { L"lt-LT", L"0427:00000427" },
+    };
+    int i;
+    for (i = 0; i < (int)(sizeof(map) / sizeof(map[0])); i++) {
+        if (_wcsicmp(lang, map[i].tag) == 0)
+            return map[i].klid;
+    }
+    return L"0409:00000409";  /* fallback */
+}
+
 /* Generate autounattend.xml with credentials and VM name substituted.
    If is_template, adds SecureStartup-FilterDriver to disable BitLocker
    (required for sysprep). */
@@ -180,7 +212,8 @@ static BOOL generate_autounattend(const wchar_t *output_path,
                                    const wchar_t *admin_user,
                                    const wchar_t *b64_password,
                                    BOOL is_template,
-                                   BOOL test_mode)
+                                   BOOL test_mode,
+                                   const wchar_t *lang)
 {
     FILE *f;
     wchar_t comp_name[16];
@@ -200,11 +233,11 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         L"                   processorArchitecture=\"amd64\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-        L"            <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>\n"
-        L"            <InputLocale>en-US</InputLocale>\n"
-        L"            <SystemLocale>en-US</SystemLocale>\n"
-        L"            <UILanguage>en-US</UILanguage>\n"
-        L"            <UserLocale>en-US</UserLocale>\n"
+        L"            <SetupUILanguage><UILanguage>%s</UILanguage></SetupUILanguage>\n"
+        L"            <InputLocale>%s</InputLocale>\n"
+        L"            <SystemLocale>%s</SystemLocale>\n"
+        L"            <UILanguage>%s</UILanguage>\n"
+        L"            <UserLocale>%s</UserLocale>\n"
         L"        </component>\n"
         L"        <component name=\"Microsoft-Windows-Setup\"\n"
         L"                   processorArchitecture=\"amd64\"\n"
@@ -253,6 +286,7 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         L"                    <Order>1</Order>\n"
         L"                    <Path>reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path>\n"
         L"                </RunSynchronousCommand>\n",
+        lang, lang_to_input_locale(lang), lang, lang, lang,
         comp_name);
 
     if (test_mode) {
@@ -332,10 +366,10 @@ static BOOL generate_autounattend(const wchar_t *output_path,
             L"                   processorArchitecture=\"amd64\"\n"
             L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
             L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-            L"            <InputLocale>0409:00000409</InputLocale>\n"
-            L"            <SystemLocale>en-US</SystemLocale>\n"
-            L"            <UILanguage>en-US</UILanguage>\n"
-            L"            <UserLocale>en-US</UserLocale>\n"
+            L"            <InputLocale>%s</InputLocale>\n"
+            L"            <SystemLocale>%s</SystemLocale>\n"
+            L"            <UILanguage>%s</UILanguage>\n"
+            L"            <UserLocale>%s</UserLocale>\n"
             L"        </component>\n"
             L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
             L"                   processorArchitecture=\"amd64\"\n"
@@ -371,6 +405,7 @@ static BOOL generate_autounattend(const wchar_t *output_path,
             L"        </component>\n"
             L"    </settings>\n"
             L"</unattend>\n",
+            lang_to_input_locale(lang), lang, lang, lang,
             admin_user, b64_password,
             admin_user, b64_password);
     }
@@ -511,7 +546,8 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
                               wchar_t *admin_pass,
                               const wchar_t *res_dir,
                               BOOL is_template,
-                              BOOL test_mode)
+                              BOOL test_mode,
+                              const wchar_t *lang)
 {
     wchar_t dir[MAX_PATH];
     wchar_t staging[MAX_PATH];
@@ -546,7 +582,7 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
 
     /* autounattend.xml */
     swprintf_s(file_path, MAX_PATH, L"%s\\autounattend.xml", staging);
-    if (!generate_autounattend(file_path, vm_name, admin_user, b64_pass, is_template, test_mode))
+    if (!generate_autounattend(file_path, vm_name, admin_user, b64_pass, is_template, test_mode, lang))
         ui_log(L"Warning: failed to write autounattend.xml");
 
     /* DISABLED: p9client.exe packaging — GPU driver copy is now handled by the
@@ -757,7 +793,8 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
 static BOOL generate_unattend_instance(const wchar_t *output_path,
                                         const wchar_t *vm_name,
                                         const wchar_t *admin_user,
-                                        const wchar_t *b64_password)
+                                        const wchar_t *b64_password,
+                                        const wchar_t *lang)
 {
     FILE *f;
     wchar_t comp_name[16];
@@ -804,10 +841,10 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"                   processorArchitecture=\"amd64\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-        L"            <InputLocale>0409:00000409</InputLocale>\n"
-        L"            <SystemLocale>en-US</SystemLocale>\n"
-        L"            <UILanguage>en-US</UILanguage>\n"
-        L"            <UserLocale>en-US</UserLocale>\n"
+        L"            <InputLocale>%s</InputLocale>\n"
+        L"            <SystemLocale>%s</SystemLocale>\n"
+        L"            <UILanguage>%s</UILanguage>\n"
+        L"            <UserLocale>%s</UserLocale>\n"
         L"        </component>\n"
         L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
         L"                   processorArchitecture=\"amd64\"\n"
@@ -844,6 +881,7 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"    </settings>\n"
         L"</unattend>\n",
         comp_name,
+        lang_to_input_locale(lang), lang, lang, lang,
         admin_user, b64_password,
         admin_user, b64_password);
 
@@ -1097,7 +1135,8 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        const wchar_t *vm_name,
                                        const wchar_t *admin_user,
                                        wchar_t *admin_pass,
-                                       const wchar_t *res_dir)
+                                       const wchar_t *res_dir,
+                                       const wchar_t *lang)
 {
     wchar_t dir[MAX_PATH];
     wchar_t staging[MAX_PATH];
@@ -1132,7 +1171,7 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
 
     /* unattend.xml (NOT autounattend.xml — post-sysprep mini-setup uses this name) */
     swprintf_s(file_path, MAX_PATH, L"%s\\unattend.xml", staging);
-    if (!generate_unattend_instance(file_path, vm_name, admin_user, b64_pass))
+    if (!generate_unattend_instance(file_path, vm_name, admin_user, b64_pass, lang))
         ui_log(L"Warning: failed to write instance unattend.xml");
 
     /* Agent exe + setup.cmd */
@@ -1165,7 +1204,8 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
                              const wchar_t *vm_name,
                              const wchar_t *admin_user,
                              const wchar_t *admin_pass,
-                             BOOL test_mode)
+                             BOOL test_mode,
+                             const wchar_t *lang)
 {
     FILE *f;
     wchar_t comp_name[16];
@@ -1230,10 +1270,10 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
         L"                   processorArchitecture=\"amd64\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-        L"            <InputLocale>0409:00000409</InputLocale>\n"
-        L"            <SystemLocale>en-US</SystemLocale>\n"
-        L"            <UILanguage>en-US</UILanguage>\n"
-        L"            <UserLocale>en-US</UserLocale>\n"
+        L"            <InputLocale>%s</InputLocale>\n"
+        L"            <SystemLocale>%s</SystemLocale>\n"
+        L"            <UILanguage>%s</UILanguage>\n"
+        L"            <UserLocale>%s</UserLocale>\n"
         L"        </component>\n"
         L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
         L"                   processorArchitecture=\"amd64\"\n"
@@ -1269,6 +1309,7 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
         L"        </component>\n"
         L"    </settings>\n"
         L"</unattend>\n",
+        lang_to_input_locale(lang), lang, lang, lang,
         admin_user, b64_pass,
         admin_user, b64_pass);
 
@@ -1615,4 +1656,56 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
 
     fclose(mf);
     return count;
+}
+
+/* ---- Language JSON helpers ---- */
+
+/* Derive language.json path from VHDX path (same directory) */
+static void get_language_json_path(const wchar_t *vhdx_path, wchar_t *out, size_t out_len)
+{
+    wchar_t dir[MAX_PATH];
+    const wchar_t *last_slash;
+    wcscpy_s(dir, MAX_PATH, vhdx_path);
+    last_slash = wcsrchr(dir, L'\\');
+    if (last_slash) dir[last_slash - dir] = L'\0';
+    swprintf_s(out, out_len, L"%s\\language.json", dir);
+}
+
+void vm_save_language_json(const wchar_t *vhdx_path, const wchar_t *lang)
+{
+    wchar_t path[MAX_PATH];
+    FILE *f;
+    char narrow[64];
+    get_language_json_path(vhdx_path, path, MAX_PATH);
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    WideCharToMultiByte(CP_UTF8, 0, lang, -1, narrow, sizeof(narrow), NULL, NULL);
+    fprintf(f, "{\"language\":\"%s\"}\n", narrow);
+    fclose(f);
+}
+
+BOOL vm_load_language_json(const wchar_t *vhdx_path, wchar_t *lang_out, int lang_out_max)
+{
+    wchar_t path[MAX_PATH];
+    FILE *f;
+    char buf[256];
+    get_language_json_path(vhdx_path, path, MAX_PATH);
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) return FALSE;
+    if (fgets(buf, sizeof(buf), f)) {
+        /* Parse {"language":"xx-YY"} */
+        char *p = strstr(buf, "\"language\":\"");
+        if (p) {
+            char *start, *end;
+            p += 12;  /* skip past "language":" */
+            start = p;
+            end = strchr(start, '"');
+            if (end) {
+                *end = '\0';
+                MultiByteToWideChar(CP_UTF8, 0, start, -1, lang_out, lang_out_max);
+                fclose(f);
+                return TRUE;
+            }
+        }
+    }
+    fclose(f);
+    return FALSE;
 }

@@ -26,7 +26,8 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
                               wchar_t *admin_pass,
                               const wchar_t *res_dir,
                               BOOL is_template,
-                              BOOL test_mode);
+                              BOOL test_mode,
+                              const wchar_t *lang);
 
 /* Create a resources ISO for an instance created from a template.
    Contains unattend.xml (not autounattend.xml) for post-sysprep mini-setup
@@ -35,7 +36,8 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        const wchar_t *vm_name,
                                        const wchar_t *admin_user,
                                        wchar_t *admin_pass,
-                                       const wchar_t *res_dir);
+                                       const wchar_t *res_dir,
+                                       const wchar_t *lang);
 
 /* ---- VHDX-First VM Creation (no resources ISO) ---- */
 
@@ -48,7 +50,8 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
                              const wchar_t *vm_name,
                              const wchar_t *admin_user,
                              const wchar_t *admin_pass,
-                             BOOL test_mode);
+                             BOOL test_mode,
+                             const wchar_t *lang);
 
 /* Generate unattend.xml for VHDX-first *template* boot.
    Boots into audit mode, runs sysprep /generalize /oobe /shutdown /mode:vm.
@@ -71,5 +74,11 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
                             const wchar_t *staging_dir,
                             const wchar_t *res_dir,
                             const void *gpu_shares);
+
+/* Write language.json alongside VHDX */
+void vm_save_language_json(const wchar_t *vhdx_path, const wchar_t *lang);
+
+/* Read language.json — returns TRUE if found, fills lang_out */
+BOOL vm_load_language_json(const wchar_t *vhdx_path, wchar_t *lang_out, int lang_out_max);
 
 #endif /* DISK_UTIL_H */

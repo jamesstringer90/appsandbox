@@ -130,6 +130,7 @@ typedef struct {
     HRESULT  result;
     wchar_t  error_msg[512];
     VmInstance *vm_inst;    /* heap-allocated VmInstance on success, NULL on failure */
+    wchar_t  language[32];   /* detected ISO language tag, e.g. "en-US" */
 } VhdxCreateArgs;
 
 /* ---- Forward declarations ---- */
@@ -920,13 +921,14 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         }
     } else {
         if (!generate_unattend_vhdx(file_path, args->config.name, args->config.admin_user,
-                                     args->config.admin_pass, args->config.test_mode)) {
+                                     args->config.admin_pass, args->config.test_mode,
+                                     L"en-US")) {
             args->result = E_FAIL;
             wcscpy_s(args->error_msg, 512, L"Failed to generate unattend.xml");
             goto done;
         }
     }
-    SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
+    /* Note: admin_pass zeroed after pipe loop (needed for LANG: regeneration) */
 
     /* Generate setup.cmd */
     swprintf_s(file_path, MAX_PATH, L"%s\\setup.cmd", staging);
@@ -1025,6 +1027,22 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                                 MultiByteToWideChar(CP_ACP, 0, line + 6, -1,
                                                     args->error_msg, 512);
                             args->result = E_FAIL;
+                        } else if (strncmp(line, "LANG:", 5) == 0) {
+                            MultiByteToWideChar(CP_ACP, 0, line + 5, -1,
+                                                args->language, 32);
+                            ui_log(L"Detected ISO language: %s", args->language);
+                            /* Regenerate unattend.xml with correct language */
+                            if (!args->config.is_template) {
+                                wchar_t unattend_path[MAX_PATH];
+                                wchar_t stg[MAX_PATH];
+                                swprintf_s(stg, MAX_PATH, L"%s\\_vhdx_staging", args->vhdx_dir);
+                                swprintf_s(unattend_path, MAX_PATH, L"%s\\unattend.xml", stg);
+                                generate_unattend_vhdx(unattend_path, args->config.name,
+                                                        args->config.admin_user,
+                                                        args->config.admin_pass,
+                                                        args->config.test_mode,
+                                                        args->language);
+                            }
                         } else if (strncmp(line, "DONE:", 5) == 0) {
                             args->result = S_OK;
                         }
@@ -1043,6 +1061,9 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
             }
         }
     }
+
+    /* Password no longer needed — zero it now */
+    SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
 
     WaitForSingleObject(pi.hProcess, INFINITE);
     GetExitCodeProcess(pi.hProcess, &exit_code);
@@ -1117,6 +1138,10 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         }
 
         args->result = S_OK;
+
+        /* Save detected language alongside VHDX */
+        if (args->language[0] != L'\0')
+            vm_save_language_json(args->config.vhdx_path, args->language);
     }
 
 done:
@@ -1384,19 +1409,24 @@ static void on_create_vm(const wchar_t *json)
 
         if (is_template_create) {
             if (_wcsicmp(config.os_type, L"Windows") == 0 && config.image_path[0] != L'\0') {
-                hr = iso_create_resources(res_iso, config.name, config.admin_user, config.admin_pass, res_dir, TRUE, config.test_mode);
+                hr = iso_create_resources(res_iso, config.name, config.admin_user, config.admin_pass, res_dir, TRUE, config.test_mode, L"en-US");
                 if (SUCCEEDED(hr)) wcscpy_s(config.resources_iso_path, MAX_PATH, res_iso);
                 else ui_log(L"Warning: Failed to create template resources ISO (0x%08X).", hr);
             }
         } else if (from_template) {
             if (_wcsicmp(config.os_type, L"Windows") == 0 && config.admin_pass[0] != L'\0') {
-                hr = iso_create_instance_resources(res_iso, config.name, config.admin_user, config.admin_pass, res_dir);
-                if (SUCCEEDED(hr)) wcscpy_s(config.resources_iso_path, MAX_PATH, res_iso);
+                wchar_t template_lang[32] = L"en-US";
+                vm_load_language_json(g_templates[template_idx].vhdx_path, template_lang, 32);
+                hr = iso_create_instance_resources(res_iso, config.name, config.admin_user, config.admin_pass, res_dir, template_lang);
+                if (SUCCEEDED(hr)) {
+                    wcscpy_s(config.resources_iso_path, MAX_PATH, res_iso);
+                    vm_save_language_json(config.vhdx_path, template_lang);
+                }
                 else ui_log(L"Warning: Failed to create instance resources ISO (0x%08X).", hr);
             }
         } else {
             if (_wcsicmp(config.os_type, L"Windows") == 0 && config.image_path[0] != L'\0' && config.admin_pass[0] != L'\0') {
-                hr = iso_create_resources(res_iso, config.name, config.admin_user, config.admin_pass, res_dir, FALSE, config.test_mode);
+                hr = iso_create_resources(res_iso, config.name, config.admin_user, config.admin_pass, res_dir, FALSE, config.test_mode, L"en-US");
                 if (SUCCEEDED(hr)) wcscpy_s(config.resources_iso_path, MAX_PATH, res_iso);
                 else ui_log(L"Warning: Failed to create resources ISO (0x%08X).", hr);
             }

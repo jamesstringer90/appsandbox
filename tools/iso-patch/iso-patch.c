@@ -257,6 +257,76 @@ static int run_command_with_progress(const wchar_t *cmdline, const wchar_t *pref
     return (int)exit_code;
 }
 
+/* Run a command and capture stdout into a caller-provided buffer.
+   Returns process exit code, or -1 on failure. */
+static int run_command_capture(const wchar_t *cmdline, char *out_buf, int out_buf_size)
+{
+    SECURITY_ATTRIBUTES sa;
+    HANDLE hReadPipe = NULL, hWritePipe = NULL;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD exit_code = (DWORD)-1;
+    wchar_t *cmd_buf;
+    size_t len;
+    int total = 0;
+
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0))
+        return -1;
+
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    ZeroMemory(&pi, sizeof(pi));
+
+    len = wcslen(cmdline) + 1;
+    cmd_buf = (wchar_t *)malloc(len * sizeof(wchar_t));
+    if (!cmd_buf) {
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        return -1;
+    }
+    wcscpy_s(cmd_buf, len, cmdline);
+
+    if (!CreateProcessW(NULL, cmd_buf, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        free(cmd_buf);
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        return -1;
+    }
+    free(cmd_buf);
+
+    CloseHandle(hWritePipe);
+    hWritePipe = NULL;
+
+    /* Read all output into buffer */
+    {
+        DWORD bytes_read;
+        while (total < out_buf_size - 1 &&
+               ReadFile(hReadPipe, out_buf + total,
+                        (DWORD)(out_buf_size - 1 - total), &bytes_read, NULL) &&
+               bytes_read > 0) {
+            total += (int)bytes_read;
+        }
+        out_buf[total] = '\0';
+    }
+
+    CloseHandle(hReadPipe);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int)exit_code;
+}
+
 /* Snapshot of which drive letters are CDROM before mounting */
 static DWORD snapshot_cdrom_drives(void)
 {
@@ -757,6 +827,40 @@ static int do_to_vhdx(const wchar_t *iso_path_arg, int image_index, int size_gb,
         const wchar_t *wim_name = wcsrchr(wim_path, L'\\');
         wim_name = wim_name ? wim_name + 1 : wim_path;
         log_msg(L"Found %s", wim_name);
+    }
+
+    /* ---- Step 2.5: Detect image language ---- */
+    {
+        wchar_t dism_cmd[1024];
+        char dism_output[8192];
+        wchar_t sys_dir[MAX_PATH];
+        const char *detected_lang = "en-US";  /* fallback */
+        GetSystemDirectoryW(sys_dir, MAX_PATH);
+        swprintf_s(dism_cmd, 1024,
+            L"%s\\dism.exe /Get-WimInfo /WimFile:\"%s\" /Index:%d",
+            sys_dir, wim_path, image_index);
+        if (run_command_capture(dism_cmd, dism_output, sizeof(dism_output)) == 0) {
+            /* Look for "xx-YY (Default)" pattern in DISM output */
+            char *p = strstr(dism_output, "(Default)");
+            if (p) {
+                /* Walk backwards to find the language tag */
+                char *end = p;
+                while (end > dism_output && *(end - 1) == ' ') end--;
+                if (end > dism_output) {
+                    char *start = end;
+                    while (start > dism_output && *(start - 1) != ' ' &&
+                           *(start - 1) != '\n' && *(start - 1) != '\r' &&
+                           *(start - 1) != '\t')
+                        start--;
+                    if (start < end) {
+                        *end = '\0';
+                        detected_lang = start;
+                    }
+                }
+            }
+        }
+        printf("LANG:%s\n", detected_lang);
+        fflush(stdout);
     }
 
     /* ---- Step 3: Create VHDX ---- */
