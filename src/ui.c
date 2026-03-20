@@ -92,6 +92,7 @@ static VmDisplayIdd *g_idd_displays[MAX_VMS];
 #define WM_VM_HYPERV_VIDEO_OFF (WM_APP + 12)
 #define WM_VHDX_PROGRESS       (WM_APP + 13)
 #define WM_VHDX_DONE           (WM_APP + 14)
+#define WM_SHOW_ALERT          (WM_APP + 15)
 
 /* Tray menu command ID ranges */
 #define TRAY_CMD_SHOW          1
@@ -131,6 +132,7 @@ typedef struct {
     wchar_t  error_msg[512];
     VmInstance *vm_inst;    /* heap-allocated VmInstance on success, NULL on failure */
     wchar_t  language[32];   /* detected ISO language tag, e.g. "en-US" */
+    BOOL     vhdx_created;   /* TRUE once VHDX exists on disk */
 } VhdxCreateArgs;
 
 /* ---- Forward declarations ---- */
@@ -735,6 +737,21 @@ HINSTANCE ui_get_instance(void)
     return g_hInstance;
 }
 
+static void ui_show_alert(const wchar_t *message)
+{
+    if (GetCurrentThreadId() == g_ui_thread_id) {
+        wchar_t buf[1024];
+        swprintf_s(buf, 1024, L"{\"type\":\"alert\",\"message\":\"%s\"}", message);
+        webview2_post(buf);
+    } else if (g_hwnd_main) {
+        size_t len = wcslen(message) + 1;
+        wchar_t *copy = (wchar_t *)malloc(len * sizeof(wchar_t));
+        if (copy) {
+            wcscpy_s(copy, len, message);
+            PostMessageW(g_hwnd_main, WM_SHOW_ALERT, 0, (LPARAM)copy);
+        }
+    }
+}
 
 /* ---- Template scanning ---- */
 
@@ -1078,6 +1095,8 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
 
     if (FAILED(args->result))
         goto done;
+
+    args->vhdx_created = TRUE;
 
     /* VHDX created successfully — now create network + HCS VM + start */
 
@@ -1466,7 +1485,11 @@ static void on_create_vm(const wchar_t *json)
     hr = (endpoint_guid_str[0] != L'\0')
         ? hcs_create_vm_with_endpoint(&config, endpoint_guid_str, inst)
         : hcs_create_vm(&config, inst);
-    if (FAILED(hr)) { ui_log(L"Error: Failed to create VM (0x%08X)", hr); return; }
+    if (FAILED(hr)) {
+        ui_log(L"Error: Failed to create compute system (0x%08X)", hr);
+        ui_show_alert(L"Failed to start VM, check its configuration.");
+        return;
+    }
 
     wcscpy_s(inst->gpu_name, 256, (config.gpu_mode == GPU_DEFAULT) ? L"Default GPU" : L"None");
     wcscpy_s(inst->resources_iso_path, MAX_PATH, config.resources_iso_path);
@@ -1487,6 +1510,10 @@ static void on_create_vm(const wchar_t *json)
         ui_log(L"VM \"%s\" %s.", config.name, is_template_create ? L"started (template)" : L"created and started");
     } else {
         ui_log(L"VM \"%s\" created but failed to start (0x%08X).", config.name, hr);
+        if (hr == (HRESULT)0x800705AF)
+            ui_show_alert(L"The host doesn't have enough resources to start this VM.");
+        else
+            ui_show_alert(L"Failed to start VM, check its configuration.");
     }
 
     save_vm_list();
@@ -1549,6 +1576,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         : hcs_create_vm(&args->config, vm);
     if (FAILED(hr)) {
         ui_log(L"Error: Failed to create compute system (0x%08X)", hr);
+        ui_show_alert(L"Failed to start VM, check its configuration.");
         PostMessageW(g_hwnd_main, WM_VM_STATE_CHANGED, 0, (LPARAM)vm);
         free(args); return 1;
     }
@@ -1557,6 +1585,8 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     hr = hcs_start_vm(vm);
     if (FAILED(hr)) {
         ui_log(L"Error: Failed to start VM (0x%08X)", hr);
+        if (hr == (HRESULT)0x800705AF)
+            ui_show_alert(L"The host doesn't have enough resources to start this VM.");
     } else {
         ui_log(L"VM \"%s\" started.", vm->name);
         vm_agent_start(vm);
@@ -1600,7 +1630,11 @@ static void do_start_vm(int idx)
             hcs_terminate_vm(vm); hcs_close_vm(vm);
             do_start_vm(idx); return;
         }
-        if (FAILED(hr)) { ui_log(L"Error: Failed to start VM (0x%08X)", hr); }
+        if (FAILED(hr)) {
+            ui_log(L"Error: Failed to start VM (0x%08X)", hr);
+            if (hr == (HRESULT)0x800705AF)
+                ui_show_alert(L"The host doesn't have enough resources to start this VM.");
+        }
         else {
             ui_log(L"VM \"%s\" started.", vm->name);
             vm_agent_start(vm);
@@ -2380,9 +2414,19 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     g_displays[idx] = vm_display_create(inst, g_hInstance, g_hwnd_main);
                     if (!g_displays[idx]) ui_log(L"Warning: Failed to auto-create display window.");
                 }
+            } else if (args->vhdx_created) {
+                /* VHDX exists on disk — keep VM in list so user can retry */
+                ui_log(L"VM \"%s\" created but failed to start: %s", inst->name, args->error_msg);
+                ui_log(L"You can adjust settings and start it manually.");
+                if (args->result == (HRESULT)0x800705AF)
+                    ui_show_alert(L"The host doesn't have enough resources to start this VM.");
+                else
+                    ui_show_alert(L"Failed to start VM, check its configuration.");
+                save_vm_list();
+                send_vm_list();
             } else {
                 ui_log(L"Error creating VM \"%s\": %s", inst->name, args->error_msg);
-                /* Clean up: remove VM from list */
+                /* VHDX never created — remove VM from list */
                 {
                     int j;
                     for (j = idx; j < g_vm_count - 1; j++) {
@@ -2411,6 +2455,16 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (log_text) {
             ui_log_post(log_text);
             free(log_text);
+        }
+        return 0;
+    }
+
+    case WM_SHOW_ALERT:
+    {
+        wchar_t *msg_text = (wchar_t *)lp;
+        if (msg_text) {
+            ui_show_alert(msg_text);
+            free(msg_text);
         }
         return 0;
     }

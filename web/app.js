@@ -46,6 +46,7 @@ window.chrome.webview.addEventListener('message', function(event) {
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
+        case 'alert':         showModal('Error', msg.message, 'OK'); break;
     }
 });
 
