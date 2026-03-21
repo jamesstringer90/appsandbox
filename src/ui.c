@@ -137,12 +137,12 @@ typedef struct {
 
 static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static void on_create_vm(const wchar_t *json);
-static void do_start_vm(int idx, int snap_idx, int branch_idx);
+static void do_start_vm(int idx, int snap_idx, int branch_idx, const wchar_t *branch_name);
 static void do_shutdown_vm(int idx);
 static void do_stop_vm(int idx);
 static void do_connect_rdp(int idx);
 static void do_connect_idd(int idx);
-static void on_snap_take(int vm_idx);
+static void on_snap_take(int vm_idx, const wchar_t *name);
 static void on_snap_delete(int vm_idx, int snap_idx);
 static void on_snap_delete_branch(int vm_idx, int snap_idx, int branch_idx);
 static void save_vm_list(void);
@@ -429,6 +429,28 @@ static void build_host_info_json(JsonBuilder *jb)
     jb_int(jb, L"vmHddGb", (int)vm_hdd_gb);
 }
 
+static ULONGLONG get_file_size_bytes(const wchar_t *path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    ULARGE_INTEGER sz;
+    if (!path || !path[0]) return 0;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) return 0;
+    sz.LowPart = fad.nFileSizeLow;
+    sz.HighPart = fad.nFileSizeHigh;
+    return sz.QuadPart;
+}
+
+static void jb_size_gb(JsonBuilder *jb, const wchar_t *key, ULONGLONG bytes)
+{
+    wchar_t buf[32];
+    double gb = (double)bytes / (1024.0 * 1024.0 * 1024.0);
+    if (gb >= 10.0)
+        swprintf_s(buf, 32, L"%.0f", gb);
+    else
+        swprintf_s(buf, 32, L"%.1f", gb);
+    jb_string(jb, key, buf);
+}
+
 static void build_vm_json(JsonBuilder *jb, int i)
 {
     jb_object_begin(jb);
@@ -462,6 +484,8 @@ static void build_vm_json(JsonBuilder *jb, int i)
         jb_int(jb, L"snapCurrentBranch", cur_branch);
         jb_bool(jb, L"hasSnapshots", st_->base_vhdx[0] != L'\0');
 
+        ULONGLONG base_size = get_file_size_bytes(st_->base_vhdx);
+
         /* Base branches */
         jb_array_begin(jb, L"baseBranches");
         for (b = 0; b < st_->base_branch_count; b++) {
@@ -479,6 +503,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
                 jb_string(jb, L"date", db);
             }
+            jb_size_gb(jb, L"sizeGb", base_size + get_file_size_bytes(st_->base_branches[b].vhdx_path));
             jb_object_end(jb);
         }
         jb_array_end(jb);
@@ -499,25 +524,29 @@ static void build_vm_json(JsonBuilder *jb, int i)
             jb_string(jb, L"name", st_->nodes[s].name);
             jb_string(jb, L"date", date_buf);
 
-            jb_array_begin(jb, L"branches");
-            for (b = 0; b < st_->nodes[s].branch_count; b++) {
-                FILETIME bft;
-                if (!st_->nodes[s].branches[b].valid) continue;
-                if (b > 0) jb_append(jb, L",");
-                jb_object_begin(jb);
-                jb_string(jb, L"name", st_->nodes[s].branches[b].friendly_name);
-                if (snapshot_get_branch_time(st_, s, b, &bft)) {
-                    FILETIME lft; SYSTEMTIME bst;
-                    wchar_t db[64];
-                    FileTimeToLocalFileTime(&bft, &lft);
-                    FileTimeToSystemTime(&lft, &bst);
-                    swprintf_s(db, 64, L"%04d-%02d-%02d %02d:%02d",
-                        bst.wYear, bst.wMonth, bst.wDay, bst.wHour, bst.wMinute);
-                    jb_string(jb, L"date", db);
+            {
+                ULONGLONG snap_size = get_file_size_bytes(st_->nodes[s].snap_vhdx);
+                jb_array_begin(jb, L"branches");
+                for (b = 0; b < st_->nodes[s].branch_count; b++) {
+                    FILETIME bft;
+                    if (!st_->nodes[s].branches[b].valid) continue;
+                    if (b > 0) jb_append(jb, L",");
+                    jb_object_begin(jb);
+                    jb_string(jb, L"name", st_->nodes[s].branches[b].friendly_name);
+                    if (snapshot_get_branch_time(st_, s, b, &bft)) {
+                        FILETIME lft; SYSTEMTIME bst;
+                        wchar_t db[64];
+                        FileTimeToLocalFileTime(&bft, &lft);
+                        FileTimeToSystemTime(&lft, &bst);
+                        swprintf_s(db, 64, L"%04d-%02d-%02d %02d:%02d",
+                            bst.wYear, bst.wMonth, bst.wDay, bst.wHour, bst.wMinute);
+                        jb_string(jb, L"date", db);
+                    }
+                    jb_size_gb(jb, L"sizeGb", base_size + snap_size + get_file_size_bytes(st_->nodes[s].branches[b].vhdx_path));
+                    jb_object_end(jb);
                 }
-                jb_object_end(jb);
+                jb_array_end(jb);
             }
-            jb_array_end(jb);
 
             jb_object_end(jb);
         }
@@ -1638,7 +1667,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     return 0;
 }
 
-static void do_start_vm(int idx, int snap_idx, int branch_idx)
+static void do_start_vm(int idx, int snap_idx, int branch_idx, const wchar_t *branch_name)
 {
     VmInstance *vm;
     if (idx < 0 || idx >= g_vm_count) return;
@@ -1655,6 +1684,16 @@ static void do_start_vm(int idx, int snap_idx, int branch_idx)
         } else {
             /* Create new branch */
             hr = snapshot_new_branch(&g_snap_trees[idx], vm, snap_idx);
+            /* Apply user-chosen name if provided */
+            if (SUCCEEDED(hr) && branch_name && branch_name[0] != L'\0') {
+                int new_bi;
+                if (snap_idx == -2)
+                    new_bi = g_snap_trees[idx].base_branch_count - 1;
+                else
+                    new_bi = g_snap_trees[idx].nodes[snap_idx].branch_count - 1;
+                if (new_bi >= 0)
+                    snapshot_rename(&g_snap_trees[idx], snap_idx, new_bi, branch_name);
+            }
         }
         if (FAILED(hr)) {
             ui_log(L"Error: Failed to select branch (0x%08X)", hr);
@@ -1664,6 +1703,7 @@ static void do_start_vm(int idx, int snap_idx, int branch_idx)
         if (snap_idx == -2) ui_log(L"Switching to base branch...");
         else ui_log(L"Switching to \"%s\" branch...", g_snap_trees[idx].nodes[snap_idx].name);
         save_vm_list();
+        send_vm_list();
     }
 
     if (!vm->handle) {
@@ -1689,7 +1729,7 @@ static void do_start_vm(int idx, int snap_idx, int branch_idx)
         HRESULT hr = hcs_start_vm(vm);
         if (hr == (HRESULT)0x80370110L && vm->handle) {
             hcs_terminate_vm(vm); hcs_close_vm(vm);
-            do_start_vm(idx, -1, -1); return;
+            do_start_vm(idx, -1, -1, NULL); return;
         }
         if (FAILED(hr)) {
             ui_log(L"Error: Failed to start VM (0x%08X)", hr);
@@ -1871,7 +1911,7 @@ static void tray_show_menu(HWND hwnd)
     }
 }
 
-static void on_snap_take(int vm_idx)
+static void on_snap_take(int vm_idx, const wchar_t *name)
 {
     HcsAsyncOp *op;
     if (vm_idx < 0 || vm_idx >= g_vm_count) return;
@@ -1882,7 +1922,10 @@ static void on_snap_take(int vm_idx)
     op->op_type = HCS_OP_SNAP_TAKE;
     op->vm_index = vm_idx;
     op->vm = &g_vms[vm_idx];
-    swprintf_s(op->snap_name, 128, L"Snapshot %d", g_snap_trees[vm_idx].count + 1);
+    if (name && name[0] != L'\0')
+        wcscpy_s(op->snap_name, 128, name);
+    else
+        swprintf_s(op->snap_name, 128, L"Snapshot %d", g_snap_trees[vm_idx].count + 1);
     ui_log(L"Taking snapshot \"%s\" of VM \"%s\"...", op->snap_name, op->vm->name);
     launch_hcs_op(op);
 }
@@ -1996,7 +2039,14 @@ static void on_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"createVm") == 0) {
         on_create_vm(json);
     } else if (wcscmp(action, L"startVm") == 0) {
-        int idx, si = -1, bi = -1; if (json_get_int(json, L"vmIndex", &idx)) { json_get_int(json, L"snapIndex", &si); json_get_int(json, L"branchIndex", &bi); do_start_vm(idx, si, bi); }
+        int idx, si = -1, bi = -1;
+        wchar_t bname[128] = {0};
+        if (json_get_int(json, L"vmIndex", &idx)) {
+            json_get_int(json, L"snapIndex", &si);
+            json_get_int(json, L"branchIndex", &bi);
+            json_get_string(json, L"branchName", bname, 128);
+            do_start_vm(idx, si, bi, bname);
+        }
     } else if (wcscmp(action, L"shutdownVm") == 0) {
         int idx; if (json_get_int(json, L"vmIndex", &idx)) do_shutdown_vm(idx);
     } else if (wcscmp(action, L"stopVm") == 0) {
@@ -2075,7 +2125,12 @@ static void on_webview2_message(const wchar_t *json)
             webview2_post(json_buf);
         }
     } else if (wcscmp(action, L"snapTake") == 0) {
-        int vi; if (json_get_int(json, L"vmIndex", &vi)) on_snap_take(vi);
+        int vi;
+        wchar_t sname[128] = {0};
+        if (json_get_int(json, L"vmIndex", &vi)) {
+            json_get_string(json, L"name", sname, 128);
+            on_snap_take(vi, sname);
+        }
     } else if (wcscmp(action, L"snapDelete") == 0) {
         int vi, si; if (json_get_int(json, L"vmIndex", &vi) && json_get_int(json, L"snapIndex", &si)) on_snap_delete(vi, si);
     } else if (wcscmp(action, L"snapDeleteBranch") == 0) {

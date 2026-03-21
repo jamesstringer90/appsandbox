@@ -149,6 +149,10 @@
         <label style="display:none; font-size:12px; color:var(--text-dim); cursor:pointer; margin-bottom:8px;">
             <input type="checkbox" id="modal-dont-show"> Don't show this again
         </label>
+        <div id="modal-input-row" style="display:none; margin-bottom:12px;">
+            <label style="font-size:12px; color:var(--text-dim);" id="modal-input-label">Name:</label>
+            <input type="text" id="modal-input" style="width:100%; margin-top:4px;">
+        </div>
         <div class="modal-buttons">
             <button onclick="modalResolve(false)">Cancel</button>
             <button class="danger" onclick="modalResolve(true)" id="modal-confirm-btn">Delete</button>
