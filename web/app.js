@@ -4,7 +4,7 @@
 /* ---- State ---- */
 let vms = [];
 let selectedVm = -1;
-let selectedSnap = -1;
+let selectedSnap = {};  /* vmIndex -> string value: 'current', 'base', 'base-N', 'S', 'S-N' */
 let editModeRow = -1;
 let editingCell = null; /* {row, col, element} */
 let pendingConfirm = null; /* {resolve} */
@@ -39,7 +39,7 @@ window.chrome.webview.addEventListener('message', function(event) {
         case 'fullState':     onFullState(msg); break;
         case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); break;
         case 'vmStateChanged': onVmStateChanged(msg); break;
-        case 'snapListChanged': renderSnapTable(msg.snapshots); break;
+        case 'snapListChanged': break; /* snapshots now inline in vmListChanged */
         case 'log':           appendLog(msg.message); break;
         case 'hostInfo':      updateHostInfo(msg); break;
         case 'browseResult':  onBrowseResult(msg.path); break;
@@ -377,6 +377,7 @@ function renderVmTable() {
         tr.onclick = function(e) {
             if (e.target.closest('.icon-btn')) return;
             if (e.target.closest('.editing')) return;
+            if (e.target.closest('.snap-cell')) return;
             selectVm(i);
         };
 
@@ -422,9 +423,16 @@ function renderVmTable() {
         tr.appendChild(makeCell(vm.gpuName || (vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7));
         tr.appendChild(makeCell(netNames[vm.networkMode] || 'None', i, 8));
 
+        /* Snapshot dropdown cell */
+        tr.appendChild(makeSnapCell(vm, i));
+
         /* Action icons — disable all while VHDX is building */
         var bld = vm.buildingVhdx;
-        tr.appendChild(makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() { sendCmd('startVm', {vmIndex: i}); }));
+        var snapVal = selectedSnap[i] || 'current';
+        tr.appendChild(makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() {
+            var p = parseSnapValue(snapVal);
+            sendCmd('startVm', { vmIndex: i, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
+        }));
         tr.appendChild(makeIconCell('connect', '\uD83D\uDDA5\uFE0F', vm.running && !bld, function() { sendCmd('connectVm', {vmIndex: i}); }));
         tr.appendChild(makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }));
         tr.appendChild(makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }));
@@ -434,10 +442,6 @@ function renderVmTable() {
 
         tbody.appendChild(tr);
     });
-
-    /* Show/hide snap section (if present) */
-    var snapSec = document.getElementById('snap-section');
-    if (snapSec) snapSec.className = (selectedVm >= 0) ? 'visible' : '';
 }
 
 function makeCell(text, row, col) {
@@ -474,7 +478,6 @@ function selectVm(idx) {
     if (editingCell) commitInlineEdit();
     if (editModeRow >= 0 && editModeRow !== idx) editModeRow = -1;
     selectedVm = idx;
-    selectedSnap = -1;
     renderVmTable();
     sendCmd('selectVm', { vmIndex: idx });
 }
@@ -628,40 +631,209 @@ function onDeleteVm(idx) {
 
 /* ---- Snapshots ---- */
 
-function renderSnapTable(snapshots) {
-    var tbody = document.getElementById('snap-tbody');
-    tbody.innerHTML = '';
-    if (!snapshots) return;
-
-    snapshots.forEach(function(snap, i) {
-        var tr = document.createElement('tr');
-        tr.className = (i === selectedSnap) ? 'selected' : '';
-        tr.onclick = function() { selectedSnap = i; renderSnapTable(snapshots); };
-
-        var td1 = document.createElement('td');
-        td1.textContent = snap.name;
-        tr.appendChild(td1);
-
-        var td2 = document.createElement('td');
-        td2.textContent = snap.date || '';
-        tr.appendChild(td2);
-
-        var td3 = document.createElement('td');
-        td3.textContent = snap.parentVhdx || '';
-        tr.appendChild(td3);
-
-        tbody.appendChild(tr);
-    });
+/* Parse select value string into {snapIndex, branchIndex} */
+function parseSnapValue(val) {
+    if (!val || val === 'current') return {snapIndex: -1, branchIndex: -1};
+    if (val === 'base') return {snapIndex: -2, branchIndex: -1};
+    if (val.substring(0, 5) === 'base-') return {snapIndex: -2, branchIndex: parseInt(val.substring(5))};
+    var parts = val.split('-');
+    if (parts.length === 1) return {snapIndex: parseInt(parts[0]), branchIndex: -1};
+    return {snapIndex: parseInt(parts[0]), branchIndex: parseInt(parts[1])};
 }
 
-function onSnapRevert() {
-    if (selectedSnap < 0) return;
-    sendCmd('snapRevert', { snapIndex: selectedSnap });
-}
+function makeSnapCell(vm, vmIdx) {
+    var td = document.createElement('td');
+    td.className = 'snap-cell';
+    var snaps = vm.snapshots || [];
+    var baseBranches = vm.baseBranches || [];
+    var curSnap = vm.snapCurrent;       /* -2=base, -1=pre-snapshot, >=0=snapshot index */
+    var curBranch = vm.snapCurrentBranch; /* branch index or -1 */
+    var hasSn = vm.hasSnapshots;
+    var sel = selectedSnap[vmIdx] || 'current';
 
-function onSnapDelete() {
-    if (selectedSnap < 0) return;
-    sendCmd('snapDelete', { snapIndex: selectedSnap });
+    var select = document.createElement('select');
+    select.className = 'snap-select';
+    select.disabled = vm.running;
+
+    function addOpt(value, text, selected) {
+        var o = document.createElement('option');
+        o.value = value;
+        o.textContent = text;
+        if (selected) o.selected = true;
+        select.appendChild(o);
+    }
+
+    if (!hasSn) {
+        addOpt('current', 'No snapshots', true);
+    } else {
+        /*  Tree with multiple branches per node:
+         *    Current (base, branch 1)
+         *    \u251C Base                       <- new branch
+         *    \u2502 \u251C branch 1 (date)     <- resume
+         *    \u2502 \u2514 branch 2 (date)     <- resume
+         *    \u251C Snapshot A (date)           <- new branch
+         *    \u2502 \u2514 branch 1 (date)     <- resume
+         *    \u2514 Snapshot B (date)           <- new branch
+         */
+
+        /* "Current" — resume whatever is active */
+        var curLabel = 'Current';
+        if (curSnap >= 0 && snaps[curSnap]) {
+            curLabel += ' (' + snaps[curSnap].name;
+            if (curBranch >= 0) {
+                var brName = snaps[curSnap].branches && snaps[curSnap].branches[curBranch]
+                    ? snaps[curSnap].branches[curBranch].name : '';
+                curLabel += ', ' + (brName || 'branch ' + (curBranch + 1));
+            }
+            curLabel += ')';
+        } else if (curSnap === -2) {
+            curLabel += ' (base';
+            if (curBranch >= 0) {
+                var bbName = baseBranches[curBranch] ? baseBranches[curBranch].name : '';
+                curLabel += ', ' + (bbName || 'branch ' + (curBranch + 1));
+            }
+            curLabel += ')';
+        }
+        addOpt('current', curLabel, sel === 'current');
+
+        /* Base + its branches */
+        addOpt('base', '\u251C Base [new branch]', sel === 'base');
+        baseBranches.forEach(function(br, b) {
+            var brChar = (b === baseBranches.length - 1) ? '\u2514' : '\u251C';
+            var label = '\u2502\u00A0\u00A0' + brChar + ' ' + (br.name || 'branch ' + (b + 1));
+            if (br.date) label += ' (' + br.date + ')';
+            addOpt('base-' + b, label, sel === 'base-' + b);
+        });
+
+        /* Snapshots + their branches */
+        snaps.forEach(function(snap, i) {
+            var isLast = (i === snaps.length - 1);
+            var treePfx = isLast ? '\u2514 ' : '\u251C ';
+            var contPfx = isLast ? '\u00A0\u00A0\u00A0' : '\u2502\u00A0\u00A0';
+            var branches = snap.branches || [];
+
+            addOpt(String(i), treePfx + snap.name + ' (' + snap.date + ') [new branch]', sel === String(i));
+
+            branches.forEach(function(br, b) {
+                var brChar = (b === branches.length - 1) ? '\u2514' : '\u251C';
+                var label = contPfx + brChar + ' ' + (br.name || 'branch ' + (b + 1));
+                if (br.date) label += ' (' + br.date + ')';
+                addOpt(i + '-' + b, label, sel === i + '-' + b);
+            });
+        });
+    }
+
+    select.onchange = function(e) {
+        e.stopPropagation();
+        selectedSnap[vmIdx] = select.value;
+        renderVmTable();
+    };
+    td.appendChild(select);
+
+    /* Take snapshot button — only when stopped */
+    var takeBtn = document.createElement('button');
+    takeBtn.className = 'snap-btn';
+    takeBtn.textContent = '+';
+    takeBtn.title = 'Take snapshot';
+    takeBtn.disabled = vm.running;
+    takeBtn.onclick = function(e) { e.stopPropagation(); sendCmd('snapTake', { vmIndex: vmIdx }); };
+    td.appendChild(takeBtn);
+
+    /* Delete button — context-sensitive */
+    var parsed = parseSnapValue(sel);
+    if (!vm.running && parsed.snapIndex >= 0) {
+        var delBtn = document.createElement('button');
+        delBtn.className = 'snap-btn danger';
+        delBtn.textContent = '\u2715';
+
+        if (parsed.branchIndex >= 0) {
+            /* Delete a single branch */
+            delBtn.title = 'Delete branch';
+            delBtn.onclick = function(e) {
+                e.stopPropagation();
+                showModal('Delete Branch',
+                    'Delete this branch? The snapshot will be kept.',
+                    'Delete'
+                ).then(function(confirmed) {
+                    if (confirmed) {
+                        sendCmd('snapDeleteBranch', { vmIndex: vmIdx, snapIndex: parsed.snapIndex, branchIndex: parsed.branchIndex });
+                        selectedSnap[vmIdx] = 'current';
+                    }
+                });
+            };
+        } else {
+            /* Delete entire snapshot + all branches */
+            delBtn.title = 'Delete snapshot';
+            delBtn.onclick = function(e) {
+                e.stopPropagation();
+                var snapName = snaps[parsed.snapIndex] ? snaps[parsed.snapIndex].name : '';
+                showModal('Delete Snapshot',
+                    'Delete snapshot "' + snapName + '" and all its branches?',
+                    'Delete'
+                ).then(function(confirmed) {
+                    if (confirmed) {
+                        sendCmd('snapDelete', { vmIndex: vmIdx, snapIndex: parsed.snapIndex });
+                        selectedSnap[vmIdx] = 'current';
+                    }
+                });
+            };
+        }
+        td.appendChild(delBtn);
+    }
+
+    /* Delete button for base branches */
+    if (!vm.running && parsed.snapIndex === -2 && parsed.branchIndex >= 0) {
+        var delBrBtn = document.createElement('button');
+        delBrBtn.className = 'snap-btn danger';
+        delBrBtn.textContent = '\u2715';
+        delBrBtn.title = 'Delete base branch';
+        delBrBtn.onclick = function(e) {
+            e.stopPropagation();
+            showModal('Delete Branch',
+                'Delete this base branch?',
+                'Delete'
+            ).then(function(confirmed) {
+                if (confirmed) {
+                    sendCmd('snapDeleteBranch', { vmIndex: vmIdx, snapIndex: -2, branchIndex: parsed.branchIndex });
+                    selectedSnap[vmIdx] = 'current';
+                }
+            });
+        };
+        td.appendChild(delBrBtn);
+    }
+
+    /* Rename button — when a snapshot or branch is selected */
+    if (!vm.running && parsed.snapIndex !== -1) {
+        var currentName = '';
+        if (parsed.snapIndex === -2 && parsed.branchIndex >= 0 && baseBranches[parsed.branchIndex]) {
+            currentName = baseBranches[parsed.branchIndex].name || '';
+        } else if (parsed.snapIndex >= 0 && snaps[parsed.snapIndex]) {
+            if (parsed.branchIndex >= 0) {
+                var br = snaps[parsed.snapIndex].branches && snaps[parsed.snapIndex].branches[parsed.branchIndex];
+                currentName = br ? br.name || '' : '';
+            } else {
+                currentName = snaps[parsed.snapIndex].name || '';
+            }
+        }
+        if (currentName || parsed.snapIndex >= 0) {
+            var renBtn = document.createElement('button');
+            renBtn.className = 'snap-btn';
+            renBtn.textContent = '\u270F';
+            renBtn.title = 'Rename';
+            renBtn.onclick = function(e) {
+                e.stopPropagation();
+                var newName = window.prompt('Rename:', currentName);
+                if (newName !== null && newName !== currentName) {
+                    var cmd = { vmIndex: vmIdx, snapIndex: parsed.snapIndex, name: newName };
+                    if (parsed.branchIndex >= 0) cmd.branchIndex = parsed.branchIndex;
+                    sendCmd('snapRename', cmd);
+                }
+            };
+            td.appendChild(renBtn);
+        }
+    }
+
+    return td;
 }
 
 /* ---- Log ---- */

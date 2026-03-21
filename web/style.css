@@ -362,23 +362,21 @@ td.editing select {
     box-sizing: border-box;
 }
 
-/* Snapshot table */
-#snap-section { display: none; }
-#snap-section.visible { display: block; }
-
-.snap-row {
-    display: flex;
-    gap: 8px;
-    align-items: flex-start;
+/* Snapshot dropdown in VM table */
+.snap-cell { white-space: nowrap; }
+.snap-select {
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 11px;
+    padding: 1px 2px;
+    max-width: 280px;
 }
-.snap-row .vm-table-wrap { flex: 1; }
-.snap-buttons {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding-top: 22px;
+.snap-btn {
+    font-size: 11px;
+    padding: 1px 5px;
+    margin-left: 2px;
+    cursor: pointer;
 }
-.snap-buttons button { width: 70px; }
+.snap-btn.danger { color: var(--danger); }
 
 /* Log panel */
 #log-panel {
