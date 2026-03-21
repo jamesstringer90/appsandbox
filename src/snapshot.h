@@ -14,13 +14,9 @@
  *   MyVM/
  *     disk.vhdx                              <- base disk (frozen once snapshots exist)
  *     snapshots/
- *       tree.dat                             <- persisted tree metadata
- *       base_branch_1.vhdx                  <- working branch off base
- *       base_branch_2.vhdx                  <- working branch off base
- *       Snapshot 1.vhdx                     <- frozen fork off base
- *       Snapshot 1_branch_1.vhdx            <- working branch off Snapshot 1
- *       Snapshot 2.vhdx                     <- frozen fork off base
- *       Snapshot 2_branch_1.vhdx            <- working branch off Snapshot 2
+ *       tree.dat                             <- persisted tree metadata (GUIDs + friendly names)
+ *       snapshot_{GUID}.vhdx                <- frozen fork off base
+ *       branch_{GUID}.vhdx                 <- working branch (off base or snapshot)
  *
  * Snapshots and base are frozen — never booted directly.
  * Booting creates/resumes a branch (differencing VHDX of the snapshot or base).

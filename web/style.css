@@ -364,6 +364,27 @@ td.editing select {
 
 /* Snapshot dropdown in VM table */
 .snap-cell { white-space: nowrap; }
+.snap-wrap {
+    position: relative;
+    display: inline-block;
+    vertical-align: middle;
+}
+.snap-overlay {
+    position: absolute;
+    left: 0; top: 0; right: 16px; bottom: 0;
+    display: flex;
+    align-items: center;
+    padding: 1px 4px;
+    font-size: 11px;
+    color: var(--text);
+    background: var(--ctrl-bg);
+    pointer-events: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    border-radius: var(--radius) 0 0 var(--radius);
+}
+.snap-select:focus + .snap-overlay { display: none; }
 .snap-select {
     font-family: 'Consolas', 'Courier New', monospace;
     font-size: 11px;

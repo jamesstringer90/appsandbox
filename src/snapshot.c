@@ -269,7 +269,7 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
 
     /* Record first branch */
     wcscpy_s(node->branches[0].guid, 64, branch_guid);
-    make_datetime_name(node->branches[0].friendly_name, 128);
+    wcscpy_s(node->branches[0].friendly_name, 128, L"Default Branch");
     wcscpy_s(node->branches[0].vhdx_path, MAX_PATH, branch_path);
     node->branches[0].valid = TRUE;
     node->branch_count = 1;

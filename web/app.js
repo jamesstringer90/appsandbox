@@ -429,10 +429,26 @@ function renderVmTable() {
         /* Action icons — disable all while VHDX is building */
         var bld = vm.buildingVhdx;
         var snapVal = selectedSnap[i] || 'current';
-        tr.appendChild(makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() {
-            var p = parseSnapValue(snapVal);
-            sendCmd('startVm', { vmIndex: i, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
-        }));
+        tr.appendChild(makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, (function(vmIdx, sv, vmObj) { return function() {
+            var p = parseSnapValue(sv);
+            if ((p.snapIndex >= 0 || p.snapIndex === -2) && p.branchIndex < 0) {
+                /* Creating a new branch — prompt for name */
+                var parentName = p.snapIndex === -2 ? 'Base' : ((vmObj.snapshots && vmObj.snapshots[p.snapIndex]) ? vmObj.snapshots[p.snapIndex].name : 'Snapshot');
+                var now = new Date();
+                var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
+                var defaultName = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' + pad(now.getDate()) + ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
+                showModal('New Branch', 'A new branch will be created from ' + parentName + '. Branches are independent working copies \u2014 changes in one branch don\u2019t affect others or modify the base snapshot.', 'Boot', {
+                    confirmClass: 'primary',
+                    input: { label: 'Branch name:', value: defaultName }
+                }).then(function(result) {
+                    if (result === false) return;
+                    selectedSnap[vmIdx] = 'current';
+                    sendCmd('startVm', { vmIndex: vmIdx, snapIndex: p.snapIndex, branchIndex: p.branchIndex, branchName: result });
+                });
+            } else {
+                sendCmd('startVm', { vmIndex: vmIdx, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
+            }
+        }; })(i, snapVal, vm)));
         tr.appendChild(makeIconCell('connect', '\uD83D\uDDA5\uFE0F', vm.running && !bld, function() { sendCmd('connectVm', {vmIndex: i}); }));
         tr.appendChild(makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }));
         tr.appendChild(makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }));
@@ -651,6 +667,9 @@ function makeSnapCell(vm, vmIdx) {
     var hasSn = vm.hasSnapshots;
     var sel = selectedSnap[vmIdx] || 'current';
 
+    var snapWrap = document.createElement('span');
+    snapWrap.className = 'snap-wrap';
+
     var select = document.createElement('select');
     select.className = 'snap-select';
     select.disabled = vm.running;
@@ -677,31 +696,15 @@ function makeSnapCell(vm, vmIdx) {
          */
 
         /* "Current" — resume whatever is active */
-        var curLabel = 'Current';
-        if (curSnap >= 0 && snaps[curSnap]) {
-            curLabel += ' (' + snaps[curSnap].name;
-            if (curBranch >= 0) {
-                var brName = snaps[curSnap].branches && snaps[curSnap].branches[curBranch]
-                    ? snaps[curSnap].branches[curBranch].name : '';
-                curLabel += ', ' + (brName || 'branch ' + (curBranch + 1));
-            }
-            curLabel += ')';
-        } else if (curSnap === -2) {
-            curLabel += ' (base';
-            if (curBranch >= 0) {
-                var bbName = baseBranches[curBranch] ? baseBranches[curBranch].name : '';
-                curLabel += ', ' + (bbName || 'branch ' + (curBranch + 1));
-            }
-            curLabel += ')';
-        }
-        addOpt('current', curLabel, sel === 'current');
+        addOpt('current', 'Current', sel === 'current');
 
         /* Base + its branches */
-        addOpt('base', '\u251C Base [new branch]', sel === 'base');
+        addOpt('base', '\u251C Base [create new child branch]', sel === 'base');
         baseBranches.forEach(function(br, b) {
             var brChar = (b === baseBranches.length - 1) ? '\u2514' : '\u251C';
             var label = '\u2502\u00A0\u00A0' + brChar + ' ' + (br.name || 'branch ' + (b + 1));
             if (br.date) label += ' (' + br.date + ')';
+            if (br.sizeGb) label += ' [' + br.sizeGb + ' GB]';
             addOpt('base-' + b, label, sel === 'base-' + b);
         });
 
@@ -712,12 +715,13 @@ function makeSnapCell(vm, vmIdx) {
             var contPfx = isLast ? '\u00A0\u00A0\u00A0' : '\u2502\u00A0\u00A0';
             var branches = snap.branches || [];
 
-            addOpt(String(i), treePfx + snap.name + ' (' + snap.date + ') [new branch]', sel === String(i));
+            addOpt(String(i), treePfx + snap.name + ' (' + snap.date + ') [create new child branch]', sel === String(i));
 
             branches.forEach(function(br, b) {
                 var brChar = (b === branches.length - 1) ? '\u2514' : '\u251C';
                 var label = contPfx + brChar + ' ' + (br.name || 'branch ' + (b + 1));
                 if (br.date) label += ' (' + br.date + ')';
+                if (br.sizeGb) label += ' [' + br.sizeGb + ' GB]';
                 addOpt(i + '-' + b, label, sel === i + '-' + b);
             });
         });
@@ -728,7 +732,44 @@ function makeSnapCell(vm, vmIdx) {
         selectedSnap[vmIdx] = select.value;
         renderVmTable();
     };
-    td.appendChild(select);
+    snapWrap.appendChild(select);
+
+    /* Chain overlay — shows selected path when dropdown is closed */
+    if (hasSn) {
+        var p = parseSnapValue(sel);
+        var chainText = '';
+        if (sel === 'current') {
+            /* Show the currently active chain */
+            if (curSnap >= 0 && snaps[curSnap]) {
+                chainText = 'base \u2192 ' + snaps[curSnap].name;
+                if (curBranch >= 0 && snaps[curSnap].branches && snaps[curSnap].branches[curBranch])
+                    chainText += ' \u2192 ' + (snaps[curSnap].branches[curBranch].name || 'branch ' + (curBranch + 1));
+            } else if (curSnap === -2) {
+                chainText = 'base';
+                if (curBranch >= 0 && baseBranches[curBranch])
+                    chainText += ' \u2192 ' + (baseBranches[curBranch].name || 'branch ' + (curBranch + 1));
+            } else {
+                chainText = 'base';
+            }
+        } else if (p.snapIndex === -2) {
+            chainText = 'base';
+            if (p.branchIndex >= 0 && baseBranches[p.branchIndex])
+                chainText += ' \u2192 ' + (baseBranches[p.branchIndex].name || 'branch ' + (p.branchIndex + 1));
+            else
+                chainText += ' [create new child branch]';
+        } else if (p.snapIndex >= 0 && snaps[p.snapIndex]) {
+            chainText = 'base \u2192 ' + snaps[p.snapIndex].name;
+            if (p.branchIndex >= 0 && snaps[p.snapIndex].branches && snaps[p.snapIndex].branches[p.branchIndex])
+                chainText += ' \u2192 ' + (snaps[p.snapIndex].branches[p.branchIndex].name || 'branch ' + (p.branchIndex + 1));
+            else
+                chainText += ' [create new child branch]';
+        }
+        var overlay = document.createElement('span');
+        overlay.className = 'snap-overlay';
+        overlay.textContent = chainText;
+        snapWrap.appendChild(overlay);
+    }
+    td.appendChild(snapWrap);
 
     /* Take snapshot button — only when stopped */
     var takeBtn = document.createElement('button');
@@ -736,7 +777,17 @@ function makeSnapCell(vm, vmIdx) {
     takeBtn.textContent = '+';
     takeBtn.title = 'Take snapshot';
     takeBtn.disabled = vm.running;
-    takeBtn.onclick = function(e) { e.stopPropagation(); sendCmd('snapTake', { vmIndex: vmIdx }); };
+    takeBtn.onclick = function(e) {
+        e.stopPropagation();
+        var defaultName = 'Snapshot ' + (snaps.length + 1);
+        showModal('New Snapshot', 'Create a new snapshot of the base disk. Snapshots are frozen points in time that you can create independent branches from.', 'Create', {
+            confirmClass: 'primary',
+            input: { label: 'Snapshot name:', value: defaultName }
+        }).then(function(result) {
+            if (result === false) return;
+            sendCmd('snapTake', { vmIndex: vmIdx, name: result });
+        });
+    };
     td.appendChild(takeBtn);
 
     /* Delete button — context-sensitive */
@@ -822,12 +873,15 @@ function makeSnapCell(vm, vmIdx) {
             renBtn.title = 'Rename';
             renBtn.onclick = function(e) {
                 e.stopPropagation();
-                var newName = window.prompt('Rename:', currentName);
-                if (newName !== null && newName !== currentName) {
-                    var cmd = { vmIndex: vmIdx, snapIndex: parsed.snapIndex, name: newName };
+                showModal('Rename', 'Enter a new name:', 'Rename', {
+                    confirmClass: 'primary',
+                    input: { label: 'Name:', value: currentName }
+                }).then(function(result) {
+                    if (result === false || result === currentName) return;
+                    var cmd = { vmIndex: vmIdx, snapIndex: parsed.snapIndex, name: result };
                     if (parsed.branchIndex >= 0) cmd.branchIndex = parsed.branchIndex;
                     sendCmd('snapRename', cmd);
-                }
+                });
             };
             td.appendChild(renBtn);
         }
@@ -849,23 +903,46 @@ function appendLog(msg) {
 
 /* ---- Modal ---- */
 
-function showModal(title, message, confirmText) {
+function showModal(title, message, confirmText, opts) {
     document.getElementById('modal-title').textContent = title;
     document.getElementById('modal-message').textContent = message;
-    document.getElementById('modal-confirm-btn').textContent = confirmText || 'Confirm';
+    var confirmBtn = document.getElementById('modal-confirm-btn');
+    confirmBtn.textContent = confirmText || 'Confirm';
+    confirmBtn.className = (opts && opts.confirmClass) || 'danger';
     var cb = document.getElementById('modal-dont-show');
     if (cb) cb.parentElement.style.display = 'none';
+    var inputRow = document.getElementById('modal-input-row');
+    var inputEl = document.getElementById('modal-input');
+    if (opts && opts.input) {
+        inputRow.style.display = 'block';
+        inputEl.value = opts.input.value || '';
+        if (opts.input.label) document.getElementById('modal-input-label').textContent = opts.input.label;
+        inputEl.onkeydown = function(e) { if (e.key === 'Enter') modalResolve(true); };
+        inputEl.oninput = function() {
+            /* Strip characters that would break the INI-style .dat file */
+            var clean = inputEl.value.replace(/[\n\r\t\[\]\\]/g, '');
+            if (clean !== inputEl.value) inputEl.value = clean;
+        };
+        inputEl.maxLength = 127;
+        setTimeout(function() { inputEl.select(); inputEl.focus(); }, 50);
+    } else {
+        inputRow.style.display = 'none';
+    }
     document.getElementById('modal-overlay').classList.add('active');
 
     return new Promise(function(resolve) {
-        pendingConfirm = { resolve: resolve };
+        pendingConfirm = { resolve: resolve, hasInput: !!(opts && opts.input) };
     });
 }
 
 function modalResolve(result) {
     document.getElementById('modal-overlay').classList.remove('active');
     if (pendingConfirm) {
-        pendingConfirm.resolve(result);
+        if (result && pendingConfirm.hasInput) {
+            pendingConfirm.resolve(document.getElementById('modal-input').value);
+        } else {
+            pendingConfirm.resolve(result);
+        }
         pendingConfirm = null;
     }
 }
