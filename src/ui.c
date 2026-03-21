@@ -72,7 +72,7 @@ static TemplateInfo g_templates[MAX_TEMPLATES];
 static int g_template_count = 0;
 
 /* Snapshot storage per VM */
-static SnapshotList g_snap_lists[MAX_VMS];
+static SnapshotTree g_snap_trees[MAX_VMS];
 
 /* Display windows (RDP and IDD) */
 static VmDisplay *g_displays[MAX_VMS];
@@ -107,14 +107,12 @@ static NOTIFYICONDATAW g_nid;
 /* Async HCS operation types */
 #define HCS_OP_STOP       1
 #define HCS_OP_SNAP_TAKE  2
-#define HCS_OP_SNAP_REVERT 3
 
 typedef struct {
     int         op_type;
     int         vm_index;
     VmInstance  *vm;
     HRESULT     result;
-    int         snap_index;
     wchar_t     snap_name[128];
 } HcsAsyncOp;
 
@@ -139,14 +137,14 @@ typedef struct {
 
 static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static void on_create_vm(const wchar_t *json);
-static void do_start_vm(int idx);
+static void do_start_vm(int idx, int snap_idx, int branch_idx);
 static void do_shutdown_vm(int idx);
 static void do_stop_vm(int idx);
 static void do_connect_rdp(int idx);
 static void do_connect_idd(int idx);
-static void on_snap_take(void);
-static void on_snap_revert(int snap_idx);
-static void on_snap_delete(int snap_idx);
+static void on_snap_take(int vm_idx);
+static void on_snap_delete(int vm_idx, int snap_idx);
+static void on_snap_delete_branch(int vm_idx, int snap_idx, int branch_idx);
 static void save_vm_list(void);
 static void load_vm_list(void);
 static void scan_templates(void);
@@ -177,7 +175,7 @@ static void safe_destroy_idd(int idx)
 
 static void build_host_info_json(JsonBuilder *jb);
 static void send_vm_list(void);
-static void send_snap_list(void);
+
 static void send_host_info(void);
 static void send_full_state(void);
 static void send_adapters(void);
@@ -377,8 +375,16 @@ static void load_vm_list(void)
             wcscpy_s(snap_dir, MAX_PATH, g_vms[i].vhdx_path);
             last_slash = wcsrchr(snap_dir, L'\\');
             if (last_slash) *last_slash = L'\0';
-            wcscat_s(snap_dir, MAX_PATH, L"\\snapshots");
-            snapshot_init(&g_snap_lists[i], snap_dir);
+            /* vhdx_path may already be inside snapshots/ (branch file) */
+            {
+                size_t dlen = wcslen(snap_dir);
+                if (dlen >= 10 && _wcsicmp(snap_dir + dlen - 10, L"\\snapshots") == 0) {
+                    /* Already points to snapshots dir — use as-is */
+                } else {
+                    wcscat_s(snap_dir, MAX_PATH, L"\\snapshots");
+                }
+            }
+            snapshot_init(&g_snap_trees[i], snap_dir);
         }
     }
 }
@@ -444,6 +450,80 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"vhdxStaging", g_vms[i].vhdx_staging);
     jb_int(jb, L"vhdxProgress", g_vms[i].vhdx_progress);
     jb_bool(jb, L"installComplete", g_vms[i].install_complete);
+
+    /* Inline snapshot tree */
+    {
+        int s, b;
+        SnapshotTree *st_ = &g_snap_trees[i];
+        int cur_snap, cur_branch;
+        snapshot_find_current(st_, g_vms[i].vhdx_path, &cur_snap, &cur_branch);
+
+        jb_int(jb, L"snapCurrent", cur_snap);
+        jb_int(jb, L"snapCurrentBranch", cur_branch);
+        jb_bool(jb, L"hasSnapshots", st_->base_vhdx[0] != L'\0');
+
+        /* Base branches */
+        jb_array_begin(jb, L"baseBranches");
+        for (b = 0; b < st_->base_branch_count; b++) {
+            FILETIME bft;
+            if (!st_->base_branches[b].valid) continue;
+            if (b > 0) jb_append(jb, L",");
+            jb_object_begin(jb);
+            jb_string(jb, L"name", st_->base_branches[b].friendly_name);
+            if (snapshot_get_branch_time(st_, -2, b, &bft)) {
+                FILETIME lft; SYSTEMTIME st;
+                wchar_t db[64];
+                FileTimeToLocalFileTime(&bft, &lft);
+                FileTimeToSystemTime(&lft, &st);
+                swprintf_s(db, 64, L"%04d-%02d-%02d %02d:%02d",
+                    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+                jb_string(jb, L"date", db);
+            }
+            jb_object_end(jb);
+        }
+        jb_array_end(jb);
+
+        /* Snapshots with branches */
+        jb_array_begin(jb, L"snapshots");
+        for (s = 0; s < st_->count; s++) {
+            FILETIME local_ft;
+            SYSTEMTIME sys_t;
+            wchar_t date_buf[64];
+            if (!st_->nodes[s].valid) continue;
+            FileTimeToLocalFileTime(&st_->nodes[s].created, &local_ft);
+            FileTimeToSystemTime(&local_ft, &sys_t);
+            swprintf_s(date_buf, 64, L"%04d-%02d-%02d %02d:%02d",
+                sys_t.wYear, sys_t.wMonth, sys_t.wDay, sys_t.wHour, sys_t.wMinute);
+            if (s > 0) jb_append(jb, L",");
+            jb_object_begin(jb);
+            jb_string(jb, L"name", st_->nodes[s].name);
+            jb_string(jb, L"date", date_buf);
+
+            jb_array_begin(jb, L"branches");
+            for (b = 0; b < st_->nodes[s].branch_count; b++) {
+                FILETIME bft;
+                if (!st_->nodes[s].branches[b].valid) continue;
+                if (b > 0) jb_append(jb, L",");
+                jb_object_begin(jb);
+                jb_string(jb, L"name", st_->nodes[s].branches[b].friendly_name);
+                if (snapshot_get_branch_time(st_, s, b, &bft)) {
+                    FILETIME lft; SYSTEMTIME bst;
+                    wchar_t db[64];
+                    FileTimeToLocalFileTime(&bft, &lft);
+                    FileTimeToSystemTime(&lft, &bst);
+                    swprintf_s(db, 64, L"%04d-%02d-%02d %02d:%02d",
+                        bst.wYear, bst.wMonth, bst.wDay, bst.wHour, bst.wMinute);
+                    jb_string(jb, L"date", db);
+                }
+                jb_object_end(jb);
+            }
+            jb_array_end(jb);
+
+            jb_object_end(jb);
+        }
+        jb_array_end(jb);
+    }
+
     jb_object_end(jb);
 }
 
@@ -481,46 +561,6 @@ static void send_vm_list(void)
         jb_append(&jb, hi_buf);
         jb.count++;
     }
-
-    jb_object_end(&jb);
-    webview2_post(buf);
-}
-
-static void send_snap_list(void)
-{
-    wchar_t buf[8192];
-    JsonBuilder jb;
-    int i;
-    SnapshotList *slist;
-
-    if (g_selected_vm < 0 || g_selected_vm >= g_vm_count) return;
-    slist = &g_snap_lists[g_selected_vm];
-
-    jb_init(&jb, buf, 8192);
-    jb_object_begin(&jb);
-    jb_string(&jb, L"type", L"snapListChanged");
-
-    jb_array_begin(&jb, L"snapshots");
-    for (i = 0; i < slist->count; i++) {
-        FILETIME local_ft;
-        SYSTEMTIME st;
-        wchar_t date_buf[64];
-
-        if (!slist->snapshots[i].valid) continue;
-
-        FileTimeToLocalFileTime(&slist->snapshots[i].timestamp, &local_ft);
-        FileTimeToSystemTime(&local_ft, &st);
-        swprintf_s(date_buf, 64, L"%04d-%02d-%02d %02d:%02d:%02d",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-
-        if (i > 0) jb_append(&jb, L",");
-        jb_object_begin(&jb);
-        jb_string(&jb, L"name", slist->snapshots[i].name);
-        jb_string(&jb, L"date", date_buf);
-        jb_string(&jb, L"parentVhdx", slist->snapshots[i].parent_vhdx);
-        jb_object_end(&jb);
-    }
-    jb_array_end(&jb);
 
     jb_object_end(&jb);
     webview2_post(buf);
@@ -890,7 +930,7 @@ static void destroy_vm_at(int idx)
 
     for (i = idx; i < g_vm_count - 1; i++) {
         g_vms[i] = g_vms[i + 1];
-        g_snap_lists[i] = g_snap_lists[i + 1];
+        g_snap_trees[i] = g_snap_trees[i + 1];
         g_displays[i] = g_displays[i + 1];
         g_idd_displays[i] = g_idd_displays[i + 1];
     }
@@ -1372,7 +1412,7 @@ static void on_create_vm(const wchar_t *json)
             inst->vhdx_progress = 0;
             memcpy(&inst->gpu_shares, &config.gpu_shares, sizeof(GpuDriverShareList));
 
-            { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir); snapshot_init(&g_snap_lists[g_vm_count], sd); }
+            { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir); snapshot_init(&g_snap_trees[g_vm_count], sd); }
             g_vm_count++;
 
             /* Write initial install state for non-template VMs */
@@ -1405,6 +1445,7 @@ static void on_create_vm(const wchar_t *json)
     /* Create disk */
     if (from_template) {
         ui_log(L"Creating differencing VHDX from template \"%s\"...", g_templates[template_idx].name);
+        DeleteFileW(config.vhdx_path); /* remove stale file from prior failed attempt */
         hr = vhdx_create_differencing(config.vhdx_path, g_templates[template_idx].vhdx_path);
         if (FAILED(hr)) { ui_log(L"Error: Failed to create differencing VHDX (0x%08X)", hr); return; }
         ui_log(L"Differencing VHDX created.");
@@ -1494,7 +1535,7 @@ static void on_create_vm(const wchar_t *json)
     wcscpy_s(inst->gpu_name, 256, (config.gpu_mode == GPU_DEFAULT) ? L"Default GPU" : L"None");
     wcscpy_s(inst->resources_iso_path, MAX_PATH, config.resources_iso_path);
 
-    { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir); snapshot_init(&g_snap_lists[g_vm_count], sd); }
+    { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir); snapshot_init(&g_snap_trees[g_vm_count], sd); }
     g_vm_count++;
 
     /* Write initial install state for non-template VMs */
@@ -1597,13 +1638,33 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     return 0;
 }
 
-static void do_start_vm(int idx)
+static void do_start_vm(int idx, int snap_idx, int branch_idx)
 {
     VmInstance *vm;
     if (idx < 0 || idx >= g_vm_count) return;
     vm = &g_vms[idx];
 
     if (vm->running) { ui_log(L"VM \"%s\" is already running.", vm->name); return; }
+
+    /* Switch to a snapshot/base branch before booting */
+    if (snap_idx >= 0 || snap_idx == -2) {
+        HRESULT hr;
+        if (branch_idx >= 0) {
+            /* Resume existing branch */
+            hr = snapshot_select_branch(&g_snap_trees[idx], vm, snap_idx, branch_idx);
+        } else {
+            /* Create new branch */
+            hr = snapshot_new_branch(&g_snap_trees[idx], vm, snap_idx);
+        }
+        if (FAILED(hr)) {
+            ui_log(L"Error: Failed to select branch (0x%08X)", hr);
+            send_vm_list();
+            return;
+        }
+        if (snap_idx == -2) ui_log(L"Switching to base branch...");
+        else ui_log(L"Switching to \"%s\" branch...", g_snap_trees[idx].nodes[snap_idx].name);
+        save_vm_list();
+    }
 
     if (!vm->handle) {
         StartVmArgs *args = (StartVmArgs *)calloc(1, sizeof(StartVmArgs));
@@ -1628,7 +1689,7 @@ static void do_start_vm(int idx)
         HRESULT hr = hcs_start_vm(vm);
         if (hr == (HRESULT)0x80370110L && vm->handle) {
             hcs_terminate_vm(vm); hcs_close_vm(vm);
-            do_start_vm(idx); return;
+            do_start_vm(idx, -1, -1); return;
         }
         if (FAILED(hr)) {
             ui_log(L"Error: Failed to start VM (0x%08X)", hr);
@@ -1678,8 +1739,7 @@ static DWORD WINAPI hcs_op_thread(LPVOID param)
     HcsAsyncOp *op = (HcsAsyncOp *)param;
     switch (op->op_type) {
     case HCS_OP_STOP:       op->result = hcs_terminate_vm(op->vm); break;
-    case HCS_OP_SNAP_TAKE:  op->result = snapshot_take(&g_snap_lists[op->vm_index], op->vm, op->snap_name); break;
-    case HCS_OP_SNAP_REVERT: op->result = snapshot_revert(&g_snap_lists[op->vm_index], op->vm, op->snap_index); break;
+    case HCS_OP_SNAP_TAKE:  op->result = snapshot_take(&g_snap_trees[op->vm_index], op->vm, op->snap_name); break;
     }
     PostMessageW(g_hwnd_main, WM_HCS_OP_DONE, 0, (LPARAM)op);
     return 0;
@@ -1811,56 +1871,47 @@ static void tray_show_menu(HWND hwnd)
     }
 }
 
-static void on_snap_take(void)
+static void on_snap_take(int vm_idx)
 {
     HcsAsyncOp *op;
-    if (g_selected_vm < 0 || g_selected_vm >= g_vm_count) return;
-    if (!g_vms[g_selected_vm].running) { ui_log(L"VM must be running to take a snapshot."); return; }
+    if (vm_idx < 0 || vm_idx >= g_vm_count) return;
+    if (g_vms[vm_idx].running) { ui_log(L"VM must be stopped to take a snapshot."); return; }
 
     op = (HcsAsyncOp *)calloc(1, sizeof(HcsAsyncOp));
     if (!op) return;
     op->op_type = HCS_OP_SNAP_TAKE;
-    op->vm_index = g_selected_vm;
-    op->vm = &g_vms[g_selected_vm];
-    swprintf_s(op->snap_name, 128, L"Snapshot %d", g_snap_lists[g_selected_vm].count + 1);
+    op->vm_index = vm_idx;
+    op->vm = &g_vms[vm_idx];
+    swprintf_s(op->snap_name, 128, L"Snapshot %d", g_snap_trees[vm_idx].count + 1);
     ui_log(L"Taking snapshot \"%s\" of VM \"%s\"...", op->snap_name, op->vm->name);
     launch_hcs_op(op);
 }
 
-static void on_snap_revert(int snap_idx)
-{
-    HcsAsyncOp *op;
-    if (g_selected_vm < 0 || g_selected_vm >= g_vm_count) return;
-    if (snap_idx < 0) { ui_log(L"Select a snapshot to revert to."); return; }
-
-    if (g_vms[g_selected_vm].running) {
-        hcs_stop_monitor(&g_vms[g_selected_vm]);
-        vm_agent_stop(&g_vms[g_selected_vm]);
-        safe_destroy_rdp(g_selected_vm);
-        safe_destroy_idd(g_selected_vm);
-    }
-
-    op = (HcsAsyncOp *)calloc(1, sizeof(HcsAsyncOp));
-    if (!op) return;
-    op->op_type = HCS_OP_SNAP_REVERT;
-    op->vm_index = g_selected_vm;
-    op->vm = &g_vms[g_selected_vm];
-    op->snap_index = snap_idx;
-    ui_log(L"Reverting VM \"%s\" to snapshot %d...", op->vm->name, snap_idx);
-    launch_hcs_op(op);
-}
-
-static void on_snap_delete(int snap_idx)
+static void on_snap_delete(int vm_idx, int snap_idx)
 {
     HRESULT hr;
-    if (g_selected_vm < 0 || g_selected_vm >= g_vm_count) return;
+    if (vm_idx < 0 || vm_idx >= g_vm_count) return;
     if (snap_idx < 0) { ui_log(L"Select a snapshot to delete."); return; }
 
     ui_log(L"Deleting snapshot %d...", snap_idx);
-    hr = snapshot_delete(&g_snap_lists[g_selected_vm], snap_idx);
+    hr = snapshot_delete(&g_snap_trees[vm_idx], &g_vms[vm_idx], snap_idx);
     if (FAILED(hr)) ui_log(L"Error: Failed to delete snapshot (0x%08X)", hr);
     else ui_log(L"Snapshot deleted.");
-    send_snap_list();
+    save_vm_list();
+    send_vm_list();
+}
+
+static void on_snap_delete_branch(int vm_idx, int snap_idx, int branch_idx)
+{
+    HRESULT hr;
+    if (vm_idx < 0 || vm_idx >= g_vm_count) return;
+
+    ui_log(L"Deleting branch %d of %s...", branch_idx, snap_idx == -2 ? L"base" : g_snap_trees[vm_idx].nodes[snap_idx].name);
+    hr = snapshot_delete_branch(&g_snap_trees[vm_idx], &g_vms[vm_idx], snap_idx, branch_idx);
+    if (FAILED(hr)) ui_log(L"Error: Failed to delete branch (0x%08X)", hr);
+    else ui_log(L"Branch deleted.");
+    save_vm_list();
+    send_vm_list();
 }
 
 /* ---- Edit VM inline ---- */
@@ -1945,7 +1996,7 @@ static void on_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"createVm") == 0) {
         on_create_vm(json);
     } else if (wcscmp(action, L"startVm") == 0) {
-        int idx; if (json_get_int(json, L"vmIndex", &idx)) do_start_vm(idx);
+        int idx, si = -1, bi = -1; if (json_get_int(json, L"vmIndex", &idx)) { json_get_int(json, L"snapIndex", &si); json_get_int(json, L"branchIndex", &bi); do_start_vm(idx, si, bi); }
     } else if (wcscmp(action, L"shutdownVm") == 0) {
         int idx; if (json_get_int(json, L"vmIndex", &idx)) do_shutdown_vm(idx);
     } else if (wcscmp(action, L"stopVm") == 0) {
@@ -1962,7 +2013,6 @@ static void on_webview2_message(const wchar_t *json)
             g_selected_vm = -1;
             save_vm_list();
             send_vm_list();
-            send_snap_list();
             ui_log(L"VM deleted.");
         }
     } else if (wcscmp(action, L"deleteTemplate") == 0) {
@@ -2002,7 +2052,6 @@ static void on_webview2_message(const wchar_t *json)
         int idx;
         if (json_get_int(json, L"vmIndex", &idx)) {
             g_selected_vm = idx;
-            send_snap_list();
         }
     } else if (wcscmp(action, L"browseImage") == 0) {
         OPENFILENAMEW ofn;
@@ -2026,11 +2075,22 @@ static void on_webview2_message(const wchar_t *json)
             webview2_post(json_buf);
         }
     } else if (wcscmp(action, L"snapTake") == 0) {
-        on_snap_take();
-    } else if (wcscmp(action, L"snapRevert") == 0) {
-        int idx; if (json_get_int(json, L"snapIndex", &idx)) on_snap_revert(idx);
+        int vi; if (json_get_int(json, L"vmIndex", &vi)) on_snap_take(vi);
     } else if (wcscmp(action, L"snapDelete") == 0) {
-        int idx; if (json_get_int(json, L"snapIndex", &idx)) on_snap_delete(idx);
+        int vi, si; if (json_get_int(json, L"vmIndex", &vi) && json_get_int(json, L"snapIndex", &si)) on_snap_delete(vi, si);
+    } else if (wcscmp(action, L"snapDeleteBranch") == 0) {
+        int vi, si, bi; if (json_get_int(json, L"vmIndex", &vi) && json_get_int(json, L"snapIndex", &si) && json_get_int(json, L"branchIndex", &bi)) on_snap_delete_branch(vi, si, bi);
+    } else if (wcscmp(action, L"snapRename") == 0) {
+        int vi, si, bi = -1;
+        wchar_t new_name[128];
+        if (json_get_int(json, L"vmIndex", &vi) && json_get_int(json, L"snapIndex", &si)
+            && json_get_string(json, L"name", new_name, 128)) {
+            json_get_int(json, L"branchIndex", &bi);
+            if (vi >= 0 && vi < g_vm_count) {
+                snapshot_rename(&g_snap_trees[vi], si, bi, new_name);
+                send_vm_list();
+            }
+        }
     } else if (wcscmp(action, L"getState") == 0) {
         send_full_state();
     } else if (wcscmp(action, L"setMinSize") == 0) {
@@ -2193,7 +2253,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                             fclose(jf);
                         }}
                         ui_log(L"Template \"%s\" created successfully.", inst->name);
-                        for (j = i; j < g_vm_count - 1; j++) { g_vms[j] = g_vms[j+1]; g_snap_lists[j] = g_snap_lists[j+1]; g_displays[j] = g_displays[j+1]; g_idd_displays[j] = g_idd_displays[j+1]; }
+                        for (j = i; j < g_vm_count - 1; j++) { g_vms[j] = g_vms[j+1]; g_snap_trees[j] = g_snap_trees[j+1]; g_displays[j] = g_displays[j+1]; g_idd_displays[j] = g_idd_displays[j+1]; }
                         ZeroMemory(&g_vms[g_vm_count-1], sizeof(VmInstance));
                         g_displays[g_vm_count-1] = NULL;
                         g_idd_displays[g_vm_count-1] = NULL;
@@ -2330,12 +2390,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case HCS_OP_SNAP_TAKE:
             if (FAILED(op->result)) ui_log(L"Error: Snapshot failed (0x%08X)", op->result);
             else ui_log(L"Snapshot \"%s\" created.", op->snap_name);
-            send_snap_list();
-            break;
-        case HCS_OP_SNAP_REVERT:
-            if (FAILED(op->result)) ui_log(L"Error: Revert failed (0x%08X)", op->result);
-            else ui_log(L"Reverted. VM is stopped - click Start to boot from snapshot.");
-            send_vm_list(); send_snap_list();
+            save_vm_list();
+            send_vm_list();
             break;
         }
         free(op);
@@ -2431,7 +2487,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     int j;
                     for (j = idx; j < g_vm_count - 1; j++) {
                         g_vms[j] = g_vms[j + 1];
-                        g_snap_lists[j] = g_snap_lists[j + 1];
+                        g_snap_trees[j] = g_snap_trees[j + 1];
                         g_displays[j] = g_displays[j + 1];
                         g_idd_displays[j] = g_idd_displays[j + 1];
                     }
