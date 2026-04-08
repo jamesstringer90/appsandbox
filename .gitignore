@@ -11,6 +11,8 @@ tools/vdd/certs/
 # Claude
 .claude/
 
+python/
+
 # User-specific files
 *.rsuser
 *.suo

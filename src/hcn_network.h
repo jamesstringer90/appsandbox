@@ -3,6 +3,15 @@
 
 #include <windows.h>
 
+/* DLL export/import */
+#ifndef ASB_API
+#ifdef ASB_BUILDING_DLL
+#define ASB_API __declspec(dllexport)
+#else
+#define ASB_API __declspec(dllimport)
+#endif
+#endif
+
 /* Opaque HCN handles */
 typedef void *HCN_NETWORK;
 typedef void *HCN_ENDPOINT;
@@ -34,14 +43,14 @@ HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
                             wchar_t *endpoint_guid_str, size_t str_len);
 
 /* Delete a network by GUID. */
-HRESULT hcn_delete_network(const GUID *network_id);
+ASB_API HRESULT hcn_delete_network(const GUID *network_id);
 
 /* Delete an endpoint by GUID. */
-HRESULT hcn_delete_endpoint(const GUID *endpoint_id);
+ASB_API HRESULT hcn_delete_endpoint(const GUID *endpoint_id);
 
 /* Enumerate network adapters suitable for External networking.
    Calls the callback for each adapter found. Returns count. */
 typedef void (*HcnAdapterCallback)(const wchar_t *friendly_name, int if_type, void *ctx);
-int hcn_enum_adapters(HcnAdapterCallback cb, void *ctx);
+ASB_API int hcn_enum_adapters(HcnAdapterCallback cb, void *ctx);
 
 #endif /* HCN_NETWORK_H */

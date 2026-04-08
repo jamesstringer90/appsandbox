@@ -20,32 +20,32 @@
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
-    <ProjectGuid>{8A7B6C5D-4E3F-2A1B-9C8D-7E6F5A4B3C2D}</ProjectGuid>
-    <RootNamespace>AppSandbox</RootNamespace>
+    <ProjectGuid>{1A2B3C4D-5E6F-7890-ABCD-111222333444}</ProjectGuid>
+    <RootNamespace>AppSandboxCore</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
     <WholeProgramOptimization>true</WholeProgramOptimization>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
@@ -68,71 +68,59 @@
   </ImportGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <OutDir>$(SolutionDir)bin\$(Configuration)-ARM64\</OutDir>
-    <IntDir>$(SolutionDir)obj\$(Configuration)-ARM64\</IntDir>
+    <IntDir>$(SolutionDir)obj\$(Configuration)-ARM64\core\</IntDir>
+    <TargetName>appsandbox_core</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)obj\$(Configuration)\</IntDir>
+    <IntDir>$(SolutionDir)obj\$(Configuration)\core\</IntDir>
+    <TargetName>appsandbox_core</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
     <OutDir>$(SolutionDir)bin\$(Configuration)-ARM64\</OutDir>
-    <IntDir>$(SolutionDir)obj\$(Configuration)-ARM64\</IntDir>
+    <IntDir>$(SolutionDir)obj\$(Configuration)-ARM64\core\</IntDir>
+    <TargetName>appsandbox_core</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)obj\$(Configuration)\</IntDir>
+    <IntDir>$(SolutionDir)obj\$(Configuration)\core\</IntDir>
+    <TargetName>appsandbox_core</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>_DEBUG;_WINDOWS;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;UNICODE;_UNICODE;ASB_BUILDING_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
-      <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>appsandbox_core.lib;comdlg32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <ImportLibrary>$(OutDir)appsandbox_core.lib</ImportLibrary>
     </Link>
-    <PostBuildEvent>
-      <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources\"
-xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web\"
-xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)"
-</Command>
-      <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;UNICODE;_UNICODE;ASB_BUILDING_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
-      <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>appsandbox_core.lib;comdlg32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <ImportLibrary>$(OutDir)appsandbox_core.lib</ImportLibrary>
     </Link>
-    <PostBuildEvent>
-      <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources\"
-xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web\"
-xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)"
-</Command>
-      <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
     <ClCompile>
@@ -140,11 +128,11 @@ xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)"
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>NDEBUG;_WINDOWS;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;UNICODE;_UNICODE;ASB_BUILDING_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -152,17 +140,9 @@ xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)"
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
-      <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>appsandbox_core.lib;comdlg32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <ImportLibrary>$(OutDir)appsandbox_core.lib</ImportLibrary>
     </Link>
-    <PostBuildEvent>
-      <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources\"
-xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web\"
-xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)"
-</Command>
-      <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -170,11 +150,11 @@ xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)"
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;UNICODE;_UNICODE;ASB_BUILDING_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -182,39 +162,34 @@ xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)"
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
-      <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>appsandbox_core.lib;comdlg32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <ImportLibrary>$(OutDir)appsandbox_core.lib</ImportLibrary>
     </Link>
-    <PostBuildEvent>
-      <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources\"
-xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web\"
-xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)"
-</Command>
-      <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\main.c" />
-    <ClCompile Include="src\ui.c" />
-    <ClCompile Include="src\vm_display.c" />
-    <ClCompile Include="src\vm_display_idd.c" />
-    <ClCompile Include="src\webview2_bridge.c" />
+    <ClCompile Include="src\asb_core.c" />
+    <ClCompile Include="src\asb_display.c" />
+    <ClCompile Include="src\hcs_vm.c" />
+    <ClCompile Include="src\hcn_network.c" />
+    <ClCompile Include="src\gpu_enum.c" />
+    <ClCompile Include="src\disk_util.c" />
+    <ClCompile Include="src\snapshot.c" />
+    <ClCompile Include="src\vmms_cert.c" />
+    <ClCompile Include="src\vm_agent.c" />
+    <ClCompile Include="src\prereq.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\resource.h" />
     <ClInclude Include="src\asb_core.h" />
     <ClInclude Include="src\asb_display.h" />
     <ClInclude Include="src\ui.h" />
-    <ClInclude Include="src\webview2_bridge.h" />
     <ClInclude Include="src\hcs_vm.h" />
     <ClInclude Include="src\hcn_network.h" />
+    <ClInclude Include="src\gpu_enum.h" />
+    <ClInclude Include="src\disk_util.h" />
     <ClInclude Include="src\snapshot.h" />
-    <ClInclude Include="src\vm_display.h" />
-    <ClInclude Include="src\vm_display_idd.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <ResourceCompile Include="src\appsandbox.rc" />
+    <ClInclude Include="src\vmms_cert.h" />
+    <ClInclude Include="src\vm_agent.h" />
+    <ClInclude Include="src\prereq.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

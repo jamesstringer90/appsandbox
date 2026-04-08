@@ -4,6 +4,15 @@
 #include <windows.h>
 #include "hcs_vm.h"
 
+/* DLL export/import */
+#ifndef ASB_API
+#ifdef ASB_BUILDING_DLL
+#define ASB_API __declspec(dllexport)
+#else
+#define ASB_API __declspec(dllimport)
+#endif
+#endif
+
 #define MAX_SNAPSHOTS 64
 #define MAX_BRANCHES  8
 
@@ -79,10 +88,10 @@ HRESULT snapshot_delete_branch(SnapshotTree *tree, VmInstance *instance, int ind
 
 /* Find which snapshot and branch match vhdx_path.
    Sets *snap_idx (-2=base, >=0=snapshot, -1=unknown) and *branch_idx (-1 if none). */
-void snapshot_find_current(SnapshotTree *tree, const wchar_t *vhdx_path, int *snap_idx, int *branch_idx);
+ASB_API void snapshot_find_current(SnapshotTree *tree, const wchar_t *vhdx_path, int *snap_idx, int *branch_idx);
 
 /* Get the last-write time of a branch file.  Returns FALSE if not found. */
-BOOL snapshot_get_branch_time(SnapshotTree *tree, int snap_idx, int branch_idx, FILETIME *ft);
+ASB_API BOOL snapshot_get_branch_time(SnapshotTree *tree, int snap_idx, int branch_idx, FILETIME *ft);
 
 /* Rename a snapshot or branch friendly name.
    snap_idx >= 0, branch_idx == -1: rename snapshot.
