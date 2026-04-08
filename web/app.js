@@ -524,6 +524,7 @@ function startInlineEdit(row, col, td) {
         var sel = document.createElement('select');
         sel.innerHTML = '<option value="0">None</option><option value="1">Default GPU</option>';
         sel.value = String(vm.gpuMode);
+        sel.onclick = function(e) { e.stopPropagation(); };
         sel.onchange = function() { commitInlineEdit(); };
         sel.onblur = function() { setTimeout(commitInlineEdit, 100); };
         td.textContent = '';
@@ -536,6 +537,7 @@ function startInlineEdit(row, col, td) {
         var sel = document.createElement('select');
         sel.innerHTML = '<option value="0">None</option><option value="1">NAT</option><option value="2">External</option><option value="3">Internal</option>';
         sel.value = String(vm.networkMode);
+        sel.onclick = function(e) { e.stopPropagation(); };
         sel.onchange = function() { commitInlineEdit(); };
         sel.onblur = function() { setTimeout(commitInlineEdit, 100); };
         td.textContent = '';

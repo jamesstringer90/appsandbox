@@ -4,6 +4,15 @@
 #include <windows.h>
 #include "gpu_enum.h"
 
+/* DLL export/import */
+#ifndef ASB_API
+#ifdef ASB_BUILDING_DLL
+#define ASB_API __declspec(dllexport)
+#else
+#define ASB_API __declspec(dllimport)
+#endif
+#endif
+
 /* Opaque HCS handles */
 typedef void *HCS_SYSTEM;
 typedef void *HCS_OPERATION;
@@ -113,17 +122,24 @@ HRESULT hcs_resume_vm(VmInstance *instance);
 /* Save VM state to a file (memory + device state). */
 HRESULT hcs_save_vm(VmInstance *instance, const wchar_t *state_path);
 
-/* Close the HCS handle (does not stop the VM). */
-void hcs_close_vm(VmInstance *instance);
+/* Close the HCS handle (does not stop the VM).
+   Uses a background thread to avoid blocking the UI. */
+ASB_API void hcs_close_vm(VmInstance *instance);
+
+/* Close an HCS handle synchronously (safe to call during atexit). */
+void hcs_close_handle_sync(HCS_SYSTEM handle);
 
 /* Try to open an existing HCS compute system by name.
    If found and running, populates instance->handle and returns TRUE. */
 BOOL hcs_try_open_vm(VmInstance *instance);
 
+/* Check if a VM is running via HCS enumeration (does not require opening). */
+BOOL hcs_is_running_by_enum(const wchar_t *vm_name);
+
 /* Register a callback for VM state changes (e.g. guest-initiated shutdown).
    The callback receives the VmInstance pointer. Called from a worker thread. */
 typedef void (*HcsVmStateCallback)(VmInstance *instance, DWORD event);
-void hcs_set_state_callback(HcsVmStateCallback cb);
+ASB_API void hcs_set_state_callback(HcsVmStateCallback cb);
 
 /* Register HCS event callback on a VM instance (call after create/open). */
 void hcs_register_vm_callback(VmInstance *instance);
@@ -132,13 +148,13 @@ void hcs_register_vm_callback(VmInstance *instance);
 void hcs_unregister_vm_callback(VmInstance *instance);
 
 /* Set the HWND for monitor thread notifications. */
-void hcs_set_monitor_hwnd(HWND hwnd);
+ASB_API void hcs_set_monitor_hwnd(HWND hwnd);
 
 /* Start the background monitor thread for a running VM. */
 void hcs_start_monitor(VmInstance *instance);
 
 /* Stop the background monitor thread. Call before closing HCS handle. */
-void hcs_stop_monitor(VmInstance *instance);
+ASB_API void hcs_stop_monitor(VmInstance *instance);
 
 /* Build the HCS JSON document for creating a VM.
    json_out must be at least json_out_chars wide chars.

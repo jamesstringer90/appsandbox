@@ -1604,6 +1604,12 @@ void hcs_close_vm(VmInstance *instance)
     }
 }
 
+void hcs_close_handle_sync(HCS_SYSTEM handle)
+{
+    if (g_hcs_dll && pfnClose && handle)
+        pfnClose(handle);
+}
+
 BOOL hcs_query_guest_status(VmInstance *instance)
 {
     HCS_OPERATION op;
@@ -1677,6 +1683,42 @@ wchar_t *hcs_query_properties(VmInstance *instance, const wchar_t *query)
         return NULL;
     }
     return doc; /* Caller must LocalFree */
+}
+
+BOOL hcs_is_running_by_enum(const wchar_t *vm_name)
+{
+    HCS_OPERATION op;
+    HRESULT hr;
+    PWSTR result_doc = NULL;
+    wchar_t needle[300];
+    BOOL running = FALSE;
+
+    if (!g_hcs_dll || !pfnEnumSystems || !pfnCreateOp || !pfnWaitOp)
+        return FALSE;
+
+    op = pfnCreateOp(NULL, NULL);
+    if (!op) return FALSE;
+
+    hr = pfnEnumSystems(NULL, op);
+    if (SUCCEEDED(hr))
+        hr = pfnWaitOp(op, 5000, &result_doc);
+    pfnCloseOp(op);
+
+    if (FAILED(hr) || !result_doc) {
+        if (result_doc) LocalFree(result_doc);
+        return FALSE;
+    }
+
+    /* Check if our VM appears with "Running" state */
+    swprintf_s(needle, 300, L"\"Id\":\"%s\"", vm_name);
+    {
+        const wchar_t *p = wcsstr(result_doc, needle);
+        if (p && wcsstr(p, L"\"Running\""))
+            running = TRUE;
+    }
+
+    LocalFree(result_doc);
+    return running;
 }
 
 BOOL hcs_find_runtime_id(const wchar_t *vm_name, GUID *out)
