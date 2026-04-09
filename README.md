@@ -120,6 +120,10 @@ AppSandbox depends on AppSandboxCore, agent, and p9client. The solution has buil
 
 MIT
 
+## Acknowledgements
+
+Beyond my own experience building [Easy-GPU-PV](https://github.com/jamesstringerparsec/Easy-GPU-PV), I found [NanaBox](https://github.com/M2Team/NanaBox) to be a really helpful resource for understanding HCS.
+
 ## Author
 
 [James Stringer](https://github.com/jamesstringerparsec)
