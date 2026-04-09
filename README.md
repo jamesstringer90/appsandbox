@@ -6,6 +6,8 @@ App Sandbox creates Windows virtual machines that share the host GPU through Win
 
 The primary use case is running software that shouldn't have access to your real machine — AI agents, untrusted executables, anything you'd otherwise need a second PC for. The VM is disposable. Snapshot it, let it run, roll back if needed.
 
+The VM does not require an internet connection to function. Display, input, clipboard, and agent communication all use Hyper-V sockets, which are point-to-point between the host and VM and do not traverse your network. Network connectivity is optional and only needed if the software inside the VM requires internet access.
+
 ## Background
 
 App Sandbox is the successor to [Easy-GPU-PV](https://github.com/jamesstringerparsec/Easy-GPU-PV). Easy-GPU-PV required Hyper-V, which is only available on Windows 11 Pro and above. App Sandbox uses the Host Compute System (HCS) instead — the same backend behind WSL2 and Docker containers. HCS only requires the **Virtual Machine Platform** optional Windows feature, which is available on all Windows 11 editions including Home.
@@ -29,11 +31,11 @@ App Sandbox is the successor to [Easy-GPU-PV](https://github.com/jamesstringerpa
 
 - **GPU-PV** — the host GPU is shared with the VM. DirectX and CUDA work inside the guest.
 - **Display** — a custom Indirect Display Driver (IDD) in the guest streams the framebuffer to the host over Hyper-V sockets. Only dirty rectangles are transmitted. The host renders with D3D11.
-- **Clipboard** — bidirectional clipboard sharing, text and files.
-- **Networking** — NAT, external (bridged), or internal. NAT mode allocates static IPs and configures the guest automatically.
+- **Clipboard** — bidirectional clipboard sharing supporting text, files, images, and other formats.
+- **Networking** — none, NAT, external, or internal. NAT mode allocates static IPs and configures the guest automatically. External mode connects the VM to a physical adapter on the host — the VM gets a DHCP lease from your router and has access to your local network.
 - **Snapshots** — save VM state and create differencing disks. Snapshots support branching — multiple independent working copies from the same point.
 - **Templates** — mark a VM as a template at creation time. Windows installs, syspreps, and shuts down automatically. New VMs created from that template skip the image extraction phase and start from OOBE, reducing setup time.
-- **Guest agent** — runs inside the VM. Handles heartbeat, graceful shutdown, IP configuration, and GPU driver installation.
+- **Guest agent** — runs inside the VM. Handles heartbeat, graceful shutdown, IP configuration, and GPU driver updates. Launches subprocesses for input injection and clipboard sync.
 
 ## Architecture
 
@@ -73,7 +75,7 @@ All system DLLs are loaded dynamically at runtime.
 - **Visual Studio 2022** with the **Desktop development with C++** workload
 - **Windows SDK** (10.0 or later, included with the C++ workload)
 - **Windows Driver Kit (WDK)** — required for building the IDD virtual display driver (`AppSandboxVDD`). Install the WDK matching your SDK version from [Microsoft's WDK download page](https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk). Without the WDK, the driver projects will fail to build but everything else will compile.
-- WebView2 headers and loader DLL are in `vendor/webview2/` — no NuGet needed.
+- WebView2 headers and loader DLL are in `vendor/webview2/`.
 
 ### Build steps
 
@@ -108,7 +110,7 @@ AppSandbox depends on AppSandboxCore, agent, and p9client. The solution has buil
 1. `iso-patch.exe` converts a Windows ISO to a VHDX, injecting an unattend.xml, the guest agent, the VDD driver, and setup scripts. The VDD is self-signed, so the setup process installs the certificate into the VM's trusted store and enables test signing mode in the guest BCD.
 2. The core library constructs an HCS JSON document describing the VM (CPU, RAM, GPU-PV shares, network endpoint, UEFI firmware, virtual disks) and creates the compute system through HCS.
 3. GPU-PV assigns a partition of the host GPU to the VM. Specific GPU driver files are copied from the host into the VM at creation time. On every boot, App Sandbox checks whether the host GPU drivers have changed and, if so, instructs the guest agent to update them automatically via a Plan 9 file share.
-4. The IDD in the guest captures frames and sends dirty rectangles to the host over AF_HYPERV sockets. The host uploads the texture and renders through D3D11.
+4. The IDD in the guest captures frames and sends dirty rectangles to the host over AF_HYPERV sockets. The host uploads the texture and renders through D3D11. Keyboard and mouse input is sent back to the guest over a separate Hyper-V socket. Clipboard data is synchronized bidirectionally over two additional sockets using a delayed-rendering protocol, supporting text, files, images, and other clipboard formats.
 5. HCN manages virtual networking. NAT mode allocates a static IP from a pool and the agent configures it inside the guest. External mode bridges to a physical adapter.
 6. Snapshots save VM memory state and create a differencing VHDX. Branches fork from any snapshot point.
 
