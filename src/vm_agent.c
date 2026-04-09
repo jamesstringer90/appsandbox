@@ -240,6 +240,16 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
 
         notify_agent_status(vm);
 
+        /* Send NAT IP to agent (only for NAT mode) */
+        if (vm->network_mode == NET_NAT && vm->nat_ip[0] != '\0') {
+            char ip_cmd[64];
+            sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/16:172.20.0.1", vm->nat_ip);
+            send_line(s, ip_cmd);
+            n = recv_line(s, buf, sizeof(buf));
+            if (n > 0)
+                ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);
+        }
+
         /* Send GPU share info to agent (if GPU-PV is assigned) */
         if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {
             char header[64];

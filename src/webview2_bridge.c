@@ -225,7 +225,7 @@ static HRESULT STDMETHODCALLTYPE CtrlH_Invoke(
 
     /* Configure settings */
     if (SUCCEEDED(webview->lpVtbl->get_Settings(webview, &settings)) && settings) {
-        settings->lpVtbl->put_AreDevToolsEnabled(settings, TRUE);
+        settings->lpVtbl->put_AreDevToolsEnabled(settings, FALSE);
         settings->lpVtbl->put_IsStatusBarEnabled(settings, FALSE);
         settings->lpVtbl->put_AreDefaultContextMenusEnabled(settings, TRUE);
         settings->lpVtbl->Release(settings);

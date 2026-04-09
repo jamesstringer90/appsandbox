@@ -289,25 +289,36 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         lang, lang_to_input_locale(lang), lang, lang, lang,
         comp_name);
 
-    if (test_mode) {
+    {
+        int order = 2;
         fwprintf(f,
             L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-            L"                    <Order>2</Order>\n"
-            L"                    <Path>bcdedit /set testsigning on</Path>\n"
-            L"                </RunSynchronousCommand>\n");
+            L"                    <Order>%d</Order>\n"
+            L"                    <Path>bcdedit /set recoveryenabled No</Path>\n"
+            L"                </RunSynchronousCommand>\n"
+            L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+            L"                    <Order>%d</Order>\n"
+            L"                    <Path>bcdedit /set bootstatuspolicy IgnoreAllFailures</Path>\n"
+            L"                </RunSynchronousCommand>\n", order, order + 1);
+        order += 2;
+        if (test_mode) {
+            fwprintf(f,
+                L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+                L"                    <Order>%d</Order>\n"
+                L"                    <Path>bcdedit /set testsigning on</Path>\n"
+                L"                </RunSynchronousCommand>\n", order++);
+        }
+        fwprintf(f,
+            L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+            L"                    <Order>%d</Order>\n"
+            L"                    <Path>cmd /c mkdir C:\\Windows\\Setup\\Scripts</Path>\n"
+            L"                </RunSynchronousCommand>\n"
+            L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+            L"                    <Order>%d</Order>\n"
+            L"                    <Path>cmd /c for %%d in (D E F G H I J) do @if exist %%d:\\SetupComplete.cmd copy /Y %%d:\\SetupComplete.cmd C:\\Windows\\Setup\\Scripts\\</Path>\n"
+            L"                </RunSynchronousCommand>\n",
+            order, order + 1);
     }
-
-    fwprintf(f,
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>%d</Order>\n"
-        L"                    <Path>cmd /c mkdir C:\\Windows\\Setup\\Scripts</Path>\n"
-        L"                </RunSynchronousCommand>\n"
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>%d</Order>\n"
-        L"                    <Path>cmd /c for %%d in (D E F G H I J) do @if exist %%d:\\SetupComplete.cmd copy /Y %%d:\\SetupComplete.cmd C:\\Windows\\Setup\\Scripts\\</Path>\n"
-        L"                </RunSynchronousCommand>\n",
-        test_mode ? 3 : 2,
-        test_mode ? 4 : 3);
 
     fwprintf(f,
         L"            </RunSynchronous>\n"
@@ -826,10 +837,18 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"                </RunSynchronousCommand>\n"
         L"                <RunSynchronousCommand wcm:action=\"add\">\n"
         L"                    <Order>2</Order>\n"
-        L"                    <Path>cmd /c mkdir C:\\Windows\\Setup\\Scripts</Path>\n"
+        L"                    <Path>bcdedit /set recoveryenabled No</Path>\n"
         L"                </RunSynchronousCommand>\n"
         L"                <RunSynchronousCommand wcm:action=\"add\">\n"
         L"                    <Order>3</Order>\n"
+        L"                    <Path>bcdedit /set bootstatuspolicy IgnoreAllFailures</Path>\n"
+        L"                </RunSynchronousCommand>\n"
+        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+        L"                    <Order>4</Order>\n"
+        L"                    <Path>cmd /c mkdir C:\\Windows\\Setup\\Scripts</Path>\n"
+        L"                </RunSynchronousCommand>\n"
+        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+        L"                    <Order>5</Order>\n"
         L"                    <Path>cmd /c for %%d in (D E F G H I J) do @if exist %%d:\\SetupComplete.cmd copy /Y %%d:\\SetupComplete.cmd C:\\Windows\\Setup\\Scripts\\</Path>\n"
         L"                </RunSynchronousCommand>\n"
         L"            </RunSynchronous>\n"
@@ -1249,12 +1268,25 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
         L"                </RunSynchronousCommand>\n",
         comp_name);
 
-    if (test_mode) {
+    {
+        int order = 2;
         fwprintf(f,
             L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-            L"                    <Order>2</Order>\n"
-            L"                    <Path>bcdedit /set testsigning on</Path>\n"
-            L"                </RunSynchronousCommand>\n");
+            L"                    <Order>%d</Order>\n"
+            L"                    <Path>bcdedit /set recoveryenabled No</Path>\n"
+            L"                </RunSynchronousCommand>\n"
+            L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+            L"                    <Order>%d</Order>\n"
+            L"                    <Path>bcdedit /set bootstatuspolicy IgnoreAllFailures</Path>\n"
+            L"                </RunSynchronousCommand>\n", order, order + 1);
+        order += 2;
+        if (test_mode) {
+            fwprintf(f,
+                L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+                L"                    <Order>%d</Order>\n"
+                L"                    <Path>bcdedit /set testsigning on</Path>\n"
+                L"                </RunSynchronousCommand>\n", order++);
+        }
     }
 
     fwprintf(f,
@@ -1362,12 +1394,25 @@ BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
         L"                </RunSynchronousCommand>\n",
         comp_name);
 
-    if (test_mode) {
+    {
+        int order = 2;
         fwprintf(f,
             L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-            L"                    <Order>2</Order>\n"
-            L"                    <Path>bcdedit /set testsigning on</Path>\n"
-            L"                </RunSynchronousCommand>\n");
+            L"                    <Order>%d</Order>\n"
+            L"                    <Path>bcdedit /set recoveryenabled No</Path>\n"
+            L"                </RunSynchronousCommand>\n"
+            L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+            L"                    <Order>%d</Order>\n"
+            L"                    <Path>bcdedit /set bootstatuspolicy IgnoreAllFailures</Path>\n"
+            L"                </RunSynchronousCommand>\n", order, order + 1);
+        order += 2;
+        if (test_mode) {
+            fwprintf(f,
+                L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+                L"                    <Order>%d</Order>\n"
+                L"                    <Path>bcdedit /set testsigning on</Path>\n"
+                L"                </RunSynchronousCommand>\n", order++);
+        }
     }
 
     fwprintf(f,

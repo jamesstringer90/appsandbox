@@ -9,7 +9,7 @@
  * when the host sends gpu_query_response with share metadata.
  *
  * Supports: ping, shutdown, restart, gpu_copy, gpu_query_response,
- *           gpu_none, idd_connect.
+ *           gpu_none, idd_connect, set_ip.
  *
  * Usage:
  *   appsandbox-agent.exe --install   Install and start the service
@@ -1539,6 +1539,96 @@ static void handle_client(SOCKET client)
         }
         else if (strcmp(buf, "gpu_none") == 0) {
             agent_log("Host reports no GPU-PV assigned.");
+        }
+        else if (strncmp(buf, "set_ip:", 7) == 0) {
+            /* set_ip:172.20.0.X/PREFIX:GATEWAY */
+            char ip[32] = {0}, prefix[8] = {0}, gateway[32] = {0};
+            char *slash, *colon2;
+            char *arg = buf + 7;
+
+            /* Parse IP/prefix:gateway */
+            slash = strchr(arg, '/');
+            colon2 = slash ? strchr(slash, ':') : NULL;
+            if (slash && colon2) {
+                int ip_len = (int)(slash - arg);
+                int pfx_len = (int)(colon2 - slash - 1);
+                if (ip_len > 0 && ip_len < (int)sizeof(ip))
+                    strncpy_s(ip, sizeof(ip), arg, ip_len);
+                if (pfx_len > 0 && pfx_len < (int)sizeof(prefix))
+                    strncpy_s(prefix, sizeof(prefix), slash + 1, pfx_len);
+                strncpy_s(gateway, sizeof(gateway), colon2 + 1, sizeof(gateway) - 1);
+            }
+
+            if (ip[0] && prefix[0] && gateway[0]) {
+                wchar_t cmd[512];
+                STARTUPINFOW si;
+                PROCESS_INFORMATION pi;
+                DWORD exit_code = 1;
+
+                swprintf_s(cmd, 512,
+                    L"netsh interface ip set address \"Ethernet\" static %S %S %S",
+                    ip,
+                    /* Convert prefix length to subnet mask */
+                    atoi(prefix) == 16 ? "255.255.0.0" :
+                    atoi(prefix) == 24 ? "255.255.255.0" :
+                    atoi(prefix) == 8  ? "255.0.0.0" : "255.255.255.0",
+                    gateway);
+
+                agent_log("Setting IP: %S", cmd);
+
+                ZeroMemory(&si, sizeof(si));
+                si.cb = sizeof(si);
+                ZeroMemory(&pi, sizeof(pi));
+
+                if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
+                                   CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                    WaitForSingleObject(pi.hProcess, 10000);
+                    GetExitCodeProcess(pi.hProcess, &exit_code);
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                }
+
+                /* Set DNS to gateway (host NAT) + 8.8.8.8 fallback */
+                if (exit_code == 0) {
+                    wchar_t dns_cmd[512];
+                    STARTUPINFOW si2;
+                    PROCESS_INFORMATION pi2;
+
+                    swprintf_s(dns_cmd, 512,
+                        L"netsh interface ip set dns \"Ethernet\" static %S", gateway);
+                    ZeroMemory(&si2, sizeof(si2));
+                    si2.cb = sizeof(si2);
+                    ZeroMemory(&pi2, sizeof(pi2));
+                    if (CreateProcessW(NULL, dns_cmd, NULL, NULL, FALSE,
+                                       CREATE_NO_WINDOW, NULL, NULL, &si2, &pi2)) {
+                        WaitForSingleObject(pi2.hProcess, 10000);
+                        CloseHandle(pi2.hProcess);
+                        CloseHandle(pi2.hThread);
+                    }
+
+                    swprintf_s(dns_cmd, 512,
+                        L"netsh interface ip add dns \"Ethernet\" 8.8.8.8 index=2");
+                    ZeroMemory(&si2, sizeof(si2));
+                    si2.cb = sizeof(si2);
+                    ZeroMemory(&pi2, sizeof(pi2));
+                    if (CreateProcessW(NULL, dns_cmd, NULL, NULL, FALSE,
+                                       CREATE_NO_WINDOW, NULL, NULL, &si2, &pi2)) {
+                        WaitForSingleObject(pi2.hProcess, 10000);
+                        CloseHandle(pi2.hProcess);
+                        CloseHandle(pi2.hThread);
+                    }
+
+                    agent_log("IP configured: %s/%s gw %s dns %s,8.8.8.8",
+                              ip, prefix, gateway, gateway);
+                    send_line(client, "ok");
+                } else {
+                    agent_log("netsh failed (exit %lu)", exit_code);
+                    send_line(client, "error:netsh_failed");
+                }
+            } else {
+                agent_log("set_ip: bad format: %s", buf);
+                send_line(client, "error:bad_format");
+            }
         }
         else if (strcmp(buf, "gpu_copy") == 0) {
             /* Host re-triggered GPU copy — ask for share list */

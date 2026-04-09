@@ -326,7 +326,8 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
 }
 
 HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
-                            wchar_t *endpoint_guid_str, size_t str_len)
+                            wchar_t *endpoint_guid_str, size_t str_len,
+                            const char *nat_ip)
 {
     wchar_t net_guid_str[64];
     wchar_t ep_guid_str[64];
@@ -349,7 +350,14 @@ HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
     guid_to_string(endpoint_id, ep_guid_str, 64);
 
     /* Static IP for NAT; DHCP for Internal (ICS) and External (Transparent) */
-    if (IsEqualGUID(network_id, &APPSANDBOX_NAT_GUID)) {
+    if (IsEqualGUID(network_id, &APPSANDBOX_NAT_GUID) && nat_ip && nat_ip[0]) {
+        swprintf_s(settings, 1024,
+            L"{"
+            L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
+            L"\"HostComputeNetwork\":\"%s\","
+            L"\"IpConfigurations\":[{\"IpAddress\":\"%S\",\"PrefixLength\":16}]"
+            L"}", net_guid_str, nat_ip);
+    } else if (IsEqualGUID(network_id, &APPSANDBOX_NAT_GUID)) {
         swprintf_s(settings, 1024,
             L"{"
             L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
