@@ -224,6 +224,8 @@ static void save_vm_list(void)
             fwprintf(f, L"NetAdapter=%s\n", g_vms[i].net_adapter);
         if (g_vms[i].resources_iso_path[0] != L'\0')
             fwprintf(f, L"ResourcesIso=%s\n", g_vms[i].resources_iso_path);
+        if (g_vms[i].nat_ip[0] != '\0')
+            fwprintf(f, L"NatIp=%S\n", g_vms[i].nat_ip);
         if (g_vms[i].is_template)
             fwprintf(f, L"IsTemplate=1\n");
         if (g_vms[i].test_mode)
@@ -305,6 +307,8 @@ static void load_vm_list(void)
             wcscpy_s(vm->net_adapter, 256, line + 11);
         else if (wcsncmp(line, L"ResourcesIso=", 13) == 0)
             wcscpy_s(vm->resources_iso_path, MAX_PATH, line + 13);
+        else if (wcsncmp(line, L"NatIp=", 6) == 0)
+            WideCharToMultiByte(CP_UTF8, 0, line + 6, -1, vm->nat_ip, sizeof(vm->nat_ip), NULL, NULL);
         else if (wcsncmp(line, L"IsTemplate=", 11) == 0)
             vm->is_template = (_wtoi(line + 11) != 0);
         else if (wcsncmp(line, L"TestMode=", 9) == 0)
@@ -482,6 +486,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
                 hcn_delete_network(&instance->network_id);
                 instance->network_cleaned = TRUE;
             }
+            instance->nat_ip[0] = '\0';
             hcs_close_vm(instance);
 
             /* Template finalization */
@@ -529,6 +534,36 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
         g_state_cb(vm_handle(instance), instance->running, g_state_ud);
 }
 
+/* ---- NAT IP allocation ---- */
+
+/* Allocate the next free IP in the 172.20.0.0/16 range.
+   Scans g_vms[] for IPs already in use.  Returns FALSE if pool exhausted. */
+static BOOL allocate_nat_ip(VmInstance *vm)
+{
+    BOOL used[256] = { 0 };  /* Track .0.2 through .0.254 */
+    int i, octet;
+
+    for (i = 0; i < g_vm_count; i++) {
+        if (&g_vms[i] == vm) continue;
+        if (g_vms[i].nat_ip[0] == '\0') continue;
+        /* Parse last octet from "172.20.0.X" */
+        {
+            int a, b, c, d;
+            if (sscanf_s(g_vms[i].nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) == 4 &&
+                a == 172 && b == 20 && c == 0 && d >= 2 && d <= 254)
+                used[d] = TRUE;
+        }
+    }
+
+    for (octet = 2; octet <= 254; octet++) {
+        if (!used[octet]) {
+            sprintf_s(vm->nat_ip, sizeof(vm->nat_ip), "172.20.0.%d", octet);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 /* ---- Background VM start thread ---- */
 
 typedef struct {
@@ -546,6 +581,18 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     HRESULT hr;
     wchar_t endpoint_guid_str[64] = { 0 };
 
+    /* Allocate NAT IP before endpoint creation (only for NAT mode) */
+    if (args->network_mode == NET_NAT) {
+        if (allocate_nat_ip(vm)) {
+            asb_log(L"Allocated NAT IP %S for \"%s\".", vm->nat_ip, vm->name);
+            save_vm_list();
+        } else {
+            asb_log(L"Warning: NAT IP pool exhausted.");
+        }
+    } else {
+        vm->nat_ip[0] = '\0';
+    }
+
     if (args->network_mode != NET_NONE) {
         switch (args->network_mode) {
         case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
@@ -554,7 +601,8 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         default:           hr = E_INVALIDARG; break;
         }
         if (SUCCEEDED(hr)) {
-            hr = hcn_create_endpoint(&args->network_id, &args->endpoint_id, endpoint_guid_str, 64);
+            hr = hcn_create_endpoint(&args->network_id, &args->endpoint_id, endpoint_guid_str, 64,
+                                     vm->nat_ip[0] ? vm->nat_ip : NULL);
             if (FAILED(hr)) {
                 asb_log(L"Error: Network endpoint failed (0x%08X).", hr);
                 if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
@@ -799,6 +847,12 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
 
     args->vhdx_created = TRUE;
 
+    /* Allocate NAT IP before endpoint creation */
+    if (args->config.network_mode == NET_NAT && args->vm_inst) {
+        if (allocate_nat_ip(args->vm_inst))
+            asb_log(L"Allocated NAT IP %S for new VM.", args->vm_inst->nat_ip);
+    }
+
     /* Network */
     if (args->config.network_mode != NET_NONE) {
         switch (args->config.network_mode) {
@@ -808,7 +862,8 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         default:           hr = E_INVALIDARG; break;
         }
         if (SUCCEEDED(hr)) {
-            hr = hcn_create_endpoint(&args->network_id, &args->endpoint_id, args->endpoint_guid, 64);
+            hr = hcn_create_endpoint(&args->network_id, &args->endpoint_id, args->endpoint_guid, 64,
+                                     (args->vm_inst && args->vm_inst->nat_ip[0]) ? args->vm_inst->nat_ip : NULL);
             if (SUCCEEDED(hr))
                 args->has_network = TRUE;
             else
@@ -1296,6 +1351,16 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
     inst->network_cleaned = FALSE;
 
+    /* Allocate NAT IP before endpoint creation */
+    if (cfg.network_mode == NET_NAT) {
+        if (allocate_nat_ip(inst)) {
+            asb_log(L"Allocated NAT IP %S for \"%s\".", inst->nat_ip, inst->name);
+            save_vm_list();
+        }
+    } else {
+        inst->nat_ip[0] = '\0';
+    }
+
     /* Networking */
     if (cfg.network_mode != NET_NONE) {
         switch (cfg.network_mode) {
@@ -1308,7 +1373,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             asb_log(L"Warning: Network failed (0x%08X). Continuing without.", hr);
             cfg.network_mode = NET_NONE;
         } else {
-            hr = hcn_create_endpoint(&inst->network_id, &inst->endpoint_id, endpoint_guid_str, 64);
+            hr = hcn_create_endpoint(&inst->network_id, &inst->endpoint_id, endpoint_guid_str, 64,
+                                     inst->nat_ip[0] ? inst->nat_ip : NULL);
             if (FAILED(hr)) {
                 asb_log(L"Warning: Endpoint failed (0x%08X).", hr);
                 hcn_delete_network(&inst->network_id);
@@ -1499,6 +1565,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
         hcn_delete_network(&inst->network_id);
         inst->network_cleaned = TRUE;
     }
+    inst->nat_ip[0] = '\0';
 
     asb_log(L"VM \"%s\" terminated.", inst->name);
     save_vm_list();

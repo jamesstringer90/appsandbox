@@ -86,6 +86,7 @@ typedef struct {
     volatile BOOL  shutdown_requested;   /* TRUE after graceful shutdown sent */
     ULONGLONG      shutdown_time;        /* GetTickCount64() when shutdown requested */
     volatile ULONGLONG last_heartbeat;   /* GetTickCount64() of last agent heartbeat */
+    char        nat_ip[32];              /* Allocated NAT IP (e.g. "172.20.0.2"), empty if not NAT */
 } VmInstance;
 
 /* Initialize HCS — loads computecore.dll dynamically.

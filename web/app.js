@@ -59,10 +59,20 @@ function onFullState(msg) {
     if (msg.hostInfo) updateHostInfo(msg.hostInfo);
     if (msg.adapters) populateAdapters(msg.adapters, msg.defaultAdapter);
     if (msg.templates) populateTemplates(msg.templates);
+    if (vms.length === 0 && msg.hostInfo) applySmartDefaults(msg.hostInfo);
     if (!minSizeReported) {
         minSizeReported = true;
         setTimeout(reportMinSize, 50);
     }
+}
+
+function applySmartDefaults(info) {
+    var ram = Math.min(Math.floor(info.hostRamMb / 2), 16384);
+    var cores = Math.min(Math.floor(info.hostCores / 2), 8);
+    if (ram < 512) ram = 512;
+    if (cores < 1) cores = 1;
+    document.getElementById('ram-size').value = ram;
+    document.getElementById('cpu-cores').value = cores;
 }
 
 function onVmStateChanged(msg) {
@@ -449,7 +459,7 @@ function renderVmTable() {
                 sendCmd('startVm', { vmIndex: vmIdx, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
             }
         }; })(i, snapVal, vm)));
-        tr.appendChild(makeIconCell('connect', '\uD83D\uDDA5\uFE0F', vm.running && !bld, function() { sendCmd('connectVm', {vmIndex: i}); }));
+        tr.appendChild(makeIconCell('connect', '\uD83D\uDDA5\uFE0F', vm.running && !bld && !vm.agentOnline, function() { sendCmd('connectVm', {vmIndex: i}); }));
         tr.appendChild(makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }));
         tr.appendChild(makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }));
         tr.appendChild(makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }));

@@ -71,6 +71,24 @@ static NOTIFYICONDATAW g_nid;
 /* UI thread ID for thread-safe log dispatch */
 static DWORD g_ui_thread_id;
 
+/* TRUE on Windows Home / Home N (no Hyper-V video, so no RDP display) */
+static BOOL g_is_home_edition = FALSE;
+
+static BOOL detect_home_edition(void)
+{
+    DWORD product_type = 0;
+    if (GetProductInfo(10, 0, 0, 0, &product_type)) {
+        switch (product_type) {
+        case 0x00000065: /* PRODUCT_CORE */
+        case 0x00000062: /* PRODUCT_CORE_N */
+        case 0x00000064: /* PRODUCT_CORE_SINGLELANGUAGE */
+        case 0x00000063: /* PRODUCT_CORE_COUNTRYSPECIFIC */
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 /* ---- Forward declarations ---- */
 
 static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -652,6 +670,8 @@ static void on_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"shutdownVm") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx)) {
+            VmInstance *inst = asb_vm_instance(asb_vm_get(idx));
+            if (inst) inst->shutdown_requested = TRUE;
             safe_destroy_rdp(idx);
             safe_destroy_idd(idx);
             asb_vm_shutdown(asb_vm_get(idx));
@@ -660,6 +680,8 @@ static void on_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"stopVm") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx)) {
+            VmInstance *inst = asb_vm_instance(asb_vm_get(idx));
+            if (inst) inst->shutdown_requested = TRUE;
             safe_destroy_rdp(idx);
             safe_destroy_idd(idx);
             asb_vm_stop(asb_vm_get(idx));
@@ -847,6 +869,7 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
 
     g_ui_thread_id = GetCurrentThreadId();
     g_hInstance = hInstance;
+    g_is_home_edition = detect_home_edition();
     asb_set_hinstance(hInstance);
 
     /* Set library callbacks before init */
@@ -926,8 +949,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (idx >= 0) {
             VmInstance *inst = asb_vm_instance(vm);
 
-            if (running && inst && !g_displays[idx]) {
-                /* Auto-open RDP display for newly started VMs */
+            if (running && inst && !g_displays[idx] && !g_is_home_edition
+                && !inst->shutdown_requested) {
+                /* Auto-open RDP display for newly started VMs
+                   (skip on Home edition or during shutdown) */
                 wchar_t pipe_name[512];
                 swprintf_s(pipe_name, 512, L"\\\\.\\pipe\\%s.BasicSession", inst->name);
                 if (WaitNamedPipeW(pipe_name, 0)) {
@@ -974,6 +999,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 if (g_displays[i] && vm_display_is_open(g_displays[i])) {
                     ui_log(L"Agent online - switching \"%s\" from RDP to IDD.", inst->name);
                     safe_destroy_rdp(i);
+                    do_connect_idd(i);
+                } else if (!g_idd_displays[i] && !inst->shutdown_requested) {
                     do_connect_idd(i);
                 }
                 break;
