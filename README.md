@@ -2,6 +2,8 @@
 
 Isolated, GPU-accelerated Windows VMs on Windows 11, including Home edition.
 
+<img width="1691" height="562" alt="App Sandbox" src="https://github.com/user-attachments/assets/d77e9d01-0bd9-48c6-9231-f35ff05b340b" />
+
 App Sandbox creates Windows virtual machines that share the host GPU through Windows GPU Paravirtualization (GPU-PV). VMs are created from a standard Windows ISO. The software handles disk creation, driver injection, unattended setup, networking, and display — the VM boots to a usable desktop without manual configuration.
 
 The primary use case is running software that shouldn't have access to your real machine — AI agents, untrusted executables, anything you'd otherwise need a second PC for. The VM is disposable. Snapshot it, let it run, roll back if needed.
