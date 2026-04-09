@@ -10,7 +10,7 @@ The VM does not require an internet connection to function. Display, input, clip
 
 ## Background
 
-App Sandbox is the successor to [Easy-GPU-PV](https://github.com/jamesstringerparsec/Easy-GPU-PV). Easy-GPU-PV required Hyper-V, which is only available on Windows 11 Pro and above. App Sandbox uses the Host Compute System (HCS) instead — the same backend behind WSL2 and Docker containers. HCS only requires the **Virtual Machine Platform** optional Windows feature, which is available on all Windows 11 editions including Home.
+App Sandbox is the successor to [Easy-GPU-PV](https://github.com/jamesstringerparsec/Easy-GPU-PV). Easy-GPU-PV was a set of PowerShell scripts that relied on Hyper-V (Windows 11 Pro only) and required the user to connect via RDP or third-party remote desktop tools. App Sandbox replaces all of that with a native application, built-in display and input over Hyper-V sockets, automated VM setup, and runs on the Host Compute System (HCS) — the same backend behind WSL2 and Docker containers. HCS only requires the **Virtual Machine Platform** optional Windows feature, which is available on all Windows 11 editions including Home.
 
 ## Requirements
 
