@@ -505,20 +505,52 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
     }
 }
 
+/* Compute letterboxed/pillarboxed viewport within client rect */
+static void compute_letterbox(UINT client_w, UINT client_h,
+                              UINT frame_w, UINT frame_h,
+                              float *out_x, float *out_y,
+                              float *out_w, float *out_h)
+{
+    float scale_x, scale_y, scale;
+    if (client_w == 0 || client_h == 0 || frame_w == 0 || frame_h == 0) {
+        *out_x = 0; *out_y = 0; *out_w = 0; *out_h = 0;
+        return;
+    }
+    scale_x = (float)client_w / (float)frame_w;
+    scale_y = (float)client_h / (float)frame_h;
+    scale = scale_x < scale_y ? scale_x : scale_y;
+    *out_w = (float)frame_w * scale;
+    *out_h = (float)frame_h * scale;
+    *out_x = ((float)client_w - *out_w) * 0.5f;
+    *out_y = ((float)client_h - *out_h) * 0.5f;
+}
+
 /* Map window client coordinates to VM framebuffer coordinates */
 static void window_to_vm_coords(HWND hwnd, int wx, int wy,
                                  UINT vm_w, UINT vm_h,
                                  UINT *vx, UINT *vy)
 {
     RECT rc;
+    float vp_x, vp_y, vp_w, vp_h;
+    float local_x, local_y;
+
     GetClientRect(hwnd, &rc);
-    if (rc.right <= 0 || rc.bottom <= 0) {
+    compute_letterbox((UINT)rc.right, (UINT)rc.bottom, vm_w, vm_h,
+                      &vp_x, &vp_y, &vp_w, &vp_h);
+
+    if (vp_w <= 0 || vp_h <= 0) {
         *vx = 0;
         *vy = 0;
         return;
     }
-    *vx = (UINT)((LONGLONG)wx * vm_w / rc.right);
-    *vy = (UINT)((LONGLONG)wy * vm_h / rc.bottom);
+
+    local_x = ((float)wx - vp_x) / vp_w * (float)vm_w;
+    local_y = ((float)wy - vp_y) / vp_h * (float)vm_h;
+
+    if (local_x < 0) local_x = 0;
+    if (local_y < 0) local_y = 0;
+    *vx = (UINT)local_x;
+    *vy = (UINT)local_y;
     if (*vx >= vm_w) *vx = vm_w - 1;
     if (*vy >= vm_h) *vy = vm_h - 1;
 }
@@ -1677,17 +1709,25 @@ static void d3d_render_frame(VmDisplayIdd *d)
         LeaveCriticalSection(&d->frame_cs);
     }
 
-    /* Set up pipeline — viewport matches texture size */
+    /* Compute letterboxed viewport within client area */
     GetClientRect(d->render_hwnd, &rc);
-    ZeroMemory(&vp, sizeof(vp));
-    vp.Width    = (float)d->frame_width;
-    vp.Height   = (float)d->frame_height;
-    vp.MaxDepth = 1.0f;
+    {
+        float vp_x, vp_y, vp_w, vp_h;
+        compute_letterbox((UINT)rc.right, (UINT)rc.bottom,
+                          d->frame_width, d->frame_height,
+                          &vp_x, &vp_y, &vp_w, &vp_h);
+        ZeroMemory(&vp, sizeof(vp));
+        vp.TopLeftX = vp_x;
+        vp.TopLeftY = vp_y;
+        vp.Width    = vp_w;
+        vp.Height   = vp_h;
+        vp.MaxDepth = 1.0f;
+    }
 
     if (d->render_count % 60 == 0 && d->hwnd) {
         wchar_t title[256];
-        swprintf_s(title, 256, L"IDD Display - viewport=%.0fx%.0f  texture=%ux%u  recv=%u",
-                   vp.Width, vp.Height, d->frame_width, d->frame_height, d->recv_count);
+        swprintf_s(title, 256, L"%s Display %ux%u recv=%u",
+                   d->vm_name, d->frame_width, d->frame_height, d->recv_count);
         SetWindowTextW(d->hwnd, title);
     }
     d->render_count++;
@@ -1708,7 +1748,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
     /* Draw fullscreen triangle (3 vertices, no vertex buffer) */
     d->ctx->lpVtbl->Draw(d->ctx, 3, 0);
 
-    d->swap_chain->lpVtbl->Present(d->swap_chain, 1, 0);
+    d->swap_chain->lpVtbl->Present(d->swap_chain, 0, 0);
 }
 
 static void d3d_cleanup(VmDisplayIdd *d)
@@ -2427,17 +2467,26 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_GETMINMAXINFO:
+    {
+        MINMAXINFO *mmi = (MINMAXINFO *)lp;
+        DWORD style   = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
+        DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
+        RECT wr;
+        /* Minimum: 320x180 client area */
+        wr.left = 0; wr.top = 0; wr.right = 320; wr.bottom = 180;
+        AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+        mmi->ptMinTrackSize.x = wr.right - wr.left;
+        mmi->ptMinTrackSize.y = wr.bottom - wr.top;
+        /* Max: native frame size */
         if (d && d->frame_width > 0 && d->frame_height > 0) {
-            MINMAXINFO *mmi = (MINMAXINFO *)lp;
-            DWORD style   = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
-            DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
-            RECT wr = { 0, 0, (LONG)d->frame_width, (LONG)d->frame_height };
+            wr.left = 0; wr.top = 0;
+            wr.right = (LONG)d->frame_width; wr.bottom = (LONG)d->frame_height;
             AdjustWindowRectEx(&wr, style, FALSE, exstyle);
             mmi->ptMaxTrackSize.x = wr.right - wr.left;
             mmi->ptMaxTrackSize.y = wr.bottom - wr.top;
-            return 0;
         }
-        break;
+        return 0;
+    }
 
     case WM_SIZE:
         if (d) {
