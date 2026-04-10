@@ -462,3 +462,29 @@ td.editing select {
     color: #ff8888;
 }
 .modal-buttons .danger:hover { background: #6a2a2a; }
+.modal-buttons .primary {
+    background: #1a3a5a;
+    border-color: #2a5a8a;
+    color: #88bbff;
+}
+.modal-buttons .primary:hover { background: #2a4a6a; }
+.prereq-progress {
+    margin-top: 12px;
+    height: 6px;
+    background: #1a1a1a;
+    border-radius: 3px;
+    overflow: hidden;
+}
+.prereq-progress-bar {
+    height: 100%;
+    width: 0%;
+    background: #4a8adf;
+    border-radius: 3px;
+    transition: width 0.3s ease;
+}
+.prereq-pct {
+    margin-top: 6px;
+    font-size: 11px;
+    color: #888;
+    text-align: center;
+}

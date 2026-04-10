@@ -140,6 +140,18 @@
     <div id="log-panel"></div>
 </section>
 
+<!-- Prerequisite modal -->
+<div class="modal-overlay" id="prereq-overlay">
+    <div class="modal">
+        <h3>Virtual Machine Platform Required</h3>
+        <p id="prereq-message">App Sandbox requires the <strong>Virtual Machine Platform</strong> Windows feature to create and run VMs. This feature is not currently enabled.</p>
+        <div class="modal-buttons" id="prereq-buttons">
+            <button onclick="document.getElementById('prereq-overlay').classList.remove('active')">Cancel</button>
+            <button class="primary" onclick="enableFeature()">Enable</button>
+        </div>
+    </div>
+</div>
+
 <!-- Confirm modal -->
 <div class="modal-overlay" id="modal-overlay">
     <div class="modal">
