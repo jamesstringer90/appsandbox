@@ -3,14 +3,30 @@
 
 #include <windows.h>
 
+#ifndef ASB_API
+#ifdef ASB_BUILDING_DLL
+#define ASB_API __declspec(dllexport)
+#else
+#define ASB_API __declspec(dllimport)
+#endif
+#endif
+
 /* Check if a Windows optional feature is enabled (via DISM). */
-BOOL prereq_is_feature_enabled(const wchar_t *feature_name);
+ASB_API BOOL prereq_is_feature_enabled(const wchar_t *feature_name);
 
-/* Enable a Windows optional feature (via DISM). Sets *reboot_required on 3010. */
-BOOL prereq_enable_feature(const wchar_t *feature_name, BOOL *reboot_required);
+/* Progress callback for feature enable.  pct: 0.0 - 100.0 */
+typedef void (*PrereqProgressCallback)(float pct, void *user_data);
 
-/* Check all HCS prerequisites and auto-enable if missing.
-   Returns TRUE if HCS is ready to use. */
-BOOL prereq_check_all(void);
+/* Enable a Windows optional feature (via DISM). Sets *reboot_required on 3010.
+   progress_cb is optional (may be NULL). */
+ASB_API BOOL prereq_enable_feature(const wchar_t *feature_name, BOOL *reboot_required,
+                                    PrereqProgressCallback progress_cb, void *user_data);
+
+/* Check all HCS prerequisites.
+   Returns TRUE if Virtual Machine Platform is enabled and HCS is available. */
+ASB_API BOOL prereq_check_all(void);
+
+/* Initiate a system reboot.  Returns TRUE if the reboot was initiated. */
+ASB_API BOOL prereq_reboot(void);
 
 #endif /* PREREQ_H */

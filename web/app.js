@@ -47,6 +47,10 @@ window.chrome.webview.addEventListener('message', function(event) {
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
         case 'alert':         showModal('Error', msg.message, 'OK'); break;
+        case 'prereqRequired': onPrereqRequired(); break;
+        case 'prereqReboot':   onPrereqReboot(); break;
+        case 'prereqProgress': onPrereqProgress(msg); break;
+        case 'prereqResult':   onPrereqResult(msg); break;
     }
 });
 
@@ -911,6 +915,65 @@ function appendLog(msg) {
     div.textContent = msg;
     panel.appendChild(div);
     panel.scrollTop = panel.scrollHeight;
+}
+
+/* ---- Prerequisite check ---- */
+
+function onPrereqRequired() {
+    document.getElementById('prereq-message').innerHTML =
+        'App Sandbox requires the <strong>Virtual Machine Platform</strong> Windows feature to create and run VMs. This feature is not currently enabled.';
+    document.getElementById('prereq-buttons').innerHTML =
+        '<button onclick="document.getElementById(\'prereq-overlay\').classList.remove(\'active\')">Cancel</button>' +
+        '<button class="primary" onclick="enableFeature()">Enable</button>';
+    document.getElementById('prereq-buttons').style.display = '';
+    document.getElementById('prereq-overlay').classList.add('active');
+}
+
+function onPrereqReboot() {
+    document.getElementById('prereq-message').innerHTML =
+        '<strong>Virtual Machine Platform</strong> has been enabled but a reboot is required before VMs can be created or started.';
+    document.getElementById('prereq-buttons').innerHTML =
+        '<button onclick="document.getElementById(\'prereq-overlay\').classList.remove(\'active\')">Later</button>' +
+        '<button class="primary" onclick="sendCmd(\'enableFeatureReboot\')">Reboot Now</button>';
+    document.getElementById('prereq-buttons').style.display = '';
+    document.getElementById('prereq-overlay').classList.add('active');
+}
+
+function enableFeature() {
+    document.getElementById('prereq-message').innerHTML =
+        'Enabling <strong>Virtual Machine Platform</strong>. This may take a minute...' +
+        '<div class="prereq-progress"><div class="prereq-progress-bar" id="prereq-bar"></div></div>' +
+        '<div class="prereq-pct" id="prereq-pct">0%</div>';
+    document.getElementById('prereq-buttons').style.display = 'none';
+    sendCmd('enableFeature');
+}
+
+function onPrereqProgress(msg) {
+    var bar = document.getElementById('prereq-bar');
+    var pctEl = document.getElementById('prereq-pct');
+    if (bar) bar.style.width = msg.pct + '%';
+    if (pctEl) pctEl.textContent = msg.pct + '%';
+}
+
+function onPrereqResult(msg) {
+    if (msg.ok && !msg.reboot) {
+        document.getElementById('prereq-overlay').classList.remove('active');
+    } else if (msg.ok && msg.reboot) {
+        document.getElementById('prereq-message').innerHTML =
+            '<strong>Virtual Machine Platform</strong> has been enabled. A reboot is required for the change to take effect.';
+        document.getElementById('prereq-buttons').innerHTML =
+            '<button onclick="document.getElementById(\'prereq-overlay\').classList.remove(\'active\')">Later</button>' +
+            '<button class="primary" onclick="sendCmd(\'enableFeatureReboot\')">Reboot Now</button>';
+        document.getElementById('prereq-buttons').style.display = '';
+    } else {
+        document.getElementById('prereq-message').innerHTML =
+            'Failed to enable <strong>Virtual Machine Platform</strong>.<br><br>' +
+            'Try enabling it manually:<br>' +
+            'Settings &gt; System &gt; Optional Features &gt; More Windows Features &gt; Virtual Machine Platform';
+        document.getElementById('prereq-buttons').innerHTML =
+            '<button onclick="document.getElementById(\'prereq-overlay\').classList.remove(\'active\')">Close</button>';
+        document.getElementById('prereq-buttons').style.display = '';
+    }
 }
 
 /* ---- Modal ---- */

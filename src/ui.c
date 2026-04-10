@@ -15,6 +15,7 @@
 #include "vm_display_idd.h"
 #include "vm_agent.h"
 #include "webview2_bridge.h"
+#include "prereq.h"
 #include <dwmapi.h>
 #include <commdlg.h>
 #include <commctrl.h>
@@ -58,6 +59,7 @@ static VmDisplayIdd *g_idd_displays[ASB_MAX_VMS];
 #define WM_TRAYICON            (WM_APP + 11)
 #define WM_SHOW_ALERT          (WM_APP + 15)
 #define WM_VM_SHUTDOWN_TIMEOUT (WM_APP + 9)
+#define WM_PREREQ_DONE        (WM_APP + 17)
 
 /* Tray */
 #define TRAY_CMD_SHOW          1
@@ -73,6 +75,8 @@ static DWORD g_ui_thread_id;
 
 /* TRUE on Windows Home / Home N (no Hyper-V video, so no RDP display) */
 static BOOL g_is_home_edition = FALSE;
+static BOOL g_prereq_ok = FALSE;
+static BOOL g_prereq_reboot_pending = FALSE;
 
 static BOOL detect_home_edition(void)
 {
@@ -608,6 +612,31 @@ static void tray_show_menu(HWND hwnd)
     }
 }
 
+/* ---- Prerequisite feature enable (background thread) ---- */
+
+#define WM_PREREQ_PROGRESS (WM_APP + 18)
+
+static void prereq_progress_cb(float pct, void *user_data)
+{
+    (void)user_data;
+    /* Send integer percentage via PostMessage (truncate to int) */
+    PostMessageW(g_hwnd_main, WM_PREREQ_PROGRESS, (WPARAM)(int)(pct + 0.5f), 0);
+}
+
+static DWORD WINAPI enable_feature_thread(LPVOID param)
+{
+    BOOL reboot_required = FALSE;
+    BOOL ok;
+    (void)param;
+
+    ok = prereq_enable_feature(L"VirtualMachinePlatform", &reboot_required,
+                                prereq_progress_cb, NULL);
+
+    /* Pack result: WPARAM = success, LPARAM = reboot_required */
+    PostMessageW(g_hwnd_main, WM_PREREQ_DONE, (WPARAM)ok, (LPARAM)reboot_required);
+    return 0;
+}
+
 /* ---- WebView2 message dispatch ---- */
 
 static void on_webview2_message(const wchar_t *json)
@@ -618,9 +647,20 @@ static void on_webview2_message(const wchar_t *json)
         return;
 
     if (wcscmp(action, L"uiReady") == 0) {
+        if (!prereq_check_all()) {
+            webview2_post(L"{\"type\":\"prereqRequired\"}");
+            return;
+        }
+        g_prereq_ok = TRUE;
         asb_init();
         send_full_state();
     } else if (wcscmp(action, L"createVm") == 0) {
+        if (!g_prereq_ok) {
+            webview2_post(g_prereq_reboot_pending
+                ? L"{\"type\":\"prereqReboot\"}"
+                : L"{\"type\":\"prereqRequired\"}");
+            return;
+        }
         AsbVmConfig cfg;
         wchar_t name_buf[256] = {0}, os_buf[32] = {0}, img_buf[MAX_PATH] = {0};
         wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[128] = {0};
@@ -658,6 +698,12 @@ static void on_webview2_message(const wchar_t *json)
         SecureZeroMemory(pass_buf, sizeof(pass_buf));
         send_vm_list();
     } else if (wcscmp(action, L"startVm") == 0) {
+        if (!g_prereq_ok) {
+            webview2_post(g_prereq_reboot_pending
+                ? L"{\"type\":\"prereqReboot\"}"
+                : L"{\"type\":\"prereqRequired\"}");
+            return;
+        }
         int idx, si = -1, bi = -1;
         wchar_t bname[128] = {0};
         if (json_get_int(json, L"vmIndex", &idx)) {
@@ -786,6 +832,11 @@ static void on_webview2_message(const wchar_t *json)
             asb_snap_rename(asb_vm_get(vi), si, bi, new_name);
             send_vm_list();
         }
+    } else if (wcscmp(action, L"enableFeature") == 0) {
+        HANDLE h = CreateThread(NULL, 0, enable_feature_thread, NULL, 0, NULL);
+        if (h) CloseHandle(h);
+    } else if (wcscmp(action, L"enableFeatureReboot") == 0) {
+        prereq_reboot();
     } else if (wcscmp(action, L"getState") == 0) {
         send_full_state();
     } else if (wcscmp(action, L"setMinSize") == 0) {
@@ -1118,6 +1169,34 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         wchar_t *log_text = (wchar_t *)lp;
         if (log_text) { ui_log_post(log_text); free(log_text); }
+        return 0;
+    }
+
+    case WM_PREREQ_PROGRESS:
+    {
+        wchar_t buf[128];
+        _snwprintf_s(buf, 128, _TRUNCATE,
+            L"{\"type\":\"prereqProgress\",\"pct\":%d}", (int)wp);
+        webview2_post(buf);
+        return 0;
+    }
+
+    case WM_PREREQ_DONE:
+    {
+        BOOL ok = (BOOL)wp;
+        BOOL reboot_required = (BOOL)lp;
+        if (ok && !reboot_required) {
+            /* Feature enabled, no reboot needed — initialize now */
+            g_prereq_ok = TRUE;
+            webview2_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":false}");
+            asb_init();
+            send_full_state();
+        } else if (ok && reboot_required) {
+            g_prereq_reboot_pending = TRUE;
+            webview2_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":true}");
+        } else {
+            webview2_post(L"{\"type\":\"prereqResult\",\"ok\":false,\"reboot\":false}");
+        }
         return 0;
     }
 
