@@ -744,6 +744,13 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
                 "powercfg /change standby-timeout-ac 0\r\n"
                 "powercfg /change standby-timeout-dc 0\r\n"
                 "echo [PWR] Display sleep disabled >> \"%LOG%\"\r\n"
+                "\r\n"
+                "REM Install VAD driver with devcon\r\n"
+                "if exist \"%ISODRV%\\drivers\\AppSandboxVAD.inf\" (\r\n"
+                "    echo [VAD] Installing driver with devcon... >> \"%LOG%\"\r\n"
+                "    \"%ISODRV%\\drivers\\devcon.exe\" install \"%ISODRV%\\drivers\\AppSandboxVAD.inf\" Root\\AppSandboxVAD >> \"%LOG%\" 2>&1\r\n"
+                "    echo [VAD] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
+                ")\r\n"
                 "\r\n",
                 sc);
 
@@ -1120,6 +1127,54 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
         }
     }
 
+    /* VAD driver files — copy to drivers\ subdirectory if available */
+    {
+        wchar_t drivers_staging[MAX_PATH];
+        wchar_t vad_dir[MAX_PATH];
+        BOOL found_vad = FALSE;
+        const wchar_t *vad_files[] = {
+            L"AppSandboxVAD.sys", L"AppSandboxVAD.inf",
+            L"AppSandboxVAD.cat", L"AppSandboxVAD.cer"
+        };
+        int vf;
+        wchar_t vad_src[MAX_PATH];
+
+        swprintf_s(drivers_staging, MAX_PATH, L"%s\\drivers", staging);
+
+        if (res_dir) {
+            swprintf_s(vad_dir, MAX_PATH, L"%s\\drivers", res_dir);
+            swprintf_s(vad_src, MAX_PATH, L"%s\\AppSandboxVAD.sys", vad_dir);
+            if (GetFileAttributesW(vad_src) != INVALID_FILE_ATTRIBUTES)
+                found_vad = TRUE;
+        }
+        if (!found_vad) {
+            wchar_t exe_dir2[MAX_PATH];
+            wchar_t *slash2;
+            GetModuleFileNameW(NULL, exe_dir2, MAX_PATH);
+            slash2 = wcsrchr(exe_dir2, L'\\');
+            if (slash2) *slash2 = L'\0';
+            swprintf_s(vad_dir, MAX_PATH, L"%s\\drivers", exe_dir2);
+            swprintf_s(vad_src, MAX_PATH, L"%s\\AppSandboxVAD.sys", vad_dir);
+            if (GetFileAttributesW(vad_src) != INVALID_FILE_ATTRIBUTES)
+                found_vad = TRUE;
+            if (!found_vad) {
+                wcscpy_s(vad_dir, MAX_PATH, exe_dir2);
+                swprintf_s(vad_src, MAX_PATH, L"%s\\AppSandboxVAD.sys", vad_dir);
+                if (GetFileAttributesW(vad_src) != INVALID_FILE_ATTRIBUTES)
+                    found_vad = TRUE;
+            }
+        }
+        if (found_vad) {
+            CreateDirectoryW(drivers_staging, NULL);
+            for (vf = 0; vf < 4; vf++) {
+                swprintf_s(vad_src, MAX_PATH, L"%s\\%s", vad_dir, vad_files[vf]);
+                swprintf_s(file_path, MAX_PATH, L"%s\\%s", drivers_staging, vad_files[vf]);
+                if (GetFileAttributesW(vad_src) != INVALID_FILE_ATTRIBUTES)
+                    CopyFileW(vad_src, file_path, FALSE);
+            }
+        }
+    }
+
     /* SSH MSI — copy to staging root if ssh_enabled */
     if (ssh_enabled) {
         wchar_t msi_path[MAX_PATH];
@@ -1203,6 +1258,13 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
                 "powercfg /change standby-timeout-ac 0\r\n"
                 "powercfg /change standby-timeout-dc 0\r\n"
                 "echo [PWR] Display sleep disabled >> \"%LOG%\"\r\n"
+                "\r\n"
+                "REM Install VAD driver with devcon\r\n"
+                "if exist \"%ISODRV%\\drivers\\AppSandboxVAD.inf\" (\r\n"
+                "    echo [VAD] Installing driver with devcon... >> \"%LOG%\"\r\n"
+                "    \"%ISODRV%\\drivers\\devcon.exe\" install \"%ISODRV%\\drivers\\AppSandboxVAD.inf\" Root\\AppSandboxVAD >> \"%LOG%\" 2>&1\r\n"
+                "    echo [VAD] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
+                ")\r\n"
                 "\r\n",
                 sc);
 
@@ -1595,6 +1657,13 @@ BOOL generate_vhdx_setupcomplete(const wchar_t *output_path, BOOL ssh_enabled)
         "powercfg /change standby-timeout-ac 0\r\n"
         "powercfg /change standby-timeout-dc 0\r\n"
         "echo [PWR] Display sleep disabled >> \"%LOG%\"\r\n"
+        "\r\n"
+        "REM Install VAD driver with devcon\r\n"
+        "if exist \"%DRVDIR%\\AppSandboxVAD.inf\" (\r\n"
+        "    echo [VAD] Installing driver with devcon... >> \"%LOG%\"\r\n"
+        "    \"%DRVDIR%\\devcon.exe\" install \"%DRVDIR%\\AppSandboxVAD.inf\" Root\\AppSandboxVAD >> \"%LOG%\" 2>&1\r\n"
+        "    echo [VAD] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
+        ")\r\n"
         "\r\n",
         sc);
 
@@ -1777,6 +1846,46 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
                 swprintf_s(src, MAX_PATH, L"%s\\%s", vdd_dir, vdd_files[vf]);
                 if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES) {
                     fwprintf(mf, L"%s\t\\Windows\\AppSandbox\\drivers\\%s\n", src, vdd_files[vf]);
+                    count++;
+                }
+            }
+        }
+    }
+
+    /* 3a. VAD driver files */
+    {
+        const wchar_t *vad_files[] = {
+            L"AppSandboxVAD.sys", L"AppSandboxVAD.inf",
+            L"AppSandboxVAD.cat", L"AppSandboxVAD.cer"
+        };
+        wchar_t vad_dir[MAX_PATH];
+        BOOL found_vad = FALSE;
+        int vf;
+
+        if (res_dir) {
+            swprintf_s(vad_dir, MAX_PATH, L"%s\\drivers", res_dir);
+            swprintf_s(src, MAX_PATH, L"%s\\AppSandboxVAD.sys", vad_dir);
+            if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES)
+                found_vad = TRUE;
+        }
+        if (!found_vad) {
+            swprintf_s(vad_dir, MAX_PATH, L"%s\\drivers", exe_dir);
+            swprintf_s(src, MAX_PATH, L"%s\\AppSandboxVAD.sys", vad_dir);
+            if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES)
+                found_vad = TRUE;
+        }
+        if (!found_vad) {
+            wcscpy_s(vad_dir, MAX_PATH, exe_dir);
+            swprintf_s(src, MAX_PATH, L"%s\\AppSandboxVAD.sys", vad_dir);
+            if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES)
+                found_vad = TRUE;
+        }
+
+        if (found_vad) {
+            for (vf = 0; vf < 4; vf++) {
+                swprintf_s(src, MAX_PATH, L"%s\\%s", vad_dir, vad_files[vf]);
+                if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES) {
+                    fwprintf(mf, L"%s\t\\Windows\\AppSandbox\\drivers\\%s\n", src, vad_files[vf]);
                     count++;
                 }
             }

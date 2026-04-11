@@ -1,0 +1,8 @@
+#ifndef _APPSANDBOXVAD_TOPOLOGY_H_
+#define _APPSANDBOXVAD_TOPOLOGY_H_
+
+NTSTATUS VadSpeakerFilterHandler(_In_ PPCPROPERTY_REQUEST PropertyRequest);
+
+NTSTATUS VadSpeakerTopoHandler(_In_ PPCPROPERTY_REQUEST PropertyRequest);
+
+#endif // _APPSANDBOXVAD_TOPOLOGY_H_

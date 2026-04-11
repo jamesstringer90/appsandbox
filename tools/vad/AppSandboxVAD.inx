@@ -1,0 +1,156 @@
+[Version]
+Signature   = "$Windows NT$"
+Class       = MEDIA
+Provider    = %ProviderName%
+ClassGUID   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+DriverVer   = 02/22/2016, 1.0.0.1
+CatalogFile = AppSandboxVAD.cat
+PnpLockdown = 1
+
+[SourceDisksNames]
+222="APPSANDBOXVAD Driver Disk","",222
+
+[SourceDisksFiles]
+appsandboxvad.sys=222
+
+[SignatureAttributes]
+appsandboxvad.sys=SignatureAttributes.DRM
+
+[SignatureAttributes.DRM]
+DRMLevel=1300
+
+[SignatureAttributes.PETrust]
+PETrust=true
+
+[Manufacturer]
+%MfgName%=APPSANDBOXVAD,NT$ARCH$.10.0...22000
+
+[APPSANDBOXVAD.NT$ARCH$.10.0...22000]
+%APPSANDBOXVAD_SA.DeviceDesc%=APPSANDBOXVAD_SA, ROOT\AppSandboxVAD
+
+[DestinationDirs]
+APPSANDBOXVAD_SA.CopyList=13    ; 13=Package's DriverStore directory
+
+;=============================================================================
+; APPSANDBOXVAD_SA
+;=============================================================================
+[APPSANDBOXVAD_SA.CopyList]
+appsandboxvad.sys
+
+[APPSANDBOXVAD_SA.AddReg]
+HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
+HKR,,Driver,,appsandboxvad.sys
+
+HKR,PowerSettings,SingleComponentMultiFxStates,3,1,0,0,0
+HKR,PowerSettings,ConservationIdleTime,3,3,0,0,0
+HKR,PowerSettings,PerformanceIdleTime,3,3,0,0,0
+HKR,PowerSettings,IdlePowerState,3,3,0,0,0
+
+HKR,Drivers,SubClasses,,"wave,midi,mixer"
+
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\midi\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+
+HKR,Drivers\wave\wdmaud.drv,Description,,%APPSANDBOXVAD_SA.DeviceDesc%
+HKR,Drivers\mixer\wdmaud.drv,Description,,%APPSANDBOXVAD_SA.DeviceDesc%
+
+;=============================================================================
+; render interfaces: speaker (internal)
+;=============================================================================
+[APPSANDBOXVAD.I.WaveSpeaker]
+AddReg=APPSANDBOXVAD.I.WaveSpeaker.AddReg
+[APPSANDBOXVAD.I.WaveSpeaker.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%APPSANDBOXVAD.WaveSpeaker.szPname%
+
+[APPSANDBOXVAD.I.TopologySpeaker]
+AddReg=APPSANDBOXVAD.I.TopologySpeaker.AddReg
+
+[APPSANDBOXVAD.I.TopologySpeaker.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%APPSANDBOXVAD.TopologySpeaker.szPname%
+
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+
+; Opt-in to event-driven (pull) mode.
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
+
+;=============================================================================
+; APPSANDBOXVAD_SA
+;=============================================================================
+[APPSANDBOXVAD_SA.NT]
+Include=ks.inf, wdmaudio.inf
+Needs=KS.Registration, WDMAUDIO.Registration
+CopyFiles=APPSANDBOXVAD_SA.CopyList
+AddReg=APPSANDBOXVAD_SA.AddReg
+
+[APPSANDBOXVAD_SA.NT.Interfaces]
+;
+; Interfaces for speaker (internal) render endpoint.
+;
+AddInterface=%KSCATEGORY_AUDIO%,    %KSNAME_WaveSpeaker%,    APPSANDBOXVAD.I.WaveSpeaker
+AddInterface=%KSCATEGORY_RENDER%,   %KSNAME_WaveSpeaker%,    APPSANDBOXVAD.I.WaveSpeaker
+AddInterface=%KSCATEGORY_REALTIME%, %KSNAME_WaveSpeaker%,    APPSANDBOXVAD.I.WaveSpeaker
+AddInterface=%KSCATEGORY_AUDIO%,    %KSNAME_TopologySpeaker%,APPSANDBOXVAD.I.TopologySpeaker
+AddInterface=%KSCATEGORY_TOPOLOGY%, %KSNAME_TopologySpeaker%,APPSANDBOXVAD.I.TopologySpeaker
+
+[APPSANDBOXVAD_SA.NT.Services]
+AddService=AppSandboxVAD,0x00000002,AppSandboxVAD_Service_Inst
+
+[AppSandboxVAD_Service_Inst]
+DisplayName=%AppSandboxVAD.SvcDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\appsandboxvad.sys
+
+[APPSANDBOXVAD_SA.NT.HW]
+AddReg = AUDIOHW.AddReg
+
+[AUDIOHW.AddReg]
+; FILE_DEVICE_SOUND
+HKR,,DeviceType,0x10001,0x0000001D
+; SDDL_DEVOBJ_SYS_ALL_ADM_RWX_WORLD_RWX_RES_RWX
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
+
+;=============================================================================
+; WDF
+;=============================================================================
+[APPSANDBOXVAD_SA.NT.Wdf]
+KmdfService = AppSandboxVAD, APPSANDBOXVAD_SA_WdfSect
+[APPSANDBOXVAD_SA_WdfSect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+;=============================================================================
+; COMMON
+;=============================================================================
+[Strings]
+
+;Non-localizable
+
+KSNAME_WaveSpeaker="WaveSpeaker"
+KSNAME_TopologySpeaker="TopologySpeaker"
+
+Proxy.CLSID="{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO="{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER="{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSCATEGORY_TOPOLOGY = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+
+KSNODETYPE_ANY   = "{00000000-0000-0000-0000-000000000000}"
+
+PKEY_AudioEndpoint_Association                              = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode                = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
+
+;Localizable
+
+ProviderName = "AppSandbox"
+MfgName      = "AppSandbox"
+
+APPSANDBOXVAD_SA.DeviceDesc="App Sandbox Virtual Audio"
+AppSandboxVAD.SvcDesc="App Sandbox Virtual Audio"
+
+;; friendly names
+APPSANDBOXVAD.WaveSpeaker.szPname="App Sandbox Virtual Audio"
+APPSANDBOXVAD.TopologySpeaker.szPname="App Sandbox Virtual Audio"
