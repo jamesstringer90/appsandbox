@@ -71,7 +71,7 @@ AppSandboxVDD.dll
 ManufacturerName = "AppSandbox"
 DiskName = "AppSandbox VDD Installation Disk"
 WudfRdDisplayName = "Windows Driver Foundation - User-mode Driver Framework Reflector"
-DeviceName = "AppSandbox Virtual Display Adapter"
+DeviceName = "App Sandbox Virtual Display Adapter"
 
 REG_MULTI_SZ  = 0x00010000
 REG_SZ        = 0x00000000
