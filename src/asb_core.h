@@ -59,6 +59,7 @@ typedef struct {
     const wchar_t *username;
     const wchar_t *password;
     BOOL   test_mode;              /* TRUE = disable Secure Boot (test-signed drivers) */
+    BOOL   ssh_enabled;            /* TRUE = install OpenSSH Server in guest */
     BOOL   is_template;            /* TRUE = create as template VM */
 } AsbVmConfig;
 
@@ -158,6 +159,8 @@ ASB_API DWORD   asb_vm_hdd_gb(AsbVm vm);
 ASB_API DWORD   asb_vm_cpu_cores(AsbVm vm);
 ASB_API int     asb_vm_gpu_mode(AsbVm vm);
 ASB_API int     asb_vm_network_mode(AsbVm vm);
+ASB_API BOOL    asb_vm_ssh_enabled(AsbVm vm);
+ASB_API DWORD   asb_vm_ssh_port(AsbVm vm);
 
 /* ---- VM config editing (VM must be stopped) ---- */
 

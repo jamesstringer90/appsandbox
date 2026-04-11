@@ -1340,7 +1340,19 @@ static void report_displays(SOCKET notify)
 
 /* ---- IDD connect: respawn helpers in console session ---- */
 
-static void handle_idd_connect(SOCKET client)
+/* Send a response, prepending the sequence tag if present */
+static void send_reply(SOCKET s, const char *tag, const char *msg)
+{
+    if (tag[0]) {
+        char rb[512];
+        sprintf_s(rb, sizeof(rb), "%s%s", tag, msg);
+        send_line(s, rb);
+    } else {
+        send_line(s, msg);
+    }
+}
+
+static void handle_idd_connect(SOCKET client, const char *tag)
 {
     DWORD new_console = WTSGetActiveConsoleSessionId();
 
@@ -1362,7 +1374,7 @@ static void handle_idd_connect(SOCKET client)
     if (new_console != 0xFFFFFFFF)
         spawn_clipboard_reader_in_session(new_console);
 
-    send_line(client, "ok");
+    send_reply(client, tag, "ok");
 }
 
 /* ---- Persistent client handler ---- */
@@ -1426,6 +1438,9 @@ static void disable_hyperv_video(SOCKET notify_sock)
         send_line(notify_sock, "hyperv_video:not_found");
     SetupDiDestroyDeviceInfoList(devs);
 }
+
+/* Forward declaration — defined after SSH proxy section */
+static void handle_ssh_enable(SOCKET client, const char *tag);
 
 static void handle_client(SOCKET client)
 {
@@ -1505,13 +1520,36 @@ static void handle_client(SOCKET client)
             break;
         }
 
+        /* Extract sequence tag (e.g. "42:ping" → tag="42:", cmd="ping") */
+        {
+            char *cmd = buf;
+            char tag[32] = {0};
+            char *colon = strchr(buf, ':');
+            if (colon && colon > buf && colon - buf < 16) {
+                /* Check all chars before colon are digits */
+                char *p;
+                BOOL is_seq = TRUE;
+                for (p = buf; p < colon; p++) {
+                    if (*p < '0' || *p > '9') { is_seq = FALSE; break; }
+                }
+                if (is_seq) {
+                    int tlen = (int)(colon - buf + 1);
+                    memcpy(tag, buf, tlen);
+                    tag[tlen] = '\0';
+                    cmd = colon + 1;
+                }
+            }
+
         agent_log("Command: %s", buf);
 
-        if (strcmp(buf, "ping") == 0) {
-            send_line(client, "ok");
+        /* Helper macro: send response with tag prefix */
+        #define REPLY(msg) send_reply(client, tag, msg)
+
+        if (strcmp(cmd, "ping") == 0) {
+            REPLY("ok");
         }
-        else if (strcmp(buf, "shutdown") == 0) {
-            send_line(client, "ok");
+        else if (strcmp(cmd, "shutdown") == 0) {
+            REPLY("ok");
             agent_log("Initiating shutdown... killing input helper first.");
             stop_input_monitor();
             agent_log("Input monitor stopped, calling InitiateSystemShutdownExW...");
@@ -1522,8 +1560,8 @@ static void handle_client(SOCKET client)
                 agent_log("InitiateSystemShutdownExW failed: %lu", GetLastError());
             /* Keep connection open — host will see it drop when VM powers off */
         }
-        else if (strcmp(buf, "restart") == 0) {
-            send_line(client, "ok");
+        else if (strcmp(cmd, "restart") == 0) {
+            REPLY("ok");
             agent_log("Initiating restart...");
             stop_input_monitor();
             if (!enable_privilege(SE_SHUTDOWN_NAME))
@@ -1532,19 +1570,22 @@ static void handle_client(SOCKET client)
                     SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED))
                 agent_log("InitiateSystemShutdownExW failed: %lu", GetLastError());
         }
-        else if (strncmp(buf, "gpu_query_response:", 19) == 0) {
-            int share_count = atoi(buf + 19);
+        else if (strncmp(cmd, "gpu_query_response:", 19) == 0) {
+            int share_count = atoi(cmd + 19);
             agent_log("Received GPU share list (%d shares).", share_count);
             handle_gpu_query_response(client, share_count);
         }
-        else if (strcmp(buf, "gpu_none") == 0) {
+        else if (strcmp(cmd, "gpu_none") == 0) {
             agent_log("Host reports no GPU-PV assigned.");
         }
-        else if (strncmp(buf, "set_ip:", 7) == 0) {
+        else if (strcmp(cmd, "ssh_enable") == 0) {
+            handle_ssh_enable(client, tag);
+        }
+        else if (strncmp(cmd, "set_ip:", 7) == 0) {
             /* set_ip:172.20.0.X/PREFIX:GATEWAY */
             char ip[32] = {0}, prefix[8] = {0}, gateway[32] = {0};
             char *slash, *colon2;
-            char *arg = buf + 7;
+            char *arg = cmd + 7;
 
             /* Parse IP/prefix:gateway */
             slash = strchr(arg, '/');
@@ -1560,12 +1601,12 @@ static void handle_client(SOCKET client)
             }
 
             if (ip[0] && prefix[0] && gateway[0]) {
-                wchar_t cmd[512];
+                wchar_t wcmd[512];
                 STARTUPINFOW si;
                 PROCESS_INFORMATION pi;
                 DWORD exit_code = 1;
 
-                swprintf_s(cmd, 512,
+                swprintf_s(wcmd, 512,
                     L"netsh interface ip set address \"Ethernet\" static %S %S %S",
                     ip,
                     /* Convert prefix length to subnet mask */
@@ -1574,13 +1615,13 @@ static void handle_client(SOCKET client)
                     atoi(prefix) == 8  ? "255.0.0.0" : "255.255.255.0",
                     gateway);
 
-                agent_log("Setting IP: %S", cmd);
+                agent_log("Setting IP: %S", wcmd);
 
                 ZeroMemory(&si, sizeof(si));
                 si.cb = sizeof(si);
                 ZeroMemory(&pi, sizeof(pi));
 
-                if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
+                if (CreateProcessW(NULL, wcmd, NULL, NULL, FALSE,
                                    CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
                     WaitForSingleObject(pi.hProcess, 10000);
                     GetExitCodeProcess(pi.hProcess, &exit_code);
@@ -1620,25 +1661,28 @@ static void handle_client(SOCKET client)
 
                     agent_log("IP configured: %s/%s gw %s dns %s,8.8.8.8",
                               ip, prefix, gateway, gateway);
-                    send_line(client, "ok");
+                    REPLY("ok");
                 } else {
                     agent_log("netsh failed (exit %lu)", exit_code);
-                    send_line(client, "error:netsh_failed");
+                    REPLY("error:netsh_failed");
                 }
             } else {
-                agent_log("set_ip: bad format: %s", buf);
-                send_line(client, "error:bad_format");
+                agent_log("set_ip: bad format: %s", cmd);
+                REPLY("error:bad_format");
             }
         }
-        else if (strcmp(buf, "gpu_copy") == 0) {
+        else if (strcmp(cmd, "gpu_copy") == 0) {
             /* Host re-triggered GPU copy — ask for share list */
-            send_line(client, "gpu_query");
+            REPLY("gpu_query");
         }
-        else if (strcmp(buf, "idd_connect") == 0) {
-            handle_idd_connect(client);
+        else if (strcmp(cmd, "idd_connect") == 0) {
+            handle_idd_connect(client, tag);
         }
         else {
-            send_line(client, "error:unknown");
+            REPLY("error:unknown");
+        }
+
+        #undef REPLY
         }
     }
 
@@ -1732,6 +1776,297 @@ static DWORD WINAPI listener_thread(LPVOID param)
     WSACleanup();
     agent_log("Listener stopped.");
     return 0;
+}
+
+/* ---- SSH: sshd detection + HV proxy (guest-side: HV socket → localhost:22) ---- */
+
+/* SSH proxy service GUID: {A5B0CAFE-0006-4000-8000-000000000001} */
+static const GUID SSH_SERVICE_GUID =
+    { 0xa5b0cafe, 0x0006, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
+
+static HANDLE  g_ssh_proxy_thread = NULL;
+static volatile BOOL g_ssh_proxy_running = FALSE;
+static HANDLE  g_ssh_wait_thread = NULL;
+static volatile BOOL g_ssh_waiting = FALSE;
+
+#define SSH_RELAY_BUF 8192
+
+typedef struct SshRelayCtx {
+    SOCKET hv_sock;
+    SOCKET tcp_sock;
+} SshRelayCtx;
+
+static DWORD WINAPI ssh_relay_thread(LPVOID param)
+{
+    SshRelayCtx *ctx = (SshRelayCtx *)param;
+    char buf[SSH_RELAY_BUF];
+    fd_set rfds;
+    struct timeval tv;
+    int n;
+
+    for (;;) {
+        FD_ZERO(&rfds);
+        FD_SET(ctx->hv_sock, &rfds);
+        FD_SET(ctx->tcp_sock, &rfds);
+        tv.tv_sec  = 5;
+        tv.tv_usec = 0;
+
+        n = select(0, &rfds, NULL, NULL, &tv);
+        if (n < 0) break;
+        if (n == 0) continue;
+
+        if (FD_ISSET(ctx->hv_sock, &rfds)) {
+            n = recv(ctx->hv_sock, buf, SSH_RELAY_BUF, 0);
+            if (n <= 0) break;
+            if (send(ctx->tcp_sock, buf, n, 0) != n) break;
+        }
+
+        if (FD_ISSET(ctx->tcp_sock, &rfds)) {
+            n = recv(ctx->tcp_sock, buf, SSH_RELAY_BUF, 0);
+            if (n <= 0) break;
+            if (send(ctx->hv_sock, buf, n, 0) != n) break;
+        }
+    }
+
+    closesocket(ctx->hv_sock);
+    closesocket(ctx->tcp_sock);
+    free(ctx);
+    return 0;
+}
+
+/* Check if sshd service is running. Returns TRUE if running. */
+static BOOL is_sshd_running(void)
+{
+    SC_HANDLE scm, svc;
+    SERVICE_STATUS ss;
+    BOOL running = FALSE;
+
+    scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!scm) return FALSE;
+
+    svc = OpenServiceA(scm, "sshd", SERVICE_QUERY_STATUS);
+    if (svc) {
+        if (QueryServiceStatus(svc, &ss) && ss.dwCurrentState == SERVICE_RUNNING)
+            running = TRUE;
+        CloseServiceHandle(svc);
+    }
+
+    CloseServiceHandle(scm);
+    return running;
+}
+
+/* Try to start sshd and set it to auto-start. Returns TRUE if running. */
+static BOOL ensure_sshd_running(void)
+{
+    SC_HANDLE scm, svc;
+    SERVICE_STATUS ss;
+    BOOL ok = FALSE;
+
+    scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (!scm) return FALSE;
+
+    svc = OpenServiceA(scm, "sshd", SERVICE_ALL_ACCESS);
+    if (svc) {
+        ChangeServiceConfigA(svc, SERVICE_NO_CHANGE, SERVICE_AUTO_START,
+                             SERVICE_NO_CHANGE, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+        if (QueryServiceStatus(svc, &ss) && ss.dwCurrentState == SERVICE_RUNNING) {
+            ok = TRUE;
+        } else {
+            if (StartServiceA(svc, 0, NULL))
+                ok = TRUE;
+            else if (GetLastError() == ERROR_SERVICE_ALREADY_RUNNING)
+                ok = TRUE;
+        }
+        CloseServiceHandle(svc);
+    }
+
+    CloseServiceHandle(scm);
+    return ok;
+}
+
+/* HV proxy listener — runs after sshd is confirmed running */
+static DWORD WINAPI ssh_proxy_thread(LPVOID param)
+{
+    SOCKET listen_s, client_s, tcp_s;
+    SOCKADDR_HV addr;
+    struct sockaddr_in tcp_addr;
+    fd_set fds;
+    struct timeval tv;
+
+    (void)param;
+
+    listen_s = socket(AF_HYPERV, SOCK_STREAM, 1 /* HV_PROTOCOL_RAW */);
+    if (listen_s == INVALID_SOCKET) {
+        agent_log("SSH proxy: socket() failed: %d", WSAGetLastError());
+        return 1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.Family = AF_HYPERV;
+    addr.VmId = HV_GUID_WILDCARD;
+    addr.ServiceId = SSH_SERVICE_GUID;
+
+    if (bind(listen_s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        agent_log("SSH proxy: bind() failed: %d", WSAGetLastError());
+        closesocket(listen_s);
+        return 1;
+    }
+
+    if (listen(listen_s, 4) != 0) {
+        agent_log("SSH proxy: listen() failed: %d", WSAGetLastError());
+        closesocket(listen_s);
+        return 1;
+    }
+
+    agent_log("SSH proxy: listening on AF_HYPERV :0006");
+
+    while (g_ssh_proxy_running) {
+        FD_ZERO(&fds);
+        FD_SET(listen_s, &fds);
+        tv.tv_sec  = 1;
+        tv.tv_usec = 0;
+
+        if (select(0, &fds, NULL, NULL, &tv) <= 0)
+            continue;
+
+        client_s = accept(listen_s, NULL, NULL);
+        if (client_s == INVALID_SOCKET)
+            continue;
+
+        /* Connect to local sshd */
+        tcp_s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (tcp_s == INVALID_SOCKET) {
+            closesocket(client_s);
+            continue;
+        }
+
+        memset(&tcp_addr, 0, sizeof(tcp_addr));
+        tcp_addr.sin_family = AF_INET;
+        tcp_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        tcp_addr.sin_port = htons(22);
+
+        if (connect(tcp_s, (struct sockaddr *)&tcp_addr, sizeof(tcp_addr)) != 0) {
+            agent_log("SSH proxy: connect to localhost:22 failed: %d", WSAGetLastError());
+            closesocket(tcp_s);
+            closesocket(client_s);
+            continue;
+        }
+
+        /* Spawn relay thread */
+        {
+            SshRelayCtx *ctx = (SshRelayCtx *)malloc(sizeof(SshRelayCtx));
+            if (ctx) {
+                HANDLE t;
+                ctx->hv_sock  = client_s;
+                ctx->tcp_sock = tcp_s;
+                t = CreateThread(NULL, 0, ssh_relay_thread, ctx, 0, NULL);
+                if (t) CloseHandle(t);  /* detached — relay cleans up itself */
+                else { free(ctx); closesocket(client_s); closesocket(tcp_s); }
+            } else {
+                closesocket(client_s);
+                closesocket(tcp_s);
+            }
+        }
+    }
+
+    closesocket(listen_s);
+    agent_log("SSH proxy: stopped.");
+    return 0;
+}
+
+static void start_ssh_proxy(void)
+{
+    if (g_ssh_proxy_thread) return;  /* already running */
+    g_ssh_proxy_running = TRUE;
+    g_ssh_proxy_thread = CreateThread(NULL, 0, ssh_proxy_thread, NULL, 0, NULL);
+}
+
+static void stop_ssh_proxy(void)
+{
+    g_ssh_proxy_running = FALSE;
+    g_ssh_waiting = FALSE;
+    if (g_ssh_wait_thread) {
+        WaitForSingleObject(g_ssh_wait_thread, 5000);
+        CloseHandle(g_ssh_wait_thread);
+        g_ssh_wait_thread = NULL;
+    }
+    if (g_ssh_proxy_thread) {
+        WaitForSingleObject(g_ssh_proxy_thread, 5000);
+        CloseHandle(g_ssh_proxy_thread);
+        g_ssh_proxy_thread = NULL;
+    }
+}
+
+/* Background thread: poll for sshd service to become running.
+   SetupComplete.cmd installs OpenSSH via MSI during first boot — sshd may
+   not be running yet when the agent first handles ssh_enable. */
+static DWORD WINAPI ssh_wait_thread(LPVOID param)
+{
+    int attempts = 0;
+    (void)param;
+
+    agent_log("SSH: waiting for sshd to become available...");
+
+    while (g_ssh_waiting && attempts < 120) {  /* up to ~2 minutes */
+        Sleep(1000);
+        attempts++;
+
+        if (ensure_sshd_running()) {
+            agent_log("SSH: sshd is running (after %d seconds).", attempts);
+            start_ssh_proxy();
+            EnterCriticalSection(&g_send_cs);
+            if (g_client_sock != INVALID_SOCKET)
+                send_line(g_client_sock, "ssh_ready");
+            LeaveCriticalSection(&g_send_cs);
+            g_ssh_waiting = FALSE;
+            return 0;
+        }
+    }
+
+    agent_log("SSH: sshd did not start within timeout.");
+    EnterCriticalSection(&g_send_cs);
+    if (g_client_sock != INVALID_SOCKET)
+        send_line(g_client_sock, "ssh_failed");
+    LeaveCriticalSection(&g_send_cs);
+    g_ssh_waiting = FALSE;
+    return 1;
+}
+
+/* Handle "ssh_enable" command from host.
+   sshd is installed by SetupComplete.cmd (MSI). Agent just detects + proxies. */
+static void handle_ssh_enable(SOCKET client, const char *tag)
+{
+    /* Already running? */
+    if (is_sshd_running()) {
+        agent_log("SSH: sshd already running.");
+        send_reply(client, tag, "ssh_ready");
+        start_ssh_proxy();
+        return;
+    }
+
+    /* Try to start it (may be installed but stopped) */
+    if (ensure_sshd_running()) {
+        agent_log("SSH: sshd started successfully.");
+        send_reply(client, tag, "ssh_ready");
+        start_ssh_proxy();
+        return;
+    }
+
+    /* Not installed yet — SetupComplete.cmd may still be running.
+       Poll on a background thread. */
+    if (g_ssh_waiting) {
+        send_reply(client, tag, "ssh_installing");
+        return;
+    }
+
+    g_ssh_waiting = TRUE;
+    send_reply(client, tag, "ssh_installing");
+    g_ssh_wait_thread = CreateThread(NULL, 0, ssh_wait_thread, NULL, 0, NULL);
+    if (!g_ssh_wait_thread) {
+        agent_log("SSH: failed to create wait thread.");
+        g_ssh_waiting = FALSE;
+        send_reply(client, tag, "ssh_failed");
+    }
 }
 
 /* ---- Windows service plumbing ---- */
@@ -1843,6 +2178,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Clean up */
     agent_log("Stop event signaled, cleaning up...");
+    agent_log("Stopping SSH proxy...");
+    stop_ssh_proxy();
+    agent_log("SSH proxy stopped.");
     agent_log("Stopping clipboard reader monitor...");
     stop_clipboard_reader_monitor();
     agent_log("Clipboard reader monitor stopped.");

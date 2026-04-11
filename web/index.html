@@ -93,8 +93,8 @@
 
         <label>Options:</label>
         <div class="form-row">
-            <label><input type="checkbox" id="test-mode" checked> Test Mode</label>
-            <span class="host-info">(disables Secure Boot — required for test-signed VDD driver)</span>
+            <label title="Disables Secure Boot — required for test-signed VDD driver"><input type="checkbox" id="test-mode" checked> Test Mode</label>
+            <label title="Installs OpenSSH Server, tunnelled over HV socket"><input type="checkbox" id="ssh-enabled"> SSH Server</label>
         </div>
     </div>
 
@@ -124,6 +124,7 @@
                 <th class="icon-col">&#x25B6;&#xFE0F;</th>
                 <th class="icon-col">&#x1F5A5;&#xFE0F;</th>
                 <th class="icon-col" title="IDD Display">&#x1F4FA;</th>
+                <th class="icon-col" title="SSH">&gt;_</th>
                 <th class="icon-col">&#x23FB;</th>
                 <th class="icon-col">&#x2715;&#xFE0F;</th>
                 <th class="icon-col">&#x1F5D1;&#xFE0F;</th>

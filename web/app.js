@@ -301,7 +301,8 @@ function gatherConfig() {
         adminUser:   document.getElementById('admin-user').value.trim(),
         adminPass:   document.getElementById('admin-pass').value,
         adminConfirm: document.getElementById('admin-confirm').value,
-        testMode:    document.getElementById('test-mode').checked
+        testMode:    document.getElementById('test-mode').checked,
+        sshEnabled:  document.getElementById('ssh-enabled').checked
     };
 }
 
@@ -376,7 +377,7 @@ function renderVmTable() {
     if (vms.length === 0) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 16;
+        td.colSpan = 17;
         td.className = 'empty-state';
         td.textContent = 'Add a virtual machine using New VM Configuration';
         tr.appendChild(td);
@@ -465,6 +466,16 @@ function renderVmTable() {
         }; })(i, snapVal, vm)));
         tr.appendChild(makeIconCell('connect', '\uD83D\uDDA5\uFE0F', vm.running && !bld && !vm.agentOnline, function() { sendCmd('connectVm', {vmIndex: i}); }));
         tr.appendChild(makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }));
+        var sshActive = vm.sshEnabled && vm.sshState === 2 && vm.running && !bld;
+        var sshCell = makeIconCell('ssh', '>_', sshActive, (function(idx) { return function() { sendCmd('sshConnect', {vmIndex: idx}); }; })(i), !vm.sshEnabled ? 'hidden' : '');
+        if (vm.sshEnabled) {
+            var sshBtn = sshCell.querySelector('.icon-btn');
+            if (vm.sshState === 1) sshBtn.title = 'Installing OpenSSH...';
+            else if (vm.sshState === 2) sshBtn.title = 'SSH: localhost:' + vm.sshPort;
+            else if (vm.sshState === 3) sshBtn.title = 'SSH install failed';
+            else sshBtn.title = 'SSH: waiting for agent';
+        }
+        tr.appendChild(sshCell);
         tr.appendChild(makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }));
         tr.appendChild(makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }));
         tr.appendChild(makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : ''));

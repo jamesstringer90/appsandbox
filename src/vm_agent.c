@@ -1,5 +1,6 @@
 #include <winsock2.h>
 #include "vm_agent.h"
+#include "vm_ssh_proxy.h"
 #include "ui.h"
 #include <stdio.h>
 
@@ -46,6 +47,7 @@ typedef struct AgentConn {
     HANDLE         cmd_done;     /* Event: signaled when response is ready */
     char           cmd[64];
     char           rsp[256];
+    unsigned int   cmd_seq;      /* Monotonic sequence ID for tagged commands */
 } AgentConn;
 
 #define MAX_AGENTS 16
@@ -194,6 +196,117 @@ static void notify_agent_status(VmInstance *vm)
         PostMessageW(g_agent_hwnd, WM_VM_AGENT_STATUS, 0, (LPARAM)vm);
 }
 
+/* Process an untagged (async) message from the agent.
+   Returns: 0 = handled, 1 = os_shutdown (caller should break),
+            2 = service_stopping (caller should stop). */
+static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
+{
+    if (strcmp(buf, "heartbeat") == 0) {
+        vm->last_heartbeat = GetTickCount64();
+    } else if (strcmp(buf, "os_shutdown") == 0) {
+        ui_log(L"Guest OS shutting down for \"%s\".", vm->name);
+        vm->agent_online = FALSE;
+        vm->shutdown_requested = TRUE;
+        vm->shutdown_time = GetTickCount64();
+        notify_agent_status(vm);
+        return 1;
+    } else if (strcmp(buf, "service_stopping") == 0) {
+        ui_log(L"Agent service stopped in \"%s\".", vm->name);
+        return 2;
+    } else if (strncmp(buf, "gpu_copy_progress:", 18) == 0) {
+        ui_log(L"GPU copy progress for \"%s\": %S", vm->name, buf + 18);
+    } else if (strncmp(buf, "gpu_copy_done:", 14) == 0) {
+        ui_log(L"GPU copy complete for \"%s\" (%S files).", vm->name, buf + 14);
+    } else if (strncmp(buf, "gpu_copy_error:", 15) == 0) {
+        ui_log(L"GPU copy error for \"%s\": %S", vm->name, buf + 15);
+    } else if (strncmp(buf, "gpu_device_status:", 18) == 0) {
+        ui_log(L"[%s] GPU: %S", vm->name, buf + 18);
+    } else if (strcmp(buf, "gpu_device_ok") == 0) {
+        ui_log(L"[%s] GPU device recovered successfully.", vm->name);
+    } else if (strncmp(buf, "gpu_device_failed:", 18) == 0) {
+        ui_log(L"[%s] GPU device still failing (problem %S).", vm->name, buf + 18);
+    } else if (strncmp(buf, "idd_status:", 11) == 0) {
+        ui_log(L"[%s] IDD driver: %S", vm->name, buf + 11);
+    } else if (strncmp(buf, "hyperv_video:", 13) == 0) {
+        ui_log(L"[%s] Hyper-V Video: %S", vm->name, buf + 13);
+        if (strcmp(buf + 13, "disabled") == 0)
+            PostMessageW(g_agent_hwnd, WM_VM_HYPERV_VIDEO_OFF, 0, (LPARAM)vm);
+    } else if (strncmp(buf, "displays:", 9) == 0) {
+        ui_log(L"[%s] Displays: %S", vm->name, buf + 9);
+    } else if (strncmp(buf, "log:", 4) == 0) {
+        ui_log(L"[%s] %S", vm->name, buf + 4);
+    } else if (strcmp(buf, "gpu_query") == 0) {
+        if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {
+            char header[64];
+            int gi;
+            sprintf_s(header, sizeof(header), "gpu_query_response:%d",
+                      vm->gpu_shares.count);
+            send_line(s, header);
+            for (gi = 0; gi < vm->gpu_shares.count; gi++) {
+                const GpuDriverShare *ds = &vm->gpu_shares.shares[gi];
+                char line[8192];
+                char share_a[128], dest_a[512], filter_a[4096];
+                WideCharToMultiByte(CP_UTF8, 0, ds->share_name, -1,
+                                    share_a, sizeof(share_a), NULL, NULL);
+                WideCharToMultiByte(CP_UTF8, 0, ds->guest_path, -1,
+                                    dest_a, sizeof(dest_a), NULL, NULL);
+                WideCharToMultiByte(CP_UTF8, 0, ds->file_filter, -1,
+                                    filter_a, sizeof(filter_a), NULL, NULL);
+                sprintf_s(line, sizeof(line), "%s|%s|%s", share_a, dest_a, filter_a);
+                send_line(s, line);
+            }
+        } else {
+            send_line(s, "gpu_none");
+        }
+    } else if (strcmp(buf, "ssh_ready") == 0) {
+        vm->ssh_state = 2;
+        vm_ssh_proxy_start(vm);
+        ui_log(L"SSH ready for \"%s\".", vm->name);
+        notify_agent_status(vm);
+    } else if (strcmp(buf, "ssh_failed") == 0) {
+        vm->ssh_state = 3;
+        ui_log(L"SSH install failed for \"%s\".", vm->name);
+        notify_agent_status(vm);
+    } else if (strcmp(buf, "ssh_installing") == 0) {
+        vm->ssh_state = 1;
+        ui_log(L"SSH installing for \"%s\"...", vm->name);
+        notify_agent_status(vm);
+    }
+    return 0;
+}
+
+/* Send a tagged command and wait for the tagged response.
+   Processes any interleaved async messages while waiting.
+   Returns: response length on success, 0 on close, -1 on error. */
+static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
+                           const char *cmd, char *rsp, int rsp_size)
+{
+    char tagged[512];
+    char prefix[32];
+    int pfx_len, n;
+
+    (*seq)++;
+    sprintf_s(tagged, sizeof(tagged), "%u:%s", *seq, cmd);
+    sprintf_s(prefix, sizeof(prefix), "%u:", *seq);
+    pfx_len = (int)strlen(prefix);
+
+    if (send_line(s, tagged) <= 0) return -1;
+
+    for (;;) {
+        n = recv_line(s, rsp, rsp_size);
+        if (n <= 0) return n;
+
+        if (strncmp(rsp, prefix, pfx_len) == 0) {
+            /* Tagged response — strip prefix */
+            memmove(rsp, rsp + pfx_len, strlen(rsp + pfx_len) + 1);
+            return (int)strlen(rsp);
+        }
+
+        /* Untagged = async message, process inline */
+        process_async_message(vm, s, rsp);
+    }
+}
+
 /* ---- Persistent connection thread ---- */
 
 static DWORD WINAPI agent_thread_proc(LPVOID param)
@@ -238,19 +351,17 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             ui_log(L"Install complete for \"%s\".", vm->name);
         }
 
-        notify_agent_status(vm);
-
         /* Send NAT IP to agent (only for NAT mode) */
         if (vm->network_mode == NET_NAT && vm->nat_ip[0] != '\0') {
             char ip_cmd[64];
             sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/16:172.20.0.1", vm->nat_ip);
-            send_line(s, ip_cmd);
-            n = recv_line(s, buf, sizeof(buf));
-            if (n > 0)
-                ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd, buf, sizeof(buf));
+            if (n <= 0) goto disconnected;
+            ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);
         }
 
-        /* Send GPU share info to agent (if GPU-PV is assigned) */
+        /* Send GPU share info to agent (if GPU-PV is assigned).
+           Fire-and-forget — no response expected, so no tagging needed. */
         if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {
             char header[64];
             int gi;
@@ -279,6 +390,26 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             send_line(s, "gpu_none");
         }
 
+        /* Request SSH install/enable if configured */
+        if (vm->ssh_enabled) {
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, "ssh_enable", buf, sizeof(buf));
+            if (n <= 0) goto disconnected;
+            if (strcmp(buf, "ssh_ready") == 0) {
+                vm->ssh_state = 2;
+                vm_ssh_proxy_start(vm);
+                ui_log(L"SSH ready for \"%s\".", vm->name);
+            } else if (strcmp(buf, "ssh_installing") == 0) {
+                vm->ssh_state = 1;
+                ui_log(L"SSH installing for \"%s\"...", vm->name);
+            } else if (strcmp(buf, "ssh_failed") == 0) {
+                vm->ssh_state = 3;
+                ui_log(L"SSH install failed for \"%s\".", vm->name);
+            }
+        }
+
+        /* Notify UI — agent online + SSH state are all set now */
+        notify_agent_status(vm);
+
         /* Connected — read loop */
         while (!conn->stop) {
             fd_set rfds;
@@ -287,13 +418,33 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
 
             /* Check for pending command first */
             if (conn->cmd_pending) {
-                if (send_line(s, conn->cmd) <= 0) break;
-                n = recv_line(s, conn->rsp, sizeof(conn->rsp));
-                if (n <= 0) {
-                    conn->rsp[0] = '\0';
-                    conn->cmd_pending = FALSE;
-                    SetEvent(conn->cmd_done);
-                    break;
+                char tagged[512];
+                conn->cmd_seq++;
+                sprintf_s(tagged, sizeof(tagged), "%u:%s", conn->cmd_seq, conn->cmd);
+                if (send_line(s, tagged) <= 0) break;
+                /* Read lines until we get our tagged response */
+                for (;;) {
+                    n = recv_line(s, conn->rsp, sizeof(conn->rsp));
+                    if (n <= 0) {
+                        conn->rsp[0] = '\0';
+                        conn->cmd_pending = FALSE;
+                        SetEvent(conn->cmd_done);
+                        goto disconnected;
+                    }
+                    /* Check for our sequence tag */
+                    {
+                        char prefix[32];
+                        int pfx_len;
+                        sprintf_s(prefix, sizeof(prefix), "%u:", conn->cmd_seq);
+                        pfx_len = (int)strlen(prefix);
+                        if (strncmp(conn->rsp, prefix, pfx_len) == 0) {
+                            /* Tagged response — strip prefix */
+                            memmove(conn->rsp, conn->rsp + pfx_len, strlen(conn->rsp + pfx_len) + 1);
+                            break;
+                        }
+                    }
+                    /* Untagged = async message, process inline */
+                    process_async_message(vm, s, conn->rsp);
                 }
                 conn->cmd_pending = FALSE;
                 SetEvent(conn->cmd_done);
@@ -313,77 +464,13 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             n = recv_line(s, buf, sizeof(buf));
             if (n <= 0) break; /* connection lost */
 
-            /* Process messages from agent */
-            if (strcmp(buf, "heartbeat") == 0) {
-                vm->last_heartbeat = GetTickCount64();
-            } else if (strcmp(buf, "os_shutdown") == 0) {
-                ui_log(L"Guest OS shutting down for \"%s\".", vm->name);
-                vm->agent_online = FALSE;
-                vm->shutdown_requested = TRUE;
-                vm->shutdown_time = GetTickCount64();
-                notify_agent_status(vm);
-                /* Don't set conn->stop — let outer loop retry in case of reboot.
-                   HCS SystemExited will call vm_agent_stop() on real shutdown. */
-                break;
-            } else if (strcmp(buf, "service_stopping") == 0) {
-                ui_log(L"Agent service stopped in \"%s\".", vm->name);
-                conn->stop = TRUE;
-                break;
-            } else if (strncmp(buf, "gpu_copy_progress:", 18) == 0) {
-                ui_log(L"GPU copy progress for \"%s\": %S", vm->name, buf + 18);
-            } else if (strncmp(buf, "gpu_copy_done:", 14) == 0) {
-                ui_log(L"GPU copy complete for \"%s\" (%S files).",
-                       vm->name, buf + 14);
-            } else if (strncmp(buf, "gpu_copy_error:", 15) == 0) {
-                ui_log(L"GPU copy error for \"%s\": %S",
-                       vm->name, buf + 15);
-            } else if (strncmp(buf, "gpu_device_status:", 18) == 0) {
-                ui_log(L"[%s] GPU: %S", vm->name, buf + 18);
-            } else if (strcmp(buf, "gpu_device_ok") == 0) {
-                ui_log(L"[%s] GPU device recovered successfully.", vm->name);
-            } else if (strncmp(buf, "gpu_device_failed:", 18) == 0) {
-                ui_log(L"[%s] GPU device still failing (problem %S).",
-                       vm->name, buf + 18);
-            } else if (strncmp(buf, "idd_status:", 11) == 0) {
-                ui_log(L"[%s] IDD driver: %S", vm->name, buf + 11);
-            } else if (strncmp(buf, "hyperv_video:", 13) == 0) {
-                ui_log(L"[%s] Hyper-V Video: %S", vm->name, buf + 13);
-                if (strcmp(buf + 13, "disabled") == 0)
-                    PostMessageW(g_agent_hwnd, WM_VM_HYPERV_VIDEO_OFF, 0, (LPARAM)vm);
-            } else if (strncmp(buf, "displays:", 9) == 0) {
-                ui_log(L"[%s] Displays: %S", vm->name, buf + 9);
-            } else if (strncmp(buf, "log:", 4) == 0) {
-                ui_log(L"[%s] %S", vm->name, buf + 4);
-            } else if (strcmp(buf, "gpu_query") == 0) {
-                /* Agent is asking for GPU shares (re-trigger) */
-                if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {
-                    char header[64];
-                    int gi;
-                    sprintf_s(header, sizeof(header), "gpu_query_response:%d",
-                              vm->gpu_shares.count);
-                    send_line(s, header);
-                    for (gi = 0; gi < vm->gpu_shares.count; gi++) {
-                        const GpuDriverShare *ds = &vm->gpu_shares.shares[gi];
-                        char line[8192];
-                        char share_a[128], dest_a[512], filter_a[4096];
-
-                        WideCharToMultiByte(CP_UTF8, 0, ds->share_name, -1,
-                                            share_a, sizeof(share_a), NULL, NULL);
-                        WideCharToMultiByte(CP_UTF8, 0, ds->guest_path, -1,
-                                            dest_a, sizeof(dest_a), NULL, NULL);
-                        WideCharToMultiByte(CP_UTF8, 0, ds->file_filter, -1,
-                                            filter_a, sizeof(filter_a), NULL, NULL);
-
-                        sprintf_s(line, sizeof(line), "%s|%s|%s",
-                                  share_a, dest_a, filter_a);
-                        send_line(s, line);
-                    }
-                } else {
-                    send_line(s, "gpu_none");
-                }
+            { int rc = process_async_message(vm, s, buf);
+              if (rc == 1) break;              /* os_shutdown */
+              if (rc == 2) { conn->stop = TRUE; break; }  /* service_stopping */
             }
         }
 
+        disconnected:
         /* Connection lost */
         vm->agent_online = FALSE;
         closesocket(s);
