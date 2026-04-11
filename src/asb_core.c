@@ -7,8 +7,6 @@
  * Uses callbacks instead of PostMessage for cross-thread notification.
  */
 
-#define ASB_BUILDING_DLL
-
 #include "asb_core.h"
 #include "hcs_vm.h"
 #include "gpu_enum.h"
@@ -17,6 +15,7 @@
 #include "snapshot.h"
 #include "vmms_cert.h"
 #include "vm_agent.h"
+#include "vm_ssh_proxy.h"
 #include "prereq.h"
 #include "ui.h"
 
@@ -230,6 +229,12 @@ static void save_vm_list(void)
             fwprintf(f, L"IsTemplate=1\n");
         if (g_vms[i].test_mode)
             fwprintf(f, L"TestMode=1\n");
+        if (g_vms[i].admin_user[0])
+            fwprintf(f, L"AdminUser=%s\n", g_vms[i].admin_user);
+        if (g_vms[i].ssh_enabled)
+            fwprintf(f, L"SshEnabled=1\n");
+        if (g_vms[i].ssh_port)
+            fwprintf(f, L"SshPort=%lu\n", g_vms[i].ssh_port);
         if (g_vms[i].install_complete)
             fwprintf(f, L"InstallComplete=1\n");
         fwprintf(f, L"\n");
@@ -313,6 +318,12 @@ static void load_vm_list(void)
             vm->is_template = (_wtoi(line + 11) != 0);
         else if (wcsncmp(line, L"TestMode=", 9) == 0)
             vm->test_mode = (_wtoi(line + 9) != 0);
+        else if (wcsncmp(line, L"AdminUser=", 10) == 0)
+            wcscpy_s(vm->admin_user, 128, line + 10);
+        else if (wcsncmp(line, L"SshEnabled=", 11) == 0)
+            vm->ssh_enabled = (_wtoi(line + 11) != 0);
+        else if (wcsncmp(line, L"SshPort=", 8) == 0)
+            vm->ssh_port = (DWORD)_wtoi(line + 8);
         else if (wcsncmp(line, L"InstallComplete=", 16) == 0)
             vm->install_complete = (_wtoi(line + 16) != 0);
     }
@@ -478,6 +489,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
             instance->shutdown_requested = FALSE;
             instance->hyperv_video_off = FALSE;
             hcs_stop_monitor(instance);
+            vm_ssh_proxy_stop(instance);
             vm_agent_stop(instance);
             asb_log(L"VM \"%s\" exited (event=0x%08X).", instance->name, event);
 
@@ -711,7 +723,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
 
     /* Generate SetupComplete.cmd */
     swprintf_s(file_path, MAX_PATH, L"%s\\SetupComplete.cmd", staging);
-    generate_vhdx_setupcomplete(file_path);
+    generate_vhdx_setupcomplete(file_path, args->config.ssh_enabled);
 
     /* Determine res_dir */
     GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
@@ -722,7 +734,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
 
     /* Generate manifest */
     swprintf_s(manifest, MAX_PATH, L"%s\\manifest.txt", staging);
-    manifest_count = generate_vhdx_manifest(manifest, staging, res_dir, &args->config.gpu_shares);
+    manifest_count = generate_vhdx_manifest(manifest, staging, res_dir, &args->config.gpu_shares, args->config.ssh_enabled);
     if (manifest_count < 0) {
         args->result = E_FAIL;
         wcscpy_s(args->error_msg, 512, L"Failed to generate staging manifest");
@@ -847,14 +859,20 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
 
     args->vhdx_created = TRUE;
 
-    /* Allocate NAT IP before endpoint creation */
-    if (args->config.network_mode == NET_NAT && args->vm_inst) {
-        if (allocate_nat_ip(args->vm_inst))
-            asb_log(L"Allocated NAT IP %S for new VM.", args->vm_inst->nat_ip);
+    /* Allocate NAT IP before endpoint creation.
+       args->vm_inst isn't set yet (HCS VM not created), so allocate
+       into the g_vms[] entry directly via vm_index. */
+    if (args->config.network_mode == NET_NAT && args->vm_index >= 0 && args->vm_index < g_vm_count) {
+        if (allocate_nat_ip(&g_vms[args->vm_index])) {
+            asb_log(L"Allocated NAT IP %S for new VM.", g_vms[args->vm_index].nat_ip);
+            save_vm_list();
+        }
     }
 
     /* Network */
     if (args->config.network_mode != NET_NONE) {
+        char *nat_ip = (args->vm_index >= 0 && args->vm_index < g_vm_count)
+                        ? g_vms[args->vm_index].nat_ip : NULL;
         switch (args->config.network_mode) {
         case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
         case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
@@ -863,7 +881,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         }
         if (SUCCEEDED(hr)) {
             hr = hcn_create_endpoint(&args->network_id, &args->endpoint_id, args->endpoint_guid, 64,
-                                     (args->vm_inst && args->vm_inst->nat_ip[0]) ? args->vm_inst->nat_ip : NULL);
+                                     (nat_ip && nat_ip[0]) ? nat_ip : NULL);
             if (SUCCEEDED(hr))
                 args->has_network = TRUE;
             else
@@ -1071,6 +1089,7 @@ ASB_API void asb_cleanup(void)
 
     for (i = 0; i < g_vm_count; i++) {
         hcs_stop_monitor(&g_vms[i]);
+        vm_ssh_proxy_stop(&g_vms[i]);
         vm_agent_stop(&g_vms[i]);
         if (g_vms[i].running) hcs_terminate_vm(&g_vms[i]);
         hcs_close_vm(&g_vms[i]);
@@ -1098,6 +1117,7 @@ ASB_API void asb_detach(void)
        the callback is already gone. */
     for (i = 0; i < g_vm_count; i++) {
         hcs_stop_monitor(&g_vms[i]);
+        vm_ssh_proxy_stop(&g_vms[i]);
         vm_agent_stop(&g_vms[i]);
         hcs_unregister_vm_callback(&g_vms[i]);
         g_vms[i].handle = NULL;  /* abandon handle — OS will close it */
@@ -1139,6 +1159,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     cfg.gpu_mode = config->gpu_mode;
     cfg.network_mode = config->network_mode;
     cfg.test_mode = config->test_mode;
+    cfg.ssh_enabled = config->ssh_enabled;
     is_template_create = config->is_template;
     cfg.is_template = is_template_create;
 
@@ -1259,6 +1280,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->network_mode = cfg.network_mode;
             inst->is_template = is_template_create;
             inst->test_mode = cfg.test_mode;
+            wcscpy_s(inst->admin_user, 128, cfg.admin_user);
+            inst->ssh_enabled = cfg.ssh_enabled;
             inst->building_vhdx = TRUE;
             inst->vhdx_progress = 0;
             memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
@@ -1321,7 +1344,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         if (is_template_create) {
             if (_wcsicmp(cfg.os_type, L"Windows") == 0 && cfg.image_path[0] != L'\0') {
                 hr = iso_create_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
-                                           res_dir_buf, TRUE, cfg.test_mode, L"en-US");
+                                           res_dir_buf, TRUE, cfg.test_mode, cfg.ssh_enabled, L"en-US");
                 if (SUCCEEDED(hr)) wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                 else asb_log(L"Warning: Failed to create template resources ISO (0x%08X).", hr);
             }
@@ -1330,7 +1353,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                 wchar_t template_lang[32] = L"en-US";
                 vm_load_language_json(g_templates[template_idx].vhdx_path, template_lang, 32);
                 hr = iso_create_instance_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
-                                                    res_dir_buf, template_lang);
+                                                    res_dir_buf, cfg.ssh_enabled, template_lang);
                 if (SUCCEEDED(hr)) {
                     wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                     vm_save_language_json(cfg.vhdx_path, template_lang);
@@ -1341,7 +1364,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             if (_wcsicmp(cfg.os_type, L"Windows") == 0 && cfg.image_path[0] != L'\0' &&
                 cfg.admin_pass[0] != L'\0') {
                 hr = iso_create_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
-                                           res_dir_buf, FALSE, cfg.test_mode, L"en-US");
+                                           res_dir_buf, FALSE, cfg.test_mode, cfg.ssh_enabled, L"en-US");
                 if (SUCCEEDED(hr)) wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                 else asb_log(L"Warning: Failed to create resources ISO (0x%08X).", hr);
             }
@@ -1481,6 +1504,8 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->config.gpu_mode = inst->gpu_mode;
         args->config.network_mode = inst->network_mode;
         args->config.test_mode = inst->test_mode;
+        wcscpy_s(args->config.admin_user, 128, inst->admin_user);
+        args->config.ssh_enabled = inst->ssh_enabled;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
         args->network_mode = inst->network_mode;
         inst->network_cleaned = FALSE;
@@ -1551,6 +1576,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
     inst->shutdown_requested = FALSE;
     inst->hyperv_video_off = FALSE;
     hcs_stop_monitor(inst);
+    vm_ssh_proxy_stop(inst);
     vm_agent_stop(inst);
 
     asb_log(L"Force stopping VM \"%s\"...", inst->name);
@@ -1588,6 +1614,7 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     inst = &g_vms[idx];
 
     hcs_stop_monitor(inst);
+    vm_ssh_proxy_stop(inst);
     vm_agent_stop(inst);
 
     if (inst->running)
@@ -1717,6 +1744,18 @@ ASB_API int asb_vm_network_mode(AsbVm vm)
 {
     VmInstance *inst = vm_inst(vm);
     return inst ? inst->network_mode : 0;
+}
+
+ASB_API BOOL asb_vm_ssh_enabled(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->ssh_enabled : FALSE;
+}
+
+ASB_API DWORD asb_vm_ssh_port(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->ssh_port : 0;
 }
 
 /* ---- VM Config Editing ---- */

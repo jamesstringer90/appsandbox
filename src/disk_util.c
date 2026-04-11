@@ -9,6 +9,12 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "urlmon.lib")
+
+#include <urlmon.h>
+
+#define SSH_MSI_URL     L"https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-Win64-v10.0.0.0.msi"
+#define SSH_MSI_NAME    L"OpenSSH-Win64-v10.0.0.0.msi"
 
 static const GUID VHDX_VENDOR_MS = {
     0xec984aec, 0xa0f9, 0x47e9,
@@ -549,7 +555,33 @@ static void remove_staging_dir(const wchar_t *dir)
     RemoveDirectoryW(dir);
 }
 
-static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir);
+static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir, BOOL ssh_enabled);
+
+/* ---- SSH MSI download / cache ---- */
+
+BOOL ensure_ssh_msi_cached(wchar_t *msi_path_out, int max_chars)
+{
+    wchar_t exe_dir[MAX_PATH], *slash;
+
+    GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
+    slash = wcsrchr(exe_dir, L'\\');
+    if (slash) *slash = L'\0';
+
+    swprintf_s(msi_path_out, max_chars, L"%s\\%s", exe_dir, SSH_MSI_NAME);
+
+    /* Already cached? */
+    if (GetFileAttributesW(msi_path_out) != INVALID_FILE_ATTRIBUTES)
+        return TRUE;
+
+    ui_log(L"Downloading OpenSSH MSI...");
+    if (URLDownloadToFileW(NULL, SSH_MSI_URL, msi_path_out, 0, NULL) == S_OK) {
+        ui_log(L"OpenSSH MSI downloaded.");
+        return TRUE;
+    }
+
+    ui_log(L"Failed to download OpenSSH MSI.");
+    return FALSE;
+}
 
 HRESULT iso_create_resources(const wchar_t *iso_path,
                               const wchar_t *vm_name,
@@ -558,6 +590,7 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
                               const wchar_t *res_dir,
                               BOOL is_template,
                               BOOL test_mode,
+                              BOOL ssh_enabled,
                               const wchar_t *lang)
 {
     wchar_t dir[MAX_PATH];
@@ -634,8 +667,8 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
     }
 #endif /* >>> END REVERT p9client.exe <<< */
 
-    /* Agent + input helper + VDD driver files */
-    stage_agent_and_setup(staging, res_dir);
+    /* Agent + input helper + VDD driver files + SSH MSI */
+    stage_agent_and_setup(staging, res_dir, ssh_enabled);
 
     /* setup.cmd — first-logon script: installs agent service.
        This runs from the ISO drive, so %~dp0 is the ISO root. */
@@ -668,7 +701,7 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
 
     /* SetupComplete.cmd — runs as SYSTEM after setup, before first logon.
        Copied to C:\Windows\Setup\Scripts\ during specialize pass.
-       Installs VDD driver (cert + test signing + devcon). */
+       Installs VDD driver (cert + test signing + devcon) + optionally OpenSSH. */
     swprintf_s(file_path, MAX_PATH, L"%s\\SetupComplete.cmd", staging);
     {
         FILE *sc;
@@ -711,7 +744,25 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
                 "powercfg /change standby-timeout-ac 0\r\n"
                 "powercfg /change standby-timeout-dc 0\r\n"
                 "echo [PWR] Display sleep disabled >> \"%LOG%\"\r\n"
-                "\r\n"
+                "\r\n",
+                sc);
+
+            if (ssh_enabled) {
+                fputs(
+                    "REM Install OpenSSH Server\r\n"
+                    "if exist \"%ISODRV%\\OpenSSH-Win64-v10.0.0.0.msi\" (\r\n"
+                    "    echo [SSH] Installing OpenSSH Server... >> \"%LOG%\"\r\n"
+                    "    msiexec /i \"%ISODRV%\\OpenSSH-Win64-v10.0.0.0.msi\" /qn /norestart >> \"%LOG%\" 2>&1\r\n"
+                    "    echo [SSH] msiexec exit code: %errorlevel% >> \"%LOG%\"\r\n"
+                    "    sc config sshd start= auto >> \"%LOG%\" 2>&1\r\n"
+                    "    net start sshd >> \"%LOG%\" 2>&1\r\n"
+                    "    echo [SSH] Done >> \"%LOG%\"\r\n"
+                    ")\r\n"
+                    "\r\n",
+                    sc);
+            }
+
+            fputs(
                 ":done\r\n"
                 "echo === SetupComplete.cmd finished === >> \"%LOG%\"\r\n",
                 sc);
@@ -909,7 +960,7 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
 }
 
 /* Helper: copy agent exe to staging and write setup.cmd */
-static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir)
+static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir, BOOL ssh_enabled)
 {
     wchar_t src_path[MAX_PATH], file_path[MAX_PATH];
     BOOL found_agent = FALSE;
@@ -1069,6 +1120,18 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
         }
     }
 
+    /* SSH MSI — copy to staging root if ssh_enabled */
+    if (ssh_enabled) {
+        wchar_t msi_path[MAX_PATH];
+        if (ensure_ssh_msi_cached(msi_path, MAX_PATH)) {
+            swprintf_s(file_path, MAX_PATH, L"%s\\%s", staging, SSH_MSI_NAME);
+            if (!CopyFileW(msi_path, file_path, FALSE))
+                ui_log(L"Warning: failed to copy SSH MSI (error %lu)", GetLastError());
+            else
+                ui_log(L"Staged %s for ISO.", SSH_MSI_NAME);
+        }
+    }
+
     /* setup.cmd — first-logon script: installs agent service only */
     swprintf_s(file_path, MAX_PATH, L"%s\\setup.cmd", staging);
     {
@@ -1097,7 +1160,7 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
 
     /* SetupComplete.cmd — runs as SYSTEM after setup, before first logon.
        Copied to C:\Windows\Setup\Scripts\ during specialize pass.
-       Installs VDD driver (cert + test signing + devcon). */
+       Installs VDD driver (cert + test signing + devcon) + optionally OpenSSH. */
     swprintf_s(file_path, MAX_PATH, L"%s\\SetupComplete.cmd", staging);
     {
         FILE *sc;
@@ -1140,7 +1203,25 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
                 "powercfg /change standby-timeout-ac 0\r\n"
                 "powercfg /change standby-timeout-dc 0\r\n"
                 "echo [PWR] Display sleep disabled >> \"%LOG%\"\r\n"
-                "\r\n"
+                "\r\n",
+                sc);
+
+            if (ssh_enabled) {
+                fputs(
+                    "REM Install OpenSSH Server\r\n"
+                    "if exist \"%ISODRV%\\OpenSSH-Win64-v10.0.0.0.msi\" (\r\n"
+                    "    echo [SSH] Installing OpenSSH Server... >> \"%LOG%\"\r\n"
+                    "    msiexec /i \"%ISODRV%\\OpenSSH-Win64-v10.0.0.0.msi\" /qn /norestart >> \"%LOG%\" 2>&1\r\n"
+                    "    echo [SSH] msiexec exit code: %errorlevel% >> \"%LOG%\"\r\n"
+                    "    sc config sshd start= auto >> \"%LOG%\" 2>&1\r\n"
+                    "    net start sshd >> \"%LOG%\" 2>&1\r\n"
+                    "    echo [SSH] Done >> \"%LOG%\"\r\n"
+                    ")\r\n"
+                    "\r\n",
+                    sc);
+            }
+
+            fputs(
                 ":done\r\n"
                 "echo === SetupComplete.cmd finished === >> \"%LOG%\"\r\n",
                 sc);
@@ -1155,6 +1236,7 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        const wchar_t *admin_user,
                                        wchar_t *admin_pass,
                                        const wchar_t *res_dir,
+                                       BOOL ssh_enabled,
                                        const wchar_t *lang)
 {
     wchar_t dir[MAX_PATH];
@@ -1193,8 +1275,8 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
     if (!generate_unattend_instance(file_path, vm_name, admin_user, b64_pass, lang))
         ui_log(L"Warning: failed to write instance unattend.xml");
 
-    /* Agent exe + setup.cmd */
-    stage_agent_and_setup(staging, res_dir);
+    /* Agent exe + setup.cmd + SSH MSI */
+    stage_agent_and_setup(staging, res_dir, ssh_enabled);
 
     /* Build ISO */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -1480,7 +1562,7 @@ BOOL generate_vhdx_setup_cmd(const wchar_t *output_path)
 }
 
 /* Generate SetupComplete.cmd for VHDX-first boot (VDD driver files on disk) */
-BOOL generate_vhdx_setupcomplete(const wchar_t *output_path)
+BOOL generate_vhdx_setupcomplete(const wchar_t *output_path, BOOL ssh_enabled)
 {
     FILE *sc;
     if (_wfopen_s(&sc, output_path, L"w") != 0 || !sc)
@@ -1513,7 +1595,26 @@ BOOL generate_vhdx_setupcomplete(const wchar_t *output_path)
         "powercfg /change standby-timeout-ac 0\r\n"
         "powercfg /change standby-timeout-dc 0\r\n"
         "echo [PWR] Display sleep disabled >> \"%LOG%\"\r\n"
-        "\r\n"
+        "\r\n",
+        sc);
+
+    if (ssh_enabled) {
+        fputs(
+            "REM Install OpenSSH Server\r\n"
+            "set SSHDIR=%SystemRoot%\\AppSandbox\r\n"
+            "if exist \"%SSHDIR%\\OpenSSH-Win64-v10.0.0.0.msi\" (\r\n"
+            "    echo [SSH] Installing OpenSSH Server... >> \"%LOG%\"\r\n"
+            "    msiexec /i \"%SSHDIR%\\OpenSSH-Win64-v10.0.0.0.msi\" /qn /norestart >> \"%LOG%\" 2>&1\r\n"
+            "    echo [SSH] msiexec exit code: %errorlevel% >> \"%LOG%\"\r\n"
+            "    sc config sshd start= auto >> \"%LOG%\" 2>&1\r\n"
+            "    net start sshd >> \"%LOG%\" 2>&1\r\n"
+            "    echo [SSH] Done >> \"%LOG%\"\r\n"
+            ")\r\n"
+            "\r\n",
+            sc);
+    }
+
+    fputs(
         ":done\r\n"
         "echo === SetupComplete.cmd finished === >> \"%LOG%\"\r\n",
         sc);
@@ -1586,7 +1687,8 @@ static int enumerate_gpu_share_files(FILE *mf,
 int generate_vhdx_manifest(const wchar_t *manifest_path,
                             const wchar_t *staging_dir,
                             const wchar_t *res_dir,
-                            const void *gpu_shares_ptr)
+                            const void *gpu_shares_ptr,
+                            BOOL ssh_enabled)
 {
     const GpuDriverShareList *gpu_shares = (const GpuDriverShareList *)gpu_shares_ptr;
     FILE *mf;
@@ -1678,6 +1780,15 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
                     count++;
                 }
             }
+        }
+    }
+
+    /* 3b. SSH MSI */
+    if (ssh_enabled) {
+        wchar_t msi_path[MAX_PATH];
+        if (ensure_ssh_msi_cached(msi_path, MAX_PATH)) {
+            fwprintf(mf, L"%s\t\\Windows\\AppSandbox\\%s\n", msi_path, SSH_MSI_NAME);
+            count++;
         }
     }
 

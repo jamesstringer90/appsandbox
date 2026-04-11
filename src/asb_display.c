@@ -8,8 +8,6 @@
  * no clipboard, no cursor rendering.
  */
 
-#define ASB_BUILDING_DLL
-
 #include <winsock2.h>
 #include <windows.h>
 #include <stdio.h>

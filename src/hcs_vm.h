@@ -44,6 +44,7 @@ typedef struct {
     GpuDriverShareList gpu_shares;         /* Plan9 shares for GPU driver files */
     BOOL    is_template;              /* TRUE = template creation (no GPU/network) */
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
+    BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
 } VmConfig;
 
 /* Runtime state of a VM */
@@ -87,6 +88,10 @@ typedef struct {
     ULONGLONG      shutdown_time;        /* GetTickCount64() when shutdown requested */
     volatile ULONGLONG last_heartbeat;   /* GetTickCount64() of last agent heartbeat */
     char        nat_ip[32];              /* Allocated NAT IP (e.g. "172.20.0.2"), empty if not NAT */
+    wchar_t     admin_user[128];          /* Guest local admin username */
+    BOOL        ssh_enabled;             /* TRUE = OpenSSH Server installed in guest */
+    DWORD       ssh_port;                /* Host-side TCP port for SSH tunnel (e.g. 2222) */
+    volatile int ssh_state;              /* 0=pending, 1=installing, 2=ready, 3=failed */
 } VmInstance;
 
 /* Initialize HCS — loads computecore.dll dynamically.

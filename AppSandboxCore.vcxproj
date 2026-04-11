@@ -177,6 +177,7 @@
     <ClCompile Include="src\vmms_cert.c" />
     <ClCompile Include="src\vm_agent.c" />
     <ClCompile Include="src\prereq.c" />
+    <ClCompile Include="src\vm_ssh_proxy.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\asb_core.h" />
@@ -190,6 +191,7 @@
     <ClInclude Include="src\vmms_cert.h" />
     <ClInclude Include="src\vm_agent.h" />
     <ClInclude Include="src\prereq.h" />
+    <ClInclude Include="src\vm_ssh_proxy.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

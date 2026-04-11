@@ -27,6 +27,7 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
                               const wchar_t *res_dir,
                               BOOL is_template,
                               BOOL test_mode,
+                              BOOL ssh_enabled,
                               const wchar_t *lang);
 
 /* Create a resources ISO for an instance created from a template.
@@ -37,6 +38,7 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        const wchar_t *admin_user,
                                        wchar_t *admin_pass,
                                        const wchar_t *res_dir,
+                                       BOOL ssh_enabled,
                                        const wchar_t *lang);
 
 /* ---- VHDX-First VM Creation (no resources ISO) ---- */
@@ -64,7 +66,7 @@ BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
 BOOL generate_vhdx_setup_cmd(const wchar_t *output_path);
 
 /* Generate SetupComplete.cmd for VHDX-first boot (VDD driver files on disk). */
-BOOL generate_vhdx_setupcomplete(const wchar_t *output_path);
+BOOL generate_vhdx_setupcomplete(const wchar_t *output_path, BOOL ssh_enabled);
 
 /* Generate staging manifest for iso-patch --stage.
    Writes tab-separated source\tdest lines for all files to pre-stage on the VHDX.
@@ -73,7 +75,12 @@ BOOL generate_vhdx_setupcomplete(const wchar_t *output_path);
 int generate_vhdx_manifest(const wchar_t *manifest_path,
                             const wchar_t *staging_dir,
                             const wchar_t *res_dir,
-                            const void *gpu_shares);
+                            const void *gpu_shares,
+                            BOOL ssh_enabled);
+
+/* Ensure OpenSSH MSI is cached locally (downloads if needed).
+   Returns TRUE if the MSI is available at the returned path. */
+BOOL ensure_ssh_msi_cached(wchar_t *msi_path_out, int max_chars);
 
 /* Write language.json alongside VHDX */
 void vm_save_language_json(const wchar_t *vhdx_path, const wchar_t *lang);

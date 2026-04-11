@@ -207,6 +207,9 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"vhdxStaging", v->vhdx_staging);
     jb_int(jb, L"vhdxProgress", v->vhdx_progress);
     jb_bool(jb, L"installComplete", v->install_complete);
+    jb_bool(jb, L"sshEnabled", v->ssh_enabled);
+    jb_int(jb, L"sshPort", (int)v->ssh_port);
+    jb_int(jb, L"sshState", v->ssh_state);
 
     /* Snapshot tree */
     {
@@ -693,6 +696,7 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"gpuMode", &val)) cfg.gpu_mode = val;
         if (json_get_int(json, L"networkMode", &val)) cfg.network_mode = val;
         json_get_bool(json, L"testMode", &cfg.test_mode);
+        json_get_bool(json, L"sshEnabled", &cfg.ssh_enabled);
 
         asb_vm_create(&cfg);
         SecureZeroMemory(pass_buf, sizeof(pass_buf));
@@ -737,6 +741,33 @@ static void on_webview2_message(const wchar_t *json)
         int idx; if (json_get_int(json, L"vmIndex", &idx)) do_connect_rdp(idx);
     } else if (wcscmp(action, L"connectIddVm") == 0) {
         int idx; if (json_get_int(json, L"vmIndex", &idx)) do_connect_idd(idx);
+    } else if (wcscmp(action, L"sshConnect") == 0) {
+        int idx;
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
+            VmInstance *inst = asb_vm_instance(asb_vm_get(idx));
+            if (inst && inst->ssh_enabled && inst->ssh_port) {
+                wchar_t cmd[512];
+                STARTUPINFOW si_;
+                PROCESS_INFORMATION pi_;
+                ZeroMemory(&si_, sizeof(si_));
+                si_.cb = sizeof(si_);
+                ZeroMemory(&pi_, sizeof(pi_));
+                if (inst->admin_user[0])
+                    _snwprintf_s(cmd, 512, _TRUNCATE,
+                        L"cmd.exe /k ssh -p %lu %s@localhost",
+                        inst->ssh_port, inst->admin_user);
+                else
+                    _snwprintf_s(cmd, 512, _TRUNCATE,
+                        L"cmd.exe /k ssh -p %lu localhost",
+                        inst->ssh_port);
+                ui_log(L"SSH: %s", cmd);
+                if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
+                                    CREATE_NEW_CONSOLE, NULL, NULL, &si_, &pi_)) {
+                    CloseHandle(pi_.hProcess);
+                    CloseHandle(pi_.hThread);
+                }
+            }
+        }
     } else if (wcscmp(action, L"deleteVm") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {

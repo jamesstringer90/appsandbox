@@ -317,6 +317,9 @@ th.icon-col, td.icon-col {
 .icon-btn.stop.inactive { color: #505050; }
 .icon-btn.delete { color: #c83c3c; }
 .icon-btn.delete.running { color: #642828; }
+.icon-btn.ssh { color: var(--accent); font-family: monospace; font-size: 12px; font-weight: bold; }
+.icon-btn.ssh.inactive { color: #505050; }
+.icon-btn.ssh.hidden { display: none; }
 .icon-btn.edit { color: var(--text-dim); }
 .icon-btn.edit:hover { color: var(--text); }
 
