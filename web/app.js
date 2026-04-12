@@ -427,16 +427,23 @@ function renderVmTable() {
         tr.appendChild(statusTd);
 
         var agentTd = document.createElement('td');
-        agentTd.style.textAlign = 'center';
-        var dotClass = 'agent-dot' + (vm.agentOnline ? ' online' : '') + (vm.isTemplate ? ' disabled' : '');
+        var agentOff = !vm.running || vm.isTemplate;
+        var dotClass = 'agent-dot' + (vm.agentOnline ? ' online' : '') + (agentOff ? ' disabled' : '');
         agentTd.innerHTML = '<span class="' + dotClass + '"></span>';
+        agentTd.title = vm.isTemplate
+            ? 'Templates do not run the in-VM agent'
+            : (!vm.running
+                ? 'VM is not running'
+                : (vm.agentOnline
+                    ? 'In-VM agent is connected — host can manage the guest'
+                    : 'In-VM agent is not connected'));
         tr.appendChild(agentTd);
 
-        tr.appendChild(makeCell(vm.cpuCores, i, 4));
-        tr.appendChild(makeCell(vm.ramMb + ' MB', i, 5));
-        tr.appendChild(makeCell(vm.hddGb + ' GB', i, 6));
-        tr.appendChild(makeCell(vm.gpuName || (vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7));
-        tr.appendChild(makeCell(netNames[vm.networkMode] || 'None', i, 8));
+        tr.appendChild(makeCell(vm.cpuCores, i, 4, 'Number of virtual CPU cores assigned to this VM'));
+        tr.appendChild(makeCell(vm.ramMb + ' MB', i, 5, 'Memory allocated to this VM, in megabytes'));
+        tr.appendChild(makeCell(vm.hddGb + ' GB', i, 6, 'Virtual disk size, in gigabytes'));
+        tr.appendChild(makeCell(vm.gpuName || (vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7, 'GPU passed through to the VM via GPU-PV, or None'));
+        tr.appendChild(makeCell(netNames[vm.networkMode] || 'None', i, 8, 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'));
 
         /* Snapshot dropdown cell */
         tr.appendChild(makeSnapCell(vm, i));
@@ -463,30 +470,31 @@ function renderVmTable() {
             } else {
                 sendCmd('startVm', { vmIndex: vmIdx, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
             }
-        }; })(i, snapVal, vm)));
-        tr.appendChild(makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }));
+        }; })(i, snapVal, vm), '', 'Start the VM (boots from the selected snapshot/branch)'));
+        tr.appendChild(makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }, '', 'Open the VM display window (IDD virtual monitor)'));
         var sshActive = vm.sshEnabled && vm.sshState === 2 && vm.running && !bld;
         var sshCell = makeIconCell('ssh', '>_', sshActive, (function(idx) { return function() { sendCmd('sshConnect', {vmIndex: idx}); }; })(i), !vm.sshEnabled ? 'hidden' : '');
         if (vm.sshEnabled) {
             var sshBtn = sshCell.querySelector('.icon-btn');
-            if (vm.sshState === 1) sshBtn.title = 'Installing OpenSSH...';
-            else if (vm.sshState === 2) sshBtn.title = 'SSH: localhost:' + vm.sshPort;
+            if (vm.sshState === 1) sshBtn.title = 'Installing OpenSSH in the guest...';
+            else if (vm.sshState === 2) sshBtn.title = 'Open an SSH terminal to the VM (localhost:' + vm.sshPort + ', tunneled over HvSocket)';
             else if (vm.sshState === 3) sshBtn.title = 'SSH install failed';
-            else sshBtn.title = 'SSH: waiting for agent';
+            else sshBtn.title = 'SSH: waiting for the in-VM agent to come online';
         }
         tr.appendChild(sshCell);
-        tr.appendChild(makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }));
-        tr.appendChild(makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }));
-        tr.appendChild(makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : ''));
-        tr.appendChild(makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }));
+        tr.appendChild(makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'));
+        tr.appendChild(makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'));
+        tr.appendChild(makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'));
+        tr.appendChild(makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped'));
 
         tbody.appendChild(tr);
     });
 }
 
-function makeCell(text, row, col) {
+function makeCell(text, row, col, title) {
     var td = document.createElement('td');
     td.textContent = text;
+    if (title) td.title = title;
 
     /* Editable columns: 4=CPU, 5=RAM, 7=GPU, 8=Network */
     if (editModeRow === row && (col === 4 || col === 5 || col === 7 || col === 8)) {
@@ -500,12 +508,13 @@ function makeCell(text, row, col) {
     return td;
 }
 
-function makeIconCell(cls, icon, active, handler, extraClass) {
+function makeIconCell(cls, icon, active, handler, extraClass, title) {
     var td = document.createElement('td');
     td.className = 'icon-col';
     var btn = document.createElement('button');
     btn.className = 'icon-btn ' + cls + (active ? '' : ' inactive') + (extraClass ? ' ' + extraClass : '');
     btn.textContent = icon;
+    if (title) btn.title = title;
     if (active) btn.onclick = handler;
     else btn.disabled = true;
     td.appendChild(btn);
