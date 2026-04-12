@@ -672,7 +672,12 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                             UINT32 rectCount = 0;
                             BOOL sendFull = !bSentFullFrame;  /* first frame must be full */
 
-                            /* Query dirty rects from IddCx */
+                            /* Query dirty rects from IddCx.  If GetDirtyRects returns
+                               0 rects OR fails, fall back to sending a full frame.
+                               0 rects does NOT reliably mean "identical" — during early
+                               boot the presenter may not supply dirty rect metadata,
+                               and skipping would stall updates until the E_PENDING
+                               timeout resend path fires ~100ms later. */
                             if (!sendFull) {
                                 IDARG_IN_GETDIRTYRECTS drIn = {};
                                 IDARG_OUT_GETDIRTYRECTS drOut = {};
@@ -681,11 +686,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                 HRESULT drHr = IddCxSwapChainGetDirtyRects(proc->hSwapChain, &drIn, &drOut);
                                 if (SUCCEEDED(drHr) && drOut.DirtyRectOutCount > 0) {
                                     rectCount = drOut.DirtyRectOutCount;
-                                } else if (SUCCEEDED(drHr) && drOut.DirtyRectOutCount == 0) {
-                                    /* No dirty rects — frame is identical, skip send */
-                                    goto skip_send;
                                 } else {
-                                    /* Can't get dirty rects — send full frame */
                                     sendFull = TRUE;
                                 }
                             }

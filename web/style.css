@@ -309,15 +309,13 @@ th.icon-col, td.icon-col {
 /* Icon colors by state */
 .icon-btn.start { color: var(--success); }
 .icon-btn.start.inactive { color: #505050; }
-.icon-btn.connect { color: var(--accent); }
-.icon-btn.connect.inactive { color: #505050; }
 .icon-btn.shutdown { color: var(--warning); }
 .icon-btn.shutdown.inactive { color: #505050; }
 .icon-btn.stop { color: #dc3232; }
 .icon-btn.stop.inactive { color: #505050; }
 .icon-btn.delete { color: #c83c3c; }
 .icon-btn.delete.running { color: #642828; }
-.icon-btn.ssh { color: var(--accent); font-family: monospace; font-size: 12px; font-weight: bold; }
+.icon-btn.ssh { color: var(--accent); font-family: monospace; font-weight: bold; }
 .icon-btn.ssh.inactive { color: #505050; }
 .icon-btn.ssh.hidden { display: none; }
 .icon-btn.edit { color: var(--text-dim); }

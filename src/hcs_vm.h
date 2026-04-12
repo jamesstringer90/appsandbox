@@ -87,6 +87,8 @@ typedef struct {
     volatile BOOL  shutdown_requested;   /* TRUE after graceful shutdown sent */
     ULONGLONG      shutdown_time;        /* GetTickCount64() when shutdown requested */
     volatile ULONGLONG last_heartbeat;   /* GetTickCount64() of last agent heartbeat */
+    HANDLE      idd_probe_thread;        /* Background VDD availability probe */
+    volatile BOOL idd_probe_stop;
     char        nat_ip[32];              /* Allocated NAT IP (e.g. "172.20.0.2"), empty if not NAT */
     wchar_t     admin_user[128];          /* Guest local admin username */
     BOOL        ssh_enabled;             /* TRUE = OpenSSH Server installed in guest */

@@ -856,7 +856,6 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     wchar_t vmgs_path[MAX_PATH];
     wchar_t vmrs_path[MAX_PATH];
     wchar_t dir[MAX_PATH];
-    wchar_t *user_sid;
     BOOL is_windows;
     HRESULT vmgs_hr, vmrs_hr;
     int written;
@@ -966,31 +965,13 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         L"\"RuntimeStateFilePath\":\"%s\""
         L"}", vmgs_esc, vmrs_esc);
 
-    /* VideoMonitor + EnhancedModeVideo with named pipe ConnectionOptions.
-       vmwp.exe creates an RDP stream on these pipes for the VM display.
-       NOTE: VideoMonitor is REQUIRED — vmwp.exe crashes (0xC0000005) without it. */
-    user_sid = get_current_user_sid();
-    if (user_sid) {
-        ui_log(L"VideoMonitor: pipe=%s.BasicSession, SID=%s", config->name, user_sid);
-        swprintf_s(video_section, 1024,
-            L"\"VideoMonitor\":{"
-                L"\"HorizontalResolution\":1024,"
-                L"\"VerticalResolution\":768,"
-                L"\"ConnectionOptions\":{"
-                    L"\"NamedPipe\":\"\\\\\\\\.\\\\pipe\\\\%s.BasicSession\","
-                    L"\"AccessSids\":[\"%s\"]"
-                L"}"
-            L"},",
-            config->name, user_sid);
-        LocalFree(user_sid);
-    } else {
-        ui_log(L"WARNING: Could not get user SID — VideoMonitor pipes will have no AccessSids");
-        wcscpy_s(video_section, 1024,
-            L"\"VideoMonitor\":{"
-                L"\"HorizontalResolution\":1024,"
-                L"\"VerticalResolution\":768"
-            L"},");
-    }
+    /* VideoMonitor is REQUIRED — vmwp.exe crashes (0xC0000005) without it.
+       No ConnectionOptions/named pipe — IDD via agent is the display path. */
+    wcscpy_s(video_section, 1024,
+        L"\"VideoMonitor\":{"
+            L"\"HorizontalResolution\":1024,"
+            L"\"VerticalResolution\":768"
+        L"},");
 
     /* SecuritySettings with TPM — enabled for all Windows VMs.
        TPM does not block test-signed drivers; only Secure Boot does. */

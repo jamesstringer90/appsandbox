@@ -464,7 +464,6 @@ function renderVmTable() {
                 sendCmd('startVm', { vmIndex: vmIdx, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
             }
         }; })(i, snapVal, vm)));
-        tr.appendChild(makeIconCell('connect', '\uD83D\uDDA5\uFE0F', vm.running && !bld && !vm.agentOnline, function() { sendCmd('connectVm', {vmIndex: i}); }));
         tr.appendChild(makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }));
         var sshActive = vm.sshEnabled && vm.sshState === 2 && vm.running && !bld;
         var sshCell = makeIconCell('ssh', '>_', sshActive, (function(idx) { return function() { sendCmd('sshConnect', {vmIndex: idx}); }; })(i), !vm.sshEnabled ? 'hidden' : '');
