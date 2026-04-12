@@ -2294,6 +2294,11 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         return 1;
     }
 
+    /* Bring the display window to the foreground on open */
+    ShowWindow(d->hwnd, SW_SHOW);
+    BringWindowToTop(d->hwnd);
+    SetForegroundWindow(d->hwnd);
+
     /* Render child fills entire client area */
     {
         RECT rc;

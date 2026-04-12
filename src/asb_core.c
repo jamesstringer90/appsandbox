@@ -7,6 +7,7 @@
  * Uses callbacks instead of PostMessage for cross-thread notification.
  */
 
+#include <winsock2.h>
 #include "asb_core.h"
 #include "hcs_vm.h"
 #include "gpu_enum.h"
@@ -125,6 +126,123 @@ ASB_API void ui_log(const wchar_t *fmt, ...)
     }
 
     if (g_log_cb) g_log_cb(buf, g_log_ud);
+}
+
+/* ---- IDD probe (detect VDD availability during install) ---- */
+
+#define AF_HYPERV       34
+#define HV_PROTOCOL_RAW 1
+
+typedef struct _SOCKADDR_HV_PROBE {
+    ADDRESS_FAMILY Family;
+    USHORT Reserved;
+    GUID VmId;
+    GUID ServiceId;
+} SOCKADDR_HV_PROBE;
+
+/* Frame channel: {A5B0CAFE-0002-4000-8000-000000000001} */
+static const GUID IDD_FRAME_SERVICE_GUID =
+    { 0xa5b0cafe, 0x0002, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
+
+#define WM_VM_IDD_READY (WM_APP + 7)
+
+static HWND g_idd_probe_hwnd = NULL;
+
+ASB_API void asb_idd_probe_set_hwnd(HWND hwnd)
+{
+    g_idd_probe_hwnd = hwnd;
+}
+
+static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
+{
+    VmInstance *vm = (VmInstance *)param;
+    SOCKET s;
+    SOCKADDR_HV_PROBE addr;
+    u_long nonblock;
+    fd_set wfds, efds;
+    struct timeval tv;
+
+    asb_log(L"IDD probe: starting for \"%s\"", vm->name);
+
+    while (!vm->idd_probe_stop && vm->running && !vm->install_complete) {
+        /* Try to connect to VDD frame service */
+        static const GUID zero_guid = {0};
+        GUID runtime_id = vm->runtime_id;
+
+        if (memcmp(&runtime_id, &zero_guid, sizeof(GUID)) == 0) {
+            if (!hcs_find_runtime_id(vm->name, &runtime_id))  {
+                Sleep(3000);
+                continue;
+            }
+            vm->runtime_id = runtime_id;
+        }
+
+        s = socket(AF_HYPERV, SOCK_STREAM, HV_PROTOCOL_RAW);
+        if (s == INVALID_SOCKET) {
+            Sleep(3000);
+            continue;
+        }
+
+        nonblock = 1;
+        ioctlsocket(s, FIONBIO, &nonblock);
+
+        memset(&addr, 0, sizeof(addr));
+        addr.Family = AF_HYPERV;
+        addr.VmId = runtime_id;
+        addr.ServiceId = IDD_FRAME_SERVICE_GUID;
+
+        if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            if (WSAGetLastError() != WSAEWOULDBLOCK) {
+                closesocket(s);
+                Sleep(3000);
+                continue;
+            }
+
+            FD_ZERO(&wfds);
+            FD_ZERO(&efds);
+            FD_SET(s, &wfds);
+            FD_SET(s, &efds);
+            tv.tv_sec = 3;
+            tv.tv_usec = 0;
+
+            if (select(0, NULL, &wfds, &efds, &tv) <= 0 || FD_ISSET(s, &efds)) {
+                closesocket(s);
+                continue;  /* timeout or error — VDD not ready yet */
+            }
+        }
+
+        /* Connection succeeded — VDD is accepting frames */
+        closesocket(s);
+
+        if (!vm->idd_probe_stop && vm->running && !vm->install_complete) {
+            asb_log(L"IDD probe: VDD ready for \"%s\", opening display", vm->name);
+            if (g_idd_probe_hwnd)
+                PostMessageW(g_idd_probe_hwnd, WM_VM_IDD_READY, 0, (LPARAM)vm);
+        }
+        break;
+    }
+
+    asb_log(L"IDD probe: exiting for \"%s\"", vm->name);
+    return 0;
+}
+
+static void idd_probe_start(VmInstance *vm)
+{
+    if (vm->idd_probe_thread) return;
+    if (vm->install_complete) return;
+    if (vm->is_template) return;
+
+    vm->idd_probe_stop = FALSE;
+    vm->idd_probe_thread = CreateThread(NULL, 0, idd_probe_thread_proc, vm, 0, NULL);
+}
+
+static void idd_probe_stop(VmInstance *vm)
+{
+    if (!vm->idd_probe_thread) return;
+    vm->idd_probe_stop = TRUE;
+    WaitForSingleObject(vm->idd_probe_thread, 5000);
+    CloseHandle(vm->idd_probe_thread);
+    vm->idd_probe_thread = NULL;
 }
 
 /* ---- Handle helpers ---- */
@@ -491,6 +609,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
             hcs_stop_monitor(instance);
             vm_ssh_proxy_stop(instance);
             vm_agent_stop(instance);
+            idd_probe_stop(instance);
             asb_log(L"VM \"%s\" exited (event=0x%08X).", instance->name, event);
 
             if (instance->network_mode != NET_NONE && !instance->network_cleaned) {
@@ -652,6 +771,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     } else {
         asb_log(L"VM \"%s\" started.", vm->name);
         vm_agent_start(vm);
+        idd_probe_start(vm);
         hcs_start_monitor(vm);
     }
 
@@ -969,6 +1089,7 @@ done:
                     asb_log(L"Template \"%s\" building (sysprep will shut down when ready).", inst->name);
                 } else {
                     vm_agent_start(inst);
+                    idd_probe_start(inst);
                     asb_log(L"VM \"%s\" created and started.", inst->name);
                 }
                 save_vm_list();
@@ -1091,6 +1212,7 @@ ASB_API void asb_cleanup(void)
         hcs_stop_monitor(&g_vms[i]);
         vm_ssh_proxy_stop(&g_vms[i]);
         vm_agent_stop(&g_vms[i]);
+        idd_probe_stop(&g_vms[i]);
         if (g_vms[i].running) hcs_terminate_vm(&g_vms[i]);
         hcs_close_vm(&g_vms[i]);
     }
@@ -1119,6 +1241,7 @@ ASB_API void asb_detach(void)
         hcs_stop_monitor(&g_vms[i]);
         vm_ssh_proxy_stop(&g_vms[i]);
         vm_agent_stop(&g_vms[i]);
+        idd_probe_stop(&g_vms[i]);
         hcs_unregister_vm_callback(&g_vms[i]);
         g_vms[i].handle = NULL;  /* abandon handle — OS will close it */
     }
@@ -1433,6 +1556,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (SUCCEEDED(hr)) {
         hcs_start_monitor(inst);
         vm_agent_start(inst);
+        idd_probe_start(inst);
         asb_log(L"VM \"%s\" %s.", cfg.name, is_template_create ? L"started (template)" : L"created and started");
     } else {
         asb_log(L"VM \"%s\" created but failed to start (0x%08X).", cfg.name, hr);
@@ -1526,6 +1650,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         }
         asb_log(L"VM \"%s\" started.", inst->name);
         vm_agent_start(inst);
+        idd_probe_start(inst);
         hcs_start_monitor(inst);
         if (g_state_cb) g_state_cb(vm, TRUE, g_state_ud);
     }
@@ -1578,6 +1703,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
     vm_agent_stop(inst);
+    idd_probe_stop(inst);
 
     asb_log(L"Force stopping VM \"%s\"...", inst->name);
     hr = hcs_terminate_vm(inst);
@@ -1616,6 +1742,7 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
     vm_agent_stop(inst);
+    idd_probe_stop(inst);
 
     if (inst->running)
         hcs_terminate_vm(inst);
@@ -2087,6 +2214,7 @@ ASB_API void asb_reconnect_running(void)
             hcs_register_vm_callback(&g_vms[i]);
             hcs_start_monitor(&g_vms[i]);
             vm_agent_start(&g_vms[i]);
+            idd_probe_start(&g_vms[i]);
         } else if (hcs_is_running_by_enum(g_vms[i].name)) {
             /* HCS open failed (stale handle from dead process) but enumeration
                confirms the VM is running.  Mark it so queries return the right

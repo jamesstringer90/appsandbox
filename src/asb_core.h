@@ -229,6 +229,9 @@ ASB_API BOOL asb_get_suppress_tray_warn(void);
 /* Set HINSTANCE (needed by modules that use ui_get_instance). */
 ASB_API void asb_set_hinstance(HINSTANCE hInst);
 
+/* Set the HWND for IDD probe notifications (WM_APP+7). */
+ASB_API void asb_idd_probe_set_hwnd(HWND hwnd);
+
 /* ---- Internal access (for the UI layer) ---- */
 
 /* Get the raw VmInstance pointer (defined in hcs_vm.h).

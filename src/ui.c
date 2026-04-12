@@ -53,6 +53,7 @@ static VmDisplayIdd *g_idd_displays[ASB_MAX_VMS];
 #define WM_VM_AGENT_GPUCOPY    (WM_APP + 4)
 #define WM_VM_DISPLAY_CLOSED   (WM_APP + 5)
 #define WM_VM_MONITOR_DETECTED (WM_APP + 6)
+#define WM_VM_IDD_READY        (WM_APP + 7)
 #define WM_VM_HYPERV_VIDEO_OFF (WM_APP + 12)
 #define WM_VM_REMOVED          (WM_APP + 16)
 #define WM_WEBVIEW2_LOG        (WM_APP + 10)
@@ -518,23 +519,6 @@ static void ui_show_alert(const wchar_t *message)
 
 /* ---- Display connections ---- */
 
-static void do_connect_rdp(int idx)
-{
-    VmInstance *v;
-    if (idx < 0 || idx >= asb_vm_count()) return;
-    v = asb_vm_instance(asb_vm_get(idx));
-    if (!v || !v->running) { ui_log(L"VM \"%s\" is not running.", v ? v->name : L"?"); return; }
-    if (v->hyperv_video_off)
-        ui_log(L"Warning: Hyper-V Video adapter is disabled - RDP may not connect.");
-    if (g_displays[idx] && vm_display_is_open(g_displays[idx])) {
-        ui_log(L"Display already open."); return;
-    }
-    safe_destroy_rdp(idx);
-    ui_log(L"Opening display for \"%s\"...", v->name);
-    g_displays[idx] = vm_display_create(v, g_hInstance, g_hwnd_main);
-    if (!g_displays[idx]) ui_log(L"Error: Failed to create display window.");
-}
-
 static void do_connect_idd(int idx)
 {
     VmInstance *v;
@@ -737,8 +721,6 @@ static void on_webview2_message(const wchar_t *json)
             asb_vm_stop(asb_vm_get(idx));
             send_vm_list();
         }
-    } else if (wcscmp(action, L"connectVm") == 0) {
-        int idx; if (json_get_int(json, L"vmIndex", &idx)) do_connect_rdp(idx);
     } else if (wcscmp(action, L"connectIddVm") == 0) {
         int idx; if (json_get_int(json, L"vmIndex", &idx)) do_connect_idd(idx);
     } else if (wcscmp(action, L"sshConnect") == 0) {
@@ -1001,6 +983,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CREATE:
         hcs_set_monitor_hwnd(hwnd);
         vm_agent_set_hwnd(hwnd);
+        asb_idd_probe_set_hwnd(hwnd);
         webview2_set_message_callback(on_webview2_message);
         if (!webview2_init(hwnd, g_hInstance)) {
             MessageBoxW(hwnd, L"WebView2 initialization failed.\nPlease install Microsoft Edge WebView2 Runtime.",
@@ -1028,24 +1011,9 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL running = (BOOL)wp;
         int idx = asb_vm_index(vm);
 
-        if (idx >= 0) {
-            VmInstance *inst = asb_vm_instance(vm);
-
-            if (running && inst && !g_displays[idx] && !g_is_home_edition
-                && !inst->shutdown_requested) {
-                /* Auto-open RDP display for newly started VMs
-                   (skip on Home edition or during shutdown) */
-                wchar_t pipe_name[512];
-                swprintf_s(pipe_name, 512, L"\\\\.\\pipe\\%s.BasicSession", inst->name);
-                if (WaitNamedPipeW(pipe_name, 0)) {
-                    g_displays[idx] = vm_display_create(inst, g_hInstance, g_hwnd_main);
-                }
-            }
-
-            if (!running) {
-                safe_destroy_rdp(idx);
-                safe_destroy_idd(idx);
-            }
+        if (idx >= 0 && !running) {
+            safe_destroy_rdp(idx);
+            safe_destroy_idd(idx);
         }
 
         send_vm_list();
@@ -1089,6 +1057,23 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
         }
         send_vm_list();
+        return 0;
+    }
+
+    case WM_VM_IDD_READY:
+    {
+        VmInstance *inst = (VmInstance *)lp;
+        if (inst && inst->running && !inst->install_complete && !inst->shutdown_requested) {
+            int i, count = asb_vm_count();
+            for (i = 0; i < count; i++) {
+                if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
+                if (!g_idd_displays[i]) {
+                    ui_log(L"VDD ready - opening IDD display for \"%s\".", inst->name);
+                    do_connect_idd(i);
+                }
+                break;
+            }
+        }
         return 0;
     }
 
