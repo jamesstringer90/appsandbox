@@ -26,12 +26,18 @@
 #include "vm_display_idd.h"
 #include "vm_agent.h"
 #include "ui.h"
+#include "resource.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "dwmapi.lib")
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
 
 #include <shellapi.h>
 #include <shlobj.h>
@@ -357,6 +363,8 @@ static LRESULT CALLBACK idd_log_listbox_proc(HWND hwnd, UINT msg, WPARAM wp, LPA
 /* Log window proc — resizes listbox child to fill the window */
 static LRESULT CALLBACK idd_log_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    static HBRUSH s_dark_brush = NULL;
+
     switch (msg) {
     case WM_SIZE: {
         HWND list = GetDlgItem(hwnd, IDC_LOG_LIST);
@@ -366,6 +374,16 @@ static LRESULT CALLBACK idd_log_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             MoveWindow(list, 0, 0, rc.right, rc.bottom, TRUE);
         }
         return 0;
+    }
+    case WM_CTLCOLORLISTBOX:
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        /* Match AppSandbox #log-panel: --ctrl-bg #2d2d2d, text #ccc */
+        HDC hdc = (HDC)wp;
+        SetTextColor(hdc, RGB(204, 204, 204));
+        SetBkColor(hdc, RGB(45, 45, 45));
+        if (!s_dark_brush) s_dark_brush = CreateSolidBrush(RGB(45, 45, 45));
+        return (LRESULT)s_dark_brush;
     }
     case WM_CLOSE:
         /* Just hide — the main IDD window owns the lifecycle */
@@ -405,6 +423,8 @@ static void ensure_idd_class(HINSTANCE hInst)
     wc.style         = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc   = idd_wnd_proc;
     wc.hInstance     = hInst;
+    wc.hIcon         = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPSANDBOX));
+    wc.hIconSm       = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPSANDBOX));
     wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = IDD_DISPLAY_CLASS;
@@ -422,13 +442,15 @@ static void ensure_idd_class(HINSTANCE hInst)
     wc.lpszClassName = IDD_RENDER_CLASS;
     RegisterClassExW(&wc);
 
-    /* Separate log window */
+    /* Separate log window — dark background to match AppSandbox main window */
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = idd_log_proc;
     wc.hInstance     = hInst;
+    wc.hIcon         = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPSANDBOX));
+    wc.hIconSm       = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPSANDBOX));
     wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = CreateSolidBrush(RGB(30, 30, 30));
     wc.lpszClassName = IDD_LOG_CLASS;
     RegisterClassExW(&wc);
 
@@ -2294,6 +2316,12 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         return 1;
     }
 
+    /* Dark mode title bar to match AppSandbox main window */
+    {
+        BOOL dark = TRUE;
+        DwmSetWindowAttribute(d->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    }
+
     /* Bring the display window to the foreground on open */
     ShowWindow(d->hwnd, SW_SHOW);
     BringWindowToTop(d->hwnd);
@@ -2324,6 +2352,10 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             NULL, NULL, d->hInstance, NULL);
 
         if (d->log_hwnd) {
+            /* Dark mode title bar to match AppSandbox main window */
+            BOOL dark = TRUE;
+            DwmSetWindowAttribute(d->log_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+
             /* Fill the log window with a listbox */
             RECT lrc;
             GetClientRect(d->log_hwnd, &lrc);
