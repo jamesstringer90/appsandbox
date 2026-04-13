@@ -10,8 +10,6 @@
  * OID (1.3.6.1.4.1.311.62.1.1.1) and grants the VIRTUAL_MACHINE SID
  * (S-1-5-83-0) read access to the private key — matching what Hyper-V's
  * VMMS role normally provides.
- *
- * Reference: https://www.sysadmins.lv/blog-en/time-machine-for-microsoft-hyper-v-server-mythbuster-rebirth.aspx
  */
 
 #include "vmms_cert.h"

@@ -953,66 +953,6 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             ui_log(L"Plan9 share: %s -> %s", ds->share_name, ds->host_path);
         }
 
-        /* DISABLED: Manifest share — share metadata is now sent directly to the
-           agent service over the HvSocket connection. To revert, uncomment this
-           block and restore p9client.exe + gpudrv-copy.cmd in disk_util.c. */
-#if 0 /* >>> REVERT: uncomment to restore AppSandbox.Manifest Plan9 share <<< */
-        /* Manifest share: write shares.txt listing all share→dest mappings */
-        if (share_count > 0) {
-            wchar_t manifest_dir[MAX_PATH];
-            wchar_t manifest_file[MAX_PATH];
-            wchar_t base_dir[MAX_PATH];
-            FILE *mf;
-
-            if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
-                wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
-            swprintf_s(manifest_dir, MAX_PATH, L"%s\\AppSandbox\\%s\\manifest",
-                       base_dir, config->name);
-            /* Create nested dirs */
-            {
-                wchar_t tmp[MAX_PATH];
-                wchar_t *p;
-                wcscpy_s(tmp, MAX_PATH, manifest_dir);
-                for (p = tmp + 3; *p; p++) {
-                    if (*p == L'\\') {
-                        *p = L'\0';
-                        CreateDirectoryW(tmp, NULL);
-                        *p = L'\\';
-                    }
-                }
-                CreateDirectoryW(tmp, NULL);
-            }
-
-            swprintf_s(manifest_file, MAX_PATH, L"%s\\shares.txt", manifest_dir);
-            if (_wfopen_s(&mf, manifest_file, L"w") == 0 && mf) {
-                for (i = 0; i < config->gpu_shares.count; i++) {
-                    const GpuDriverShare *ds = &config->gpu_shares.shares[i];
-                    if (GetFileAttributesW(ds->host_path) != INVALID_FILE_ATTRIBUTES) {
-                        if (ds->file_filter[0])
-                            fprintf(mf, "%ls %ls %ls\n",
-                                    ds->share_name, ds->guest_path, ds->file_filter);
-                        else
-                            fprintf(mf, "%ls %ls\n",
-                                    ds->share_name, ds->guest_path);
-                    }
-                }
-                fclose(mf);
-            }
-
-            /* Add manifest as a Plan9 share */
-            if (pfnGrantAccess) pfnGrantAccess(config->name, manifest_dir);
-            escape_json_path(manifest_dir, esc_buf, MAX_PATH * 2);
-            swprintf_s(shares + wcslen(shares), 8192 - wcslen(shares),
-                L",{\"Name\":\"AppSandbox.Manifest\","
-                L"\"AccessName\":\"AppSandbox.Manifest\","
-                L"\"Path\":\"%s\","
-                L"\"Port\":50001,"
-                L"\"Flags\":1}",
-                esc_buf);
-            share_count++;
-        }
-#endif /* >>> END REVERT AppSandbox.Manifest share <<< */
-
         /* lxss\lib: GPU libs for Linux guests */
         {
             wchar_t sys_dir[MAX_PATH];

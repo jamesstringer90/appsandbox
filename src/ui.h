@@ -16,9 +16,9 @@
    Returns the window handle, or NULL on failure. */
 HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow);
 
-/* Append a line to the log output in the main window.
-   Thread-safe: can be called from any thread.
-   Implemented in asb_core.c (DLL) — calls the registered AsbLogCallback. */
+/* Write a line to appsandbox.log and forward it to the registered
+   AsbLogCallback (if any). Thread-safe: can be called from any thread.
+   Implemented in asb_core.c (DLL). */
 ASB_API void ui_log(const wchar_t *fmt, ...);
 
 /* Get the HINSTANCE used to create the main window.
