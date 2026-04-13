@@ -23,6 +23,10 @@ BOOL hcn_init(void);
 /* Clean up HCN module. */
 void hcn_cleanup(void);
 
+/* Delete any stale AppSandbox networks left over from a previous run.
+   Call once at startup, before any VMs are started. */
+void hcn_cleanup_stale_networks(void);
+
 /* Create a NAT network. Returns S_OK on success.
    network_id: output GUID for the created network. */
 HRESULT hcn_create_nat_network(GUID *network_id);

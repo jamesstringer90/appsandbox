@@ -246,6 +246,11 @@ ASB_API VmInstance   *asb_vm_instance(AsbVm vm);
 ASB_API SnapshotTree *asb_vm_snap_tree(AsbVm vm);
 ASB_API GpuList      *asb_gpu_list(void);
 ASB_API int           asb_vm_index(AsbVm vm);
+
+/* Tear down the VM's HCN endpoint, and the shared network too if no other
+   running VM is still attached to a network of the same mode. Safe to call
+   even if network_cleaned is already TRUE. */
+ASB_API void          asb_vm_cleanup_network(VmInstance *vm);
 #endif
 
 #endif /* ASB_CORE_H */

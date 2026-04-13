@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <sddl.h>
 #include <aclapi.h>
-#include <tlhelp32.h>
 
 /* Get current user's SID as a string (e.g. "S-1-5-21-...").
    Caller must LocalFree the returned string. Returns NULL on failure. */
@@ -645,8 +644,6 @@ static void pump_sleep(int ms)
     }
 }
 
-static void kill_all_vmwp(void); /* forward declaration */
-
 void hcs_destroy_stale(const wchar_t *name)
 {
     HCS_SYSTEM stale = NULL;
@@ -657,8 +654,7 @@ void hcs_destroy_stale(const wchar_t *name)
 
     hr = pfnOpen(name, GENERIC_ALL, &stale);
     if (FAILED(hr) || !stale) {
-        ui_log(L"hcs_destroy_stale: open \"%s\" failed (0x%08X), killing orphaned vmwp...", name, hr);
-        kill_all_vmwp();
+        /* Not registered with HCS — name is free, nothing to clean up. */
         return;
     }
 
@@ -738,63 +734,8 @@ BOOL hcs_try_open_vm(VmInstance *instance)
     return FALSE;
 }
 
-/* Enable a privilege in the current process token. */
-static BOOL enable_privilege(LPCWSTR priv_name)
-{
-    HANDLE token;
-    TOKEN_PRIVILEGES tp;
-    if (!OpenProcessToken(GetCurrentProcess(),
-                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
-        return FALSE;
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if (!LookupPrivilegeValueW(NULL, priv_name, &tp.Privileges[0].Luid)) {
-        CloseHandle(token);
-        return FALSE;
-    }
-    AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL);
-    CloseHandle(token);
-    return GetLastError() == ERROR_SUCCESS;
-}
-
-/* Kill all vmwp.exe processes (orphaned VM worker processes).
-   Requires SeDebugPrivilege since vmwp.exe runs as SYSTEM. */
-static void kill_all_vmwp(void)
-{
-    HANDLE snap;
-    PROCESSENTRY32W pe;
-    int killed = 0;
-
-    enable_privilege(SE_DEBUG_NAME);
-
-    snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return;
-
-    pe.dwSize = sizeof(pe);
-    if (Process32FirstW(snap, &pe)) {
-        do {
-            if (_wcsicmp(pe.szExeFile, L"vmwp.exe") == 0) {
-                HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
-                if (proc) {
-                    ui_log(L"Killing orphaned vmwp.exe (PID %lu)...", pe.th32ProcessID);
-                    TerminateProcess(proc, 1);
-                    CloseHandle(proc);
-                    killed++;
-                } else {
-                    ui_log(L"Cannot open vmwp.exe PID %lu (error %lu)",
-                           pe.th32ProcessID, GetLastError());
-                }
-            }
-        } while (Process32NextW(snap, &pe));
-    }
-    CloseHandle(snap);
-
-    if (killed > 0) Sleep(2000);
-}
-
 /* Wait for a file to become unlocked (vmwp.exe releasing handles after terminate).
-   If still locked after initial wait, kills the locking processes.
-   Returns TRUE if file is available, FALSE if still locked. */
+   Returns TRUE if file is available, FALSE if still locked after timeout. */
 static BOOL wait_for_file_available(const wchar_t *path, int timeout_ms)
 {
     int elapsed = 0;
@@ -803,7 +744,6 @@ static BOOL wait_for_file_available(const wchar_t *path, int timeout_ms)
     if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES)
         return TRUE; /* File doesn't exist — that's fine */
 
-    /* First try: wait for natural release, pumping messages to avoid UI lockup */
     while (elapsed < timeout_ms) {
         MSG msg;
         h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
@@ -823,17 +763,6 @@ static BOOL wait_for_file_available(const wchar_t *path, int timeout_ms)
         elapsed += 500;
     }
 
-    /* Still locked — kill orphaned vmwp.exe processes */
-    ui_log(L"VHDX still locked after %ds, killing orphaned vmwp.exe...", timeout_ms / 1000);
-    kill_all_vmwp();
-
-    /* Final check */
-    h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
-                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h != INVALID_HANDLE_VALUE) {
-        CloseHandle(h);
-        return TRUE;
-    }
     return FALSE;
 }
 
@@ -1253,7 +1182,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
     hr = pfnCreate(config->name, json, op, NULL, &instance->handle);
     hr = hcs_exec_and_wait(hr, op);
 
-    /* Retry once — hcs_destroy_stale may have killed vmwp.exe to clear a stuck system */
+    /* Retry once — hcs_destroy_stale may have terminated a stuck system */
     if (hr == (HRESULT)0x8037010DL || hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
         ui_log(L"Retrying VM create after stale cleanup...");
         pump_sleep(2000);
@@ -1345,7 +1274,7 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
     hr = pfnCreate(config->name, json, op, NULL, &instance->handle);
     hr = hcs_exec_and_wait(hr, op);
 
-    /* Retry once — hcs_destroy_stale may have killed vmwp.exe to clear a stuck system */
+    /* Retry once — hcs_destroy_stale may have terminated a stuck system */
     if (hr == (HRESULT)0x8037010DL || hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
         ui_log(L"Retrying VM create after stale cleanup...");
         pump_sleep(2000);
