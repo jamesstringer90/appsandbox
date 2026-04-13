@@ -8,106 +8,12 @@
 </head>
 <body>
 
-<!-- New VM Configuration -->
-<section id="config-section">
-    <h2 class="collapsible" onclick="toggleSection('config-section')"><span class="collapse-arrow" id="config-section-arrow">&#x25BC;</span> New VM Configuration</h2>
-    <div id="config-section-body" class="section-body">
-    <div class="form-grid">
-        <label for="vm-name">VM Name:</label>
-        <div class="form-row">
-            <input type="text" id="vm-name" value="MyVM" class="input-md">
-            <span class="field-warn" id="vm-name-warn"></span>
-        </div>
-
-        <label for="os-type">OS Type:</label>
-        <div class="form-row">
-            <select id="os-type">
-                <option value="Windows" selected>Windows</option>
-            </select>
-        </div>
-
-        <label>OS Image:</label>
-        <div class="image-row">
-            <input type="text" id="image-path" placeholder="Path to ISO or VHDX...">
-            <button id="btn-browse" onclick="sendCmd('browseImage')">Browse...</button>
-            <span class="or-separator">OR</span>
-            <label style="text-align:left">Template:</label>
-            <div class="template-dropdown" id="template-dropdown">
-                <div class="template-dropdown-selected" id="template-dropdown-selected">(None)</div>
-                <div class="template-dropdown-list" id="template-dropdown-list"></div>
-                <input type="hidden" id="template-select" value="">
-            </div>
-        </div>
-
-        <label for="hdd-size">HDD Size:</label>
-        <div class="form-row">
-            <input type="number" id="hdd-size" value="64" min="1" class="input-sm"> GB
-            <span class="host-info" id="host-hdd"></span>
-        </div>
-
-        <label for="ram-size">RAM Size:</label>
-        <div class="form-row">
-            <input type="number" id="ram-size" value="16384" min="512" class="input-sm"> MB
-            <span class="host-info" id="host-ram"></span>
-        </div>
-
-        <label for="cpu-cores">CPU Cores:</label>
-        <div class="form-row">
-            <input type="number" id="cpu-cores" value="8" min="1" class="input-sm">
-            <span class="host-info" id="host-cpu"></span>
-        </div>
-
-        <label for="gpu-mode">GPU:</label>
-        <div class="form-row">
-            <select id="gpu-mode">
-                <option value="0">None</option>
-                <option value="1" selected>Default GPU</option>
-            </select>
-        </div>
-
-        <label for="net-mode">Network:</label>
-        <div class="form-row">
-            <select id="net-mode" onchange="onNetModeChange()">
-                <option value="0">None</option>
-                <option value="1" selected>NAT</option>
-                <option value="2">External</option>
-                <option value="3">Internal</option>
-            </select>
-            <label style="text-align:left">Adapter:</label>
-            <select id="net-adapter"></select>
-        </div>
-
-        <label>Username:</label>
-        <div class="cred-row">
-            <input type="text" id="admin-user" value="User" class="input-md">
-            <span class="field-warn" id="admin-user-warn"></span>
-        </div>
-
-        <label>Password:</label>
-        <div class="cred-row">
-            <input type="password" id="admin-pass" value="test123">
-            <label>Confirm:</label>
-            <input type="password" id="admin-confirm" value="test123">
-            <span class="toggle-pass" onmousedown="showPassword()" onmouseup="hidePassword()" onmouseleave="hidePassword()">&#x1F441;</span>
-        </div>
-
-        <label>Options:</label>
-        <div class="form-row">
-            <label title="Disables Secure Boot — required for test-signed VDD driver"><input type="checkbox" id="test-mode" checked> Test Mode</label>
-            <label title="Installs OpenSSH Server, tunnelled over HV socket"><input type="checkbox" id="ssh-enabled"> SSH Server</label>
-        </div>
-    </div>
-
-    <div class="action-buttons">
-        <button id="btn-create" class="primary" disabled onclick="onCreateVm()">Create new VM</button>
-        <button id="btn-create-template" disabled onclick="onCreateTemplate()">Build new Template using ISO</button>
-    </div>
-    </div>
-</section>
-
 <!-- Virtual Machines -->
 <section id="vm-section">
-    <h2>Virtual Machines</h2>
+    <div class="section-header">
+        <h2>Sandboxes</h2>
+        <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
+    </div>
     <div class="vm-table-wrap">
         <table id="vm-table">
             <thead><tr>
@@ -148,6 +54,103 @@
         <div class="modal-buttons" id="prereq-buttons">
             <button onclick="document.getElementById('prereq-overlay').classList.remove('active')">Cancel</button>
             <button class="primary" onclick="enableFeature()">Enable</button>
+        </div>
+    </div>
+</div>
+
+<!-- Create Sandbox modal -->
+<div class="modal-overlay" id="create-vm-overlay">
+    <div class="modal wide">
+        <h3>New Sandbox</h3>
+        <div class="form-grid">
+            <label for="vm-name">VM Name:</label>
+            <div class="form-row">
+                <input type="text" id="vm-name" value="MyAppSandbox" class="input-md">
+                <span class="field-warn" id="vm-name-warn"></span>
+            </div>
+
+            <label for="os-type">OS Type:</label>
+            <div class="form-row">
+                <select id="os-type">
+                    <option value="Windows" selected>Windows</option>
+                </select>
+            </div>
+
+            <label>OS Image:</label>
+            <div class="image-row">
+                <input type="text" id="image-path" placeholder="Path to ISO or VHDX...">
+                <button id="btn-browse" onclick="sendCmd('browseImage')">Browse...</button>
+                <span class="or-separator">OR</span>
+                <label style="text-align:left">Template:</label>
+                <div class="template-dropdown" id="template-dropdown">
+                    <div class="template-dropdown-selected" id="template-dropdown-selected">(None)</div>
+                    <div class="template-dropdown-list" id="template-dropdown-list"></div>
+                    <input type="hidden" id="template-select" value="">
+                </div>
+            </div>
+
+            <label for="hdd-size">HDD Size:</label>
+            <div class="form-row">
+                <input type="number" id="hdd-size" value="64" min="1" class="input-sm"> GB
+                <span class="host-info" id="host-hdd"></span>
+            </div>
+
+            <label for="ram-size">RAM Size:</label>
+            <div class="form-row">
+                <input type="number" id="ram-size" value="16384" min="512" class="input-sm"> MB
+                <span class="host-info" id="host-ram"></span>
+            </div>
+
+            <label for="cpu-cores">CPU Cores:</label>
+            <div class="form-row">
+                <input type="number" id="cpu-cores" value="8" min="1" class="input-sm">
+                <span class="host-info" id="host-cpu"></span>
+            </div>
+
+            <label for="gpu-mode">GPU:</label>
+            <div class="form-row">
+                <select id="gpu-mode">
+                    <option value="0">None</option>
+                    <option value="1" selected>Default GPU</option>
+                </select>
+            </div>
+
+            <label for="net-mode">Network:</label>
+            <div class="form-row">
+                <select id="net-mode" onchange="onNetModeChange()">
+                    <option value="0">None</option>
+                    <option value="1" selected>NAT</option>
+                    <option value="2">External</option>
+                    <option value="3">Internal</option>
+                </select>
+                <label id="net-adapter-label" style="text-align:left">Adapter:</label>
+                <select id="net-adapter"></select>
+            </div>
+
+            <label>Username:</label>
+            <div class="cred-row">
+                <input type="text" id="admin-user" value="User" class="input-md">
+                <span class="field-warn" id="admin-user-warn"></span>
+            </div>
+
+            <label>Password:</label>
+            <div class="cred-row">
+                <input type="password" id="admin-pass" value="test123">
+                <label>Confirm:</label>
+                <input type="password" id="admin-confirm" value="test123">
+                <span class="toggle-pass" onmousedown="showPassword()" onmouseup="hidePassword()" onmouseleave="hidePassword()">&#x1F441;</span>
+            </div>
+
+            <label>Options:</label>
+            <div class="form-row">
+                <label title="Disables Secure Boot — required for test-signed VDD driver"><input type="checkbox" id="test-mode" checked> Test Mode</label>
+                <label title="Installs OpenSSH Server, tunnelled over HV socket"><input type="checkbox" id="ssh-enabled"> SSH Server</label>
+            </div>
+        </div>
+        <div class="modal-buttons">
+            <button onclick="closeCreateModal()">Cancel</button>
+            <button id="btn-create-template" disabled onclick="onCreateTemplate()">Build Template</button>
+            <button id="btn-create" class="primary" disabled onclick="onCreateVm()">Create Sandbox</button>
         </div>
     </div>
 </div>
