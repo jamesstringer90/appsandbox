@@ -957,7 +957,7 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
         return NULL;
 
     hwnd = CreateWindowExW(
-        0, L"AppSandbox_Main", L"App Sandbox - VM Manager",
+        0, L"AppSandbox_Main", L"App Sandbox",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1575, 900,
         NULL, NULL, hInstance, NULL);

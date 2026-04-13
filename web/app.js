@@ -9,6 +9,7 @@ let editModeRow = -1;
 let editingCell = null; /* {row, col, element} */
 let pendingConfirm = null; /* {resolve} */
 let minSizeReported = false;
+let lastHostInfo = null;
 
 /* ---- Collapsible sections ---- */
 function toggleSection(id) {
@@ -17,7 +18,7 @@ function toggleSection(id) {
     localStorage.setItem('collapse_' + id, collapsed ? '1' : '0');
 }
 (function restoreCollapse() {
-    var defaults = { 'config-section': '0', 'log-section': '1' };
+    var defaults = { 'log-section': '1' };
     Object.keys(defaults).forEach(function(id) {
         var val = localStorage.getItem('collapse_' + id);
         if (val === null) val = defaults[id];
@@ -63,7 +64,6 @@ function onFullState(msg) {
     if (msg.hostInfo) updateHostInfo(msg.hostInfo);
     if (msg.adapters) populateAdapters(msg.adapters, msg.defaultAdapter);
     if (msg.templates) populateTemplates(msg.templates);
-    if (vms.length === 0 && msg.hostInfo) applySmartDefaults(msg.hostInfo);
     if (!minSizeReported) {
         minSizeReported = true;
         setTimeout(reportMinSize, 50);
@@ -91,6 +91,7 @@ function onVmStateChanged(msg) {
 
 function updateHostInfo(info) {
     if (!info) return;
+    lastHostInfo = info;
     var el;
     el = document.getElementById('host-cpu');
     if (el) el.textContent = 'Host: ' + info.hostCores + ' cores | VMs using: ' + info.vmCores;
@@ -280,7 +281,9 @@ function hidePassword() {
 function onNetModeChange() {
     /* Adapter dropdown only relevant for External */
     var mode = parseInt(document.getElementById('net-mode').value);
-    document.getElementById('net-adapter').style.display = (mode === 2) ? '' : 'none';
+    var show = (mode === 2) ? '' : 'none';
+    document.getElementById('net-adapter').style.display = show;
+    document.getElementById('net-adapter-label').style.display = show;
 }
 onNetModeChange();
 
@@ -353,6 +356,7 @@ function onCreateVm() {
     }
     sendCmd('createVm', cfg);
     clearCreateForm();
+    closeCreateModal();
 }
 
 function onCreateTemplate() {
@@ -366,7 +370,56 @@ function onCreateTemplate() {
     cfg.isTemplate = true;
     sendCmd('createVm', cfg);
     clearCreateForm();
+    closeCreateModal();
 }
+
+/* ---- Create Sandbox modal ---- */
+
+function openCreateModal() {
+    /* Reset to defaults every time the modal opens */
+    document.getElementById('vm-name').value = 'MyAppSandbox';
+    document.getElementById('image-path').value = '';
+    selectTemplate('', templateDefaultLabel());
+    document.getElementById('hdd-size').value = 64;
+    document.getElementById('gpu-mode').value = '1';
+    document.getElementById('net-mode').value = '1';
+    document.getElementById('admin-user').value = 'User';
+    document.getElementById('admin-pass').value = 'test123';
+    document.getElementById('admin-confirm').value = 'test123';
+    document.getElementById('test-mode').checked = true;
+    document.getElementById('ssh-enabled').checked = false;
+
+    /* Smart defaults (RAM/cores) from latest host info */
+    if (lastHostInfo) applySmartDefaults(lastHostInfo);
+
+    /* Clear validation state */
+    document.getElementById('vm-name-warn').textContent = '';
+    document.getElementById('admin-user-warn').textContent = '';
+    checkPasswordMatch();
+    onNetModeChange();
+    updateCreateButtons();
+    revalidateVmName();
+
+    document.getElementById('create-vm-overlay').classList.add('active');
+    setTimeout(function() { document.getElementById('vm-name').focus(); }, 0);
+}
+
+function closeCreateModal() {
+    document.getElementById('create-vm-overlay').classList.remove('active');
+}
+
+/* Close on backdrop click */
+document.getElementById('create-vm-overlay').addEventListener('click', function(e) {
+    if (e.target === this) closeCreateModal();
+});
+
+/* Close on Escape */
+document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Escape') return;
+    if (document.getElementById('create-vm-overlay').classList.contains('active')) {
+        closeCreateModal();
+    }
+});
 
 /* ---- VM Table ---- */
 
@@ -379,7 +432,11 @@ function renderVmTable() {
         var td = document.createElement('td');
         td.colSpan = 17;
         td.className = 'empty-state';
-        td.textContent = 'Add a virtual machine using New VM Configuration';
+        var btn = document.createElement('button');
+        btn.className = 'primary empty-state-btn';
+        btn.textContent = '+ Create your first sandbox';
+        btn.onclick = openCreateModal;
+        td.appendChild(btn);
         tr.appendChild(td);
         tbody.appendChild(tr);
         return;

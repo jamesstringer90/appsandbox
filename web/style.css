@@ -42,6 +42,25 @@ h2 {
     border-bottom: 1px solid var(--ctrl-border);
 }
 
+/* Section header row: title on left, action button on right */
+.section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--ctrl-border);
+}
+.section-header h2 {
+    border-bottom: none;
+    margin-bottom: 0;
+    padding-bottom: 0;
+}
+#btn-new-sandbox {
+    height: 26px;
+    padding: 2px 14px;
+}
+
 /* Collapsible sections */
 h2.collapsible { cursor: pointer; }
 h2.collapsible:hover { color: var(--text); }
@@ -279,7 +298,8 @@ td {
     white-space: nowrap;
 }
 
-td.empty-state { text-align: center; color: var(--text-dim); font-style: italic; padding: 12px 6px; }
+td.empty-state { text-align: center; color: var(--text-dim); padding: 20px 6px; }
+.empty-state-btn { height: 32px; padding: 4px 18px; font-size: 13px; }
 tr:hover td { background: #252525; }
 tr.selected td { background: #1a3a5a; }
 
@@ -441,6 +461,13 @@ td.editing select {
     padding: 20px;
     max-width: 420px;
     width: 90%;
+}
+.modal.wide {
+    max-width: 640px;
+    width: 92%;
+}
+.modal.wide .form-grid {
+    margin-bottom: 16px;
 }
 .modal h3 {
     font-size: 14px;
