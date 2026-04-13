@@ -1,10 +1,9 @@
 /*
  * asb_core.c -- App Sandbox Core Library implementation.
  *
- * All VM orchestration extracted from ui.c: persistence, lifecycle
- * (create/start/stop/delete), snapshots, templates, config editing.
- *
- * Uses callbacks instead of PostMessage for cross-thread notification.
+ * VM orchestration: persistence, lifecycle (create/start/stop/delete),
+ * snapshots, templates, config editing. Notifies consumers via callbacks
+ * registered through asb_set_*_callback().
  */
 
 #include <winsock2.h>
@@ -79,7 +78,7 @@ static void                *g_alert_ud     = NULL;
 static AsbVmRemovedCallback g_removed_cb   = NULL;
 static void                *g_removed_ud   = NULL;
 
-/* ---- Internal logging (replaces ui_log for library code) ---- */
+/* ---- Internal logging (writes to appsandbox.log and the registered log callback) ---- */
 
 static void asb_log(const wchar_t *fmt, ...)
 {
@@ -682,7 +681,7 @@ static BOOL another_vm_uses_network_mode(const VmInstance *self, int mode)
     return FALSE;
 }
 
-void asb_vm_cleanup_network(VmInstance *vm)
+ASB_API void asb_vm_cleanup_network(VmInstance *vm)
 {
     if (!vm) return;
     if (vm->network_mode == NET_NONE) return;

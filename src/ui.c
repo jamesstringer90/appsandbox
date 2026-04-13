@@ -74,7 +74,7 @@ static NOTIFYICONDATAW g_nid;
 /* UI thread ID for thread-safe log dispatch */
 static DWORD g_ui_thread_id;
 
-/* TRUE on Windows Home / Home N (no Hyper-V video, so no RDP display) */
+/* TRUE on Windows Home / Home N editions (Hyper-V not supported) */
 static BOOL g_is_home_edition = FALSE;
 static BOOL g_prereq_ok = FALSE;
 static BOOL g_prereq_reboot_pending = FALSE;

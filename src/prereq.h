@@ -22,8 +22,8 @@ typedef void (*PrereqProgressCallback)(float pct, void *user_data);
 ASB_API BOOL prereq_enable_feature(const wchar_t *feature_name, BOOL *reboot_required,
                                     PrereqProgressCallback progress_cb, void *user_data);
 
-/* Check all HCS prerequisites.
-   Returns TRUE if Virtual Machine Platform is enabled and HCS is available. */
+/* Check HCS prerequisites. Returns TRUE if the Virtual Machine Platform
+   optional feature is enabled. */
 ASB_API BOOL prereq_check_all(void);
 
 /* Initiate a system reboot.  Returns TRUE if the reboot was initiated. */

@@ -37,7 +37,7 @@ typedef struct {
     DWORD   hdd_gb;
     DWORD   cpu_cores;
     int     gpu_mode;             /* GPU_NONE or GPU_DEFAULT */
-    int     network_mode;         /* NET_NONE, NET_NAT, etc. */
+    int     network_mode;         /* NET_NONE, NET_NAT, NET_EXTERNAL, or NET_INTERNAL */
     wchar_t admin_user[128];      /* Guest local admin username */
     wchar_t admin_pass[128];      /* Guest local admin password */
     wchar_t resources_iso_path[MAX_PATH]; /* ISO with autounattend + agent + helpers */
@@ -121,7 +121,7 @@ HRESULT hcs_terminate_vm(VmInstance *instance);
 /* Hot-detach the network adapter from a running VM. */
 void hcs_detach_network(VmInstance *instance);
 
-/* Pause a running VM (for snapshots). */
+/* Pause a running VM. */
 HRESULT hcs_pause_vm(VmInstance *instance);
 
 /* Resume a paused VM. */
@@ -164,10 +164,8 @@ void hcs_start_monitor(VmInstance *instance);
 /* Stop the background monitor thread. Call before closing HCS handle. */
 ASB_API void hcs_stop_monitor(VmInstance *instance);
 
-/* Build the HCS JSON document for creating a VM.
-   json_out must be at least json_out_chars wide chars.
+/* Create a VM with a network endpoint.
    endpoint_guid is the HCN endpoint GUID string (NULL if no network). */
-/* Create a VM with a network endpoint. */
 HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpoint_guid,
                                      VmInstance *instance);
 

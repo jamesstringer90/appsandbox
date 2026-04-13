@@ -629,44 +629,6 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
     if (!generate_autounattend(file_path, vm_name, admin_user, b64_pass, is_template, test_mode, lang))
         ui_log(L"Warning: failed to write autounattend.xml");
 
-    /* DISABLED: p9client.exe packaging — GPU driver copy is now handled by the
-       agent service via embedded 9P client (p9copy). To revert, uncomment this
-       block and the gpudrv-copy.cmd block below, and restore setup.cmd lines. */
-#if 0 /* >>> REVERT: uncomment to restore standalone p9client.exe on ISO <<< */
-    /* p9client.exe for GPU driver copy via Plan9 shares.
-       Check res_dir first, then fall back to parent directory (exe_dir). */
-    {
-        BOOL found_p9 = FALSE;
-        if (res_dir) {
-            swprintf_s(src_path, MAX_PATH, L"%s\\p9client.exe", res_dir);
-            if (GetFileAttributesW(src_path) != INVALID_FILE_ATTRIBUTES)
-                found_p9 = TRUE;
-        }
-        if (!found_p9) {
-            /* Try parent of res_dir (the exe directory itself) */
-            wcscpy_s(src_path, MAX_PATH, dir);
-            /* dir was derived from iso_path; try exe directory instead */
-            {
-                wchar_t exe_dir[MAX_PATH];
-                wchar_t *slash;
-                GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
-                slash = wcsrchr(exe_dir, L'\\');
-                if (slash) *slash = L'\0';
-                swprintf_s(src_path, MAX_PATH, L"%s\\p9client.exe", exe_dir);
-                if (GetFileAttributesW(src_path) != INVALID_FILE_ATTRIBUTES)
-                    found_p9 = TRUE;
-            }
-        }
-        if (found_p9) {
-            swprintf_s(file_path, MAX_PATH, L"%s\\p9client.exe", staging);
-            if (!CopyFileW(src_path, file_path, FALSE))
-                ui_log(L"Warning: failed to copy p9client.exe (error %lu)", GetLastError());
-        } else {
-            ui_log(L"Warning: p9client.exe not found (needed for GPU driver copy)");
-        }
-    }
-#endif /* >>> END REVERT p9client.exe <<< */
-
     /* Agent + input helper + VDD driver files + SSH MSI */
     stage_agent_and_setup(staging, res_dir, ssh_enabled);
 
@@ -776,67 +738,6 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
             fclose(sc);
         }
     }
-
-    /* DISABLED: gpudrv-copy.cmd — GPU driver copy is now handled by the agent
-       service via embedded 9P client. To revert, uncomment this block and
-       restore setup.cmd + p9client.exe packaging above. */
-#if 0 /* >>> REVERT: uncomment to restore gpudrv-copy.cmd on ISO <<< */
-    /* gpudrv-copy.cmd — boot-time script: reads manifest and copies driver shares.
-       In a .cmd file, for variables use %%a. In C fputs, no escaping needed. */
-    swprintf_s(file_path, MAX_PATH, L"%s\\gpudrv-copy.cmd", staging);
-    {
-        FILE *cmd;
-        if (_wfopen_s(&cmd, file_path, L"w") == 0 && cmd) {
-            fputs(
-                "@echo off\r\n"
-                "set P9=%SystemRoot%\\AppSandbox\\p9client.exe\r\n"
-                "set CFG=%SystemRoot%\\AppSandbox\\config\r\n"
-                "\r\n"
-                "echo [AppSandbox] Fetching GPU driver manifest...\r\n"
-                "\"%P9%\" AppSandbox.Manifest \"%CFG%\"\r\n"
-                "if not exist \"%CFG%\\shares.txt\" (\r\n"
-                "    echo [AppSandbox] No manifest found, skipping GPU driver copy.\r\n"
-                "    exit /b 0\r\n"
-                ")\r\n"
-                "\r\n"
-                "echo [AppSandbox] Copying GPU driver files...\r\n"
-                "for /f \"usebackq tokens=1,2,*\" %%a in (\"%CFG%\\shares.txt\") do (\r\n"
-                "    if \"%%c\"==\"\" (\r\n"
-                "        echo [AppSandbox] Share: %%a -^> %%b\r\n"
-                "        \"%P9%\" %%a \"%%b\"\r\n"
-                "    ) else (\r\n"
-                "        echo [AppSandbox] Share: %%a -^> %%b [filtered]\r\n"
-                "        \"%P9%\" %%a \"%%b\" --filter %%c\r\n"
-                "    )\r\n"
-                ")\r\n"
-                "echo [AppSandbox] GPU driver copy complete.\r\n"
-                "\r\n"
-                "echo [AppSandbox] Restarting GPU devices to load drivers...\r\n"
-                "setlocal enabledelayedexpansion\r\n"
-                "set \"DEVID=\"\r\n"
-                "for /f \"tokens=1,* delims=:\" %%a in ('pnputil /enum-devices /class Display') do (\r\n"
-                "    echo %%a | findstr /i \"Instance\" >nul && (\r\n"
-                "        set \"DEVID=%%b\"\r\n"
-                "        set \"DEVID=!DEVID:~1!\"\r\n"
-                "    )\r\n"
-                "    echo %%a | findstr /i \"Driver Name\" >nul && (\r\n"
-                "        set \"DRVNAME=%%b\"\r\n"
-                "        echo !DRVNAME! | findstr /i \"vrd.inf\" >nul && (\r\n"
-                "            echo [AppSandbox] Restarting GPU-PV device !DEVID!\r\n"
-                "            pnputil /disable-device \"!DEVID!\"\r\n"
-                "            pnputil /enable-device \"!DEVID!\"\r\n"
-                "        )\r\n"
-                "    )\r\n"
-                ")\r\n"
-                "endlocal\r\n"
-                "echo [AppSandbox] GPU device restart complete.\r\n",
-                cmd);
-            fclose(cmd);
-        } else {
-            ui_log(L"Warning: failed to write gpudrv-copy.cmd");
-        }
-    }
-#endif /* >>> END REVERT gpudrv-copy.cmd <<< */
 
     /* Build ISO from staging directory */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
