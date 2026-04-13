@@ -186,8 +186,11 @@ static BOOL hcn_network_exists(const GUID *id)
     return FALSE;
 }
 
-/* Delete all AppSandbox networks by their fixed GUIDs. Fast — no enumeration. */
-static void hcn_cleanup_our_networks(void)
+/* Delete all AppSandbox networks by their fixed GUIDs. Fast — no enumeration.
+   Call only at startup to clean up stale networks from a previous run; never
+   from per-VM create paths, or you'll rip the network out from under any
+   already-running VM that's attached to it. */
+void hcn_cleanup_stale_networks(void)
 {
     PWSTR er = NULL;
     if (!pfnDeleteNet) return;
@@ -219,8 +222,10 @@ HRESULT hcn_create_nat_network(GUID *network_id)
 
     *network_id = APPSANDBOX_NAT_GUID;
 
-    /* Clean up stale network from previous run */
-    hcn_cleanup_our_networks();
+    /* Reuse the existing AppSandbox NAT network if it's already up —
+       multiple VMs share one network, each with its own endpoint. */
+    if (hcn_network_exists(&APPSANDBOX_NAT_GUID))
+        return S_OK;
 
     swprintf_s(settings, 1024,
         L"{"
@@ -260,7 +265,8 @@ HRESULT hcn_create_internal_network(GUID *network_id)
 
     *network_id = APPSANDBOX_INTERNAL_GUID;
 
-    hcn_cleanup_our_networks();
+    if (hcn_network_exists(&APPSANDBOX_INTERNAL_GUID))
+        return S_OK;
 
     swprintf_s(settings, 1024,
         L"{"
@@ -293,7 +299,8 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
 
     *network_id = APPSANDBOX_EXTERNAL_GUID;
 
-    hcn_cleanup_our_networks();
+    if (hcn_network_exists(&APPSANDBOX_EXTERNAL_GUID))
+        return S_OK;
 
     /* Use specified adapter, or auto-detect */
     if (adapter_name && adapter_name[0] != L'\0') {

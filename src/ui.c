@@ -1143,11 +1143,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 safe_destroy_idd(i);
                 break;
             }
-            if (inst->network_mode != NET_NONE && !inst->network_cleaned) {
-                hcn_delete_endpoint(&inst->endpoint_id);
-                hcn_delete_network(&inst->network_id);
-                inst->network_cleaned = TRUE;
-            }
+            asb_vm_cleanup_network(inst);
             hcs_close_vm(inst);
         }
         send_vm_list();

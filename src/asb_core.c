@@ -612,11 +612,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
             idd_probe_stop(instance);
             asb_log(L"VM \"%s\" exited (event=0x%08X).", instance->name, event);
 
-            if (instance->network_mode != NET_NONE && !instance->network_cleaned) {
-                hcn_delete_endpoint(&instance->endpoint_id);
-                hcn_delete_network(&instance->network_id);
-                instance->network_cleaned = TRUE;
-            }
+            asb_vm_cleanup_network(instance);
             instance->nat_ip[0] = '\0';
             hcs_close_vm(instance);
 
@@ -638,8 +634,6 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
                 }}
                 asb_log(L"Template \"%s\" created successfully.", instance->name);
 
-                if (g_removed_cb) g_removed_cb(i, g_removed_ud);
-
                 EnterCriticalSection(&g_cs);
                 for (j = i; j < g_vm_count - 1; j++) {
                     g_vms[j] = g_vms[j+1];
@@ -650,6 +644,11 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
                 LeaveCriticalSection(&g_cs);
 
                 scan_templates();
+
+                /* Fire the removed callback last — WM_VM_REMOVED is async, so
+                   both g_vms[] and g_templates[] must be fully updated before
+                   the UI thread can pull the message and re-query them. */
+                if (g_removed_cb) g_removed_cb(i, g_removed_ud);
             }
 
             save_vm_list();
@@ -663,6 +662,38 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
     /* Notify consumer */
     if (g_state_cb && instance)
         g_state_cb(vm_handle(instance), instance->running, g_state_ud);
+}
+
+/* Returns TRUE if any other running VM (excluding `self`) is still attached
+   to a network of the given mode. Used to decide whether it's safe to tear
+   down the shared HCN network when `self` stops. */
+static BOOL another_vm_uses_network_mode(const VmInstance *self, int mode)
+{
+    int i;
+    if (mode == NET_NONE) return FALSE;
+    for (i = 0; i < g_vm_count; i++) {
+        const VmInstance *v = &g_vms[i];
+        if (v == self) continue;
+        if (!v->running) continue;
+        if (v->network_cleaned) continue;
+        if (v->network_mode != mode) continue;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void asb_vm_cleanup_network(VmInstance *vm)
+{
+    if (!vm) return;
+    if (vm->network_mode == NET_NONE) return;
+    if (vm->network_cleaned) return;
+    hcn_delete_endpoint(&vm->endpoint_id);
+    /* The HCN network is shared across all VMs of the same mode
+       (fixed GUID). Only tear it down if no other running VM is
+       still attached to it. */
+    if (!another_vm_uses_network_mode(vm, vm->network_mode))
+        hcn_delete_network(&vm->network_id);
+    vm->network_cleaned = TRUE;
 }
 
 /* ---- NAT IP allocation ---- */
@@ -1004,8 +1035,9 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                                      (nat_ip && nat_ip[0]) ? nat_ip : NULL);
             if (SUCCEEDED(hr))
                 args->has_network = TRUE;
-            else
-                hcn_delete_network(&args->network_id);
+            /* If endpoint create fails, leave the network alone — it may be
+               shared with other VMs. Orphan networks are cleaned up at next
+               launch by hcn_cleanup_stale_networks(). */
         }
         if (FAILED(hr))
             args->config.network_mode = NET_NONE;
@@ -1178,10 +1210,14 @@ ASB_API HRESULT asb_init(void)
 
     vmms_cert_ensure();
 
-    if (!hcn_init())
+    if (!hcn_init()) {
         asb_log(L"HCN: NOT available");
-    else
+    } else {
         asb_log(L"HCN: Available");
+        /* Tear down any stale networks from a previous run. Must happen
+           before any VM is started so we don't delete a live network. */
+        hcn_cleanup_stale_networks();
+    }
 
     gpu_enumerate(&g_gpu_list);
     {
@@ -1439,6 +1475,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
     /* ---- Synchronous path (from-template, non-Windows, etc.) ---- */
 
+    /* Populate name early so log lines (e.g. NAT IP allocation) identify the VM. */
+    wcscpy_s(inst->name, 256, cfg.name);
+
     /* Create disk */
     if (from_template) {
         asb_log(L"Creating differencing VHDX from template \"%s\"...", g_templates[template_idx].name);
@@ -1523,7 +1562,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                                      inst->nat_ip[0] ? inst->nat_ip : NULL);
             if (FAILED(hr)) {
                 asb_log(L"Warning: Endpoint failed (0x%08X).", hr);
-                hcn_delete_network(&inst->network_id);
+                /* Leave the shared network alone — other VMs may be using it. */
                 cfg.network_mode = NET_NONE;
             }
         }
@@ -1712,11 +1751,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
 
     hcs_close_vm(inst);
 
-    if (inst->network_mode != NET_NONE && !inst->network_cleaned) {
-        hcn_delete_endpoint(&inst->endpoint_id);
-        hcn_delete_network(&inst->network_id);
-        inst->network_cleaned = TRUE;
-    }
+    asb_vm_cleanup_network(inst);
     inst->nat_ip[0] = '\0';
 
     asb_log(L"VM \"%s\" terminated.", inst->name);
@@ -1747,11 +1782,7 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     if (inst->running)
         hcs_terminate_vm(inst);
 
-    if (inst->network_mode != NET_NONE && !inst->network_cleaned) {
-        hcn_delete_endpoint(&inst->endpoint_id);
-        hcn_delete_network(&inst->network_id);
-        inst->network_cleaned = TRUE;
-    }
+    asb_vm_cleanup_network(inst);
 
     hcs_close_vm(inst);
     hcs_destroy_stale(inst->name);
