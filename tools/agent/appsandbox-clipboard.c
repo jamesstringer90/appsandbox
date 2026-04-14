@@ -2,7 +2,7 @@
  * appsandbox-clipboard.exe — Guest-side clipboard writer for AppSandbox.
  *
  * Runs as SYSTEM, spawned by the agent service. Listens on AF_HYPERV
- * socket (GUID :0004) for the host IDD display to connect. Handles the
+ * socket (GUID :0005) for the host IDD display to connect. Handles the
  * host→guest clipboard direction using delayed rendering:
  *   - On FORMAT_LIST from host: stores format metadata, requests data
  *     via FORMAT_DATA_REQ one format at a time
@@ -10,7 +10,7 @@
  *     formats to guest clipboard once complete
  *
  * Guest→host clipboard is handled separately by appsandbox-clipboard-reader.exe
- * (USER, GUID :0005).
+ * (USER, GUID :0006).
  *
  * Logs to C:\Windows\AppSandbox\clipboard.log (beside agent.log).
  */
@@ -44,9 +44,9 @@ typedef struct _SOCKADDR_HV {
 static const GUID HV_GUID_WILDCARD =
     { 0, 0, 0, { 0, 0, 0, 0, 0, 0, 0, 0 } };
 
-/* Clipboard channel: {A5B0CAFE-0004-4000-8000-000000000001} */
+/* Clipboard channel: {A5B0CAFE-0005-4000-8000-000000000001} */
 static const GUID CLIPBOARD_SERVICE_GUID =
-    { 0xa5b0cafe, 0x0004, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
+    { 0xa5b0cafe, 0x0005, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
 /* ---- Clipboard protocol ---- */
 
@@ -735,7 +735,7 @@ int main(void)
         return 1;
     }
 
-    clip_log("Listening on GUID a5b0cafe-0004-4000-8000-000000000001.");
+    clip_log("Listening on GUID a5b0cafe-0005-4000-8000-000000000001.");
 
     /* Accept loop — one client at a time */
     for (;;) {

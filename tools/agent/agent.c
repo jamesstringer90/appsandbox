@@ -869,7 +869,7 @@ static void stop_clipboard_monitor(void)
     }
 }
 
-/* ---- Clipboard reader process (runs as USER, :0005) ---- */
+/* ---- Clipboard reader process (runs as USER, :0006) ---- */
 
 static HANDLE g_clipboard_reader_process = NULL;
 static DWORD  g_clipboard_reader_session = 0xFFFFFFFF;
@@ -1362,13 +1362,13 @@ static void handle_idd_connect(SOCKET client, const char *tag)
     if (new_console != 0xFFFFFFFF)
         spawn_input_in_session(new_console);
 
-    /* Kill and respawn clipboard helper (SYSTEM, :0004) in the console session */
+    /* Kill and respawn clipboard helper (SYSTEM, :0005) in the console session */
     kill_clipboard_helper();
     agent_log("idd_connect: respawning clipboard helper in session %lu.", new_console);
     if (new_console != 0xFFFFFFFF)
         spawn_clipboard_in_session(new_console);
 
-    /* Kill and respawn clipboard reader (user, :0005) in the console session */
+    /* Kill and respawn clipboard reader (user, :0006) in the console session */
     kill_clipboard_reader();
     agent_log("idd_connect: respawning clipboard reader in session %lu.", new_console);
     if (new_console != 0xFFFFFFFF)
@@ -1780,9 +1780,9 @@ static DWORD WINAPI listener_thread(LPVOID param)
 
 /* ---- SSH: sshd detection + HV proxy (guest-side: HV socket → localhost:22) ---- */
 
-/* SSH proxy service GUID: {A5B0CAFE-0006-4000-8000-000000000001} */
+/* SSH proxy service GUID: {A5B0CAFE-0007-4000-8000-000000000001} */
 static const GUID SSH_SERVICE_GUID =
-    { 0xa5b0cafe, 0x0006, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
+    { 0xa5b0cafe, 0x0007, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
 static HANDLE  g_ssh_proxy_thread = NULL;
 static volatile BOOL g_ssh_proxy_running = FALSE;
@@ -1918,7 +1918,7 @@ static DWORD WINAPI ssh_proxy_thread(LPVOID param)
         return 1;
     }
 
-    agent_log("SSH proxy: listening on AF_HYPERV :0006");
+    agent_log("SSH proxy: listening on AF_HYPERV :0007");
 
     while (g_ssh_proxy_running) {
         FD_ZERO(&fds);
@@ -2158,10 +2158,10 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     /* Start input helper monitor (spawns/respawns in console session as SYSTEM) */
     start_input_monitor();
 
-    /* Start clipboard helper monitor (SYSTEM, :0004) */
+    /* Start clipboard helper monitor (SYSTEM, :0005) */
     start_clipboard_monitor();
 
-    /* Start clipboard reader monitor (user, :0005) */
+    /* Start clipboard reader monitor (user, :0006) */
     start_clipboard_reader_monitor();
 
     set_service_status(SERVICE_RUNNING, 0);

@@ -4,8 +4,8 @@
  * Connects to the guest VM over AF_HYPERV sockets:
  *   :0002  Frame channel — receives frames, renders via D3D11 textured quad
  *   :0003  Input channel — forwards keyboard/mouse events to guest
- *   :0004  Clipboard writer — sends host clipboard to guest (host→guest)
- *   :0005  Clipboard reader — receives guest clipboard from reader (guest→host)
+ *   :0005  Clipboard writer — sends host clipboard to guest (host→guest)
+ *   :0006  Clipboard reader — receives guest clipboard from reader (guest→host)
  *
  * Pure C, compiled as C.
  */
@@ -63,11 +63,11 @@ static const GUID INPUT_SERVICE_GUID =
 
 /* Clipboard channel service GUID — connects to guest clipboard writer (host→guest) */
 static const GUID CLIPBOARD_SERVICE_GUID =
-    { 0xa5b0cafe, 0x0004, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
+    { 0xa5b0cafe, 0x0005, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
 /* Clipboard reader channel — connects to guest clipboard reader (guest→host) */
 static const GUID CLIPBOARD_READER_SERVICE_GUID =
-    { 0xa5b0cafe, 0x0005, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
+    { 0xa5b0cafe, 0x0006, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
 /* ---- Clipboard protocol ---- */
 
@@ -266,7 +266,7 @@ struct VmDisplayIdd {
     HWND           log_list_hwnd;   /* listbox inside log window */
     HWND           render_hwnd;     /* child window for D3D11 rendering */
 
-    /* Clipboard writer channel (:0004 — host→guest, delayed rendering) */
+    /* Clipboard writer channel (:0005 — host→guest, delayed rendering) */
     volatile SOCKET  clip_socket;
     volatile LONG    clip_suppress;
     HANDLE           clip_recv_thread;
@@ -277,7 +277,7 @@ struct VmDisplayIdd {
     int              clip_fmt_count;
     int              clip_fetch_idx;  /* next format to request; == count means all fetched */
 
-    /* Clipboard reader channel (:0005 — guest→host) */
+    /* Clipboard reader channel (:0006 — guest→host) */
     volatile SOCKET  clip_reader_socket;
     HANDLE           clip_reader_recv_thread;
     volatile LONG    clip_reader_suppress;
@@ -960,7 +960,7 @@ static void clip_send_format_list(VmDisplayIdd *d)
     hdr.data_size = (UINT32)offset;
 
     /* Suppress the echo: guest writer will apply this, triggering
-       WM_CLIPBOARDUPDATE in the guest reader which sends it back on :0005.
+       WM_CLIPBOARDUPDATE in the guest reader which sends it back on :0006.
        Tell the reader recv thread to ignore the next FORMAT_LIST. */
     InterlockedExchange(&d->clip_reader_suppress, 1);
 
@@ -1147,7 +1147,7 @@ static DWORD WINAPI clip_recv_thread_proc(LPVOID param)
                     DWORD no_timeout = 0;
                     setsockopt(clip_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
                     d->clip_socket = clip_s;
-                    idd_log(d, L"CLIP: Reconnected (GUID :0004).");
+                    idd_log(d, L"CLIP: Reconnected (GUID :0005).");
                     break;  /* back to outer for loop → message loop */
                 }
                 closesocket(clip_s);
@@ -1163,7 +1163,7 @@ static DWORD WINAPI clip_recv_thread_proc(LPVOID param)
 }
 
 /* ==================================================================
- * Clipboard reader channel (:0005 — guest→host)
+ * Clipboard reader channel (:0006 — guest→host)
  * ================================================================== */
 
 /* Free reader pending format data */
@@ -1330,7 +1330,7 @@ static BOOL clip_reader_recv_file_data(VmDisplayIdd *d, SOCKET s, const ClipHead
     return TRUE;
 }
 
-/* Handle a single message from the reader channel (:0005). */
+/* Handle a single message from the reader channel (:0006). */
 static BOOL clip_reader_handle_message(VmDisplayIdd *d, SOCKET s, const ClipHeader *hdr)
 {
     switch (hdr->msg_type) {
@@ -1345,7 +1345,7 @@ static BOOL clip_reader_handle_message(VmDisplayIdd *d, SOCKET s, const ClipHead
         if (!buf) return FALSE;
         if (!recv_exact(s, buf, (int)hdr->data_size)) { HeapFree(GetProcessHeap(), 0, buf); return FALSE; }
 
-        /* Echo suppression: host just sent FORMAT_LIST on :0004, guest writer
+        /* Echo suppression: host just sent FORMAT_LIST on :0005, guest writer
            applied it, guest reader echoed it back.  Discard. */
         if (InterlockedExchange(&d->clip_reader_suppress, 0)) {
             idd_log(d, L"CLIP-R: FORMAT_LIST suppressed (echo from host->guest).");
@@ -1437,8 +1437,8 @@ static BOOL clip_reader_handle_message(VmDisplayIdd *d, SOCKET s, const ClipHead
     }
 }
 
-/* Reader recv thread — handles guest→host clipboard via :0005 with auto-reconnect.
-   Unlike :0004, the reader process runs as the logged-in user and may not be
+/* Reader recv thread — handles guest→host clipboard via :0006 with auto-reconnect.
+   Unlike :0005, the reader process runs as the logged-in user and may not be
    available at window creation time, so this thread handles initial connection
    as well as reconnection. */
 static DWORD WINAPI clip_reader_recv_thread_proc(LPVOID param)
@@ -1450,7 +1450,7 @@ static DWORD WINAPI clip_reader_recv_thread_proc(LPVOID param)
     idd_log(d, L"CLIP-R: Recv thread started.");
 
     while (!d->stop) {
-        /* Connect (or reconnect) to :0005 */
+        /* Connect (or reconnect) to :0006 */
         while (!d->stop) {
             int wait;
             SOCKET rs;
@@ -1466,7 +1466,7 @@ static DWORD WINAPI clip_reader_recv_thread_proc(LPVOID param)
                     DWORD no_timeout = 0;
                     setsockopt(rs, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
                     d->clip_reader_socket = rs;
-                    idd_log(d, L"CLIP-R: Connected (GUID :0005).");
+                    idd_log(d, L"CLIP-R: Connected (GUID :0006).");
                     break;
                 }
                 closesocket(rs);
@@ -1993,7 +1993,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             }
         }
 
-        /* Ensure clipboard writer channel is connected (:0004, host→guest) */
+        /* Ensure clipboard writer channel is connected (:0005, host→guest) */
         if (d->clip_socket == INVALID_SOCKET && !d->clip_recv_thread) {
             SOCKET clip_s = connect_to_hv_service(&d->runtime_id, &CLIPBOARD_SERVICE_GUID, 1000);
             if (clip_s != INVALID_SOCKET) {
@@ -2004,7 +2004,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     setsockopt(clip_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
                     d->clip_socket = clip_s;
                     d->clip_recv_thread = CreateThread(NULL, 0, clip_recv_thread_proc, d, 0, NULL);
-                    idd_log(d, L"Clipboard writer connected + ready (GUID :0004).");
+                    idd_log(d, L"Clipboard writer connected + ready (GUID :0005).");
                 } else {
                     idd_log(d, L"Clipboard writer handshake failed - closing.");
                     closesocket(clip_s);
@@ -2012,7 +2012,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             }
         }
 
-        /* Ensure clipboard reader recv thread is running (:0005, guest→host).
+        /* Ensure clipboard reader recv thread is running (:0006, guest→host).
            The thread handles connecting on its own — the reader process runs as
            the logged-in user and may not be available yet at window creation. */
         if (!d->clip_reader_recv_thread) {
@@ -2439,7 +2439,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             /* Stop recv threads */
             d->stop = TRUE;
 
-            /* Wait for clipboard writer recv thread (:0004) */
+            /* Wait for clipboard writer recv thread (:0005) */
             if (d->clip_recv_thread) {
                 if (d->clip_socket != INVALID_SOCKET) {
                     closesocket(d->clip_socket);
@@ -2450,7 +2450,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 d->clip_recv_thread = NULL;
             }
 
-            /* Wait for clipboard reader recv thread (:0005) */
+            /* Wait for clipboard reader recv thread (:0006) */
             if (d->clip_reader_recv_thread) {
                 if (d->clip_reader_socket != INVALID_SOCKET) {
                     closesocket(d->clip_reader_socket);
