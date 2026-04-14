@@ -1,7 +1,5 @@
 /*
  * p9copy.c — Reusable 9P2000.L client for copying Plan9 shares via HvSocket.
- *
- * Extracted from tools/p9client/p9client.c for embedding in the agent service.
  * All state is local to each p9_copy_share() call (no globals except the logger).
  */
 

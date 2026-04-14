@@ -10,6 +10,7 @@ let editingCell = null; /* {row, col, element} */
 let pendingConfirm = null; /* {resolve} */
 let minSizeReported = false;
 let lastHostInfo = null;
+let rowCache = {};          /* vm.name -> <tr> — persistent rows so the status spinner doesn't reset on every update */
 
 /* ---- Collapsible sections ---- */
 function toggleSection(id) {
@@ -423,92 +424,108 @@ document.addEventListener('keydown', function(e) {
 
 /* ---- VM Table ---- */
 
-function renderVmTable() {
-    var tbody = document.getElementById('vm-tbody');
-    tbody.innerHTML = '';
+/* Update the status <td> in place. Preserves the spinner element across
+   updates so its CSS animation doesn't restart on every staging-file tick. */
+function updateStatusCell(td, vm) {
+    var needsSpinner = false;
+    var label = '';
+    var className = '';
 
-    if (vms.length === 0) {
-        var tr = document.createElement('tr');
-        var td = document.createElement('td');
-        td.colSpan = 17;
-        td.className = 'empty-state';
-        var btn = document.createElement('button');
-        btn.className = 'primary empty-state-btn';
-        btn.textContent = '+ Create your first sandbox';
-        btn.onclick = openCreateModal;
-        td.appendChild(btn);
-        tr.appendChild(td);
-        tbody.appendChild(tr);
-        return;
+    if (vm.buildingVhdx) {
+        needsSpinner = true;
+        label = vm.vhdxStaging ? 'Staging files... ' : 'Building Disk (' + (vm.vhdxProgress || 0) + '%) ';
+        className = 'status-building';
+    } else if (vm.running && vm.shuttingDown) {
+        className = 'status-shutting-down';
+        label = 'Shutting Down';
+    } else if (vm.running && vm.isTemplate) {
+        needsSpinner = true;
+        label = 'Building Template ';
+        className = 'status-building';
+    } else if (vm.running && !vm.installComplete && !vm.isTemplate) {
+        needsSpinner = true;
+        label = 'Installing Windows ';
+        className = 'status-building';
+    } else if (vm.running) {
+        className = 'status-running';
+        label = 'Running';
+    } else {
+        className = 'status-stopped';
+        label = 'Stopped';
     }
 
-    vms.forEach(function(vm, i) {
-        var tr = document.createElement('tr');
-        tr.className = (i === selectedVm ? 'selected ' : '') +
-                       (vm.running ? 'running' : 'stopped');
-        tr.onclick = function(e) {
-            if (e.target.closest('.icon-btn')) return;
-            if (e.target.closest('.editing')) return;
-            if (e.target.closest('.snap-cell')) return;
-            selectVm(i);
-        };
+    td.className = className;
 
-        /* Data cells */
-        tr.appendChild(makeCell(vm.name, i, 0));
-        tr.appendChild(makeCell(vm.osType, i, 1));
+    var existingSpinner = td.querySelector('.spinner');
 
-        var statusTd = document.createElement('td');
-        if (vm.buildingVhdx) {
-            statusTd.className = 'status-building';
-            var label = vm.vhdxStaging ? 'Staging files... ' : 'Building Disk (' + (vm.vhdxProgress || 0) + '%) ';
-            statusTd.appendChild(document.createTextNode(label));
+    if (needsSpinner) {
+        /* Drop any existing children except the spinner, then insert the new text
+           before it. The spinner stays in the document the whole time, so its
+           CSS animation clock isn't reset. */
+        if (existingSpinner) {
+            var child = td.firstChild;
+            while (child) {
+                var next = child.nextSibling;
+                if (child !== existingSpinner) td.removeChild(child);
+                child = next;
+            }
+            td.insertBefore(document.createTextNode(label), existingSpinner);
+        } else {
+            td.textContent = '';
+            td.appendChild(document.createTextNode(label));
             var spin = document.createElement('span');
             spin.className = 'spinner';
-            statusTd.appendChild(spin);
-        } else if (vm.running && vm.shuttingDown) {
-            statusTd.className = 'status-shutting-down';
-            statusTd.textContent = 'Shutting Down';
-        } else if (vm.running && vm.isTemplate) {
-            statusTd.className = 'status-building';
-            statusTd.innerHTML = 'Building Template <span class="spinner"></span>';
-        } else if (vm.running && !vm.installComplete && !vm.isTemplate) {
-            statusTd.className = 'status-building';
-            statusTd.innerHTML = 'Installing Windows <span class="spinner"></span>';
-        } else if (vm.running) {
-            statusTd.className = 'status-running';
-            statusTd.textContent = 'Running';
-        } else {
-            statusTd.className = 'status-stopped';
-            statusTd.textContent = 'Stopped';
+            td.appendChild(spin);
         }
-        tr.appendChild(statusTd);
+    } else {
+        /* No spinner needed — wipe and set plain text. Any existing spinner is
+           removed along with the old text. */
+        td.textContent = label;
+    }
+}
 
-        var agentTd = document.createElement('td');
-        var agentOff = !vm.running || vm.isTemplate;
-        var dotClass = 'agent-dot' + (vm.agentOnline ? ' online' : '') + (agentOff ? ' disabled' : '');
-        agentTd.innerHTML = '<span class="' + dotClass + '"></span>';
-        agentTd.title = vm.isTemplate
-            ? 'Templates do not run the in-VM agent'
-            : (!vm.running
-                ? 'VM is not running'
-                : (vm.agentOnline
-                    ? 'In-VM agent is connected — host can manage the guest'
-                    : 'In-VM agent is not connected'));
-        tr.appendChild(agentTd);
+/* Build the list of <td> cells for a row. The status cell is passed in and
+   updated in place (rather than recreated) so the spinner animation survives. */
+function buildRowCells(vm, i, statusTd) {
+    updateStatusCell(statusTd, vm);
 
-        tr.appendChild(makeCell(vm.cpuCores, i, 4, 'Number of virtual CPU cores assigned to this VM'));
-        tr.appendChild(makeCell(vm.ramMb + ' MB', i, 5, 'Memory allocated to this VM, in megabytes'));
-        tr.appendChild(makeCell(vm.hddGb + ' GB', i, 6, 'Virtual disk size, in gigabytes'));
-        tr.appendChild(makeCell(vm.gpuName || (vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7, 'GPU passed through to the VM via GPU-PV, or None'));
-        tr.appendChild(makeCell(netNames[vm.networkMode] || 'None', i, 8, 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'));
+    var agentTd = document.createElement('td');
+    var agentOff = !vm.running || vm.isTemplate;
+    var dotClass = 'agent-dot' + (vm.agentOnline ? ' online' : '') + (agentOff ? ' disabled' : '');
+    agentTd.innerHTML = '<span class="' + dotClass + '"></span>';
+    agentTd.title = vm.isTemplate
+        ? 'Templates do not run the in-VM agent'
+        : (!vm.running
+            ? 'VM is not running'
+            : (vm.agentOnline
+                ? 'In-VM agent is connected — host can manage the guest'
+                : 'In-VM agent is not connected'));
 
-        /* Snapshot dropdown cell */
-        tr.appendChild(makeSnapCell(vm, i));
+    var bld = vm.buildingVhdx;
+    var snapVal = selectedSnap[i] || 'current';
 
-        /* Action icons — disable all while VHDX is building */
-        var bld = vm.buildingVhdx;
-        var snapVal = selectedSnap[i] || 'current';
-        tr.appendChild(makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, (function(vmIdx, sv, vmObj) { return function() {
+    var sshActive = vm.sshEnabled && vm.sshState === 2 && vm.running && !bld;
+    var sshCell = makeIconCell('ssh', '>_', sshActive, (function(idx) { return function() { sendCmd('sshConnect', {vmIndex: idx}); }; })(i), !vm.sshEnabled ? 'hidden' : '');
+    if (vm.sshEnabled) {
+        var sshBtn = sshCell.querySelector('.icon-btn');
+        if (vm.sshState === 1) sshBtn.title = 'Installing OpenSSH in the guest...';
+        else if (vm.sshState === 2) sshBtn.title = 'Open an SSH terminal to the VM (localhost:' + vm.sshPort + ', tunneled over HvSocket)';
+        else if (vm.sshState === 3) sshBtn.title = 'SSH install failed';
+        else sshBtn.title = 'SSH: waiting for the in-VM agent to come online';
+    }
+
+    return [
+        makeCell(vm.name, i, 0),
+        makeCell(vm.osType, i, 1),
+        statusTd,
+        agentTd,
+        makeCell(vm.cpuCores, i, 4, 'Number of virtual CPU cores assigned to this VM'),
+        makeCell(vm.ramMb + ' MB', i, 5, 'Memory allocated to this VM, in megabytes'),
+        makeCell(vm.hddGb + ' GB', i, 6, 'Virtual disk size, in gigabytes'),
+        makeCell(vm.gpuName || (vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7, 'GPU passed through to the VM via GPU-PV, or None'),
+        makeCell(netNames[vm.networkMode] || 'None', i, 8, 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
+        makeSnapCell(vm, i),
+        makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, (function(vmIdx, sv, vmObj) { return function() {
             var p = parseSnapValue(sv);
             if ((p.snapIndex >= 0 || p.snapIndex === -2) && p.branchIndex < 0) {
                 /* Creating a new branch — prompt for name */
@@ -527,24 +544,90 @@ function renderVmTable() {
             } else {
                 sendCmd('startVm', { vmIndex: vmIdx, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
             }
-        }; })(i, snapVal, vm), '', 'Start the VM (boots from the selected snapshot/branch)'));
-        tr.appendChild(makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }, '', 'Open the VM display window (IDD virtual monitor)'));
-        var sshActive = vm.sshEnabled && vm.sshState === 2 && vm.running && !bld;
-        var sshCell = makeIconCell('ssh', '>_', sshActive, (function(idx) { return function() { sendCmd('sshConnect', {vmIndex: idx}); }; })(i), !vm.sshEnabled ? 'hidden' : '');
-        if (vm.sshEnabled) {
-            var sshBtn = sshCell.querySelector('.icon-btn');
-            if (vm.sshState === 1) sshBtn.title = 'Installing OpenSSH in the guest...';
-            else if (vm.sshState === 2) sshBtn.title = 'Open an SSH terminal to the VM (localhost:' + vm.sshPort + ', tunneled over HvSocket)';
-            else if (vm.sshState === 3) sshBtn.title = 'SSH install failed';
-            else sshBtn.title = 'SSH: waiting for the in-VM agent to come online';
-        }
-        tr.appendChild(sshCell);
-        tr.appendChild(makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'));
-        tr.appendChild(makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'));
-        tr.appendChild(makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'));
-        tr.appendChild(makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped'));
+        }; })(i, snapVal, vm), '', 'Start the VM (boots from the selected snapshot/branch)'),
+        makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }, '', 'Open the VM display window (IDD virtual monitor)'),
+        sshCell,
+        makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
+        makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
+        makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
+        makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped'),
+    ];
+}
 
+function renderVmTable() {
+    var tbody = document.getElementById('vm-tbody');
+
+    if (vms.length === 0) {
+        rowCache = {};
+        tbody.innerHTML = '';
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 17;
+        td.className = 'empty-state';
+        var btn = document.createElement('button');
+        btn.className = 'primary empty-state-btn';
+        btn.textContent = '+ Create your first sandbox';
+        btn.onclick = openCreateModal;
+        td.appendChild(btn);
+        tr.appendChild(td);
         tbody.appendChild(tr);
+        return;
+    }
+
+    /* Drop cached rows for VMs that no longer exist. */
+    var seen = {};
+    vms.forEach(function(vm) { seen[vm.name] = true; });
+    Object.keys(rowCache).forEach(function(name) {
+        if (!seen[name]) {
+            var stale = rowCache[name];
+            if (stale.parentNode) stale.parentNode.removeChild(stale);
+            delete rowCache[name];
+        }
+    });
+
+    /* Remove any non-cached tbody children (e.g. leftover empty-state row). */
+    var kids = Array.prototype.slice.call(tbody.children);
+    kids.forEach(function(c) {
+        var cached = false;
+        for (var n in rowCache) { if (rowCache[n] === c) { cached = true; break; } }
+        if (!cached) tbody.removeChild(c);
+    });
+
+    /* Build or update each row in order. */
+    vms.forEach(function(vm, i) {
+        var tr = rowCache[vm.name];
+        if (!tr) {
+            tr = document.createElement('tr');
+            rowCache[vm.name] = tr;
+        }
+
+        tr.className = (i === selectedVm ? 'selected ' : '') +
+                       (vm.running ? 'running' : 'stopped');
+        tr.onclick = function(e) {
+            if (e.target.closest('.icon-btn')) return;
+            if (e.target.closest('.editing')) return;
+            if (e.target.closest('.snap-cell')) return;
+            selectVm(i);
+        };
+
+        /* Reuse the existing status <td> so the spinner inside it is never
+           detached from the document — this is what keeps its CSS animation
+           from restarting when staging-file updates arrive. */
+        var statusTd = tr.children[2] || document.createElement('td');
+        var cells = buildRowCells(vm, i, statusTd);
+
+        for (var c = 0; c < cells.length; c++) {
+            var newCell = cells[c];
+            var oldCell = tr.children[c];
+            if (oldCell === newCell) continue;
+            if (oldCell) tr.replaceChild(newCell, oldCell);
+            else tr.appendChild(newCell);
+        }
+        while (tr.children.length > cells.length) tr.removeChild(tr.lastChild);
+
+        if (tbody.children[i] !== tr) {
+            tbody.insertBefore(tr, tbody.children[i] || null);
+        }
     });
 }
 

@@ -102,12 +102,10 @@ Output goes to `bin\Debug\` or `bin\Release\`. The post-build step copies `web/`
 | appsandbox-displays | .exe | Guest-side IDD frame sender |
 | appsandbox-clipboard | .exe | Guest-side clipboard writer (host to guest) |
 | appsandbox-clipboard-reader | .exe | Guest-side clipboard reader (guest to host) |
-| p9client | .exe | Standalone 9P2000.L client CLI. Not used at runtime — the agent embeds its own copy of this code (`p9copy`) for GPU driver file transfer. |
 | AppSandboxVDD | .sys | Indirect Display Driver (IddCx) — requires WDK. Builds with a self-signed certificate. |
 | AppSandboxVDD.Package | — | Driver package for AppSandboxVDD |
 | AppSandboxVAD | .sys | Virtual Audio Driver (WDM audio miniport) — speaker device in the guest. Requires WDK. |
 | VADPackage | — | Driver package for AppSandboxVAD |
-| test9p | .exe | 9P client test harness |
 
 AppSandbox depends on AppSandboxCore and agent. The solution has build dependencies configured.
 
