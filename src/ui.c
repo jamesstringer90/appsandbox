@@ -551,33 +551,205 @@ static void tray_add(HWND hwnd)
 
 static void tray_remove(void) { Shell_NotifyIconW(NIM_DELETE, &g_nid); }
 
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+
+/* ---- Themed tray menu ----
+ *
+ * HMENU is retained for layout + input handling, but every item is MF_OWNERDRAW
+ * so we can paint it in the same palette as the WebView2 front end
+ * (see web/style.css). A WH_CALLWNDPROC hook paints the outer frame dark
+ * via DWMWA_BORDER_COLOR (no-op on Win10 / pre-22H2). */
+
+#define TRAY_BG_COLOR       RGB(0x1e, 0x1e, 0x1e)  /* --bg */
+#define TRAY_SEL_COLOR      RGB(0x2a, 0x5a, 0x8a)  /* primary btn bg */
+#define TRAY_TEXT_COLOR     RGB(0xe6, 0xe6, 0xe6)  /* --text */
+#define TRAY_TEXT_DIM_COLOR RGB(0x88, 0x88, 0x88)  /* --text-dim */
+#define TRAY_SEP_COLOR      RGB(0x3e, 0x3e, 0x3e)  /* --ctrl-border */
+
+typedef struct {
+    wchar_t label[256];
+    BOOL    is_separator;
+    BOOL    is_header;    /* dim label used as a section heading */
+    BOOL    is_indented;  /* indent under a header */
+} TrayDrawItem;
+
+static TrayDrawItem g_tray_items[64];
+static int          g_tray_item_count;
+static HBRUSH       g_tray_bg_brush;
+
+static HFONT tray_get_font(void)
+{
+    static HFONT font = NULL;
+    if (!font) {
+        NONCLIENTMETRICSW ncm;
+        ZeroMemory(&ncm, sizeof(ncm));
+        ncm.cbSize = sizeof(ncm);
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
+            font = CreateFontIndirectW(&ncm.lfMenuFont);
+        if (!font) font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    }
+    return font;
+}
+
+static void tray_append(HMENU menu, UINT id, const wchar_t *label,
+                        BOOL is_separator, BOOL is_header, BOOL is_indented)
+{
+    TrayDrawItem *it;
+    UINT flags;
+    if (g_tray_item_count >= 64) return;
+
+    it = &g_tray_items[g_tray_item_count];
+    ZeroMemory(it, sizeof(*it));
+    if (label) wcscpy_s(it->label, 256, label);
+    it->is_separator = is_separator;
+    it->is_header    = is_header;
+    it->is_indented  = is_indented;
+
+    flags = MF_OWNERDRAW | (is_separator ? MF_SEPARATOR : 0);
+    AppendMenuW(menu, flags, id, (LPCWSTR)(UINT_PTR)g_tray_item_count);
+    g_tray_item_count++;
+}
+
+static void tray_handle_measure(MEASUREITEMSTRUCT *mis)
+{
+    TrayDrawItem *it;
+    HDC hdc;
+    HFONT old;
+    SIZE sz;
+
+    if (!mis || mis->CtlType != ODT_MENU) return;
+    if ((int)mis->itemData >= g_tray_item_count) return;
+
+    it = &g_tray_items[mis->itemData];
+    if (it->is_separator) {
+        mis->itemHeight = 7;
+        mis->itemWidth  = 0;
+        return;
+    }
+
+    hdc = GetDC(NULL);
+    old = (HFONT)SelectObject(hdc, tray_get_font());
+    GetTextExtentPoint32W(hdc, it->label, (int)wcslen(it->label), &sz);
+    SelectObject(hdc, old);
+    ReleaseDC(NULL, hdc);
+
+    mis->itemHeight = sz.cy + (it->is_header ? 6 : 10);
+    mis->itemWidth  = sz.cx + (it->is_indented ? 40 : 28);
+}
+
+static void tray_handle_draw(DRAWITEMSTRUCT *dis)
+{
+    TrayDrawItem *it;
+    RECT rc;
+    BOOL selected, grayed;
+    COLORREF bg, fg;
+    HBRUSH bg_brush;
+    HFONT old_font;
+    int indent;
+
+    if (!dis || dis->CtlType != ODT_MENU) return;
+    if ((int)dis->itemData >= g_tray_item_count) return;
+
+    it = &g_tray_items[dis->itemData];
+    rc = dis->rcItem;
+
+    if (it->is_separator) {
+        HPEN pen, old_pen;
+        int y;
+        bg_brush = CreateSolidBrush(TRAY_BG_COLOR);
+        FillRect(dis->hDC, &rc, bg_brush);
+        DeleteObject(bg_brush);
+        pen = CreatePen(PS_SOLID, 1, TRAY_SEP_COLOR);
+        old_pen = (HPEN)SelectObject(dis->hDC, pen);
+        y = (rc.top + rc.bottom) / 2;
+        MoveToEx(dis->hDC, rc.left + 14, y, NULL);
+        LineTo(dis->hDC, rc.right - 14, y);
+        SelectObject(dis->hDC, old_pen);
+        DeleteObject(pen);
+        return;
+    }
+
+    selected = (dis->itemState & ODS_SELECTED) && !(dis->itemState & ODS_GRAYED);
+    grayed   = (dis->itemState & ODS_GRAYED) != 0;
+
+    bg = selected ? TRAY_SEL_COLOR : TRAY_BG_COLOR;
+    fg = (grayed || it->is_header) ? TRAY_TEXT_DIM_COLOR : TRAY_TEXT_COLOR;
+
+    bg_brush = CreateSolidBrush(bg);
+    FillRect(dis->hDC, &rc, bg_brush);
+    DeleteObject(bg_brush);
+
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, fg);
+    old_font = (HFONT)SelectObject(dis->hDC, tray_get_font());
+
+    indent = it->is_indented ? 28 : 14;
+    rc.left += indent;
+    rc.right -= 14;
+    DrawTextW(dis->hDC, it->label, -1, &rc,
+              DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+
+    SelectObject(dis->hDC, old_font);
+}
+
+/* WH_CALLWNDPROC hook: catches messages sent to the popup menu window
+   (class "#32768") as TrackPopupMenu brings it up, and paints its border
+   the same color as the menu background so it visually disappears. */
+static LRESULT CALLBACK tray_menu_hook_proc(int code, WPARAM wp, LPARAM lp)
+{
+    if (code == HC_ACTION) {
+        CWPSTRUCT *cwp = (CWPSTRUCT *)lp;
+        wchar_t cls[16];
+        if (GetClassNameW(cwp->hwnd, cls, 16) > 0 && wcscmp(cls, L"#32768") == 0) {
+            COLORREF border = TRAY_BG_COLOR;
+            DwmSetWindowAttribute(cwp->hwnd, DWMWA_BORDER_COLOR,
+                                  &border, sizeof(border));
+        }
+    }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
 static void tray_show_menu(HWND hwnd)
 {
     HMENU menu = CreatePopupMenu();
     POINT pt;
     int i, cmd, count = asb_vm_count();
+    HHOOK hook;
+    MENUINFO mi;
 
-    AppendMenuW(menu, MF_STRING, TRAY_CMD_SHOW, L"Show App Sandbox");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    if (!g_tray_bg_brush) g_tray_bg_brush = CreateSolidBrush(TRAY_BG_COLOR);
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize  = sizeof(mi);
+    mi.fMask   = MIM_BACKGROUND;
+    mi.hbrBack = g_tray_bg_brush;
+    SetMenuInfo(menu, &mi);
+
+    g_tray_item_count = 0;
+
+    tray_append(menu, TRAY_CMD_SHOW, L"Show App Sandbox", FALSE, FALSE, FALSE);
+    tray_append(menu, 0,             NULL,                TRUE,  FALSE, FALSE);
 
     for (i = 0; i < count; i++) {
         VmInstance *v = asb_vm_instance(asb_vm_get(i));
-        wchar_t label[300];
         if (!v || !v->running) continue;
-        swprintf_s(label, 300, L"%s  ", v->name);
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, label);
-        AppendMenuW(menu, MF_STRING, TRAY_CMD_CONNECT_BASE + i,  L"    \U0001F4FA Connect");
-        AppendMenuW(menu, MF_STRING, TRAY_CMD_SHUTDOWN_BASE + i, L"    \u23FB Shutdown");
-        AppendMenuW(menu, MF_STRING, TRAY_CMD_STOP_BASE + i,     L"    \u2715 Force Stop");
-        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+        tray_append(menu, 0, v->name, FALSE, TRUE, FALSE);
+        tray_append(menu, TRAY_CMD_CONNECT_BASE + i,  L"\U0001F4FA  Connect",    FALSE, FALSE, TRUE);
+        tray_append(menu, TRAY_CMD_SHUTDOWN_BASE + i, L"\u23FB  Shutdown",       FALSE, FALSE, TRUE);
+        tray_append(menu, TRAY_CMD_STOP_BASE + i,     L"\u2715  Force Stop",     FALSE, FALSE, TRUE);
+        tray_append(menu, 0, NULL, TRUE, FALSE, FALSE);
     }
 
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, TRAY_CMD_EXIT, L"Exit");
+    tray_append(menu, TRAY_CMD_EXIT, L"Exit", FALSE, FALSE, FALSE);
 
     GetCursorPos(&pt);
     SetForegroundWindow(hwnd);
+
+    hook = SetWindowsHookExW(WH_CALLWNDPROC, tray_menu_hook_proc,
+                             NULL, GetCurrentThreadId());
     cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
+    if (hook) UnhookWindowsHookEx(hook);
     DestroyMenu(menu);
 
     if (cmd == TRAY_CMD_SHOW) {
@@ -995,6 +1167,20 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE:
         webview2_resize(hwnd);
         return 0;
+
+    case WM_MEASUREITEM:
+        if (((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_MENU) {
+            tray_handle_measure((MEASUREITEMSTRUCT *)lp);
+            return TRUE;
+        }
+        break;
+
+    case WM_DRAWITEM:
+        if (((DRAWITEMSTRUCT *)lp)->CtlType == ODT_MENU) {
+            tray_handle_draw((DRAWITEMSTRUCT *)lp);
+            return TRUE;
+        }
+        break;
 
     case WM_GETMINMAXINFO:
     {

@@ -4,7 +4,7 @@
  * Runs as the interactive USER (spawned by agent via WTSQueryUserToken)
  * so it can fully enumerate and read the user's clipboard.
  *
- * Listens on AF_HYPERV socket (GUID :0005) for the host IDD display to
+ * Listens on AF_HYPERV socket (GUID :0006) for the host IDD display to
  * connect.  Handles the guest->host clipboard direction:
  *   - Monitors clipboard via AddClipboardFormatListener
  *   - On WM_CLIPBOARDUPDATE: enumerates formats, sends FORMAT_LIST to host
@@ -12,7 +12,7 @@
  *     FORMAT_DATA_RESP (including FILE_DATA for CF_HDROP)
  *
  * Host->guest clipboard is handled separately by appsandbox-clipboard.exe
- * (SYSTEM, GUID :0004).
+ * (SYSTEM, GUID :0005).
  *
  * Logs to %TEMP%\clipboard-reader.log (user-writable).
  */
@@ -42,9 +42,9 @@ typedef struct _SOCKADDR_HV {
 static const GUID HV_GUID_WILDCARD =
     { 0, 0, 0, { 0, 0, 0, 0, 0, 0, 0, 0 } };
 
-/* Clipboard reader channel: {A5B0CAFE-0005-4000-8000-000000000001} */
+/* Clipboard reader channel: {A5B0CAFE-0006-4000-8000-000000000001} */
 static const GUID CLIPBOARD_READER_SERVICE_GUID =
-    { 0xa5b0cafe, 0x0005, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
+    { 0xa5b0cafe, 0x0006, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
 /* ---- Clipboard protocol (must match host-side vm_display_idd.c) ---- */
 
@@ -615,7 +615,7 @@ int main(void)
         return 1;
     }
 
-    reader_log("Listening on GUID a5b0cafe-0005-4000-8000-000000000001.");
+    reader_log("Listening on GUID a5b0cafe-0006-4000-8000-000000000001.");
 
     /* Accept loop — one client at a time */
     for (;;) {

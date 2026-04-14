@@ -3,7 +3,7 @@
  *
  * For each VM with ssh_enabled, binds 127.0.0.1:<ephemeral> and relays
  * TCP connections to the guest agent's SSH proxy thread over AF_HYPERV
- * service GUID :0006.
+ * service GUID :0007.
  */
 
 #include <winsock2.h>
@@ -28,7 +28,7 @@ typedef struct _SOCKADDR_HV {
 } SOCKADDR_HV;
 
 static const GUID SSH_SERVICE_GUID =
-    { 0xa5b0cafe, 0x0006, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
+    { 0xa5b0cafe, 0x0007, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
 /* ---- Per-VM proxy state ---- */
 
