@@ -198,7 +198,9 @@ static void notify_agent_status(VmInstance *vm)
 
 /* Process an untagged (async) message from the agent.
    Returns: 0 = handled, 1 = os_shutdown (caller should break),
-            2 = service_stopping (caller should stop). */
+            2 = service_stopping (caller should break and let the reconnect
+                loop retry — SCM restarts the service on failure, so we must
+                keep trying to reconnect). */
 static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
 {
     if (strcmp(buf, "heartbeat") == 0) {
@@ -465,8 +467,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             if (n <= 0) break; /* connection lost */
 
             { int rc = process_async_message(vm, s, buf);
-              if (rc == 1) break;              /* os_shutdown */
-              if (rc == 2) { conn->stop = TRUE; break; }  /* service_stopping */
+              if (rc == 1 || rc == 2) break;   /* os_shutdown or service_stopping — reconnect loop will retry */
             }
         }
 
