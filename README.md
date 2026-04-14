@@ -34,7 +34,9 @@ App Sandbox is the successor to [Easy-GPU-PV](https://github.com/jamesstringerpa
 - **GPU-PV** — the host GPU is shared with the VM. DirectX and CUDA work inside the guest.
 - **Display** — a custom Indirect Display Driver (IDD) in the guest streams the framebuffer to the host over Hyper-V sockets. Only dirty rectangles are transmitted. The host renders with D3D11.
 - **Clipboard** — bidirectional clipboard sharing supporting text, files, images, and other formats.
+- **Audio** — a virtual speaker device (AppSandboxVAD) inside the guest streams audio back to the host.
 - **Networking** — none, NAT, external, or internal. NAT mode allocates static IPs and configures the guest automatically. External mode connects the VM to a physical adapter on the host — the VM gets a DHCP lease from your router and has access to your local network.
+- **SSH** — optionally install OpenSSH Server in the guest. The host exposes it on a local TCP port via a Hyper-V socket proxy, so `ssh` works without networking configured.
 - **Snapshots** — save VM state and create differencing disks. Snapshots support branching — multiple independent working copies from the same point.
 - **Templates** — mark a VM as a template at creation time. Windows installs, syspreps, and shuts down automatically. New VMs created from that template skip the image extraction phase and start from OOBE, reducing setup time.
 - **Guest agent** — runs inside the VM. Handles heartbeat, graceful shutdown, IP configuration, and GPU driver updates. Launches subprocesses for input injection and clipboard sync.
@@ -100,12 +102,14 @@ Output goes to `bin\Debug\` or `bin\Release\`. The post-build step copies `web/`
 | appsandbox-displays | .exe | Guest-side IDD frame sender |
 | appsandbox-clipboard | .exe | Guest-side clipboard writer (host to guest) |
 | appsandbox-clipboard-reader | .exe | Guest-side clipboard reader (guest to host) |
-| p9client | .exe | 9P filesystem client for file sharing |
+| p9client | .exe | Standalone 9P2000.L client CLI. Not used at runtime — the agent embeds its own copy of this code (`p9copy`) for GPU driver file transfer. |
 | AppSandboxVDD | .sys | Indirect Display Driver (IddCx) — requires WDK. Builds with a self-signed certificate. |
 | AppSandboxVDD.Package | — | Driver package for AppSandboxVDD |
+| AppSandboxVAD | .sys | Virtual Audio Driver (WDM audio miniport) — speaker device in the guest. Requires WDK. |
+| VADPackage | — | Driver package for AppSandboxVAD |
 | test9p | .exe | 9P client test harness |
 
-AppSandbox depends on AppSandboxCore, agent, and p9client. The solution has build dependencies configured.
+AppSandbox depends on AppSandboxCore and agent. The solution has build dependencies configured.
 
 ## How it works
 
