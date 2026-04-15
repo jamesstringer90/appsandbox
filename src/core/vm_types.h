@@ -43,6 +43,7 @@ typedef struct CoreVmInfo {
     char        name[CORE_VM_NAME_MAX];
     char        os_type[CORE_VM_OS_TYPE_MAX];
     int         running;
+    int         shutting_down;
     int         ram_mb;
     int         hdd_gb;
     int         cpu_cores;

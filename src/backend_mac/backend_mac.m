@@ -32,6 +32,7 @@
 static NSMutableDictionary<NSString *, VzVm *> *g_vms;            /* running VMs */
 static NSMutableDictionary<NSString *, VzDisplayWindow *> *g_displays;
 static NSMutableDictionary<NSString *, NSDictionary *> *g_installing; /* name -> {progress, stage} */
+static NSMutableSet<NSString *> *g_shuttingDown;
 static CoreVmEventCallback g_event_cb;
 static void *g_event_user_data;
 
@@ -62,6 +63,39 @@ static void post_log(NSString *msg) {
 
 static void post_alert(NSString *vmName, NSString *msg) {
     post_event(CORE_VM_EVENT_ALERT, vmName, 0, msg);
+}
+
+static NSString *vzStateString(VZVirtualMachineState state) {
+    switch (state) {
+        case VZVirtualMachineStateStopped:   return @"Stopped";
+        case VZVirtualMachineStateRunning:   return @"Running";
+        case VZVirtualMachineStateStarting:  return @"Starting";
+        case VZVirtualMachineStatePausing:   return @"Pausing";
+        case VZVirtualMachineStatePaused:    return @"Paused";
+        case VZVirtualMachineStateResuming:  return @"Resuming";
+        case VZVirtualMachineStateStopping:  return @"Stopping";
+        case VZVirtualMachineStateError:     return @"Error";
+        default:                             return @"Unknown";
+    }
+}
+
+static void handle_vm_state_change(NSString *name, VZVirtualMachineState state) {
+    post_log([NSString stringWithFormat:@"[%@] State: %@", name, vzStateString(state)]);
+
+    if (state == VZVirtualMachineStateStopping) {
+        [g_shuttingDown addObject:name];
+        post_list_changed();
+    } else if (state == VZVirtualMachineStateStopped) {
+        [g_shuttingDown removeObject:name];
+        [g_displays removeObjectForKey:name];
+        [g_vms removeObjectForKey:name];
+        post_state_changed(name, NO);
+        post_list_changed();
+    } else if (state == VZVirtualMachineStateRunning) {
+        [g_shuttingDown removeObject:name];
+        post_state_changed(name, YES);
+        post_list_changed();
+    }
 }
 
 static void post_list_changed(void) {
@@ -106,9 +140,10 @@ static void finish_install(NSString *name, NSError *error) {
 
 static int backend_mac_init(void) {
     run_on_main(^{
-        if (!g_vms)        g_vms = [NSMutableDictionary dictionary];
-        if (!g_displays)   g_displays = [NSMutableDictionary dictionary];
-        if (!g_installing) g_installing = [NSMutableDictionary dictionary];
+        if (!g_vms)          g_vms = [NSMutableDictionary dictionary];
+        if (!g_displays)     g_displays = [NSMutableDictionary dictionary];
+        if (!g_installing)   g_installing = [NSMutableDictionary dictionary];
+        if (!g_shuttingDown) g_shuttingDown = [NSMutableSet set];
     });
     return BACKEND_OK;
 }
@@ -118,6 +153,7 @@ static void backend_mac_cleanup(void) {
         g_vms = nil;
         g_displays = nil;
         g_installing = nil;
+        g_shuttingDown = nil;
         g_event_cb = NULL;
         g_event_user_data = NULL;
     });
@@ -249,24 +285,28 @@ static int backend_mac_start_vm(const char *name) {
             post_alert(n, @"VM is already running");
             return;
         }
+        post_log([NSString stringWithFormat:@"[%@] Loading VM configuration...", n]);
         NSError *err = nil;
         VzVm *vm = [VzVm loadVmNamed:n error:&err];
         if (!vm) {
+            post_log([NSString stringWithFormat:@"[%@] Load failed: %@", n,
+                       err ? err.localizedDescription : @"unknown"]);
             post_alert(n, [NSString stringWithFormat:@"Load failed: %@",
                            err ? err.localizedDescription : @"unknown"]);
             return;
         }
         g_vms[n] = vm;
+        vm.onStateChange = ^(VZVirtualMachineState state) {
+            handle_vm_state_change(n, state);
+        };
         [vm startWithCompletion:^(NSError * _Nullable startErr) {
             run_on_main(^{
                 if (startErr) {
                     [g_vms removeObjectForKey:n];
+                    post_log([NSString stringWithFormat:@"[%@] Start failed: %@", n, startErr.localizedDescription]);
                     post_alert(n, [NSString stringWithFormat:@"Start failed: %@",
                                    startErr.localizedDescription]);
                     post_state_changed(n, NO);
-                    post_list_changed();
-                } else {
-                    post_state_changed(n, YES);
                     post_list_changed();
                 }
             });
@@ -284,24 +324,19 @@ static int backend_mac_stop_vm(const char *name, int force) {
         VzVm *vm = g_vms[n];
         if (!vm) { rc = BACKEND_ERR_NOT_RUNNING; return; }
 
-        void (^onDone)(NSError *) = ^(NSError * _Nullable stopErr) {
+        void (^onError)(NSError *) = ^(NSError * _Nullable stopErr) {
+            if (!stopErr) return;
             run_on_main(^{
-                if (stopErr) {
-                    post_alert(n, [NSString stringWithFormat:@"Stop failed: %@",
-                                   stopErr.localizedDescription]);
-                    return;
-                }
-                [g_displays removeObjectForKey:n];
-                [g_vms removeObjectForKey:n];
-                post_state_changed(n, NO);
-                post_list_changed();
+                post_log([NSString stringWithFormat:@"[%@] Stop failed: %@", n, stopErr.localizedDescription]);
+                post_alert(n, [NSString stringWithFormat:@"Stop failed: %@",
+                               stopErr.localizedDescription]);
             });
         };
 
         if (force) {
-            [vm stopWithCompletion:onDone];
+            [vm stopWithCompletion:onError];
         } else {
-            [vm requestStopWithCompletion:onDone];
+            [vm requestStopWithCompletion:onError];
         }
     });
     return rc;
@@ -314,13 +349,16 @@ static int backend_mac_delete_vm(const char *name) {
     __block int rc = BACKEND_OK;
     run_on_main(^{
         if (g_vms[n]) { rc = BACKEND_ERR_ALREADY_RUNNING; return; }
+        post_log([NSString stringWithFormat:@"[%@] Deleting VM...", n]);
         [g_installing removeObjectForKey:n];
         NSError *err = nil;
         if (![VmDir deleteVm:n error:&err]) {
+            post_log([NSString stringWithFormat:@"[%@] Delete failed: %@", n, err.localizedDescription]);
             post_alert(n, [NSString stringWithFormat:@"Delete failed: %@", err.localizedDescription]);
             rc = BACKEND_ERR_FAILED;
             return;
         }
+        post_log([NSString stringWithFormat:@"[%@] VM deleted", n]);
         post_list_changed();
     });
     return rc;
@@ -342,6 +380,7 @@ static int backend_mac_list_vms(CoreVmInfo *out, int max_count, int *out_count) 
             strlcpy(info->os_type, "macOS", sizeof(info->os_type));
 
             info->running = g_vms[name] != nil ? 1 : 0;
+            info->shutting_down = [g_shuttingDown containsObject:name] ? 1 : 0;
 
             NSDictionary *cfgDict = [VmDir readConfigFor:name];
             info->ram_mb = [cfgDict[@"ramMb"] intValue];
