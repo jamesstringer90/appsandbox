@@ -12,6 +12,8 @@
 
 #import <Foundation/Foundation.h>
 
+NS_ASSUME_NONNULL_BEGIN
+
 @interface VmDir : NSObject
 
 + (NSURL *)vmsRootDirectory;
@@ -32,3 +34,5 @@
 + (BOOL)writeConfig:(NSDictionary *)config for:(NSString *)name error:(NSError **)error;
 
 @end
+
+NS_ASSUME_NONNULL_END
