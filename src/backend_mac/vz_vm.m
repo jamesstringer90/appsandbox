@@ -27,9 +27,9 @@ static VZVirtioSoundDeviceConfiguration *BuildAudio(BOOL withInput) {
 static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
     VZMacGraphicsDeviceConfiguration *gfx = [[VZMacGraphicsDeviceConfiguration alloc] init];
     gfx.displays = @[[[VZMacGraphicsDisplayConfiguration alloc]
-                          initWithWidthInPixels:1920
-                                 heightInPixels:1080
-                                  pixelsPerInch:80]];
+                          initWithWidthInPixels:2560
+                                 heightInPixels:1600
+                                  pixelsPerInch:144]];
     return gfx;
 }
 
