@@ -59,10 +59,17 @@ var hostBridge = (function() {
         }
     }
 
-    return { send: send, isWebView2: isWebView2, isWKWebView: isWKWebView };
+    return { send: send, isWebView2: isWebView2, isWKWebView: isWKWebView, isMac: isWKWebView };
 })();
 
 function sendCmd(action, data) { hostBridge.send(action, data); }
+
+/* Hide Windows-only form fields when running on macOS. */
+if (hostBridge.isMac) {
+    var winOnly = document.querySelectorAll('.win-only');
+    for (var i = 0; i < winOnly.length; i++) winOnly[i].style.display = 'none';
+    document.getElementById('os-type').value = 'macOS';
+}
 
 /* Unified dispatch. Native code on either platform calls
  * window.onHostMessage(obj) with an already-parsed object. WebView2 also
@@ -271,7 +278,7 @@ function onBrowseResult(path) {
 function updateCreateButtons() {
     var hasImage = document.getElementById('image-path').value.trim() !== '';
     var hasTpl = document.getElementById('template-select').value !== '';
-    document.getElementById('btn-create').disabled = !(hasImage || hasTpl);
+    document.getElementById('btn-create').disabled = hostBridge.isMac ? false : !(hasImage || hasTpl);
     document.getElementById('btn-create-template').disabled = !hasImage;
 }
 
@@ -359,7 +366,7 @@ function clearCreateForm() {
 
 function validateVmName(name) {
     if (!name) return 'VM name is required.';
-    if (name.length > 15) return 'VM name cannot exceed 15 characters (NetBIOS limit).';
+    if (!hostBridge.isMac && name.length > 15) return 'VM name cannot exceed 15 characters (NetBIOS limit).';
     if (/[^a-zA-Z0-9-]/.test(name)) return 'VM name can only contain letters, digits, and hyphens.';
     if (/^\d+$/.test(name)) return 'VM name cannot be only digits.';
     if (name.startsWith('-') || name.endsWith('-')) return 'VM name cannot start or end with a hyphen.';
@@ -390,11 +397,13 @@ function onCreateVm() {
     var cfg = gatherConfig();
     var nameErr = validateVmName(cfg.name);
     if (nameErr) { sendCmd('log', { message: nameErr }); return; }
-    var userErr = validateUsername(cfg.adminUser);
-    if (userErr) { sendCmd('log', { message: userErr }); return; }
-    if (cfg.adminPass !== cfg.adminConfirm) {
-        sendCmd('log', { message: 'Passwords do not match.' });
-        return;
+    if (!hostBridge.isMac) {
+        var userErr = validateUsername(cfg.adminUser);
+        if (userErr) { sendCmd('log', { message: userErr }); return; }
+        if (cfg.adminPass !== cfg.adminConfirm) {
+            sendCmd('log', { message: 'Passwords do not match.' });
+            return;
+        }
     }
     sendCmd('createVm', cfg);
     clearCreateForm();

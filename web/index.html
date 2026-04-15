@@ -69,15 +69,15 @@
                 <span class="field-warn" id="vm-name-warn"></span>
             </div>
 
-            <label for="os-type">OS Type:</label>
-            <div class="form-row">
+            <label for="os-type" class="win-only">OS Type:</label>
+            <div class="form-row win-only">
                 <select id="os-type">
                     <option value="Windows" selected>Windows</option>
                 </select>
             </div>
 
-            <label>OS Image:</label>
-            <div class="image-row">
+            <label class="win-only">OS Image:</label>
+            <div class="image-row win-only">
                 <input type="text" id="image-path" placeholder="Path to ISO or VHDX...">
                 <button id="btn-browse" onclick="sendCmd('browseImage')">Browse...</button>
                 <span class="or-separator">OR</span>
@@ -107,8 +107,8 @@
                 <span class="host-info" id="host-cpu"></span>
             </div>
 
-            <label for="gpu-mode">GPU:</label>
-            <div class="form-row">
+            <label for="gpu-mode" class="win-only">GPU:</label>
+            <div class="form-row win-only">
                 <select id="gpu-mode">
                     <option value="0">None</option>
                     <option value="1" selected>Default GPU</option>
@@ -127,29 +127,29 @@
                 <select id="net-adapter"></select>
             </div>
 
-            <label>Username:</label>
-            <div class="cred-row">
+            <label class="win-only">Username:</label>
+            <div class="cred-row win-only">
                 <input type="text" id="admin-user" value="User" class="input-md">
                 <span class="field-warn" id="admin-user-warn"></span>
             </div>
 
-            <label>Password:</label>
-            <div class="cred-row">
+            <label class="win-only">Password:</label>
+            <div class="cred-row win-only">
                 <input type="password" id="admin-pass" value="test123">
                 <label>Confirm:</label>
                 <input type="password" id="admin-confirm" value="test123">
                 <span class="toggle-pass" onmousedown="showPassword()" onmouseup="hidePassword()" onmouseleave="hidePassword()">&#x1F441;</span>
             </div>
 
-            <label>Options:</label>
-            <div class="form-row">
+            <label class="win-only">Options:</label>
+            <div class="form-row win-only">
                 <label title="Disables Secure Boot — required for test-signed VDD driver"><input type="checkbox" id="test-mode" checked> Test Mode</label>
                 <label title="Installs OpenSSH Server, tunnelled over HV socket"><input type="checkbox" id="ssh-enabled"> SSH Server</label>
             </div>
         </div>
         <div class="modal-buttons">
             <button onclick="closeCreateModal()">Cancel</button>
-            <button id="btn-create-template" disabled onclick="onCreateTemplate()">Build Template</button>
+            <button id="btn-create-template" class="win-only" disabled onclick="onCreateTemplate()">Build Template</button>
             <button id="btn-create" class="primary" disabled onclick="onCreateVm()">Create Sandbox</button>
         </div>
     </div>
