@@ -29,14 +29,47 @@ function toggleSection(id) {
 
 const netNames = ['None', 'NAT', 'External', 'Internal'];
 
-/* ---- Message bridge ---- */
+/* ---- Message bridge ----
+ *
+ * Two host environments are supported:
+ *   - WebView2 on Windows  (window.chrome.webview)
+ *   - WKWebView on macOS   (window.webkit.messageHandlers.host)
+ *
+ * Native code on both platforms calls window.onHostMessage(obj) with a
+ * parsed message object; the JS side only sees one uniform surface. On
+ * Windows we keep using the native chrome.webview event path because it
+ * is the existing, tested route — onHostMessage is simply wired into the
+ * same listener.
+ */
 
-function sendCmd(action, data) {
-    window.chrome.webview.postMessage(Object.assign({ action: action }, data || {}));
-}
+var hostBridge = (function() {
+    var isWebView2 = !!(window.chrome && window.chrome.webview);
+    var isWKWebView = !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.host);
 
-window.chrome.webview.addEventListener('message', function(event) {
-    var msg = event.data;
+    function send(action, data) {
+        var msg = Object.assign({ action: action }, data || {});
+        if (isWebView2) {
+            window.chrome.webview.postMessage(msg);
+        } else if (isWKWebView) {
+            /* WKWebView only accepts JSON-serializable values; strings round-trip
+             * most reliably so we hand the native side the raw JSON text. */
+            window.webkit.messageHandlers.host.postMessage(JSON.stringify(msg));
+        } else {
+            console.warn('[hostBridge] no native host available; dropping', msg);
+        }
+    }
+
+    return { send: send, isWebView2: isWebView2, isWKWebView: isWKWebView };
+})();
+
+function sendCmd(action, data) { hostBridge.send(action, data); }
+
+/* Unified dispatch. Native code on either platform calls
+ * window.onHostMessage(obj) with an already-parsed object. WebView2 also
+ * delivers messages through chrome.webview.addEventListener('message'),
+ * which we route into the same handler so both paths end up in one place. */
+window.onHostMessage = function(msg) {
+    if (!msg || typeof msg !== 'object') return;
     switch (msg.type) {
         case 'fullState':     onFullState(msg); break;
         case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); break;
@@ -54,7 +87,15 @@ window.chrome.webview.addEventListener('message', function(event) {
         case 'prereqProgress': onPrereqProgress(msg); break;
         case 'prereqResult':   onPrereqResult(msg); break;
     }
-});
+};
+
+/* WebView2 delivers events as DOM CustomEvents; forward them into
+ * window.onHostMessage so both transports converge on the same handler. */
+if (hostBridge.isWebView2) {
+    window.chrome.webview.addEventListener('message', function(event) {
+        window.onHostMessage(event.data);
+    });
+}
 
 /* ---- Initial state ---- */
 
@@ -444,7 +485,9 @@ function updateStatusCell(td, vm) {
         className = 'status-building';
     } else if (vm.running && !vm.installComplete && !vm.isTemplate) {
         needsSpinner = true;
-        label = 'Installing Windows ';
+        label = (vm.installStatus && vm.installStatus.length > 0)
+            ? (vm.installStatus + ' ')
+            : ((vm.osType === 'macOS' ? 'Installing macOS ' : 'Installing Windows '));
         className = 'status-building';
     } else if (vm.running) {
         className = 'status-running';
