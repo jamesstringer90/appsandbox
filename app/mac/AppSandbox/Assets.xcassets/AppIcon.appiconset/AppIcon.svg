@@ -1,0 +1,210 @@
+<svg width="100%" height="100%" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Sandbox Wood Gradients -->
+    <linearGradient id="woodTop" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FCD34D" /> <!-- Amber 300 -->
+      <stop offset="100%" stop-color="#F59E0B" /> <!-- Amber 500 -->
+    </linearGradient>
+    
+    <linearGradient id="woodFrontLeft" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#D97706" /> <!-- Amber 600 -->
+      <stop offset="100%" stop-color="#B45309" /> <!-- Amber 700 -->
+    </linearGradient>
+
+    <linearGradient id="woodFrontRight" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#B45309" /> <!-- Amber 700 -->
+      <stop offset="100%" stop-color="#92400E" /> <!-- Amber 800 -->
+    </linearGradient>
+
+    <linearGradient id="woodInside" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#78350F" /> <!-- Amber 900 -->
+      <stop offset="100%" stop-color="#451A03" /> <!-- Amber 950 -->
+    </linearGradient>
+
+    <!-- Sand Gradients -->
+    <linearGradient id="sandGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FDE047" /> <!-- Yellow 300 -->
+      <stop offset="100%" stop-color="#FACC15" /> <!-- Yellow 400 -->
+    </linearGradient>
+
+    <!-- App Block Gradients (GUI App) -->
+    <linearGradient id="app1Top" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#93C5FD" />
+      <stop offset="100%" stop-color="#60A5FA" />
+    </linearGradient>
+    <linearGradient id="app1Left" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#3B82F6" />
+      <stop offset="100%" stop-color="#2563EB" />
+    </linearGradient>
+    <linearGradient id="app1Right" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#2563EB" />
+      <stop offset="100%" stop-color="#1D4ED8" />
+    </linearGradient>
+
+    <!-- AI Terminal Block Gradients -->
+    <linearGradient id="app2Top" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6EE7B7" />
+      <stop offset="100%" stop-color="#34D399" />
+    </linearGradient>
+    <linearGradient id="app2Left" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#059669" />
+      <stop offset="100%" stop-color="#047857" />
+    </linearGradient>
+    <linearGradient id="app2Right" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#10B981" />
+      <stop offset="100%" stop-color="#059669" />
+    </linearGradient>
+  </defs>
+
+  <!-- Transparent Background for Taskbar Icon -->
+  <rect width="512" height="512" fill="transparent" />
+
+  <!-- Master Group with subtle Y-shift to center the isometric perspective -->
+  <g transform="translate(0, 30)">
+    
+    <!-- Base Drop Shadow -->
+    <ellipse cx="256" cy="400" rx="220" ry="30" fill="rgba(0,0,0,0.15)" filter="blur(4px)" />
+
+    <!-- ========================================== -->
+    <!-- 1. BACKGROUND FRAME (BACK RIMS & SAND)     -->
+    <!-- ========================================== -->
+    <!-- Drawn first so the back walls and sand live perfectly under the apps -->
+    <g stroke-linejoin="round" stroke-linecap="round">
+      
+      <!-- Back Top Rims (Split so they stay behind the tall apps) -->
+      <polygon points="256,120 48,224 88,224 256,140" fill="url(#woodTop)" stroke="url(#woodTop)" stroke-width="8" />
+      <polygon points="256,120 464,224 424,224 256,140" fill="url(#woodTop)" stroke="url(#woodTop)" stroke-width="8" />
+
+      <!-- Back Inside Walls -->
+      <polygon points="256,140 88,224 88,248 256,164" fill="url(#woodInside)" stroke="url(#woodInside)" stroke-width="8" />
+      <polygon points="256,140 424,224 424,248 256,164" fill="#692b0a" stroke="#692b0a" stroke-width="8" />
+
+      <!-- Sand Surface (Now uniform darker color, shadow removed) -->
+      <polygon points="256,164 424,248 256,332 88,248" fill="url(#sandGrad)" stroke="url(#sandGrad)" stroke-width="8" />
+      
+    </g>
+
+    <!-- ========================================== -->
+    <!-- 2. SAND TEXTURE (Behind the apps)          -->
+    <!-- ========================================== -->
+    <!-- Sand texture dots strictly placed inside the sand polygon and drawn before apps -->
+    <g fill="#A16207" opacity="0.5">
+      <circle cx="256" cy="200" r="3" />
+      <circle cx="200" cy="230" r="2.5" />
+      <circle cx="320" cy="220" r="2" />
+      <circle cx="150" cy="235" r="2.5" />
+      <circle cx="380" cy="235" r="2" />
+      <circle cx="256" cy="280" r="3" />
+      <circle cx="220" cy="270" r="2.5" />
+      <circle cx="300" cy="270" r="2.5" />
+      <circle cx="170" cy="250" r="2" />
+      <circle cx="350" cy="250" r="2" />
+    </g>
+
+    <!-- ========================================== -->
+    <!-- 3. TOY APP BLOCKS (Sunken into the sand)   -->
+    <!-- ========================================== -->
+    
+    <g stroke-linejoin="round" stroke-linecap="round" stroke-width="2">
+      
+      <!-- LEFT APP (Main GUI App - Blue Block) -->
+      <!-- Moved higher and slightly left -->
+      <g transform="translate(135, 135) scale(1.5)">
+        <g stroke="#1D4ED8">
+          <!-- Top Face -->
+          <polygon points="0,0 48,24 64,16 16,-8" fill="url(#app1Top)" />
+          <!-- Front Right Face (Side) -->
+          <polygon points="48,88 64,80 64,16 48,24" fill="url(#app1Right)" />
+          <!-- Front Left Face (Main UI) -->
+          <polygon points="0,64 48,88 48,24 0,0" fill="url(#app1Left)" />
+        </g>
+        
+        <!-- Left App UI Details (Mapped isometrically to face) -->
+        <g transform="matrix(1, 0.5, 0, 1, 0, 0)">
+          <!-- Screen Background -->
+          <rect x="4" y="4" width="40" height="56" rx="4" fill="#FFFFFF" stroke="none" />
+          <!-- Top Window Bar -->
+          <path d="M 4,8 Q 4,4 8,4 L 40,4 Q 44,4 44,8 L 44,16 L 4,16 Z" fill="#BFDBFE" stroke="none" />
+          <!-- Toy Window Buttons -->
+          <circle cx="10" cy="10" r="2.5" fill="#EF4444" stroke="none" />
+          <circle cx="17" cy="10" r="2.5" fill="#FACC15" stroke="none" />
+          <circle cx="24" cy="10" r="2.5" fill="#22C55E" stroke="none" />
+          <!-- App Content Lines -->
+          <rect x="10" y="24" width="24" height="6" rx="3" fill="#E2E8F0" stroke="none" />
+          <rect x="10" y="34" width="14" height="6" rx="3" fill="#E2E8F0" stroke="none" />
+          <rect x="10" y="44" width="20" height="6" rx="3" fill="#E2E8F0" stroke="none" />
+        </g>
+      </g>
+
+
+      <!-- RIGHT APP (AI Terminal App - Green Block) -->
+      <!-- Maintains right position -->
+      <g transform="translate(290, 170) scale(1.5)">
+        <g stroke="#047857">
+          <!-- Top Face -->
+          <polygon points="-16,-8 0,0 48,-24 32,-32" fill="url(#app2Top)" />
+          <!-- Front Left Face (Side) -->
+          <polygon points="-16,56 0,64 0,0 -16,-8" fill="url(#app2Left)" />
+          <!-- Front Right Face (Main UI) -->
+          <polygon points="0,64 48,40 48,-24 0,0" fill="url(#app2Right)" />
+        </g>
+
+        <!-- Right App UI Details (Mapped isometrically to face) -->
+        <g transform="matrix(1, -0.5, 0, 1, 0, 0)">
+          <!-- Screen Background -->
+          <rect x="4" y="4" width="40" height="56" rx="4" fill="#064E3B" stroke="none" />
+          <!-- Top Window Bar -->
+          <path d="M 4,8 Q 4,4 8,4 L 40,4 Q 44,4 44,8 L 44,16 L 4,16 Z" fill="#047857" stroke="none" />
+          <circle cx="38" cy="10" r="2.5" fill="#10B981" stroke="none" />
+          <!-- Terminal Text Prompt ( >_ ) -->
+          <path d="M 10,24 L 14,28 L 10,32" stroke="#34D399" stroke-width="2.5" fill="none" />
+          <rect x="18" y="28" width="6" height="4" fill="#34D399" stroke="none" />
+          <!-- AI Node detail -->
+          <circle cx="14" cy="46" r="3" fill="#10B981" stroke="none" />
+          <circle cx="24" cy="46" r="3" fill="#10B981" stroke="none" />
+          <line x1="17" y1="46" x2="21" y2="46" stroke="#10B981" stroke-width="1.5" />
+        </g>
+      </g>
+
+    </g>
+
+    <!-- ========================================== -->
+    <!-- 4. SAND MOUNDS (Burying the app bases)     -->
+    <!-- ========================================== -->
+    
+    <!-- Mounds around Left App (Blue) -->
+    <g fill="#FDE047">
+      <ellipse cx="145" cy="238" rx="22" ry="11" /> <!-- Left corner -->
+      <ellipse cx="176" cy="254" rx="28" ry="14" /> <!-- Left edge -->
+      <ellipse cx="207" cy="268" rx="30" ry="15" /> <!-- Bottom tip -->
+      <ellipse cx="231" cy="257" rx="20" ry="10" /> <!-- Right corner -->
+    </g>
+    
+    <!-- Mounds around Right App (Green) -->
+    <g fill="#FDE047">
+      <ellipse cx="266" cy="256" rx="20" ry="10" /> <!-- Left corner -->
+      <ellipse cx="290" cy="268" rx="30" ry="15" /> <!-- Bottom tip -->
+      <ellipse cx="326" cy="250" rx="28" ry="14" /> <!-- Right edge -->
+      <ellipse cx="362" cy="232" rx="22" ry="11" /> <!-- Right corner -->
+    </g>
+
+    <!-- ========================================== -->
+    <!-- 5. FOREGROUND FRAME (Drawn Last)           -->
+    <!-- ========================================== -->
+    <!-- Front walls occlude anything sticking out the front -->
+    <g stroke-linejoin="round" stroke-linecap="round">
+      
+      <!-- Front Top Rims -->
+      <polygon points="48,224 256,328 256,308 88,224" fill="url(#woodTop)" stroke="url(#woodTop)" stroke-width="8" />
+      <polygon points="464,224 256,328 256,308 424,224" fill="url(#woodTop)" stroke="url(#woodTop)" stroke-width="8" />
+
+      <!-- Front Left Outer Wall -->
+      <polygon points="48,224 256,328 256,392 48,288" fill="url(#woodFrontLeft)" stroke="url(#woodFrontLeft)" stroke-width="8" />
+      
+      <!-- Front Right Outer Wall -->
+      <polygon points="256,328 464,224 464,288 256,392" fill="url(#woodFrontRight)" stroke="url(#woodFrontRight)" stroke-width="8" />
+
+    </g>
+
+  </g>
+</svg>
