@@ -2,9 +2,8 @@
   "images" : [
     {
       "filename" : "AppIcon.svg",
-      "idiom" : "mac",
-      "platform" : "macos",
-      "size" : "512x512"
+      "idiom" : "universal",
+      "platform" : "macos"
     }
   ],
   "info" : {
