@@ -10,6 +10,7 @@
 
 #import "WebBridge.h"
 #import <Cocoa/Cocoa.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #import "host_info.h"
 
@@ -309,7 +310,7 @@ static void handleBrowseImage(NSDictionary *msg) {
         panel.canChooseFiles = YES;
         panel.canChooseDirectories = NO;
         panel.allowsMultipleSelection = NO;
-        panel.allowedFileTypes = @[@"ipsw"];
+        panel.allowedContentTypes = @[[UTType typeWithFilenameExtension:@"ipsw"]];
         panel.message = @"Select a macOS restore image (.ipsw)";
         [panel beginWithCompletionHandler:^(NSModalResponse result) {
             NSString *path = @"";

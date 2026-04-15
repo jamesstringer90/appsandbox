@@ -5,6 +5,8 @@
 #import <Foundation/Foundation.h>
 #import <Virtualization/Virtualization.h>
 
+NS_ASSUME_NONNULL_BEGIN
+
 @interface VzNetwork : NSObject
 
 /* NAT-attached virtio network device. Works out of the box, no entitlements. */
@@ -16,3 +18,5 @@
 + (nullable VZVirtioNetworkDeviceConfiguration *)bridgedConfigurationForInterface:(nullable NSString *)interfaceName;
 
 @end
+
+NS_ASSUME_NONNULL_END

@@ -5,13 +5,15 @@
 #import <Foundation/Foundation.h>
 #import <Virtualization/Virtualization.h>
 
+NS_ASSUME_NONNULL_BEGIN
+
 typedef void (^VzVmStateChangeBlock)(VZVirtualMachineState state);
 
 @interface VzVm : NSObject
 
 @property (nonatomic, strong, readonly) VZVirtualMachine *machine;
 @property (nonatomic, strong, readonly) NSString *name;
-@property (nonatomic, copy) VzVmStateChangeBlock onStateChange;
+@property (nonatomic, copy, nullable) VzVmStateChangeBlock onStateChange;
 
 /* Build a VZVirtualMachineConfiguration from on-disk state for the named VM.
  * Returns a ready-to-start wrapper, or nil on error. */
@@ -19,7 +21,7 @@ typedef void (^VzVmStateChangeBlock)(VZVirtualMachineState state);
 
 /* Build a fresh configuration for install (no disks are loaded from disk.img;
  * this is used by vz_install during VZMacOSInstaller setup). */
-+ (VZVirtualMachineConfiguration *)buildInstallConfigurationForName:(NSString *)name
++ (nullable VZVirtualMachineConfiguration *)buildInstallConfigurationForName:(NSString *)name
                                                       hardwareModel:(VZMacHardwareModel *)hardwareModel
                                                    auxiliaryStorage:(VZMacAuxiliaryStorage *)aux
                                                   machineIdentifier:(VZMacMachineIdentifier *)machineId
@@ -32,3 +34,5 @@ typedef void (^VzVmStateChangeBlock)(VZVirtualMachineState state);
 - (void)requestStopWithCompletion:(void (^)(NSError * _Nullable))completion;
 
 @end
+
+NS_ASSUME_NONNULL_END

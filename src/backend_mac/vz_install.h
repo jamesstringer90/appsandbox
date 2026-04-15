@@ -7,6 +7,8 @@
 #import <Foundation/Foundation.h>
 #import <Virtualization/Virtualization.h>
 
+NS_ASSUME_NONNULL_BEGIN
+
 typedef void (^VzInstallProgressBlock)(double fraction, NSString *stage);
 typedef void (^VzInstallCompletionBlock)(NSError * _Nullable error);
 typedef void (^VzRestoreImageURLBlock)(NSURL * _Nullable url, NSError * _Nullable error);
@@ -36,3 +38,5 @@ typedef void (^VzRestoreImageURLBlock)(NSURL * _Nullable url, NSError * _Nullabl
                   completion:(VzInstallCompletionBlock)completion;
 
 @end
+
+NS_ASSUME_NONNULL_END
