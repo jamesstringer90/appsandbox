@@ -68,7 +68,9 @@ function sendCmd(action, data) { hostBridge.send(action, data); }
 if (hostBridge.isMac) {
     var winOnly = document.querySelectorAll('.win-only');
     for (var i = 0; i < winOnly.length; i++) winOnly[i].style.display = 'none';
-    document.getElementById('os-type').value = 'macOS';
+    var osSelect = document.getElementById('os-type');
+    osSelect.value = 'macOS';
+    osSelect.disabled = true;
 }
 
 /* Unified dispatch. Native code on either platform calls
