@@ -26,6 +26,7 @@
     _vmView = [[VZVirtualMachineView alloc] initWithFrame:frame];
     _vmView.virtualMachine = vm.machine;
     _vmView.capturesSystemKeys = YES;
+    _vmView.automaticallyReconfiguresDisplay = YES;
     _vmView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     window.contentView = _vmView;
     return self;

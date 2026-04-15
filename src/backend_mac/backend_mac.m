@@ -91,10 +91,10 @@ static void finish_install(NSString *name, NSError *error) {
     run_on_main(^{
         [g_installing removeObjectForKey:name];
         if (error) {
+            post_log([NSString stringWithFormat:@"[%@] Install failed: %@", name, error.localizedDescription]);
             post_alert(name, [NSString stringWithFormat:@"Install failed: %@", error.localizedDescription]);
-            /* Leave the directory behind so the user can inspect logs; they can
-             * delete it from the UI. */
         } else {
+            post_log([NSString stringWithFormat:@"[%@] macOS install complete", name]);
             post_event(CORE_VM_EVENT_INSTALL_STATUS, name, 100, @"Install complete");
             post_event(CORE_VM_EVENT_PROGRESS, name, 100, nil);
         }
@@ -127,6 +127,8 @@ static void backend_mac_cleanup(void) {
 
 static void start_install_flow(NSString *name, NSURL *restoreURL,
                                int ramMb, int hddGb, int cpus) {
+    post_log([NSString stringWithFormat:@"[%@] Starting macOS install (%d cores, %d MB RAM, %d GB disk)",
+              name, cpus, ramMb, hddGb]);
     post_event(CORE_VM_EVENT_INSTALL_STATUS, name, 0, @"Starting install");
     post_list_changed();
     [VzInstall installMacOSWithName:name
@@ -192,6 +194,16 @@ static int backend_mac_create_vm(const CoreVmConfig *cfg, char *err, size_t err_
             return;
         }
 
+        NSURL *cachedIpsw = [[[VmDir vmsRootDirectory] URLByDeletingLastPathComponent]
+                                URLByAppendingPathComponent:@"restore.ipsw"];
+
+        if ([[NSFileManager defaultManager] fileExistsAtPath:cachedIpsw.path]) {
+            post_log([NSString stringWithFormat:@"Using cached restore image: %@", cachedIpsw.path]);
+            start_install_flow(name, cachedIpsw, ramMb, hddGb, cpus);
+            return;
+        }
+
+        post_log(@"No cached restore image found, fetching latest from Apple...");
         post_event(CORE_VM_EVENT_INSTALL_STATUS, name, 0, @"Fetching latest restore image");
         [VzInstall fetchLatestRestoreImageURLWithCompletion:^(NSURL * _Nullable url, NSError * _Nullable fetchErr) {
             if (!url) {
@@ -199,18 +211,21 @@ static int backend_mac_create_vm(const CoreVmConfig *cfg, char *err, size_t err_
                     userInfo:@{NSLocalizedDescriptionKey: @"No supported restore image available"}]);
                 return;
             }
-            NSURL *localIpsw = [[VmDir directoryForVm:name] URLByAppendingPathComponent:@"restore.ipsw"];
+            post_log([NSString stringWithFormat:@"Downloading restore image (~15 GB) — this may take a while"]);
+            post_log([NSString stringWithFormat:@"Source: %@", url.absoluteString]);
             [VzInstall downloadRestoreImageFromURL:url
-                                             toURL:localIpsw
+                                             toURL:cachedIpsw
                                           progress:^(double frac, NSString *stage) {
                 update_install_progress(name, frac, stage);
             }
                                         completion:^(NSError * _Nullable dlErr) {
                 if (dlErr) {
+                    post_log([NSString stringWithFormat:@"Download failed: %@", dlErr.localizedDescription]);
                     finish_install(name, dlErr);
                     return;
                 }
-                start_install_flow(name, localIpsw, ramMb, hddGb, cpus);
+                post_log(@"Restore image downloaded, starting install...");
+                start_install_flow(name, cachedIpsw, ramMb, hddGb, cpus);
             }];
         }];
     });
