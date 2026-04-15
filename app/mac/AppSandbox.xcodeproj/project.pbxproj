@@ -23,6 +23,7 @@
 		4002000000000000000000AA /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3002000000000000000000AA /* WebKit.framework */; };
 		4003000000000000000000AA /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3003000000000000000000AA /* Virtualization.framework */; };
 		6003000000000000000000AA /* web in Resources */ = {isa = PBXBuildFile; fileRef = 5003000000000000000000AA /* web */; };
+		6004000000000000000000AA /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 5004000000000000000000AA /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -56,6 +57,7 @@
 		5001000000000000000000AA /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = Info.plist; path = AppSandbox/Info.plist; sourceTree = "<group>"; };
 		5002000000000000000000AA /* AppSandbox.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; name = AppSandbox.entitlements; path = AppSandbox/AppSandbox.entitlements; sourceTree = "<group>"; };
 		5003000000000000000000AA /* web */ = {isa = PBXFileReference; lastKnownFileType = folder; name = web; path = ../../web; sourceTree = "<group>"; };
+		5004000000000000000000AA /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = AppSandbox/Assets.xcassets; sourceTree = "<group>"; };
 		C001000000000000000000AA /* AppSandbox.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppSandbox.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -105,6 +107,7 @@
 			children = (
 				5001000000000000000000AA /* Info.plist */,
 				5002000000000000000000AA /* AppSandbox.entitlements */,
+				5004000000000000000000AA /* Assets.xcassets */,
 			);
 			name = AppSandbox;
 			sourceTree = "<group>";
@@ -225,6 +228,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				6003000000000000000000AA /* web in Resources */,
+				6004000000000000000000AA /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
