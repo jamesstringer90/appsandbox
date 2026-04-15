@@ -2,7 +2,7 @@
 #import "vm_dir.h"
 #import "vz_network.h"
 
-@interface VzVm ()
+@interface VzVm () <VZVirtualMachineDelegate>
 @property (nonatomic, strong, readwrite) VZVirtualMachine *machine;
 @property (nonatomic, strong, readwrite) NSString *name;
 @end
@@ -34,6 +34,57 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
 }
 
 @implementation VzVm
+
+- (void)dealloc {
+    if (_machine) {
+        [_machine removeObserver:self forKeyPath:@"state"];
+    }
+}
+
+- (void)setupObservation {
+    _machine.delegate = self;
+    [_machine addObserver:self
+               forKeyPath:@"state"
+                  options:NSKeyValueObservingOptionNew
+                  context:NULL];
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath
+                      ofObject:(id)object
+                        change:(NSDictionary<NSKeyValueChangeKey,id> *)change
+                       context:(void *)context {
+    (void)object; (void)change; (void)context;
+    if (![keyPath isEqualToString:@"state"]) return;
+    VzVmStateChangeBlock block = self.onStateChange;
+    if (block) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            block(self.machine.state);
+        });
+    }
+}
+
+#pragma mark - VZVirtualMachineDelegate
+
+- (void)guestDidStopVirtualMachine:(VZVirtualMachine *)virtualMachine {
+    (void)virtualMachine;
+    VzVmStateChangeBlock block = self.onStateChange;
+    if (block) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            block(VZVirtualMachineStateStopped);
+        });
+    }
+}
+
+- (void)virtualMachine:(VZVirtualMachine *)virtualMachine
+    didStopWithError:(NSError *)error {
+    (void)virtualMachine; (void)error;
+    VzVmStateChangeBlock block = self.onStateChange;
+    if (block) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            block(VZVirtualMachineStateStopped);
+        });
+    }
+}
 
 + (VZVirtualMachineConfiguration *)buildInstallConfigurationForName:(NSString *)name
                                                       hardwareModel:(VZMacHardwareModel *)hardwareModel
@@ -131,6 +182,7 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
     VzVm *vm = [[VzVm alloc] init];
     vm.name = name;
     vm.machine = [[VZVirtualMachine alloc] initWithConfiguration:config];
+    [vm setupObservation];
     return vm;
 }
 

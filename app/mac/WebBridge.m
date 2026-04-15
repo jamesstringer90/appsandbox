@@ -67,7 +67,7 @@ static NSDictionary *vmInfoToJsDict(const CoreVmInfo *info) {
         @"name":            [NSString stringWithUTF8String:info->name],
         @"osType":          [NSString stringWithUTF8String:info->os_type],
         @"running":         @(info->running ? YES : NO),
-        @"shuttingDown":    @NO,
+        @"shuttingDown":    @(info->shutting_down ? YES : NO),
         @"agentOnline":     @NO,
         @"ramMb":           @(info->ram_mb),
         @"hddGb":           @(info->hdd_gb),

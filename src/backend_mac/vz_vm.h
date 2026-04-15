@@ -5,10 +5,13 @@
 #import <Foundation/Foundation.h>
 #import <Virtualization/Virtualization.h>
 
+typedef void (^VzVmStateChangeBlock)(VZVirtualMachineState state);
+
 @interface VzVm : NSObject
 
 @property (nonatomic, strong, readonly) VZVirtualMachine *machine;
 @property (nonatomic, strong, readonly) NSString *name;
+@property (nonatomic, copy) VzVmStateChangeBlock onStateChange;
 
 /* Build a VZVirtualMachineConfiguration from on-disk state for the named VM.
  * Returns a ready-to-start wrapper, or nil on error. */
@@ -21,7 +24,7 @@
                                                    auxiliaryStorage:(VZMacAuxiliaryStorage *)aux
                                                   machineIdentifier:(VZMacMachineIdentifier *)machineId
                                                               ramMb:(int)ramMb
-                                                             cpuCount:(int)cpuCount
+                                                           cpuCount:(int)cpuCount
                                                               error:(NSError **)error;
 
 - (void)startWithCompletion:(void (^)(NSError * _Nullable))completion;
