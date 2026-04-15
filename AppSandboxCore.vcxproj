@@ -94,7 +94,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\backend_win</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -112,7 +112,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\backend_win</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -132,7 +132,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\backend_win</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -154,7 +154,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\backend_win</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -167,31 +167,34 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\asb_core.c" />
-    <ClCompile Include="src\asb_display.c" />
-    <ClCompile Include="src\hcs_vm.c" />
-    <ClCompile Include="src\hcn_network.c" />
-    <ClCompile Include="src\gpu_enum.c" />
-    <ClCompile Include="src\disk_util.c" />
-    <ClCompile Include="src\snapshot.c" />
-    <ClCompile Include="src\vmms_cert.c" />
-    <ClCompile Include="src\vm_agent.c" />
-    <ClCompile Include="src\prereq.c" />
-    <ClCompile Include="src\vm_ssh_proxy.c" />
+    <ClCompile Include="src\backend_win\asb_core.c" />
+    <ClCompile Include="src\backend_win\asb_display.c" />
+    <ClCompile Include="src\backend_win\hcs_vm.c" />
+    <ClCompile Include="src\backend_win\hcn_network.c" />
+    <ClCompile Include="src\backend_win\gpu_enum.c" />
+    <ClCompile Include="src\backend_win\disk_util.c" />
+    <ClCompile Include="src\backend_win\snapshot.c" />
+    <ClCompile Include="src\backend_win\vmms_cert.c" />
+    <ClCompile Include="src\backend_win\vm_agent.c" />
+    <ClCompile Include="src\backend_win\prereq.c" />
+    <ClCompile Include="src\backend_win\vm_ssh_proxy.c" />
+    <ClCompile Include="src\backend_win\backend_win.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\asb_core.h" />
-    <ClInclude Include="src\asb_display.h" />
+    <ClInclude Include="src\core\backend.h" />
+    <ClInclude Include="src\core\vm_types.h" />
+    <ClInclude Include="src\backend_win\asb_core.h" />
+    <ClInclude Include="src\backend_win\asb_display.h" />
     <ClInclude Include="src\ui.h" />
-    <ClInclude Include="src\hcs_vm.h" />
-    <ClInclude Include="src\hcn_network.h" />
-    <ClInclude Include="src\gpu_enum.h" />
-    <ClInclude Include="src\disk_util.h" />
-    <ClInclude Include="src\snapshot.h" />
-    <ClInclude Include="src\vmms_cert.h" />
-    <ClInclude Include="src\vm_agent.h" />
-    <ClInclude Include="src\prereq.h" />
-    <ClInclude Include="src\vm_ssh_proxy.h" />
+    <ClInclude Include="src\backend_win\hcs_vm.h" />
+    <ClInclude Include="src\backend_win\hcn_network.h" />
+    <ClInclude Include="src\backend_win\gpu_enum.h" />
+    <ClInclude Include="src\backend_win\disk_util.h" />
+    <ClInclude Include="src\backend_win\snapshot.h" />
+    <ClInclude Include="src\backend_win\vmms_cert.h" />
+    <ClInclude Include="src\backend_win\vm_agent.h" />
+    <ClInclude Include="src\backend_win\prereq.h" />
+    <ClInclude Include="src\backend_win\vm_ssh_proxy.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
