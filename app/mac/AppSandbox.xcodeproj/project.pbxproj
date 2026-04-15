@@ -1,0 +1,441 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		2001000000000000000000AA /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 1001000000000000000000AA /* main.m */; };
+		2003000000000000000000AA /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = 1003000000000000000000AA /* AppDelegate.m */; };
+		2005000000000000000000AA /* MainWindowController.m in Sources */ = {isa = PBXBuildFile; fileRef = 1005000000000000000000AA /* MainWindowController.m */; };
+		2007000000000000000000AA /* WebBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = 1007000000000000000000AA /* WebBridge.m */; };
+		2008000000000000000000AA /* backend_mac.m in Sources */ = {isa = PBXBuildFile; fileRef = 1008000000000000000000AA /* backend_mac.m */; };
+		200A000000000000000000AA /* host_info.m in Sources */ = {isa = PBXBuildFile; fileRef = 100A000000000000000000AA /* host_info.m */; };
+		200C000000000000000000AA /* vm_dir.m in Sources */ = {isa = PBXBuildFile; fileRef = 100C000000000000000000AA /* vm_dir.m */; };
+		200E000000000000000000AA /* vz_disk.m in Sources */ = {isa = PBXBuildFile; fileRef = 100E000000000000000000AA /* vz_disk.m */; };
+		2010000000000000000000AA /* vz_display.m in Sources */ = {isa = PBXBuildFile; fileRef = 1010000000000000000000AA /* vz_display.m */; };
+		2012000000000000000000AA /* vz_install.m in Sources */ = {isa = PBXBuildFile; fileRef = 1012000000000000000000AA /* vz_install.m */; };
+		2014000000000000000000AA /* vz_network.m in Sources */ = {isa = PBXBuildFile; fileRef = 1014000000000000000000AA /* vz_network.m */; };
+		2016000000000000000000AA /* vz_vm.m in Sources */ = {isa = PBXBuildFile; fileRef = 1016000000000000000000AA /* vz_vm.m */; };
+		4001000000000000000000AA /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3001000000000000000000AA /* Cocoa.framework */; };
+		4002000000000000000000AA /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3002000000000000000000AA /* WebKit.framework */; };
+		4003000000000000000000AA /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3003000000000000000000AA /* Virtualization.framework */; };
+		6003000000000000000000AA /* web in Resources */ = {isa = PBXBuildFile; fileRef = 5003000000000000000000AA /* web */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		1001000000000000000000AA /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = main.m; path = main.m; sourceTree = "<group>"; };
+		1002000000000000000000AA /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = AppDelegate.h; path = AppDelegate.h; sourceTree = "<group>"; };
+		1003000000000000000000AA /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = AppDelegate.m; path = AppDelegate.m; sourceTree = "<group>"; };
+		1004000000000000000000AA /* MainWindowController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = MainWindowController.h; path = MainWindowController.h; sourceTree = "<group>"; };
+		1005000000000000000000AA /* MainWindowController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = MainWindowController.m; path = MainWindowController.m; sourceTree = "<group>"; };
+		1006000000000000000000AA /* WebBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = WebBridge.h; path = WebBridge.h; sourceTree = "<group>"; };
+		1007000000000000000000AA /* WebBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = WebBridge.m; path = WebBridge.m; sourceTree = "<group>"; };
+		1008000000000000000000AA /* backend_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = backend_mac.m; path = ../../src/backend_mac/backend_mac.m; sourceTree = "<group>"; };
+		1009000000000000000000AA /* host_info.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = host_info.h; path = ../../src/backend_mac/host_info.h; sourceTree = "<group>"; };
+		100A000000000000000000AA /* host_info.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = host_info.m; path = ../../src/backend_mac/host_info.m; sourceTree = "<group>"; };
+		100B000000000000000000AA /* vm_dir.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vm_dir.h; path = ../../src/backend_mac/vm_dir.h; sourceTree = "<group>"; };
+		100C000000000000000000AA /* vm_dir.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = vm_dir.m; path = ../../src/backend_mac/vm_dir.m; sourceTree = "<group>"; };
+		100D000000000000000000AA /* vz_disk.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vz_disk.h; path = ../../src/backend_mac/vz_disk.h; sourceTree = "<group>"; };
+		100E000000000000000000AA /* vz_disk.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = vz_disk.m; path = ../../src/backend_mac/vz_disk.m; sourceTree = "<group>"; };
+		100F000000000000000000AA /* vz_display.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vz_display.h; path = ../../src/backend_mac/vz_display.h; sourceTree = "<group>"; };
+		1010000000000000000000AA /* vz_display.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = vz_display.m; path = ../../src/backend_mac/vz_display.m; sourceTree = "<group>"; };
+		1011000000000000000000AA /* vz_install.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vz_install.h; path = ../../src/backend_mac/vz_install.h; sourceTree = "<group>"; };
+		1012000000000000000000AA /* vz_install.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = vz_install.m; path = ../../src/backend_mac/vz_install.m; sourceTree = "<group>"; };
+		1013000000000000000000AA /* vz_network.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vz_network.h; path = ../../src/backend_mac/vz_network.h; sourceTree = "<group>"; };
+		1014000000000000000000AA /* vz_network.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = vz_network.m; path = ../../src/backend_mac/vz_network.m; sourceTree = "<group>"; };
+		1015000000000000000000AA /* vz_vm.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vz_vm.h; path = ../../src/backend_mac/vz_vm.h; sourceTree = "<group>"; };
+		1016000000000000000000AA /* vz_vm.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = vz_vm.m; path = ../../src/backend_mac/vz_vm.m; sourceTree = "<group>"; };
+		1017000000000000000000AA /* backend.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = backend.h; path = ../../src/core/backend.h; sourceTree = "<group>"; };
+		1018000000000000000000AA /* vm_types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vm_types.h; path = ../../src/core/vm_types.h; sourceTree = "<group>"; };
+		3001000000000000000000AA /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = System/Library/Frameworks/Cocoa.framework; sourceTree = SDKROOT; };
+		3002000000000000000000AA /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		3003000000000000000000AA /* Virtualization.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Virtualization.framework; path = System/Library/Frameworks/Virtualization.framework; sourceTree = SDKROOT; };
+		5001000000000000000000AA /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = Info.plist; path = AppSandbox/Info.plist; sourceTree = "<group>"; };
+		5002000000000000000000AA /* AppSandbox.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; name = AppSandbox.entitlements; path = AppSandbox/AppSandbox.entitlements; sourceTree = "<group>"; };
+		5003000000000000000000AA /* web */ = {isa = PBXFileReference; lastKnownFileType = folder; name = web; path = ../../web; sourceTree = "<group>"; };
+		C001000000000000000000AA /* AppSandbox.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppSandbox.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A002000000000000000000AA /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4001000000000000000000AA /* Cocoa.framework in Frameworks */,
+				4002000000000000000000AA /* WebKit.framework in Frameworks */,
+				4003000000000000000000AA /* Virtualization.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		7001000000000000000000AA = {
+			isa = PBXGroup;
+			children = (
+				7003000000000000000000AA /* app */,
+				7005000000000000000000AA /* src */,
+				5003000000000000000000AA /* web */,
+				7008000000000000000000AA /* Frameworks */,
+				7009000000000000000000AA /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		7003000000000000000000AA /* app */ = {
+			isa = PBXGroup;
+			children = (
+				1001000000000000000000AA /* main.m */,
+				1002000000000000000000AA /* AppDelegate.h */,
+				1003000000000000000000AA /* AppDelegate.m */,
+				1004000000000000000000AA /* MainWindowController.h */,
+				1005000000000000000000AA /* MainWindowController.m */,
+				1006000000000000000000AA /* WebBridge.h */,
+				1007000000000000000000AA /* WebBridge.m */,
+				7004000000000000000000AA /* AppSandbox */,
+			);
+			name = app;
+			path = .;
+			sourceTree = "<group>";
+		};
+		7004000000000000000000AA /* AppSandbox */ = {
+			isa = PBXGroup;
+			children = (
+				5001000000000000000000AA /* Info.plist */,
+				5002000000000000000000AA /* AppSandbox.entitlements */,
+			);
+			name = AppSandbox;
+			sourceTree = "<group>";
+		};
+		7005000000000000000000AA /* src */ = {
+			isa = PBXGroup;
+			children = (
+				7006000000000000000000AA /* core */,
+				7007000000000000000000AA /* backend_mac */,
+			);
+			name = src;
+			sourceTree = "<group>";
+		};
+		7006000000000000000000AA /* core */ = {
+			isa = PBXGroup;
+			children = (
+				1017000000000000000000AA /* backend.h */,
+				1018000000000000000000AA /* vm_types.h */,
+			);
+			name = core;
+			sourceTree = "<group>";
+		};
+		7007000000000000000000AA /* backend_mac */ = {
+			isa = PBXGroup;
+			children = (
+				1008000000000000000000AA /* backend_mac.m */,
+				1009000000000000000000AA /* host_info.h */,
+				100A000000000000000000AA /* host_info.m */,
+				100B000000000000000000AA /* vm_dir.h */,
+				100C000000000000000000AA /* vm_dir.m */,
+				100D000000000000000000AA /* vz_disk.h */,
+				100E000000000000000000AA /* vz_disk.m */,
+				100F000000000000000000AA /* vz_display.h */,
+				1010000000000000000000AA /* vz_display.m */,
+				1011000000000000000000AA /* vz_install.h */,
+				1012000000000000000000AA /* vz_install.m */,
+				1013000000000000000000AA /* vz_network.h */,
+				1014000000000000000000AA /* vz_network.m */,
+				1015000000000000000000AA /* vz_vm.h */,
+				1016000000000000000000AA /* vz_vm.m */,
+			);
+			name = backend_mac;
+			sourceTree = "<group>";
+		};
+		7008000000000000000000AA /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				3001000000000000000000AA /* Cocoa.framework */,
+				3002000000000000000000AA /* WebKit.framework */,
+				3003000000000000000000AA /* Virtualization.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		7009000000000000000000AA /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				C001000000000000000000AA /* AppSandbox.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		8003000000000000000000AA /* AppSandbox */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 8002000000000000000000AA /* Build configuration list for PBXNativeTarget "AppSandbox" */;
+			buildPhases = (
+				A001000000000000000000AA /* Sources */,
+				A002000000000000000000AA /* Frameworks */,
+				A003000000000000000000AA /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = AppSandbox;
+			productName = AppSandbox;
+			productReference = C001000000000000000000AA /* AppSandbox.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		B001000000000000000000AA /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					8003000000000000000000AA = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = 8001000000000000000000AA /* Build configuration list for PBXProject "AppSandbox" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 7001000000000000000000AA;
+			productRefGroup = 7009000000000000000000AA /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				8003000000000000000000AA /* AppSandbox */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A003000000000000000000AA /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6003000000000000000000AA /* web in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A001000000000000000000AA /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2001000000000000000000AA /* main.m in Sources */,
+				2003000000000000000000AA /* AppDelegate.m in Sources */,
+				2005000000000000000000AA /* MainWindowController.m in Sources */,
+				2007000000000000000000AA /* WebBridge.m in Sources */,
+				2008000000000000000000AA /* backend_mac.m in Sources */,
+				200A000000000000000000AA /* host_info.m in Sources */,
+				200C000000000000000000AA /* vm_dir.m in Sources */,
+				200E000000000000000000AA /* vz_disk.m in Sources */,
+				2010000000000000000000AA /* vz_display.m in Sources */,
+				2012000000000000000000AA /* vz_install.m in Sources */,
+				2014000000000000000000AA /* vz_network.m in Sources */,
+				2016000000000000000000AA /* vz_vm.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		9001000000000000000000AA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		9002000000000000000000AA /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		9003000000000000000000AA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = AppSandbox/AppSandbox.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../../src",
+					"$(SRCROOT)/../../src/core",
+					"$(SRCROOT)/../../src/backend_mac",
+				);
+				INFOPLIST_FILE = AppSandbox/Info.plist;
+				INSTALL_PATH = "$(LOCAL_APPS_DIR)";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.appsandbox.AppSandbox;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		9004000000000000000000AA /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = AppSandbox/AppSandbox.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../../src",
+					"$(SRCROOT)/../../src/core",
+					"$(SRCROOT)/../../src/backend_mac",
+				);
+				INFOPLIST_FILE = AppSandbox/Info.plist;
+				INSTALL_PATH = "$(LOCAL_APPS_DIR)";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.appsandbox.AppSandbox;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		8001000000000000000000AA /* Build configuration list for PBXProject "AppSandbox" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9001000000000000000000AA /* Debug */,
+				9002000000000000000000AA /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		8002000000000000000000AA /* Build configuration list for PBXNativeTarget "AppSandbox" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9003000000000000000000AA /* Debug */,
+				9004000000000000000000AA /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = B001000000000000000000AA /* Project object */;
+}
