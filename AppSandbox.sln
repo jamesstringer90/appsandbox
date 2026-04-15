@@ -30,6 +30,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "appsandbox-clipboard", "too
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "appsandbox-clipboard-reader", "tools\agent\appsandbox-clipboard-reader.vcxproj", "{D4E5F6A7-B8C9-0123-CDEF-456789012345}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "appsandbox-audio", "tools\agent\appsandbox-audio.vcxproj", "{E5F6A7B8-C9D0-1234-EF01-567890123456}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -134,6 +136,14 @@ Global
 		{D4E5F6A7-B8C9-0123-CDEF-456789012345}.Release|ARM64.Build.0 = Release|ARM64
 		{D4E5F6A7-B8C9-0123-CDEF-456789012345}.Release|x64.ActiveCfg = Release|x64
 		{D4E5F6A7-B8C9-0123-CDEF-456789012345}.Release|x64.Build.0 = Release|x64
+		{E5F6A7B8-C9D0-1234-EF01-567890123456}.Debug|ARM64.ActiveCfg = Debug|ARM64
+		{E5F6A7B8-C9D0-1234-EF01-567890123456}.Debug|ARM64.Build.0 = Debug|ARM64
+		{E5F6A7B8-C9D0-1234-EF01-567890123456}.Debug|x64.ActiveCfg = Debug|x64
+		{E5F6A7B8-C9D0-1234-EF01-567890123456}.Debug|x64.Build.0 = Debug|x64
+		{E5F6A7B8-C9D0-1234-EF01-567890123456}.Release|ARM64.ActiveCfg = Release|ARM64
+		{E5F6A7B8-C9D0-1234-EF01-567890123456}.Release|ARM64.Build.0 = Release|ARM64
+		{E5F6A7B8-C9D0-1234-EF01-567890123456}.Release|x64.ActiveCfg = Release|x64
+		{E5F6A7B8-C9D0-1234-EF01-567890123456}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

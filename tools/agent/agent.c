@@ -1002,6 +1002,140 @@ static void stop_clipboard_reader_monitor(void)
     }
 }
 
+/* ---- Audio capture helper process (SYSTEM in console session, :0004) ---- */
+
+static HANDLE g_audio_process = NULL;
+static DWORD  g_audio_session = 0xFFFFFFFF;
+static volatile BOOL g_audio_monitor_running = FALSE;
+static HANDLE g_audio_monitor_thread = NULL;
+
+static void kill_audio_helper(void)
+{
+    if (g_audio_process) {
+        TerminateProcess(g_audio_process, 0);
+        WaitForSingleObject(g_audio_process, 3000);
+        CloseHandle(g_audio_process);
+        g_audio_process = NULL;
+        g_audio_session = 0xFFFFFFFF;
+    }
+}
+
+static BOOL spawn_audio_in_session(DWORD session_id)
+{
+    HANDLE cur_token = NULL, dup_token = NULL;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t exe_path[MAX_PATH];
+    wchar_t *slash;
+
+    GetModuleFileNameW(NULL, exe_path, MAX_PATH);
+    slash = wcsrchr(exe_path, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    wcscat_s(exe_path, MAX_PATH, L"appsandbox-audio.exe");
+
+    if (GetFileAttributesW(exe_path) == INVALID_FILE_ATTRIBUTES) {
+        agent_log("Audio helper: %ls not found.", exe_path);
+        return FALSE;
+    }
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &cur_token)) {
+        agent_log("Audio helper: OpenProcessToken failed (%lu).", GetLastError());
+        return FALSE;
+    }
+
+    if (!DuplicateTokenEx(cur_token, TOKEN_ALL_ACCESS, NULL,
+                           SecurityImpersonation, TokenPrimary, &dup_token)) {
+        agent_log("Audio helper: DuplicateTokenEx failed (%lu).", GetLastError());
+        CloseHandle(cur_token);
+        return FALSE;
+    }
+    CloseHandle(cur_token);
+
+    if (!SetTokenInformation(dup_token, TokenSessionId,
+                              &session_id, sizeof(session_id))) {
+        agent_log("Audio helper: SetTokenInformation(session=%lu) failed (%lu).",
+                   session_id, GetLastError());
+        CloseHandle(dup_token);
+        return FALSE;
+    }
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.lpDesktop = L"WinSta0\\Default";
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (!CreateProcessAsUserW(dup_token, exe_path, NULL, NULL, NULL,
+                               FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        agent_log("Audio helper: CreateProcessAsUserW failed (%lu).", GetLastError());
+        CloseHandle(dup_token);
+        return FALSE;
+    }
+
+    agent_log("Audio helper: spawned PID %lu in session %lu.", pi.dwProcessId, session_id);
+    g_audio_process = pi.hProcess;
+    g_audio_session = session_id;
+    CloseHandle(pi.hThread);
+    CloseHandle(dup_token);
+    return TRUE;
+}
+
+static DWORD WINAPI audio_monitor_thread(LPVOID param)
+{
+    (void)param;
+    agent_log("Audio monitor: started.");
+
+    while (g_audio_monitor_running) {
+        DWORD cur_session = WTSGetActiveConsoleSessionId();
+
+        if (cur_session != 0xFFFFFFFF) {
+            BOOL helper_alive = g_audio_process &&
+                WaitForSingleObject(g_audio_process, 0) != WAIT_OBJECT_0;
+
+            if (cur_session != g_audio_session) {
+                if (helper_alive) {
+                    agent_log("Audio monitor: console session changed %lu -> %lu, respawning.",
+                               g_audio_session, cur_session);
+                    kill_audio_helper();
+                }
+                spawn_audio_in_session(cur_session);
+            } else if (!helper_alive) {
+                if (g_audio_process) {
+                    CloseHandle(g_audio_process);
+                    g_audio_process = NULL;
+                }
+                agent_log("Audio monitor: helper died, respawning in session %lu.", cur_session);
+                spawn_audio_in_session(cur_session);
+            }
+        }
+
+        {
+            int i;
+            for (i = 0; i < 6 && g_audio_monitor_running; i++)
+                Sleep(500);
+        }
+    }
+
+    kill_audio_helper();
+    agent_log("Audio monitor: stopped.");
+    return 0;
+}
+
+static void start_audio_monitor(void)
+{
+    g_audio_monitor_running = TRUE;
+    g_audio_monitor_thread = CreateThread(NULL, 0, audio_monitor_thread, NULL, 0, NULL);
+}
+
+static void stop_audio_monitor(void)
+{
+    g_audio_monitor_running = FALSE;
+    if (g_audio_monitor_thread) {
+        WaitForSingleObject(g_audio_monitor_thread, 5000);
+        CloseHandle(g_audio_monitor_thread);
+        g_audio_monitor_thread = NULL;
+    }
+}
+
 /* ---- IDD driver status check ---- */
 
 /* Check if AppSandboxVDD driver is installed and report status.
@@ -2164,6 +2298,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     /* Start clipboard reader monitor (user, :0006) */
     start_clipboard_reader_monitor();
 
+    /* Start audio capture monitor (SYSTEM, :0004) */
+    start_audio_monitor();
+
     set_service_status(SERVICE_RUNNING, 0);
     agent_log("Service started.");
 
@@ -2181,6 +2318,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     agent_log("Stopping SSH proxy...");
     stop_ssh_proxy();
     agent_log("SSH proxy stopped.");
+    agent_log("Stopping audio monitor...");
+    stop_audio_monitor();
+    agent_log("Audio monitor stopped.");
     agent_log("Stopping clipboard reader monitor...");
     stop_clipboard_reader_monitor();
     agent_log("Clipboard reader monitor stopped.");

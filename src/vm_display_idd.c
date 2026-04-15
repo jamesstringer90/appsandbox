@@ -13,6 +13,12 @@
 #include <winsock2.h>
 #include <windows.h>
 
+#define COBJMACROS
+#include <initguid.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <ksmedia.h>
+
 #pragma warning(push)
 #pragma warning(disable: 4201) /* nameless struct/union in SDK headers */
 #include <d3d11.h>
@@ -34,6 +40,7 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "ole32.lib")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -68,6 +75,29 @@ static const GUID CLIPBOARD_SERVICE_GUID =
 /* Clipboard reader channel — connects to guest clipboard reader (guest→host) */
 static const GUID CLIPBOARD_READER_SERVICE_GUID =
     { 0xa5b0cafe, 0x0006, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
+
+/* Audio capture channel — connects to guest audio helper (guest→host) */
+static const GUID AUDIO_SERVICE_GUID =
+    { 0xa5b0cafe, 0x0004, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
+
+/* ---- Audio wire protocol (mirror of tools/agent/appsandbox-audio.c) ---- */
+
+#define AUDIO_HEADER_MAGIC  0x31415341  /* 'ASA1' */
+
+#pragma pack(push, 1)
+typedef struct AudioHeader {
+    UINT32 magic;
+    UINT32 sample_rate;
+    UINT16 channels;
+    UINT16 bits_per_sample;
+    UINT16 format_tag;      /* 1=PCM, 3=IEEE_FLOAT */
+    UINT16 block_align;
+} AudioHeader;
+
+typedef struct AudioFrameHeader {
+    UINT32 bytes;
+} AudioFrameHeader;
+#pragma pack(pop)
 
 /* ---- Clipboard protocol ---- */
 
@@ -286,6 +316,11 @@ struct VmDisplayIdd {
     int              clip_reader_fmt_count;
     int              clip_reader_fetch_idx;
 
+    /* Audio playback channel (:0004 — guest→host render) */
+    volatile SOCKET  audio_socket;
+    HANDLE           audio_recv_thread;
+    volatile BOOL    audio_muted;
+
     /* Threads */
     HANDLE         recv_thread;
     HANDLE         window_thread;
@@ -302,6 +337,9 @@ static DWORD WINAPI     idd_recv_thread_proc(LPVOID param);
 static const wchar_t *IDD_DISPLAY_CLASS = L"AppSandboxIddDisplay";
 static const wchar_t *IDD_RENDER_CLASS  = L"AppSandboxIddRender";
 static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
+
+/* System menu command IDs — must be < 0xF000 and have low 4 bits clear */
+#define IDM_AUDIO_MUTE  0x1000
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 
@@ -645,6 +683,206 @@ static SOCKET connect_to_hv_service(const GUID *vm_runtime_id, const GUID *servi
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&sock_timeout, sizeof(sock_timeout));
 
     return s;
+}
+
+/* ==================================================================
+ * Audio playback — guest -> host
+ * ================================================================== */
+
+static const CLSID AUDIO_CLSID_MMDeviceEnumerator =
+    { 0xBCDE0395, 0xE52F, 0x467C, { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
+static const IID AUDIO_IID_IMMDeviceEnumerator =
+    { 0xA95664D2, 0x9614, 0x4F35, { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
+static const IID AUDIO_IID_IAudioClient =
+    { 0x1CB9AD4C, 0xDBFA, 0x4C32, { 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2 } };
+static const IID AUDIO_IID_IAudioRenderClient =
+    { 0xF294ACFC, 0x3146, 0x4483, { 0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2 } };
+
+static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)param;
+    HRESULT hr;
+    BOOL com_ok = FALSE;
+    IMMDeviceEnumerator *pEnum = NULL;
+    IMMDevice *pDev = NULL;
+    IAudioClient *pAC = NULL;
+    IAudioRenderClient *pRC = NULL;
+    WAVEFORMATEX *mixfmt = NULL;
+    WAVEFORMATEX *renderfmt = NULL;
+    BYTE *scratch = NULL;
+    UINT32 scratch_cap = 0;
+    UINT32 buf_frames = 0;
+    UINT32 render_block_align = 0;
+    AudioHeader hdr;
+    BOOL stream_started = FALSE;
+    BOOL session_logged = FALSE;
+    int  header_misses = 0;
+
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE)
+        com_ok = TRUE;
+
+    /* Outer retry loop — keep trying to connect to the guest capture helper */
+    while (!d->stop) {
+        SOCKET s = connect_to_hv_service(&d->runtime_id, &AUDIO_SERVICE_GUID, 1000);
+        if (s == INVALID_SOCKET) {
+            int wait;
+            for (wait = 0; wait < 2000 && !d->stop; wait += 200)
+                Sleep(200);
+            continue;
+        }
+
+        /* Blocking recv for the session */
+        {
+            DWORD no_timeout = 0;
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
+        }
+        d->audio_socket = s;
+
+        /* Read one-shot AudioHeader.
+           The guest closes without sending a header when the VAD endpoint
+           isn't ready yet (e.g. before user login / audio stack init).
+           Log only the first miss per run so we don't spam. */
+        if (!recv_exact(s, &hdr, sizeof(hdr)) || hdr.magic != AUDIO_HEADER_MAGIC) {
+            if (header_misses == 0)
+                idd_log(d, L"Audio header bad/absent - guest not ready, retrying quietly.");
+            header_misses++;
+            goto session_cleanup;
+        }
+
+        idd_log(d, L"Audio connected (GUID :0004).");
+        session_logged = TRUE;
+        header_misses = 0;
+
+        idd_log(d, L"Audio header: %lu Hz, %u ch, %u bits, tag=%u.",
+                 hdr.sample_rate, hdr.channels, hdr.bits_per_sample, hdr.format_tag);
+
+        /* Set up WASAPI render on the default endpoint */
+        hr = CoCreateInstance(&AUDIO_CLSID_MMDeviceEnumerator, NULL,
+                               CLSCTX_ALL, &AUDIO_IID_IMMDeviceEnumerator,
+                               (void **)&pEnum);
+        if (FAILED(hr)) { idd_log(d, L"Audio: CoCreateInstance failed 0x%08lX.", hr); goto session_cleanup; }
+
+        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(pEnum, eRender, eConsole, &pDev);
+        if (FAILED(hr)) { idd_log(d, L"Audio: GetDefaultAudioEndpoint failed 0x%08lX.", hr); goto session_cleanup; }
+
+        hr = IMMDevice_Activate(pDev, &AUDIO_IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&pAC);
+        if (FAILED(hr)) { idd_log(d, L"Audio: Activate failed 0x%08lX.", hr); goto session_cleanup; }
+
+        hr = IAudioClient_GetMixFormat(pAC, &mixfmt);
+        if (FAILED(hr) || !mixfmt) { idd_log(d, L"Audio: GetMixFormat failed 0x%08lX.", hr); goto session_cleanup; }
+
+        /* Build the source format exactly matching what the guest is sending. */
+        renderfmt = (WAVEFORMATEX *)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
+        if (!renderfmt) goto session_cleanup;
+        ZeroMemory(renderfmt, sizeof(WAVEFORMATEX));
+        renderfmt->wFormatTag      = hdr.format_tag;
+        renderfmt->nChannels       = hdr.channels;
+        renderfmt->nSamplesPerSec  = hdr.sample_rate;
+        renderfmt->wBitsPerSample  = hdr.bits_per_sample;
+        renderfmt->nBlockAlign     = hdr.block_align ? hdr.block_align
+                                     : (WORD)((hdr.channels * hdr.bits_per_sample) / 8);
+        renderfmt->nAvgBytesPerSec = renderfmt->nSamplesPerSec * renderfmt->nBlockAlign;
+        renderfmt->cbSize          = 0;
+        render_block_align         = renderfmt->nBlockAlign;
+
+        /* 40ms buffer. HV socket is effectively memcpy and the guest polls
+           every 5ms, so scheduler jitter is the only thing we need to absorb. */
+        hr = IAudioClient_Initialize(pAC, AUDCLNT_SHAREMODE_SHARED,
+                                      AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                                      AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                      400000, 0, renderfmt, NULL);
+        if (FAILED(hr)) {
+            idd_log(d, L"Audio: IAudioClient::Initialize failed 0x%08lX.", hr);
+            goto session_cleanup;
+        }
+
+        hr = IAudioClient_GetBufferSize(pAC, &buf_frames);
+        if (FAILED(hr)) goto session_cleanup;
+
+        hr = IAudioClient_GetService(pAC, &AUDIO_IID_IAudioRenderClient, (void **)&pRC);
+        if (FAILED(hr)) goto session_cleanup;
+
+        hr = IAudioClient_Start(pAC);
+        if (FAILED(hr)) goto session_cleanup;
+        stream_started = TRUE;
+
+        idd_log(d, L"Audio render started: buf=%lu frames.", buf_frames);
+
+        /* Receive loop */
+        while (!d->stop) {
+            AudioFrameHeader fh;
+            UINT32 frames_in_payload;
+            UINT32 padding;
+            UINT32 free_frames;
+            UINT32 frames_to_write;
+            BYTE *dst;
+
+            if (!recv_exact(s, &fh, sizeof(fh))) break;
+            if (fh.bytes == 0 || fh.bytes > 4 * 1024 * 1024) break;
+
+            if (fh.bytes > scratch_cap) {
+                BYTE *nb = scratch
+                    ? (BYTE *)HeapReAlloc(GetProcessHeap(), 0, scratch, fh.bytes)
+                    : (BYTE *)HeapAlloc(GetProcessHeap(), 0, fh.bytes);
+                if (!nb) break;
+                scratch = nb;
+                scratch_cap = fh.bytes;
+            }
+            if (!recv_exact(s, scratch, (int)fh.bytes)) break;
+
+            /* Host-side mute: keep draining the socket but don't push to WASAPI */
+            if (d->audio_muted) continue;
+
+            frames_in_payload = fh.bytes / render_block_align;
+            if (frames_in_payload == 0) continue;
+
+            /* Push into WASAPI buffer; drop if no room (low-latency, no stalling) */
+            hr = IAudioClient_GetCurrentPadding(pAC, &padding);
+            if (FAILED(hr)) break;
+            free_frames = buf_frames - padding;
+            frames_to_write = frames_in_payload;
+            if (frames_to_write > free_frames)
+                frames_to_write = free_frames;
+            if (frames_to_write == 0)
+                continue;
+
+            hr = IAudioRenderClient_GetBuffer(pRC, frames_to_write, &dst);
+            if (FAILED(hr)) break;
+            memcpy(dst, scratch, (size_t)frames_to_write * render_block_align);
+            IAudioRenderClient_ReleaseBuffer(pRC, frames_to_write, 0);
+        }
+
+session_cleanup:
+        if (stream_started && pAC) {
+            IAudioClient_Stop(pAC);
+            stream_started = FALSE;
+        }
+        if (pRC)    { IAudioRenderClient_Release(pRC);    pRC = NULL; }
+        if (pAC)    { IAudioClient_Release(pAC);          pAC = NULL; }
+        if (pDev)   { IMMDevice_Release(pDev);            pDev = NULL; }
+        if (pEnum)  { IMMDeviceEnumerator_Release(pEnum); pEnum = NULL; }
+        if (mixfmt)    { CoTaskMemFree(mixfmt);    mixfmt = NULL; }
+        if (renderfmt) { CoTaskMemFree(renderfmt); renderfmt = NULL; }
+
+        if (d->audio_socket != INVALID_SOCKET) {
+            closesocket(d->audio_socket);
+            d->audio_socket = INVALID_SOCKET;
+        }
+        if (session_logged) {
+            idd_log(d, L"Audio session ended.");
+            session_logged = FALSE;
+        }
+
+        if (d->stop) break;
+        /* Back off when the guest keeps rejecting us (VAD not ready) */
+        Sleep(header_misses > 3 ? 5000 : 500);
+    }
+
+    if (scratch) HeapFree(GetProcessHeap(), 0, scratch);
+    if (com_ok)  CoUninitialize();
+    d->audio_recv_thread = NULL;
+    return 0;
 }
 
 /* ==================================================================
@@ -1748,7 +1986,8 @@ static void d3d_render_frame(VmDisplayIdd *d)
 
     if (d->render_count % 60 == 0 && d->hwnd) {
         wchar_t title[256];
-        swprintf_s(title, 256, L"%s Display %ux%u recv=%u",
+        swprintf_s(title, 256, L"%s%s Display %ux%u recv=%u",
+                   d->audio_muted ? L"\U0001F507 " : L"",
                    d->vm_name, d->frame_width, d->frame_height, d->recv_count);
         SetWindowTextW(d->hwnd, title);
     }
@@ -2018,6 +2257,13 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         if (!d->clip_reader_recv_thread) {
             d->clip_reader_recv_thread = CreateThread(NULL, 0, clip_reader_recv_thread_proc, d, 0, NULL);
             idd_log(d, L"CLIP-R: Started recv thread (will connect when reader is available).");
+        }
+
+        /* Ensure audio recv thread is running (:0004, guest→host).
+           The thread handles connecting on its own — the helper may not be up yet. */
+        if (!d->audio_recv_thread) {
+            d->audio_recv_thread = CreateThread(NULL, 0, audio_recv_thread_proc, d, 0, NULL);
+            idd_log(d, L"Audio: Started recv thread (will connect when helper is available).");
         }
 
         /* Try to connect frame channel (VDD driver, GUID :0002) */
@@ -2322,6 +2568,15 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         DwmSetWindowAttribute(d->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
     }
 
+    /* Add "Mute audio" toggle to the system menu (right-click title bar) */
+    {
+        HMENU sysmenu = GetSystemMenu(d->hwnd, FALSE);
+        if (sysmenu) {
+            AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
+        }
+    }
+
     /* Bring the display window to the foreground on open */
     ShowWindow(d->hwnd, SW_SHOW);
     BringWindowToTop(d->hwnd);
@@ -2430,6 +2685,25 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
 
     switch (msg) {
+    case WM_SYSCOMMAND:
+        if (d && (wp & 0xFFF0) == IDM_AUDIO_MUTE) {
+            HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
+            wchar_t title[300];
+            d->audio_muted = !d->audio_muted;
+            if (sysmenu) {
+                CheckMenuItem(sysmenu, IDM_AUDIO_MUTE,
+                              MF_BYCOMMAND | (d->audio_muted ? MF_CHECKED : MF_UNCHECKED));
+            }
+            if (d->audio_muted)
+                swprintf_s(title, 300, L"\U0001F507 %s - IDD Display", d->vm_name);
+            else
+                swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
+            SetWindowTextW(hwnd, title);
+            idd_log(d, d->audio_muted ? L"Audio muted." : L"Audio unmuted.");
+            return 0;
+        }
+        break;
+
     case WM_CLOSE:
         if (d) {
             BOOL user_initiated = d->open;
@@ -2459,6 +2733,17 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 WaitForSingleObject(d->clip_reader_recv_thread, 2000);
                 CloseHandle(d->clip_reader_recv_thread);
                 d->clip_reader_recv_thread = NULL;
+            }
+
+            /* Wait for audio recv thread (:0004) */
+            if (d->audio_recv_thread) {
+                if (d->audio_socket != INVALID_SOCKET) {
+                    closesocket(d->audio_socket);
+                    d->audio_socket = INVALID_SOCKET;
+                }
+                WaitForSingleObject(d->audio_recv_thread, 2000);
+                CloseHandle(d->audio_recv_thread);
+                d->audio_recv_thread = NULL;
             }
 
             /* Wait briefly for recv thread to exit */
@@ -2698,6 +2983,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->input_socket       = INVALID_SOCKET;
     d->clip_socket        = INVALID_SOCKET;
     d->clip_reader_socket = INVALID_SOCKET;
+    d->audio_socket       = INVALID_SOCKET;
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;
@@ -2783,6 +3069,16 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
         }
         WaitForSingleObject(display->clip_reader_recv_thread, 3000);
         CloseHandle(display->clip_reader_recv_thread);
+    }
+
+    /* audio_recv_thread guard */
+    if (display->audio_recv_thread) {
+        if (display->audio_socket != INVALID_SOCKET) {
+            closesocket(display->audio_socket);
+            display->audio_socket = INVALID_SOCKET;
+        }
+        WaitForSingleObject(display->audio_recv_thread, 3000);
+        CloseHandle(display->audio_recv_thread);
     }
 
     DeleteCriticalSection(&display->frame_cs);
