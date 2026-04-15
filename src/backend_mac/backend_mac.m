@@ -95,12 +95,22 @@ static void handle_vm_state_change(NSString *name, VZVirtualMachineState state) 
         post_list_changed();
     } else if (state == VZVirtualMachineStateStopped) {
         [g_shuttingDown removeObject:name];
-        [g_displays removeObjectForKey:name];
+        VzDisplayWindow *display = g_displays[name];
+        if (display) {
+            [display.window close];
+            [g_displays removeObjectForKey:name];
+        }
         [g_vms removeObjectForKey:name];
         post_state_changed(name, NO);
         post_list_changed();
     } else if (state == VZVirtualMachineStateRunning) {
         [g_shuttingDown removeObject:name];
+        VzVm *vm = g_vms[name];
+        if (vm && !g_displays[name]) {
+            VzDisplayWindow *display = [[VzDisplayWindow alloc] initWithVzVm:vm];
+            g_displays[name] = display;
+            [display showDisplay];
+        }
         post_state_changed(name, YES);
         post_list_changed();
     }
