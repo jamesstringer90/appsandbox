@@ -16,7 +16,7 @@
 
 /* We need the WebView2 COM interface definitions.
    The header uses MIDL_INTERFACE which expands to plain vtable structs in C. */
-#include "../vendor/webview2/WebView2.h"
+#include "WebView2.h"
 
 /* ---- Dynamic loading of WebView2Loader.dll ---- */
 
