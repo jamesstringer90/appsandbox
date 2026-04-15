@@ -65,6 +65,14 @@ static void post_alert(NSString *vmName, NSString *msg) {
     post_event(CORE_VM_EVENT_ALERT, vmName, 0, msg);
 }
 
+static void post_list_changed(void) {
+    post_event(CORE_VM_EVENT_LIST_CHANGED, nil, 0, nil);
+}
+
+static void post_state_changed(NSString *name, BOOL running) {
+    post_event(CORE_VM_EVENT_STATE_CHANGED, name, running ? 1 : 0, nil);
+}
+
 static NSString *vzStateString(VZVirtualMachineState state) {
     switch (state) {
         case VZVirtualMachineStateStopped:   return @"Stopped";
@@ -96,14 +104,6 @@ static void handle_vm_state_change(NSString *name, VZVirtualMachineState state) 
         post_state_changed(name, YES);
         post_list_changed();
     }
-}
-
-static void post_list_changed(void) {
-    post_event(CORE_VM_EVENT_LIST_CHANGED, nil, 0, nil);
-}
-
-static void post_state_changed(NSString *name, BOOL running) {
-    post_event(CORE_VM_EVENT_STATE_CHANGED, name, running ? 1 : 0, nil);
 }
 
 static void update_install_progress(NSString *name, double frac, NSString *stage) {
