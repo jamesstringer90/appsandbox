@@ -1,9 +1,10 @@
 {
   "images" : [
     {
-      "filename" : "AppIcon.svg",
+      "filename" : "AppIcon.png",
       "idiom" : "universal",
-      "platform" : "macos"
+      "platform" : "macos",
+      "size" : "1024x1024"
     }
   ],
   "info" : {
