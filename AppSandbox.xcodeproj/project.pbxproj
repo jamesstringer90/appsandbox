@@ -7,24 +7,60 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		/* App target — Sources (app_mac only) */
 		2001000000000000000000AA /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 1001000000000000000000AA /* main.m */; };
 		2003000000000000000000AA /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = 1003000000000000000000AA /* AppDelegate.m */; };
 		2005000000000000000000AA /* MainWindowController.m in Sources */ = {isa = PBXBuildFile; fileRef = 1005000000000000000000AA /* MainWindowController.m */; };
 		2007000000000000000000AA /* WebBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = 1007000000000000000000AA /* WebBridge.m */; };
-		2008000000000000000000AA /* backend_mac.m in Sources */ = {isa = PBXBuildFile; fileRef = 1008000000000000000000AA /* backend_mac.m */; };
-		200A000000000000000000AA /* host_info.m in Sources */ = {isa = PBXBuildFile; fileRef = 100A000000000000000000AA /* host_info.m */; };
-		200C000000000000000000AA /* vm_dir.m in Sources */ = {isa = PBXBuildFile; fileRef = 100C000000000000000000AA /* vm_dir.m */; };
-		200E000000000000000000AA /* vz_disk.m in Sources */ = {isa = PBXBuildFile; fileRef = 100E000000000000000000AA /* vz_disk.m */; };
-		2010000000000000000000AA /* vz_display.m in Sources */ = {isa = PBXBuildFile; fileRef = 1010000000000000000000AA /* vz_display.m */; };
-		2012000000000000000000AA /* vz_install.m in Sources */ = {isa = PBXBuildFile; fileRef = 1012000000000000000000AA /* vz_install.m */; };
-		2014000000000000000000AA /* vz_network.m in Sources */ = {isa = PBXBuildFile; fileRef = 1014000000000000000000AA /* vz_network.m */; };
-		2016000000000000000000AA /* vz_vm.m in Sources */ = {isa = PBXBuildFile; fileRef = 1016000000000000000000AA /* vz_vm.m */; };
+		/* App target — Frameworks */
 		4001000000000000000000AA /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3001000000000000000000AA /* Cocoa.framework */; };
 		4002000000000000000000AA /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3002000000000000000000AA /* WebKit.framework */; };
-		4003000000000000000000AA /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3003000000000000000000AA /* Virtualization.framework */; };
+		4010000000000000000000BB /* AppSandboxCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C002000000000000000000BB /* AppSandboxCore.framework */; };
+		/* App target — Resources */
 		6003000000000000000000AA /* web in Resources */ = {isa = PBXBuildFile; fileRef = 5003000000000000000000AA /* web */; };
 		6004000000000000000000AA /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 5004000000000000000000AA /* Assets.xcassets */; };
+		/* App target — Embed Frameworks */
+		6010000000000000000000BB /* AppSandboxCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = C002000000000000000000BB /* AppSandboxCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		/* Framework target — Sources (backend_mac) */
+		2020000000000000000000BB /* backend_mac.m in Sources */ = {isa = PBXBuildFile; fileRef = 1008000000000000000000AA /* backend_mac.m */; };
+		2021000000000000000000BB /* host_info.m in Sources */ = {isa = PBXBuildFile; fileRef = 100A000000000000000000AA /* host_info.m */; };
+		2022000000000000000000BB /* vm_dir.m in Sources */ = {isa = PBXBuildFile; fileRef = 100C000000000000000000AA /* vm_dir.m */; };
+		2023000000000000000000BB /* vz_disk.m in Sources */ = {isa = PBXBuildFile; fileRef = 100E000000000000000000AA /* vz_disk.m */; };
+		2024000000000000000000BB /* vz_display.m in Sources */ = {isa = PBXBuildFile; fileRef = 1010000000000000000000AA /* vz_display.m */; };
+		2025000000000000000000BB /* vz_install.m in Sources */ = {isa = PBXBuildFile; fileRef = 1012000000000000000000AA /* vz_install.m */; };
+		2026000000000000000000BB /* vz_network.m in Sources */ = {isa = PBXBuildFile; fileRef = 1014000000000000000000AA /* vz_network.m */; };
+		2027000000000000000000BB /* vz_vm.m in Sources */ = {isa = PBXBuildFile; fileRef = 1016000000000000000000AA /* vz_vm.m */; };
+		/* Framework target — Frameworks */
+		4011000000000000000000BB /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3001000000000000000000AA /* Cocoa.framework */; };
+		4012000000000000000000BB /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3003000000000000000000AA /* Virtualization.framework */; };
+		/* Framework target — Headers (public) */
+		6011000000000000000000BB /* backend.h in Headers */ = {isa = PBXBuildFile; fileRef = 1017000000000000000000AA /* backend.h */; settings = {ATTRIBUTES = (Public, ); }; };
+		6012000000000000000000BB /* vm_types.h in Headers */ = {isa = PBXBuildFile; fileRef = 1018000000000000000000AA /* vm_types.h */; settings = {ATTRIBUTES = (Public, ); }; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		D002000000000000000000BB /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B001000000000000000000AA /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 8010000000000000000000BB;
+			remoteInfo = AppSandboxCore;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A004000000000000000000BB /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				6010000000000000000000BB /* AppSandboxCore.framework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		1001000000000000000000AA /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
@@ -51,6 +87,7 @@
 		1016000000000000000000AA /* vz_vm.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_vm.m; sourceTree = "<group>"; };
 		1017000000000000000000AA /* backend.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = backend.h; sourceTree = "<group>"; };
 		1018000000000000000000AA /* vm_types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_types.h; sourceTree = "<group>"; };
+		1020000000000000000000BB /* AppSandboxCore-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "AppSandboxCore-Info.plist"; sourceTree = "<group>"; };
 		3001000000000000000000AA /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = System/Library/Frameworks/Cocoa.framework; sourceTree = SDKROOT; };
 		3002000000000000000000AA /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		3003000000000000000000AA /* Virtualization.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Virtualization.framework; path = System/Library/Frameworks/Virtualization.framework; sourceTree = SDKROOT; };
@@ -59,6 +96,7 @@
 		5003000000000000000000AA /* web */ = {isa = PBXFileReference; lastKnownFileType = folder; path = web; sourceTree = SOURCE_ROOT; };
 		5004000000000000000000AA /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		C001000000000000000000AA /* AppSandbox.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppSandbox.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C002000000000000000000BB /* AppSandboxCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = AppSandboxCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -68,7 +106,16 @@
 			files = (
 				4001000000000000000000AA /* Cocoa.framework in Frameworks */,
 				4002000000000000000000AA /* WebKit.framework in Frameworks */,
-				4003000000000000000000AA /* Virtualization.framework in Frameworks */,
+				4010000000000000000000BB /* AppSandboxCore.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A012000000000000000000BB /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4011000000000000000000BB /* Cocoa.framework in Frameworks */,
+				4012000000000000000000BB /* Virtualization.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -98,6 +145,7 @@
 				5001000000000000000000AA /* Info.plist */,
 				5002000000000000000000AA /* AppSandbox.entitlements */,
 				5004000000000000000000AA /* Assets.xcassets */,
+				1020000000000000000000BB /* AppSandboxCore-Info.plist */,
 			);
 			name = app_mac;
 			path = src/app_mac;
@@ -160,11 +208,24 @@
 			isa = PBXGroup;
 			children = (
 				C001000000000000000000AA /* AppSandbox.app */,
+				C002000000000000000000BB /* AppSandboxCore.framework */,
 			);
 			name = Products;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
+
+/* Begin PBXHeadersBuildPhase section */
+		A010000000000000000000BB /* Headers */ = {
+			isa = PBXHeadersBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6011000000000000000000BB /* backend.h in Headers */,
+				6012000000000000000000BB /* vm_types.h in Headers */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXHeadersBuildPhase section */
 
 /* Begin PBXNativeTarget section */
 		8003000000000000000000AA /* AppSandbox */ = {
@@ -174,15 +235,34 @@
 				A001000000000000000000AA /* Sources */,
 				A002000000000000000000AA /* Frameworks */,
 				A003000000000000000000AA /* Resources */,
+				A004000000000000000000BB /* Embed Frameworks */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				D001000000000000000000BB /* PBXTargetDependency */,
 			);
 			name = AppSandbox;
 			productName = AppSandbox;
 			productReference = C001000000000000000000AA /* AppSandbox.app */;
 			productType = "com.apple.product-type.application";
+		};
+		8010000000000000000000BB /* AppSandboxCore */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 8011000000000000000000BB /* Build configuration list for PBXNativeTarget "AppSandboxCore" */;
+			buildPhases = (
+				A010000000000000000000BB /* Headers */,
+				A011000000000000000000BB /* Sources */,
+				A012000000000000000000BB /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = AppSandboxCore;
+			productName = AppSandboxCore;
+			productReference = C002000000000000000000BB /* AppSandboxCore.framework */;
+			productType = "com.apple.product-type.framework";
 		};
 /* End PBXNativeTarget section */
 
@@ -194,6 +274,9 @@
 				LastUpgradeCheck = 1500;
 				TargetAttributes = {
 					8003000000000000000000AA = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					8010000000000000000000BB = {
 						CreatedOnToolsVersion = 15.0;
 					};
 				};
@@ -212,6 +295,7 @@
 			projectRoot = "";
 			targets = (
 				8003000000000000000000AA /* AppSandbox */,
+				8010000000000000000000BB /* AppSandboxCore */,
 			);
 		};
 /* End PBXProject section */
@@ -237,20 +321,36 @@
 				2003000000000000000000AA /* AppDelegate.m in Sources */,
 				2005000000000000000000AA /* MainWindowController.m in Sources */,
 				2007000000000000000000AA /* WebBridge.m in Sources */,
-				2008000000000000000000AA /* backend_mac.m in Sources */,
-				200A000000000000000000AA /* host_info.m in Sources */,
-				200C000000000000000000AA /* vm_dir.m in Sources */,
-				200E000000000000000000AA /* vz_disk.m in Sources */,
-				2010000000000000000000AA /* vz_display.m in Sources */,
-				2012000000000000000000AA /* vz_install.m in Sources */,
-				2014000000000000000000AA /* vz_network.m in Sources */,
-				2016000000000000000000AA /* vz_vm.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A011000000000000000000BB /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2020000000000000000000BB /* backend_mac.m in Sources */,
+				2021000000000000000000BB /* host_info.m in Sources */,
+				2022000000000000000000BB /* vm_dir.m in Sources */,
+				2023000000000000000000BB /* vz_disk.m in Sources */,
+				2024000000000000000000BB /* vz_display.m in Sources */,
+				2025000000000000000000BB /* vz_install.m in Sources */,
+				2026000000000000000000BB /* vz_network.m in Sources */,
+				2027000000000000000000BB /* vz_vm.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		D001000000000000000000BB /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 8010000000000000000000BB /* AppSandboxCore */;
+			targetProxy = D002000000000000000000BB /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		/* Project-level Debug */
 		9001000000000000000000AA /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -308,6 +408,7 @@
 			};
 			name = Debug;
 		};
+		/* Project-level Release */
 		9002000000000000000000AA /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -358,6 +459,7 @@
 			};
 			name = Release;
 		};
+		/* AppSandbox (app) target — Debug */
 		9003000000000000000000AA /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -386,6 +488,7 @@
 			};
 			name = Debug;
 		};
+		/* AppSandbox (app) target — Release */
 		9004000000000000000000AA /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -414,6 +517,56 @@
 			};
 			name = Release;
 		};
+		/* AppSandboxCore (framework) target — Debug */
+		9010000000000000000000BB /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEFINES_MODULE = YES;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				GCC_SYMBOLS_PRIVATE_EXTERN = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/src",
+					"$(SRCROOT)/src/core",
+					"$(SRCROOT)/src/backend_mac",
+				);
+				INFOPLIST_FILE = "src/app_mac/AppSandboxCore-Info.plist";
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.appsandbox.AppSandboxCore;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		/* AppSandboxCore (framework) target — Release */
+		9011000000000000000000BB /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEFINES_MODULE = YES;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				GCC_SYMBOLS_PRIVATE_EXTERN = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/src",
+					"$(SRCROOT)/src/core",
+					"$(SRCROOT)/src/backend_mac",
+				);
+				INFOPLIST_FILE = "src/app_mac/AppSandboxCore-Info.plist";
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.appsandbox.AppSandboxCore;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -431,6 +584,15 @@
 			buildConfigurations = (
 				9003000000000000000000AA /* Debug */,
 				9004000000000000000000AA /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		8011000000000000000000BB /* Build configuration list for PBXNativeTarget "AppSandboxCore" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9010000000000000000000BB /* Debug */,
+				9011000000000000000000BB /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
