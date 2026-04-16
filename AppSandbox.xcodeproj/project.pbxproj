@@ -27,37 +27,37 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		1001000000000000000000AA /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = main.m; path = main.m; sourceTree = "<group>"; };
-		1002000000000000000000AA /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = AppDelegate.h; path = AppDelegate.h; sourceTree = "<group>"; };
-		1003000000000000000000AA /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = AppDelegate.m; path = AppDelegate.m; sourceTree = "<group>"; };
-		1004000000000000000000AA /* MainWindowController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = MainWindowController.h; path = MainWindowController.h; sourceTree = "<group>"; };
-		1005000000000000000000AA /* MainWindowController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = MainWindowController.m; path = MainWindowController.m; sourceTree = "<group>"; };
-		1006000000000000000000AA /* WebBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = WebBridge.h; path = WebBridge.h; sourceTree = "<group>"; };
-		1007000000000000000000AA /* WebBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = WebBridge.m; path = WebBridge.m; sourceTree = "<group>"; };
-		1008000000000000000000AA /* backend_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = backend_mac.m; path = ../../src/backend_mac/backend_mac.m; sourceTree = "<group>"; };
-		1009000000000000000000AA /* host_info.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = host_info.h; path = ../../src/backend_mac/host_info.h; sourceTree = "<group>"; };
-		100A000000000000000000AA /* host_info.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = host_info.m; path = ../../src/backend_mac/host_info.m; sourceTree = "<group>"; };
-		100B000000000000000000AA /* vm_dir.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vm_dir.h; path = ../../src/backend_mac/vm_dir.h; sourceTree = "<group>"; };
-		100C000000000000000000AA /* vm_dir.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = vm_dir.m; path = ../../src/backend_mac/vm_dir.m; sourceTree = "<group>"; };
-		100D000000000000000000AA /* vz_disk.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vz_disk.h; path = ../../src/backend_mac/vz_disk.h; sourceTree = "<group>"; };
-		100E000000000000000000AA /* vz_disk.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = vz_disk.m; path = ../../src/backend_mac/vz_disk.m; sourceTree = "<group>"; };
-		100F000000000000000000AA /* vz_display.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vz_display.h; path = ../../src/backend_mac/vz_display.h; sourceTree = "<group>"; };
-		1010000000000000000000AA /* vz_display.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = vz_display.m; path = ../../src/backend_mac/vz_display.m; sourceTree = "<group>"; };
-		1011000000000000000000AA /* vz_install.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vz_install.h; path = ../../src/backend_mac/vz_install.h; sourceTree = "<group>"; };
-		1012000000000000000000AA /* vz_install.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = vz_install.m; path = ../../src/backend_mac/vz_install.m; sourceTree = "<group>"; };
-		1013000000000000000000AA /* vz_network.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vz_network.h; path = ../../src/backend_mac/vz_network.h; sourceTree = "<group>"; };
-		1014000000000000000000AA /* vz_network.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = vz_network.m; path = ../../src/backend_mac/vz_network.m; sourceTree = "<group>"; };
-		1015000000000000000000AA /* vz_vm.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vz_vm.h; path = ../../src/backend_mac/vz_vm.h; sourceTree = "<group>"; };
-		1016000000000000000000AA /* vz_vm.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = vz_vm.m; path = ../../src/backend_mac/vz_vm.m; sourceTree = "<group>"; };
-		1017000000000000000000AA /* backend.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = backend.h; path = ../../src/core/backend.h; sourceTree = "<group>"; };
-		1018000000000000000000AA /* vm_types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = vm_types.h; path = ../../src/core/vm_types.h; sourceTree = "<group>"; };
+		1001000000000000000000AA /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
+		1002000000000000000000AA /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
+		1003000000000000000000AA /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppDelegate.m; sourceTree = "<group>"; };
+		1004000000000000000000AA /* MainWindowController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MainWindowController.h; sourceTree = "<group>"; };
+		1005000000000000000000AA /* MainWindowController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = MainWindowController.m; sourceTree = "<group>"; };
+		1006000000000000000000AA /* WebBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WebBridge.h; sourceTree = "<group>"; };
+		1007000000000000000000AA /* WebBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WebBridge.m; sourceTree = "<group>"; };
+		1008000000000000000000AA /* backend_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = backend_mac.m; sourceTree = "<group>"; };
+		1009000000000000000000AA /* host_info.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = host_info.h; sourceTree = "<group>"; };
+		100A000000000000000000AA /* host_info.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = host_info.m; sourceTree = "<group>"; };
+		100B000000000000000000AA /* vm_dir.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_dir.h; sourceTree = "<group>"; };
+		100C000000000000000000AA /* vm_dir.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_dir.m; sourceTree = "<group>"; };
+		100D000000000000000000AA /* vz_disk.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_disk.h; sourceTree = "<group>"; };
+		100E000000000000000000AA /* vz_disk.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_disk.m; sourceTree = "<group>"; };
+		100F000000000000000000AA /* vz_display.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_display.h; sourceTree = "<group>"; };
+		1010000000000000000000AA /* vz_display.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_display.m; sourceTree = "<group>"; };
+		1011000000000000000000AA /* vz_install.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_install.h; sourceTree = "<group>"; };
+		1012000000000000000000AA /* vz_install.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_install.m; sourceTree = "<group>"; };
+		1013000000000000000000AA /* vz_network.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_network.h; sourceTree = "<group>"; };
+		1014000000000000000000AA /* vz_network.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_network.m; sourceTree = "<group>"; };
+		1015000000000000000000AA /* vz_vm.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_vm.h; sourceTree = "<group>"; };
+		1016000000000000000000AA /* vz_vm.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_vm.m; sourceTree = "<group>"; };
+		1017000000000000000000AA /* backend.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = backend.h; sourceTree = "<group>"; };
+		1018000000000000000000AA /* vm_types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_types.h; sourceTree = "<group>"; };
 		3001000000000000000000AA /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = System/Library/Frameworks/Cocoa.framework; sourceTree = SDKROOT; };
 		3002000000000000000000AA /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		3003000000000000000000AA /* Virtualization.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Virtualization.framework; path = System/Library/Frameworks/Virtualization.framework; sourceTree = SDKROOT; };
-		5001000000000000000000AA /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = Info.plist; path = AppSandbox/Info.plist; sourceTree = "<group>"; };
-		5002000000000000000000AA /* AppSandbox.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; name = AppSandbox.entitlements; path = AppSandbox/AppSandbox.entitlements; sourceTree = "<group>"; };
-		5003000000000000000000AA /* web */ = {isa = PBXFileReference; lastKnownFileType = folder; name = web; path = ../../web; sourceTree = "<group>"; };
-		5004000000000000000000AA /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = AppSandbox/Assets.xcassets; sourceTree = "<group>"; };
+		5001000000000000000000AA /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		5002000000000000000000AA /* AppSandbox.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = AppSandbox.entitlements; sourceTree = "<group>"; };
+		5003000000000000000000AA /* web */ = {isa = PBXFileReference; lastKnownFileType = folder; path = web; sourceTree = SOURCE_ROOT; };
+		5004000000000000000000AA /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		C001000000000000000000AA /* AppSandbox.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppSandbox.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -78,7 +78,6 @@
 		7001000000000000000000AA = {
 			isa = PBXGroup;
 			children = (
-				7003000000000000000000AA /* app */,
 				7005000000000000000000AA /* src */,
 				5003000000000000000000AA /* web */,
 				7008000000000000000000AA /* Frameworks */,
@@ -86,7 +85,7 @@
 			);
 			sourceTree = "<group>";
 		};
-		7003000000000000000000AA /* app */ = {
+		7003000000000000000000AA /* app_mac */ = {
 			isa = PBXGroup;
 			children = (
 				1001000000000000000000AA /* main.m */,
@@ -96,27 +95,20 @@
 				1005000000000000000000AA /* MainWindowController.m */,
 				1006000000000000000000AA /* WebBridge.h */,
 				1007000000000000000000AA /* WebBridge.m */,
-				7004000000000000000000AA /* AppSandbox */,
-			);
-			name = app;
-			path = .;
-			sourceTree = "<group>";
-		};
-		7004000000000000000000AA /* AppSandbox */ = {
-			isa = PBXGroup;
-			children = (
 				5001000000000000000000AA /* Info.plist */,
 				5002000000000000000000AA /* AppSandbox.entitlements */,
 				5004000000000000000000AA /* Assets.xcassets */,
 			);
-			name = AppSandbox;
-			sourceTree = "<group>";
+			name = app_mac;
+			path = src/app_mac;
+			sourceTree = SOURCE_ROOT;
 		};
 		7005000000000000000000AA /* src */ = {
 			isa = PBXGroup;
 			children = (
-				7006000000000000000000AA /* core */,
+				7003000000000000000000AA /* app_mac */,
 				7007000000000000000000AA /* backend_mac */,
+				7006000000000000000000AA /* core */,
 			);
 			name = src;
 			sourceTree = "<group>";
@@ -128,7 +120,8 @@
 				1018000000000000000000AA /* vm_types.h */,
 			);
 			name = core;
-			sourceTree = "<group>";
+			path = src/core;
+			sourceTree = SOURCE_ROOT;
 		};
 		7007000000000000000000AA /* backend_mac */ = {
 			isa = PBXGroup;
@@ -150,7 +143,8 @@
 				1016000000000000000000AA /* vz_vm.m */,
 			);
 			name = backend_mac;
-			sourceTree = "<group>";
+			path = src/backend_mac;
+			sourceTree = SOURCE_ROOT;
 		};
 		7008000000000000000000AA /* Frameworks */ = {
 			isa = PBXGroup;
@@ -368,18 +362,19 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = AppSandbox/AppSandbox.entitlements;
+				CODE_SIGN_ENTITLEMENTS = src/app_mac/AppSandbox.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/../../src",
-					"$(SRCROOT)/../../src/core",
-					"$(SRCROOT)/../../src/backend_mac",
+					"$(SRCROOT)/src",
+					"$(SRCROOT)/src/core",
+					"$(SRCROOT)/src/app_mac",
+					"$(SRCROOT)/src/backend_mac",
 				);
-				INFOPLIST_FILE = AppSandbox/Info.plist;
+				INFOPLIST_FILE = src/app_mac/Info.plist;
 				INSTALL_PATH = "$(LOCAL_APPS_DIR)";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -395,18 +390,19 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = AppSandbox/AppSandbox.entitlements;
+				CODE_SIGN_ENTITLEMENTS = src/app_mac/AppSandbox.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/../../src",
-					"$(SRCROOT)/../../src/core",
-					"$(SRCROOT)/../../src/backend_mac",
+					"$(SRCROOT)/src",
+					"$(SRCROOT)/src/core",
+					"$(SRCROOT)/src/app_mac",
+					"$(SRCROOT)/src/backend_mac",
 				);
-				INFOPLIST_FILE = AppSandbox/Info.plist;
+				INFOPLIST_FILE = src/app_mac/Info.plist;
 				INSTALL_PATH = "$(LOCAL_APPS_DIR)";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

@@ -18,7 +18,7 @@ import sys
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CORE_DIR = os.path.join(REPO_ROOT, "src", "core")
 VCXPROJ = os.path.join(REPO_ROOT, "AppSandboxCore.vcxproj")
-XCODEPROJ = os.path.join(REPO_ROOT, "app", "mac", "AppSandbox.xcodeproj", "project.pbxproj")
+XCODEPROJ = os.path.join(REPO_ROOT, "AppSandbox.xcodeproj", "project.pbxproj")
 
 
 def find_core_files():
@@ -45,8 +45,15 @@ def parse_xcodeproj(path):
         return None
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
-    matches = re.findall(r'path\s*=\s*[^\s;]*src/core/([^\s;/]+\.[ch])', text)
-    return set(matches)
+    has_core_group = 'path = src/core' in text
+    if not has_core_group:
+        return set()
+    result = set()
+    for m in re.finditer(r'isa\s*=\s*PBXFileReference\s*;[^}]*path\s*=\s*(\S+\.[ch])\s*;', text):
+        fname = m.group(1)
+        if os.path.isfile(os.path.join(CORE_DIR, fname)):
+            result.add(fname)
+    return result
 
 
 def report(label, on_disk, in_proj):
@@ -75,7 +82,7 @@ def main():
     on_disk = set(find_core_files())
     total_drift = 0
     total_drift += report("AppSandboxCore.vcxproj", on_disk, parse_vcxproj(VCXPROJ))
-    total_drift += report("app/mac/AppSandbox.xcodeproj", on_disk, parse_xcodeproj(XCODEPROJ))
+    total_drift += report("AppSandbox.xcodeproj", on_disk, parse_xcodeproj(XCODEPROJ))
     if total_drift > 0:
         print(f"\n{total_drift} drift(s) detected")
         return 1
