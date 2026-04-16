@@ -73,8 +73,8 @@ static NSDictionary *vmInfoToJsDict(const CoreVmInfo *info) {
         @"ramMb":           @(info->ram_mb),
         @"hddGb":           @(info->hdd_gb),
         @"cpuCores":        @(info->cpu_cores),
-        @"gpuMode":         @0,
-        @"gpuName":         @"",
+        @"gpuMode":         @1,
+        @"gpuName":         [HostInfo hostGpuName],
         @"networkMode":     @1,  /* NAT */
         @"netAdapter":      @"",
         @"isTemplate":      @NO,
