@@ -403,8 +403,10 @@
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
+				OBJROOT = "$(SRCROOT)/bin/Intermediates.noindex";
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = macosx;
+				SYMROOT = "$(SRCROOT)/bin";
 			};
 			name = Debug;
 		};
@@ -455,7 +457,9 @@
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
+				OBJROOT = "$(SRCROOT)/bin/Intermediates.noindex";
 				SDKROOT = macosx;
+				SYMROOT = "$(SRCROOT)/bin";
 			};
 			name = Release;
 		};
