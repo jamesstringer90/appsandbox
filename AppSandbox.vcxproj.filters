@@ -15,10 +15,13 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="src\main.c">
+    <ClCompile Include="src\app_win\main.c">
       <Filter>App</Filter>
     </ClCompile>
-    <ClCompile Include="src\ui.c">
+    <ClCompile Include="src\app_win\ui.c">
+      <Filter>App</Filter>
+    </ClCompile>
+    <ClCompile Include="src\app_win\webview2_bridge.c">
       <Filter>App</Filter>
     </ClCompile>
     <ClCompile Include="src\backend_win\vm_display.c">
@@ -27,24 +30,21 @@
     <ClCompile Include="src\backend_win\vm_display_idd.c">
       <Filter>Backend Win</Filter>
     </ClCompile>
-    <ClCompile Include="src\backend_win\webview2_bridge.c">
-      <Filter>Backend Win</Filter>
-    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\resource.h">
+    <ClInclude Include="src\app_win\resource.h">
       <Filter>Headers</Filter>
     </ClInclude>
-    <ClInclude Include="src\ui.h">
+    <ClInclude Include="src\app_win\ui.h">
       <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\app_win\webview2_bridge.h">
+      <Filter>App</Filter>
     </ClInclude>
     <ClInclude Include="src\backend_win\asb_core.h">
       <Filter>Backend Win</Filter>
     </ClInclude>
     <ClInclude Include="src\backend_win\asb_display.h">
-      <Filter>Backend Win</Filter>
-    </ClInclude>
-    <ClInclude Include="src\backend_win\webview2_bridge.h">
       <Filter>Backend Win</Filter>
     </ClInclude>
     <ClInclude Include="src\backend_win\hcs_vm.h">
