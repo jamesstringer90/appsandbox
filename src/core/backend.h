@@ -22,6 +22,8 @@
   #else
     #define CORE_API __declspec(dllimport)
   #endif
+#elif defined(__APPLE__)
+  #define CORE_API __attribute__((visibility("default")))
 #else
   #define CORE_API
 #endif
