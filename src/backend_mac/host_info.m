@@ -1,6 +1,7 @@
 #import "host_info.h"
 #import "vm_dir.h"
 
+#import <Metal/Metal.h>
 #include <sys/sysctl.h>
 
 @implementation HostInfo
@@ -31,6 +32,12 @@
     NSNumber *freeBytes = attrs[NSFileSystemFreeSize];
     if (!freeBytes) return 0;
     return (int)([freeBytes unsignedLongLongValue] / (1024ULL * 1024ULL * 1024ULL));
+}
+
++ (NSString *)hostGpuName {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    NSString *name = [device.name copy];
+    return name ?: @"";
 }
 
 @end

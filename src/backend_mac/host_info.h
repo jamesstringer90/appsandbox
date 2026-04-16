@@ -19,4 +19,7 @@
 /* Free bytes on the volume that backs the VMs root directory, as GB. */
 + (int)freeGb;
 
+/* Host GPU name (e.g. "Apple M3 Pro"). VM guests implicitly share this GPU. */
++ (NSString *)hostGpuName;
+
 @end
