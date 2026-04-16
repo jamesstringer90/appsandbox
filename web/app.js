@@ -568,7 +568,7 @@ function buildRowCells(vm, i, statusTd) {
         else sshBtn.title = 'SSH: waiting for the in-VM agent to come online';
     }
 
-    return [
+    var cells = [
         makeCell(vm.name, i, 0),
         makeCell(vm.osType, i, 1),
         statusTd,
@@ -578,7 +578,9 @@ function buildRowCells(vm, i, statusTd) {
         makeCell(vm.hddGb + ' GB', i, 6, 'Virtual disk size, in gigabytes'),
         makeCell(vm.gpuName || (vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7, 'GPU passed through to the VM via GPU-PV, or None'),
         makeCell(netNames[vm.networkMode] || 'None', i, 8, 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
-        makeSnapCell(vm, i),
+    ];
+    if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
+    cells.push(
         makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, (function(vmIdx, sv, vmObj) { return function() {
             var p = parseSnapValue(sv);
             if ((p.snapIndex >= 0 || p.snapIndex === -2) && p.branchIndex < 0) {
@@ -605,7 +607,8 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
         makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped'),
-    ];
+    );
+    return cells;
 }
 
 function renderVmTable() {
@@ -616,7 +619,7 @@ function renderVmTable() {
         tbody.innerHTML = '';
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 17;
+        td.colSpan = hostBridge.isMac ? 16 : 17;
         td.className = 'empty-state';
         var btn = document.createElement('button');
         btn.className = 'primary empty-state-btn';
