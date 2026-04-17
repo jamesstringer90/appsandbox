@@ -7,7 +7,6 @@
  *   aux.img         -- VZMacAuxiliaryStorage (NVRAM + firmware data)
  *   hardware.bin    -- VZMacHardwareModel dataRepresentation
  *   machine-id.bin  -- VZMacMachineIdentifier dataRepresentation
- *   config.json     -- ram/cpu/hdd and other metadata
  */
 
 #import <Foundation/Foundation.h>
@@ -23,15 +22,10 @@ NS_ASSUME_NONNULL_BEGIN
 + (NSURL *)auxiliaryStorageURLFor:(NSString *)name;
 + (NSURL *)hardwareModelURLFor:(NSString *)name;
 + (NSURL *)machineIdentifierURLFor:(NSString *)name;
-+ (NSURL *)configURLFor:(NSString *)name;
 
 + (BOOL)ensureDirectoryFor:(NSString *)name error:(NSError **)error;
 + (BOOL)vmExists:(NSString *)name;
-+ (NSArray<NSString *> *)listAllVmNames;
 + (BOOL)deleteVm:(NSString *)name error:(NSError **)error;
-
-+ (nullable NSDictionary *)readConfigFor:(NSString *)name;
-+ (BOOL)writeConfig:(NSDictionary *)config for:(NSString *)name error:(NSError **)error;
 
 @end
 

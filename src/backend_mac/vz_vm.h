@@ -17,7 +17,10 @@ typedef void (^VzVmStateChangeBlock)(VZVirtualMachineState state);
 
 /* Build a VZVirtualMachineConfiguration from on-disk state for the named VM.
  * Returns a ready-to-start wrapper, or nil on error. */
-+ (nullable VzVm *)loadVmNamed:(NSString *)name error:(NSError **)error;
++ (nullable VzVm *)loadVmNamed:(NSString *)name
+                         ramMb:(int)ramMb
+                      cpuCores:(int)cpuCores
+                         error:(NSError **)error;
 
 /* Build a fresh configuration for install (no disks are loaded from disk.img;
  * this is used by vz_install during VZMacOSInstaller setup). */
