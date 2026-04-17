@@ -12,7 +12,7 @@
 #import "asb_core_mac.h"
 #import "host_info.h"
 
-#include "vm_types.h"
+#include "asb_types.h"
 
 #pragma mark - Static state
 

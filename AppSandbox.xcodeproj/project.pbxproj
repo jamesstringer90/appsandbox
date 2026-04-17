@@ -35,8 +35,7 @@
 		4012000000000000000000BB /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3003000000000000000000AA /* Virtualization.framework */; };
 		4013000000000000000000BB /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3004000000000000000000AA /* Metal.framework */; };
 		/* Framework target — Headers (public) */
-		6011000000000000000000BB /* backend.h in Headers */ = {isa = PBXBuildFile; fileRef = 1017000000000000000000AA /* backend.h */; settings = {ATTRIBUTES = (Public, ); }; };
-		6012000000000000000000BB /* vm_types.h in Headers */ = {isa = PBXBuildFile; fileRef = 1018000000000000000000AA /* vm_types.h */; settings = {ATTRIBUTES = (Public, ); }; };
+		6012000000000000000000BB /* asb_types.h in Headers */ = {isa = PBXBuildFile; fileRef = 1018000000000000000000AA /* asb_types.h */; settings = {ATTRIBUTES = (Public, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -87,8 +86,7 @@
 		1014000000000000000000AA /* vz_network.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_network.m; sourceTree = "<group>"; };
 		1015000000000000000000AA /* vz_vm.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_vm.h; sourceTree = "<group>"; };
 		1016000000000000000000AA /* vz_vm.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_vm.m; sourceTree = "<group>"; };
-		1017000000000000000000AA /* backend.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = backend.h; sourceTree = "<group>"; };
-		1018000000000000000000AA /* vm_types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_types.h; sourceTree = "<group>"; };
+		1018000000000000000000AA /* asb_types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_types.h; sourceTree = "<group>"; };
 		1020000000000000000000BB /* AppSandboxCore-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "AppSandboxCore-Info.plist"; sourceTree = "<group>"; };
 		3001000000000000000000AA /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = System/Library/Frameworks/Cocoa.framework; sourceTree = SDKROOT; };
 		3002000000000000000000AA /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
@@ -168,8 +166,7 @@
 		7006000000000000000000AA /* core */ = {
 			isa = PBXGroup;
 			children = (
-				1017000000000000000000AA /* backend.h */,
-				1018000000000000000000AA /* vm_types.h */,
+				1018000000000000000000AA /* asb_types.h */,
 			);
 			name = core;
 			path = src/core;
@@ -226,8 +223,7 @@
 			isa = PBXHeadersBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				6011000000000000000000BB /* backend.h in Headers */,
-				6012000000000000000000BB /* vm_types.h in Headers */,
+				6012000000000000000000BB /* asb_types.h in Headers */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

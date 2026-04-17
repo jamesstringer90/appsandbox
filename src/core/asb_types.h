@@ -1,19 +1,27 @@
 /*
- * vm_types.h -- Platform-neutral VM descriptor types.
+ * asb_types.h -- Platform-neutral VM descriptor types and error codes.
  *
- * Shared by core and all backends. All strings are UTF-8 char *.
- * Types are prefixed `Core` to avoid collisions with per-backend
- * native structs (e.g. Windows hcs_vm.h's own VmConfig).
+ * Shared by both platform orchestrators (asb_core on Windows,
+ * asb_core_mac on macOS) and their UI layers.
  */
 
-#ifndef ASB_CORE_VM_TYPES_H
-#define ASB_CORE_VM_TYPES_H
+#ifndef ASB_TYPES_H
+#define ASB_TYPES_H
 
 #include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Return codes shared by both platform orchestrators. */
+#define BACKEND_OK                   0
+#define BACKEND_ERR_INVALID_ARG     -1
+#define BACKEND_ERR_NOT_FOUND       -2
+#define BACKEND_ERR_FAILED          -3
+#define BACKEND_ERR_NOT_IMPLEMENTED -4
+#define BACKEND_ERR_ALREADY_RUNNING -5
+#define BACKEND_ERR_NOT_RUNNING     -6
 
 #define CORE_VM_NAME_MAX       128
 #define CORE_VM_OS_TYPE_MAX     32
@@ -77,4 +85,4 @@ typedef void (*CoreVmEventCallback)(const CoreVmEvent *event, void *user_data);
 }
 #endif
 
-#endif /* ASB_CORE_VM_TYPES_H */
+#endif /* ASB_TYPES_H */
