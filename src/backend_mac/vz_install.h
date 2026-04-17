@@ -18,10 +18,12 @@ typedef void (^VzRestoreImageURLBlock)(NSURL * _Nullable url, NSError * _Nullabl
 /* Query Apple's service for the latest supported macOS restore image URL. */
 + (void)fetchLatestRestoreImageURLWithCompletion:(VzRestoreImageURLBlock)completion;
 
-/* Download a restore image (.ipsw) to a local file, reporting progress. */
+/* Download a restore image (.ipsw) to a local file, reporting progress.
+ * The size block fires once with the total byte count on first progress tick. */
 + (void)downloadRestoreImageFromURL:(NSURL *)remoteURL
                               toURL:(NSURL *)localURL
                            progress:(VzInstallProgressBlock)progress
+                               size:(void (^)(int64_t totalBytes))sizeBlock
                          completion:(VzInstallCompletionBlock)completion;
 
 /* Install macOS into a new VM directory. Creates the disk image, aux storage,
