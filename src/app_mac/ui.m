@@ -56,7 +56,7 @@ static NSDictionary *vmToJsDict(const AsbVmMac *vm) {
     return @{
         @"name":            [NSString stringWithUTF8String:vm->name],
         @"osType":          [NSString stringWithUTF8String:vm->os_type],
-        @"running":         @(vm->running ? YES : NO),
+        @"running":         @(vm->running || (!vm->install_complete && vm->install_progress >= 0)),
         @"shuttingDown":    @(vm->shutting_down ? YES : NO),
         @"agentOnline":     @NO,
         @"ramMb":           @(vm->ram_mb),
@@ -68,7 +68,7 @@ static NSDictionary *vmToJsDict(const AsbVmMac *vm) {
         @"netAdapter":      @"",
         @"isTemplate":      @NO,
         @"hypervVideoOff":  @NO,
-        @"buildingVhdx":    @(!vm->install_complete && vm->install_progress >= 0),
+        @"buildingVhdx":    @NO,
         @"vhdxStaging":     @NO,
         @"vhdxProgress":    @(vm->install_progress < 0 ? 0 : vm->install_progress),
         @"installComplete": @(vm->install_complete ? YES : NO),

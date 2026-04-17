@@ -126,6 +126,8 @@ didCompleteWithError:(NSError *)error {
     delegate.destinationURL = localURL;
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    cfg.timeoutIntervalForRequest = 0;
+    cfg.timeoutIntervalForResource = 0;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg
                                                            delegate:delegate
                                                       delegateQueue:nil];

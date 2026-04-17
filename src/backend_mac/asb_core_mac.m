@@ -519,7 +519,17 @@ int asb_mac_vm_delete(const char *name) {
     if (!name) return BACKEND_ERR_INVALID_ARG;
     int idx = vm_index_of(name);
     if (idx < 0) return BACKEND_ERR_NOT_FOUND;
-    if (g_vms[idx].running) return BACKEND_ERR_ALREADY_RUNNING;
+
+    if (g_vms[idx].running && g_vms[idx].vz_handle) {
+        post_log("[%s] Stopping VM before delete...", name);
+        [g_vms[idx].vz_handle stopWithCompletion:^(NSError * _Nullable err) { (void)err; }];
+        g_vms[idx].running = NO;
+        g_vms[idx].shutting_down = NO;
+        if (g_display_refs[idx]) {
+            VzDisplayWindow *display = g_display_refs[idx];
+            [display.window close];
+        }
+    }
 
     post_log("[%s] Deleting VM...", name);
 
