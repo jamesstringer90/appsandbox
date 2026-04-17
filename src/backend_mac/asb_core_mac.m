@@ -291,28 +291,27 @@ static void start_install_flow(int idx, NSURL *restoreURL) {
     int ramMb = g_vms[idx].ram_mb;
     int hddGb = g_vms[idx].hdd_gb;
     int cpus  = g_vms[idx].cpu_cores;
-    const char *vmName = g_vms[idx].name;
+    NSString *nsName = [NSString stringWithUTF8String:g_vms[idx].name];
 
     post_log("[%s] Starting macOS install (%d cores, %d MB RAM, %d GB disk)",
-             vmName, cpus, ramMb, hddGb);
-    post_event(CORE_VM_EVENT_INSTALL_STATUS, vmName, 0, "Starting install");
+             nsName.UTF8String, cpus, ramMb, hddGb);
+    post_event(CORE_VM_EVENT_INSTALL_STATUS, nsName.UTF8String, 0, "Starting install");
     post_list_changed();
 
-    NSString *name = [NSString stringWithUTF8String:vmName];
-    [VzInstall installMacOSWithName:name
+    [VzInstall installMacOSWithName:nsName
                     restoreImageURL:restoreURL
                               ramMb:ramMb
                               hddGb:hddGb
                            cpuCores:cpus
                            progress:^(double frac, NSString *stage) {
         run_on_main(^{
-            int i = vm_index_of(vmName);
+            int i = vm_index_of(nsName.UTF8String);
             if (i >= 0) update_install_progress(i, frac, stage);
         });
     }
                          completion:^(NSError * _Nullable err) {
         run_on_main(^{
-            int i = vm_index_of(vmName);
+            int i = vm_index_of(nsName.UTF8String);
             if (i >= 0) finish_install(i, err);
         });
     }];
@@ -364,7 +363,7 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     if (imagePath.length > 0) {
         if (image_path) strlcpy(g_last_ipsw_path, image_path, sizeof(g_last_ipsw_path));
         run_on_main(^{
-            int i = vm_index_of(name);
+            int i = vm_index_of(nsName.UTF8String);
             if (i >= 0) start_install_flow(i, [NSURL fileURLWithPath:imagePath]);
         });
         return BACKEND_OK;
@@ -376,19 +375,19 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     if ([[NSFileManager defaultManager] fileExistsAtPath:cachedIpsw.path]) {
         post_log("Using cached restore image: %s", cachedIpsw.path.UTF8String);
         run_on_main(^{
-            int i = vm_index_of(name);
+            int i = vm_index_of(nsName.UTF8String);
             if (i >= 0) start_install_flow(i, cachedIpsw);
         });
         return BACKEND_OK;
     }
 
     post_log("No cached restore image found, fetching latest from Apple...");
-    post_event(CORE_VM_EVENT_INSTALL_STATUS, name, 0, "Fetching latest restore image");
+    post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, 0, "Fetching latest restore image");
 
     [VzInstall fetchLatestRestoreImageURLWithCompletion:^(NSURL * _Nullable url, NSError * _Nullable fetchErr) {
         if (!url) {
             run_on_main(^{
-                int i = vm_index_of(name);
+                int i = vm_index_of(nsName.UTF8String);
                 if (i >= 0) {
                     finish_install(i, fetchErr ?: [NSError errorWithDomain:@"VzInstall" code:20
                         userInfo:@{NSLocalizedDescriptionKey: @"No supported restore image available"}]);
@@ -401,7 +400,7 @@ int asb_mac_vm_create(const char *name, const char *os_type,
                                          toURL:cachedIpsw
                                       progress:^(double frac, NSString *stage) {
             run_on_main(^{
-                int i = vm_index_of(name);
+                int i = vm_index_of(nsName.UTF8String);
                 if (i >= 0) update_install_progress(i, frac, stage);
             });
         }
@@ -409,14 +408,14 @@ int asb_mac_vm_create(const char *name, const char *os_type,
             if (dlErr) {
                 post_log("Download failed: %s", dlErr.localizedDescription.UTF8String);
                 run_on_main(^{
-                    int i = vm_index_of(name);
+                    int i = vm_index_of(nsName.UTF8String);
                     if (i >= 0) finish_install(i, dlErr);
                 });
                 return;
             }
             post_log("Restore image downloaded, starting install...");
             run_on_main(^{
-                int i = vm_index_of(name);
+                int i = vm_index_of(nsName.UTF8String);
                 if (i >= 0) start_install_flow(i, cachedIpsw);
             });
         }];
@@ -459,7 +458,7 @@ int asb_mac_vm_start(const char *name) {
 
     vm.onStateChange = ^(VZVirtualMachineState state) {
         run_on_main(^{
-            int i = vm_index_of(name);
+            int i = vm_index_of(nsName.UTF8String);
             if (i >= 0) handle_vm_state_change(i, state);
         });
     };
@@ -467,7 +466,7 @@ int asb_mac_vm_start(const char *name) {
     [vm startWithCompletion:^(NSError * _Nullable startErr) {
         run_on_main(^{
             if (startErr) {
-                int i = vm_index_of(name);
+                int i = vm_index_of(nsName.UTF8String);
                 if (i >= 0) {
                     g_vz_refs[i] = nil;
                     g_vms[i].vz_handle = nil;
@@ -493,10 +492,11 @@ int asb_mac_vm_stop(const char *name, int force) {
     VzVm *vm = g_vms[idx].vz_handle;
     if (!vm) return BACKEND_ERR_NOT_RUNNING;
 
+    NSString *nsName = [NSString stringWithUTF8String:name];
     void (^onError)(NSError *) = ^(NSError * _Nullable stopErr) {
         if (!stopErr) return;
         run_on_main(^{
-            int i = vm_index_of(name);
+            int i = vm_index_of(nsName.UTF8String);
             if (i >= 0) {
                 post_log("[%s] Stop failed: %s", g_vms[i].name,
                          stopErr.localizedDescription.UTF8String);
