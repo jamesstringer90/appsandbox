@@ -10,6 +10,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #import "asb_core_mac.h"
+#import "vz_display.h"
 #import "host_info.h"
 
 #include "asb_types.h"
