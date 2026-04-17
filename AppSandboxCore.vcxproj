@@ -178,11 +178,9 @@
     <ClCompile Include="src\backend_win\vm_agent.c" />
     <ClCompile Include="src\backend_win\prereq.c" />
     <ClCompile Include="src\backend_win\vm_ssh_proxy.c" />
-    <ClCompile Include="src\backend_win\backend_win.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\core\backend.h" />
-    <ClInclude Include="src\core\vm_types.h" />
+    <ClInclude Include="src\core\asb_types.h" />
     <ClInclude Include="src\backend_win\asb_core.h" />
     <ClInclude Include="src\backend_win\asb_display.h" />
     <ClInclude Include="src\ui.h" />
