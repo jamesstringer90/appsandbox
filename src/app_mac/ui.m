@@ -68,7 +68,7 @@ static NSDictionary *vmToJsDict(const AsbVmMac *vm) {
         @"netAdapter":      @"",
         @"isTemplate":      @NO,
         @"hypervVideoOff":  @NO,
-        @"buildingVhdx":    @NO,
+        @"buildingVhdx":    @(!vm->install_complete && vm->install_progress >= 0),
         @"vhdxStaging":     @NO,
         @"vhdxProgress":    @(vm->install_progress < 0 ? 0 : vm->install_progress),
         @"installComplete": @(vm->install_complete ? YES : NO),
