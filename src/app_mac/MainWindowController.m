@@ -1,5 +1,5 @@
 #import "MainWindowController.h"
-#import "WebBridge.h"
+#import "ui.h"
 
 @implementation MainWindowController
 
@@ -27,7 +27,7 @@
     self.webView.navigationDelegate = self;
     window.contentView = self.webView;
 
-    WebBridgeSetWebView(self.webView);
+    ui_set_webview(self.webView);
 
     NSString *resourcePath = [[NSBundle mainBundle] pathForResource:@"index"
                                                              ofType:@"html"
@@ -50,7 +50,7 @@
       didReceiveScriptMessage:(WKScriptMessage *)message {
     (void)userContentController;
     if ([message.body isKindOfClass:[NSString class]]) {
-        WebBridgeHandleMessage((NSString *)message.body);
+        ui_handle_message((NSString *)message.body);
     }
 }
 

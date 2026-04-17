@@ -11,7 +11,7 @@
 		2001000000000000000000AA /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 1001000000000000000000AA /* main.m */; };
 		2003000000000000000000AA /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = 1003000000000000000000AA /* AppDelegate.m */; };
 		2005000000000000000000AA /* MainWindowController.m in Sources */ = {isa = PBXBuildFile; fileRef = 1005000000000000000000AA /* MainWindowController.m */; };
-		2007000000000000000000AA /* WebBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = 1007000000000000000000AA /* WebBridge.m */; };
+		2007000000000000000000AA /* ui.m in Sources */ = {isa = PBXBuildFile; fileRef = 1007000000000000000000AA /* ui.m */; };
 		/* App target — Frameworks */
 		4001000000000000000000AA /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3001000000000000000000AA /* Cocoa.framework */; };
 		4002000000000000000000AA /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3002000000000000000000AA /* WebKit.framework */; };
@@ -22,7 +22,7 @@
 		/* App target — Embed Frameworks */
 		6010000000000000000000BB /* AppSandboxCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = C002000000000000000000BB /* AppSandboxCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		/* Framework target — Sources (backend_mac) */
-		2020000000000000000000BB /* backend_mac.m in Sources */ = {isa = PBXBuildFile; fileRef = 1008000000000000000000AA /* backend_mac.m */; };
+		2028000000000000000000BB /* asb_core_mac.m in Sources */ = {isa = PBXBuildFile; fileRef = 1019000000000000000000AA /* asb_core_mac.m */; };
 		2021000000000000000000BB /* host_info.m in Sources */ = {isa = PBXBuildFile; fileRef = 100A000000000000000000AA /* host_info.m */; };
 		2022000000000000000000BB /* vm_dir.m in Sources */ = {isa = PBXBuildFile; fileRef = 100C000000000000000000AA /* vm_dir.m */; };
 		2023000000000000000000BB /* vz_disk.m in Sources */ = {isa = PBXBuildFile; fileRef = 100E000000000000000000AA /* vz_disk.m */; };
@@ -69,9 +69,10 @@
 		1003000000000000000000AA /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppDelegate.m; sourceTree = "<group>"; };
 		1004000000000000000000AA /* MainWindowController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MainWindowController.h; sourceTree = "<group>"; };
 		1005000000000000000000AA /* MainWindowController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = MainWindowController.m; sourceTree = "<group>"; };
-		1006000000000000000000AA /* WebBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WebBridge.h; sourceTree = "<group>"; };
-		1007000000000000000000AA /* WebBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WebBridge.m; sourceTree = "<group>"; };
-		1008000000000000000000AA /* backend_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = backend_mac.m; sourceTree = "<group>"; };
+		1006000000000000000000AA /* ui.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ui.h; sourceTree = "<group>"; };
+		1007000000000000000000AA /* ui.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ui.m; sourceTree = "<group>"; };
+		1019000000000000000000AA /* asb_core_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = asb_core_mac.m; sourceTree = "<group>"; };
+		101A000000000000000000AA /* asb_core_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_core_mac.h; sourceTree = "<group>"; };
 		1009000000000000000000AA /* host_info.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = host_info.h; sourceTree = "<group>"; };
 		100A000000000000000000AA /* host_info.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = host_info.m; sourceTree = "<group>"; };
 		100B000000000000000000AA /* vm_dir.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_dir.h; sourceTree = "<group>"; };
@@ -143,8 +144,8 @@
 				1003000000000000000000AA /* AppDelegate.m */,
 				1004000000000000000000AA /* MainWindowController.h */,
 				1005000000000000000000AA /* MainWindowController.m */,
-				1006000000000000000000AA /* WebBridge.h */,
-				1007000000000000000000AA /* WebBridge.m */,
+				1006000000000000000000AA /* ui.h */,
+				1007000000000000000000AA /* ui.m */,
 				5001000000000000000000AA /* Info.plist */,
 				5002000000000000000000AA /* AppSandbox.entitlements */,
 				5004000000000000000000AA /* Assets.xcassets */,
@@ -177,7 +178,8 @@
 		7007000000000000000000AA /* backend_mac */ = {
 			isa = PBXGroup;
 			children = (
-				1008000000000000000000AA /* backend_mac.m */,
+				101A000000000000000000AA /* asb_core_mac.h */,
+				1019000000000000000000AA /* asb_core_mac.m */,
 				1009000000000000000000AA /* host_info.h */,
 				100A000000000000000000AA /* host_info.m */,
 				100B000000000000000000AA /* vm_dir.h */,
@@ -324,7 +326,7 @@
 				2001000000000000000000AA /* main.m in Sources */,
 				2003000000000000000000AA /* AppDelegate.m in Sources */,
 				2005000000000000000000AA /* MainWindowController.m in Sources */,
-				2007000000000000000000AA /* WebBridge.m in Sources */,
+				2007000000000000000000AA /* ui.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -332,7 +334,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				2020000000000000000000BB /* backend_mac.m in Sources */,
+				2028000000000000000000BB /* asb_core_mac.m in Sources */,
 				2021000000000000000000BB /* host_info.m in Sources */,
 				2022000000000000000000BB /* vm_dir.m in Sources */,
 				2023000000000000000000BB /* vz_disk.m in Sources */,

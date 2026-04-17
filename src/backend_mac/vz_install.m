@@ -133,18 +133,6 @@ didCompleteWithError:(NSError *)error {
     [task resume];
 }
 
-+ (NSURL *)installCompleteMarkerURLFor:(NSString *)name {
-    return [[VmDir directoryForVm:name] URLByAppendingPathComponent:@".install-complete"];
-}
-
-+ (BOOL)isInstallCompleteFor:(NSString *)name {
-    return [[NSFileManager defaultManager] fileExistsAtPath:[[self installCompleteMarkerURLFor:name] path]];
-}
-
-+ (void)markInstallCompleteFor:(NSString *)name {
-    NSData *empty = [NSData data];
-    [empty writeToURL:[self installCompleteMarkerURLFor:name] atomically:YES];
-}
 
 + (void)installMacOSWithName:(NSString *)name
              restoreImageURL:(NSURL *)restoreImageURL
@@ -213,14 +201,6 @@ didCompleteWithError:(NSError *)error {
             return;
         }
 
-        NSDictionary *cfgDict = @{
-            @"ramMb":    @(ramMbFinal),
-            @"cpuCores": @(cpus),
-            @"hddGb":    @(hddGb),
-            @"osType":   @"macOS",
-        };
-        [VmDir writeConfig:cfgDict for:name error:nil];
-
         NSError *buildErr = nil;
         VZVirtualMachineConfiguration *config =
             [VzVm buildInstallConfigurationForName:name
@@ -250,8 +230,7 @@ didCompleteWithError:(NSError *)error {
 
             [installer installWithCompletionHandler:^(NSError * _Nullable installErr) {
                 [obs stopObserving];
-                (void)obs; /* keep alive until here */
-                if (!installErr) [VzInstall markInstallCompleteFor:name];
+                (void)obs;
                 dispatch_async(dispatch_get_main_queue(), ^{ completion(installErr); });
             }];
         });

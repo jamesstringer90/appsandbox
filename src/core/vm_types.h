@@ -47,6 +47,9 @@ typedef struct CoreVmInfo {
     int         ram_mb;
     int         hdd_gb;
     int         cpu_cores;
+    int         gpu_mode;
+    char        gpu_name[64];
+    int         network_mode;
     int         install_complete;
     int         install_progress;                  /* 0-100, or -1 if not installing */
     char        install_status[CORE_VM_STATUS_MAX];

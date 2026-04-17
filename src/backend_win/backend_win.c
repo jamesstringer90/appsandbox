@@ -201,6 +201,9 @@ static int backend_win_list_vms(CoreVmInfo *out, int max_count, int *out_count)
 
         VmInstance *inst = asb_vm_instance(vm);
         if (inst) {
+            info->gpu_mode = inst->gpu_mode;
+            wide_to_utf8(inst->gpu_name, info->gpu_name, sizeof(info->gpu_name));
+            info->network_mode = inst->network_mode;
             info->install_complete = inst->install_complete ? 1 : 0;
             info->install_progress = inst->install_complete ? 100 : inst->vhdx_progress;
             wide_to_utf8(inst->vhdx_step, info->install_status, sizeof(info->install_status));
@@ -222,6 +225,28 @@ static int backend_win_open_display(const char *name, void *host_window)
     return BACKEND_ERR_NOT_IMPLEMENTED;
 }
 
+static int backend_win_edit_vm(const char *name, const char *field, const char *value)
+{
+    wchar_t wname[256], wfield[64], wvalue[512];
+    if (!name || !field || !value) return BACKEND_ERR_INVALID_ARG;
+    if (!utf8_to_wide(name, wname, 256)) return BACKEND_ERR_INVALID_ARG;
+    if (!utf8_to_wide(field, wfield, 64)) return BACKEND_ERR_INVALID_ARG;
+    if (!utf8_to_wide(value, wvalue, 512)) return BACKEND_ERR_INVALID_ARG;
+
+    AsbVm vm = asb_vm_find(wname);
+    if (!vm) return BACKEND_ERR_NOT_FOUND;
+
+    HRESULT hr = E_NOTIMPL;
+    if (wcscmp(wfield, L"name") == 0)         hr = asb_vm_set_name(vm, wvalue);
+    else if (wcscmp(wfield, L"ramMb") == 0)   hr = asb_vm_set_ram(vm, _wtoi(wvalue));
+    else if (wcscmp(wfield, L"cpuCores") == 0) hr = asb_vm_set_cpu(vm, _wtoi(wvalue));
+    else if (wcscmp(wfield, L"gpuMode") == 0) hr = asb_vm_set_gpu(vm, _wtoi(wvalue));
+    else if (wcscmp(wfield, L"networkMode") == 0) hr = asb_vm_set_network(vm, _wtoi(wvalue));
+    else return BACKEND_ERR_INVALID_ARG;
+
+    return SUCCEEDED(hr) ? BACKEND_OK : BACKEND_ERR_FAILED;
+}
+
 static void backend_win_set_event_cb(CoreVmEventCallback cb, void *user_data)
 {
     g_event_cb = cb;
@@ -237,6 +262,7 @@ static const BackendVtbl g_backend_win = {
     backend_win_delete_vm,
     backend_win_list_vms,
     backend_win_open_display,
+    backend_win_edit_vm,
     backend_win_set_event_cb,
 };
 

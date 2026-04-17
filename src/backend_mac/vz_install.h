@@ -24,9 +24,6 @@ typedef void (^VzRestoreImageURLBlock)(NSURL * _Nullable url, NSError * _Nullabl
                            progress:(VzInstallProgressBlock)progress
                          completion:(VzInstallCompletionBlock)completion;
 
-/* YES after a previous install finished without error (marker file present). */
-+ (BOOL)isInstallCompleteFor:(NSString *)name;
-
 /* Install macOS into a new VM directory. Creates the disk image, aux storage,
  * hardware model, and machine identifier, then runs VZMacOSInstaller. */
 + (void)installMacOSWithName:(NSString *)name

@@ -59,6 +59,11 @@ typedef struct BackendVtbl {
      * host_window is a platform-specific handle (HWND/NSWindow *) or NULL. */
     int  (*open_display)(const char *name, void *host_window);
 
+    /* Edit a single VM configuration field by name.
+     * field: "name", "ramMb", "cpuCores", "gpuMode", "networkMode", etc.
+     * value: new value as a string. */
+    int  (*edit_vm)(const char *name, const char *field, const char *value);
+
     /* Register callback for backend-originated events (state changes,
      * install progress, log lines, alerts). Pass NULL to clear. */
     void (*set_event_cb)(CoreVmEventCallback cb, void *user_data);

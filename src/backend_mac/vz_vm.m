@@ -125,7 +125,10 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
     return config;
 }
 
-+ (VzVm *)loadVmNamed:(NSString *)name error:(NSError **)error {
++ (VzVm *)loadVmNamed:(NSString *)name
+                ramMb:(int)ramMb
+             cpuCores:(int)cpuCores
+                error:(NSError **)error {
     NSData *hwData = [NSData dataWithContentsOfURL:[VmDir hardwareModelURLFor:name]];
     NSData *midData = [NSData dataWithContentsOfURL:[VmDir machineIdentifierURLFor:name]];
     if (!hwData || !midData) {
@@ -158,9 +161,6 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
                                                           error:error];
     if (!att) return nil;
 
-    NSDictionary *cfgDict = [VmDir readConfigFor:name];
-    int ramMb = [cfgDict[@"ramMb"] intValue];
-    int cpuCores = [cfgDict[@"cpuCores"] intValue];
     if (ramMb <= 0) ramMb = 8192;
     if (cpuCores <= 0) cpuCores = 4;
 

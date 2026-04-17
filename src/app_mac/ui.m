@@ -1,28 +1,23 @@
 /*
- * WebBridge.m -- JS <-> native bridge for the macOS host.
+ * ui.m -- JS <-> native bridge for the macOS host.
  *
  * Speaks the same action/event protocol as the Windows WebView2 bridge
- * (see src/ui.c) so a single web/app.js drives both platforms. Actions
- * arrive from JS as a JSON string on the "host" WKScriptMessageHandler;
- * outgoing events are serialized and handed to window.onHostMessage via
- * evaluateJavaScript:.
+ * (see src/app_win/ui.c) so a single web/app.js drives both platforms.
  */
 
-#import "WebBridge.h"
+#import "ui.h"
 #import <Cocoa/Cocoa.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#import "asb_core_mac.h"
 #import "host_info.h"
 
-#include "backend.h"
 #include "vm_types.h"
 
 #pragma mark - Static state
 
 static __weak WKWebView *g_webView;
 
-/* Cached name list in the same order as the last list_vms() call, so
- * vmIndex values from the UI can be resolved to VM names. */
 static NSMutableArray<NSString *> *g_vmNames;
 
 static BOOL g_initialized;
@@ -37,9 +32,6 @@ static NSString *JSONStringFromObject(id obj) {
 }
 
 static NSString *escapeForJsCall(NSString *json) {
-    /* Embed the outgoing payload as a JSON string literal, then call
-     * JSON.parse at the receiving end. This is the only escape-safe way
-     * to pass arbitrary text through evaluateJavaScript. */
     NSData *data = [NSJSONSerialization dataWithJSONObject:@[json] options:0 error:nil];
     NSString *literal = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     return literal;
@@ -59,31 +51,27 @@ static void postToJs(NSDictionary *message) {
 
 #pragma mark - Event translation
 
-static NSDictionary *vmInfoToJsDict(const CoreVmInfo *info) {
-    /* Emit every field the JS side expects from a Windows VM row, with
-     * sensible defaults for the Windows-only concepts. Missing fields make
-     * the UI throw, so this list must stay in sync with build_vm_json()
-     * in src/ui.c and the fields referenced by web/app.js. */
+static NSDictionary *vmToJsDict(const AsbVmMac *vm) {
     return @{
-        @"name":            [NSString stringWithUTF8String:info->name],
-        @"osType":          [NSString stringWithUTF8String:info->os_type],
-        @"running":         @(info->running ? YES : NO),
-        @"shuttingDown":    @(info->shutting_down ? YES : NO),
+        @"name":            [NSString stringWithUTF8String:vm->name],
+        @"osType":          [NSString stringWithUTF8String:vm->os_type],
+        @"running":         @(vm->running ? YES : NO),
+        @"shuttingDown":    @(vm->shutting_down ? YES : NO),
         @"agentOnline":     @NO,
-        @"ramMb":           @(info->ram_mb),
-        @"hddGb":           @(info->hdd_gb),
-        @"cpuCores":        @(info->cpu_cores),
-        @"gpuMode":         @1,
+        @"ramMb":           @(vm->ram_mb),
+        @"hddGb":           @(vm->hdd_gb),
+        @"cpuCores":        @(vm->cpu_cores),
+        @"gpuMode":         @(vm->gpu_mode),
         @"gpuName":         [HostInfo hostGpuName],
-        @"networkMode":     @1,  /* NAT */
+        @"networkMode":     @(vm->network_mode),
         @"netAdapter":      @"",
         @"isTemplate":      @NO,
         @"hypervVideoOff":  @NO,
         @"buildingVhdx":    @NO,
         @"vhdxStaging":     @NO,
-        @"vhdxProgress":    @(info->install_progress < 0 ? 0 : info->install_progress),
-        @"installComplete": @(info->install_complete ? YES : NO),
-        @"installStatus":   [NSString stringWithUTF8String:info->install_status],
+        @"vhdxProgress":    @(vm->install_progress < 0 ? 0 : vm->install_progress),
+        @"installComplete": @(vm->install_complete ? YES : NO),
+        @"installStatus":   [NSString stringWithUTF8String:vm->install_status],
         @"sshEnabled":      @NO,
         @"sshPort":         @0,
         @"sshState":        @0,
@@ -95,16 +83,18 @@ static NSDictionary *vmInfoToJsDict(const CoreVmInfo *info) {
     };
 }
 
-static NSDictionary *buildHostInfoDict(const CoreVmInfo *vms, int count) {
+static NSDictionary *buildHostInfoDict(void) {
     int vmCores = 0;
     int vmRamMb = 0;
     int vmHddGb = 0;
+    int count = asb_mac_vm_count();
     for (int i = 0; i < count; i++) {
-        if (vms[i].running) {
-            vmCores += vms[i].cpu_cores;
-            vmRamMb += vms[i].ram_mb;
+        AsbVmMac *vm = asb_mac_vm_get(i);
+        if (vm->running) {
+            vmCores += vm->cpu_cores;
+            vmRamMb += vm->ram_mb;
         }
-        vmHddGb += vms[i].hdd_gb;
+        vmHddGb += vm->hdd_gb;
     }
     return @{
         @"hostCores": @([HostInfo hostCores]),
@@ -116,58 +106,45 @@ static NSDictionary *buildHostInfoDict(const CoreVmInfo *vms, int count) {
     };
 }
 
-static NSArray *collectVms(NSMutableArray<NSDictionary *> *outJs,
-                           NSMutableArray<NSString *> *outNames,
-                           CoreVmInfo *outInfos,
-                           int *outCount) {
-    const BackendVtbl *b = backend_get();
-    int count = 0;
-    if (b->list_vms) {
-        b->list_vms(outInfos, 64, &count);
-    }
+static void collectVms(NSMutableArray<NSDictionary *> *outJs,
+                        NSMutableArray<NSString *> *outNames) {
+    int count = asb_mac_vm_count();
     for (int i = 0; i < count; i++) {
-        [outJs addObject:vmInfoToJsDict(&outInfos[i])];
-        [outNames addObject:[NSString stringWithUTF8String:outInfos[i].name]];
+        AsbVmMac *vm = asb_mac_vm_get(i);
+        [outJs addObject:vmToJsDict(vm)];
+        [outNames addObject:[NSString stringWithUTF8String:vm->name]];
     }
-    if (outCount) *outCount = count;
-    return outJs;
 }
 
 static void sendVmListChanged(void) {
     NSMutableArray<NSDictionary *> *jsVms = [NSMutableArray array];
     NSMutableArray<NSString *> *names = [NSMutableArray array];
-    CoreVmInfo infos[64];
-    int count = 0;
-    collectVms(jsVms, names, infos, &count);
+    collectVms(jsVms, names);
 
     g_vmNames = names;
 
-    NSDictionary *msg = @{
+    postToJs(@{
         @"type": @"vmListChanged",
         @"vms": jsVms,
-        @"hostInfo": buildHostInfoDict(infos, count),
-    };
-    postToJs(msg);
+        @"hostInfo": buildHostInfoDict(),
+    });
 }
 
 static void sendFullState(void) {
     NSMutableArray<NSDictionary *> *jsVms = [NSMutableArray array];
     NSMutableArray<NSString *> *names = [NSMutableArray array];
-    CoreVmInfo infos[64];
-    int count = 0;
-    collectVms(jsVms, names, infos, &count);
+    collectVms(jsVms, names);
 
     g_vmNames = names;
 
-    NSDictionary *msg = @{
+    postToJs(@{
         @"type": @"fullState",
         @"vms": jsVms,
-        @"hostInfo": buildHostInfoDict(infos, count),
-        @"adapters": @[],       /* bridged networking is not exposed yet on mac */
+        @"hostInfo": buildHostInfoDict(),
+        @"adapters": @[],
         @"defaultAdapter": @0,
-        @"templates": @[],      /* templates are not yet implemented on mac */
-    };
-    postToJs(msg);
+        @"templates": @[],
+    });
 }
 
 static void sendLog(NSString *message) {
@@ -180,13 +157,13 @@ static void sendAlert(NSString *message) {
     postToJs(@{ @"type": @"alert", @"message": message });
 }
 
-#pragma mark - Backend event callback
+#pragma mark - Orchestrator event callback
 
-static void BackendEventCallback(const CoreVmEvent *event, void *user_data) {
-    (void)user_data;
-    if (!event) return;
-    NSString *str = event->str_value ? [NSString stringWithUTF8String:event->str_value] : nil;
-    switch (event->type) {
+static void AsbEventCallback(int type, const char *vm_name,
+                               int int_value, const char *str_value) {
+    (void)vm_name; (void)int_value;
+    NSString *str = str_value ? [NSString stringWithUTF8String:str_value] : nil;
+    switch (type) {
         case CORE_VM_EVENT_LOG:
             sendLog(str);
             break;
@@ -205,20 +182,17 @@ static void BackendEventCallback(const CoreVmEvent *event, void *user_data) {
 
 #pragma mark - Public entry points
 
-void WebBridgeSetWebView(WKWebView *webView) {
+void ui_set_webview(WKWebView *webView) {
     g_webView = webView;
     if (g_initialized) return;
     g_initialized = YES;
 
-    const BackendVtbl *b = backend_get();
-    if (b->init) b->init();
-    if (b->set_event_cb) b->set_event_cb(BackendEventCallback, NULL);
+    asb_mac_init();
+    asb_mac_set_event_cb(AsbEventCallback);
     g_vmNames = [NSMutableArray array];
 }
 
-void WebBridgePostJson(NSString *json) {
-    /* Legacy entry — the rest of the bridge posts structured dicts. Kept
-     * for backwards compat in case anything else calls it. */
+void ui_post_json(NSString *json) {
     if (!json) return;
     id parsed = [NSJSONSerialization JSONObjectWithData:[json dataUsingEncoding:NSUTF8StringEncoding]
                                                  options:0
@@ -235,72 +209,67 @@ static NSString *vmNameAtIndex(id indexValue) {
     return g_vmNames[idx];
 }
 
-static const char *utf8OrNull(NSString *s) {
-    return s.length > 0 ? [s UTF8String] : NULL;
-}
-
 static void handleCreateVm(NSDictionary *msg) {
-    /* app.js sends the full sandbox form as top-level fields on the action. */
     NSString *name      = msg[@"name"];
     NSString *osType    = msg[@"osType"] ?: @"macOS";
     NSString *image     = msg[@"imagePath"];
-    NSString *tmpl      = msg[@"templateName"];
-    NSString *user      = msg[@"adminUser"];
-    NSString *password  = msg[@"adminPass"];
+    int ramMb           = [msg[@"ramMb"] intValue];
+    int hddGb           = [msg[@"hddGb"] intValue];
+    int cpuCores        = [msg[@"cpuCores"] intValue];
+    int gpuMode         = [msg[@"gpuMode"] intValue];
+    int networkMode     = [msg[@"networkMode"] intValue];
 
-    CoreVmConfig cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.name          = utf8OrNull(name);
-    cfg.os_type       = utf8OrNull(osType);
-    cfg.image_path    = utf8OrNull(image);
-    cfg.template_name = utf8OrNull(tmpl);
-    cfg.ram_mb        = [msg[@"ramMb"] intValue];
-    cfg.hdd_gb        = [msg[@"hddGb"] intValue];
-    cfg.cpu_cores     = [msg[@"cpuCores"] intValue];
-    cfg.gpu_mode      = [msg[@"gpuMode"] intValue];
-    cfg.network_mode  = [msg[@"networkMode"] intValue];
-    cfg.net_adapter   = utf8OrNull(msg[@"netAdapter"]);
-    cfg.username      = utf8OrNull(user);
-    cfg.password      = utf8OrNull(password);
-    cfg.is_template   = [msg[@"isTemplate"] intValue];
-
-    char err[256] = { 0 };
-    const BackendVtbl *b = backend_get();
-    int rc = b->create_vm ? b->create_vm(&cfg, err, sizeof(err)) : BACKEND_ERR_NOT_IMPLEMENTED;
-    if (rc != BACKEND_OK) {
-        sendAlert([NSString stringWithFormat:@"Create failed: %s",
-                    err[0] ? err : "unknown error"]);
+    const char *imagePath = (image.length > 0) ? [image UTF8String] : NULL;
+    int rc = asb_mac_vm_create([name UTF8String], [osType UTF8String],
+                                ramMb, hddGb, cpuCores,
+                                gpuMode, networkMode, imagePath);
+    if (rc != 0) {
+        sendAlert([NSString stringWithFormat:@"Create failed (error %d)", rc]);
     }
 }
 
 static void handleStartVm(NSDictionary *msg) {
     NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
     if (!n) return;
-    backend_get()->start_vm([n UTF8String]);
+    asb_mac_vm_start([n UTF8String]);
 }
 
 static void handleStopVm(NSDictionary *msg) {
     NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
     if (!n) return;
-    backend_get()->stop_vm([n UTF8String], 1 /* force */);
+    asb_mac_vm_stop([n UTF8String], 1);
 }
 
 static void handleShutdownVm(NSDictionary *msg) {
     NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
     if (!n) return;
-    backend_get()->stop_vm([n UTF8String], 0 /* graceful */);
+    asb_mac_vm_stop([n UTF8String], 0);
 }
 
 static void handleDeleteVm(NSDictionary *msg) {
     NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
     if (!n) return;
-    backend_get()->delete_vm([n UTF8String]);
+    asb_mac_vm_delete([n UTF8String]);
 }
 
-static void handleConnectIdd(NSDictionary *msg) {
+static void handleConnectDisplay(NSDictionary *msg) {
     NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
     if (!n) return;
-    backend_get()->open_display([n UTF8String], NULL);
+    AsbVmMac *vm = asb_mac_vm_find([n UTF8String]);
+    if (vm && vm->display) {
+        [vm->display showDisplay];
+    }
+}
+
+static void handleEditVm(NSDictionary *msg) {
+    NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
+    NSString *field = msg[@"field"];
+    id rawValue = msg[@"value"];
+    NSString *value = [rawValue isKindOfClass:[NSString class]]
+        ? rawValue : [NSString stringWithFormat:@"%@", rawValue];
+    if (!n || !field || !value) return;
+    asb_mac_vm_edit([n UTF8String], [field UTF8String], [value UTF8String]);
+    sendVmListChanged();
 }
 
 static void handleBrowseImage(NSDictionary *msg) {
@@ -320,13 +289,13 @@ static void handleBrowseImage(NSDictionary *msg) {
     });
 }
 
-void WebBridgeHandleMessage(NSString *json) {
+void ui_handle_message(NSString *json) {
     if (json.length == 0) return;
     NSData *data = [json dataUsingEncoding:NSUTF8StringEncoding];
     NSError *err = nil;
     id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
     if (![parsed isKindOfClass:[NSDictionary class]]) {
-        NSLog(@"[WebBridge] invalid message: %@", json);
+        NSLog(@"[ui] invalid message: %@", json);
         return;
     }
     NSDictionary *msg = parsed;
@@ -336,7 +305,7 @@ void WebBridgeHandleMessage(NSString *json) {
     if ([action isEqualToString:@"uiReady"] || [action isEqualToString:@"getState"]) {
         sendFullState();
     } else if ([action isEqualToString:@"setMinSize"]) {
-        /* The mac window manager handles minimum sizes itself. No-op. */
+        /* The mac window manager handles minimum sizes itself. */
     } else if ([action isEqualToString:@"createVm"]) {
         handleCreateVm(msg);
     } else if ([action isEqualToString:@"startVm"]) {
@@ -348,7 +317,9 @@ void WebBridgeHandleMessage(NSString *json) {
     } else if ([action isEqualToString:@"deleteVm"]) {
         handleDeleteVm(msg);
     } else if ([action isEqualToString:@"connectIddVm"]) {
-        handleConnectIdd(msg);
+        handleConnectDisplay(msg);
+    } else if ([action isEqualToString:@"editVm"]) {
+        handleEditVm(msg);
     } else if ([action isEqualToString:@"browseImage"]) {
         handleBrowseImage(msg);
     } else if ([action isEqualToString:@"log"]) {
@@ -356,8 +327,7 @@ void WebBridgeHandleMessage(NSString *json) {
         if (message) sendLog(message);
     } else if ([action isEqualToString:@"selectVm"]) {
         /* Selection is a UI-local concept; the native side doesn't care. */
-    } else if ([action isEqualToString:@"editVm"] ||
-               [action isEqualToString:@"snapTake"] ||
+    } else if ([action isEqualToString:@"snapTake"] ||
                [action isEqualToString:@"snapDelete"] ||
                [action isEqualToString:@"snapDeleteBranch"] ||
                [action isEqualToString:@"snapRename"] ||
@@ -367,6 +337,6 @@ void WebBridgeHandleMessage(NSString *json) {
                [action isEqualToString:@"enableFeatureReboot"]) {
         sendLog([NSString stringWithFormat:@"%@ is not supported on macOS yet.", action]);
     } else {
-        NSLog(@"[WebBridge] unhandled action: %@", action);
+        NSLog(@"[ui] unhandled action: %@", action);
     }
 }
