@@ -211,7 +211,24 @@ AsbVmMac *asb_mac_vm_find(const char *name) {
 static void handle_vm_state_change(int idx, VZVirtualMachineState state) {
     if (idx < 0 || idx >= g_vm_count) return;
 
-    post_log("[%s] State: %d", g_vms[idx].name, (int)state);
+    static const char *state_names[] = {
+        [VZVirtualMachineStateStopped]   = "Stopped",
+        [VZVirtualMachineStateRunning]   = "Running",
+        [VZVirtualMachineStatePaused]    = "Paused",
+        [VZVirtualMachineStateError]     = "Error",
+        [VZVirtualMachineStateStarting]  = "Starting",
+        [VZVirtualMachineStatePausing]   = "Pausing",
+        [VZVirtualMachineStateResuming]  = "Resuming",
+        [VZVirtualMachineStateStopping]  = "Stopping",
+        [VZVirtualMachineStateSaving]    = "Saving",
+        [VZVirtualMachineStateRestoring] = "Restoring",
+    };
+    const char *label = ((int)state >= 0 && (int)state < (int)(sizeof(state_names)/sizeof(state_names[0])))
+        ? state_names[(int)state] : NULL;
+    if (label)
+        post_log("[%s] State: %s", g_vms[idx].name, label);
+    else
+        post_log("[%s] State: %d", g_vms[idx].name, (int)state);
 
     if (state == VZVirtualMachineStateStopping) {
         g_vms[idx].shutting_down = YES;
@@ -280,9 +297,12 @@ static void finish_install(int idx, NSError *error) {
         g_vms[idx].install_progress = 100;
         strlcpy(g_vms[idx].install_status, "Install complete", sizeof(g_vms[idx].install_status));
         save_vm_list();
-        post_log("[%s] macOS install complete", g_vms[idx].name);
+        post_log("[%s] macOS install complete, starting VM...", g_vms[idx].name);
         post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, 100, "Install complete");
         post_event(CORE_VM_EVENT_PROGRESS, g_vms[idx].name, 100, NULL);
+        post_list_changed();
+        asb_mac_vm_start(g_vms[idx].name);
+        return;
     }
     post_list_changed();
 }
@@ -395,7 +415,8 @@ int asb_mac_vm_create(const char *name, const char *os_type,
             });
             return;
         }
-        post_log("Downloading restore image (~15 GB) — this may take a while");
+        post_log("Downloading restore image — this may take a while");
+        post_log("Source: %s", url.absoluteString.UTF8String);
         [VzInstall downloadRestoreImageFromURL:url
                                          toURL:cachedIpsw
                                       progress:^(double frac, NSString *stage) {
@@ -403,6 +424,10 @@ int asb_mac_vm_create(const char *name, const char *os_type,
                 int i = vm_index_of(nsName.UTF8String);
                 if (i >= 0) update_install_progress(i, frac, stage);
             });
+        }
+                                          size:^(int64_t totalBytes) {
+            double gb = (double)totalBytes / (1024.0 * 1024.0 * 1024.0);
+            post_log("Restore image size: %.1f GB", gb);
         }
                                     completion:^(NSError * _Nullable dlErr) {
             if (dlErr) {

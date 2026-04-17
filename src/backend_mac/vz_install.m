@@ -10,6 +10,8 @@
 @property (nonatomic, copy) VzInstallCompletionBlock completion;
 @property (nonatomic, strong) NSURL *destinationURL;
 @property (nonatomic, assign) BOOL finished;
+@property (nonatomic, assign) BOOL reportedSize;
+@property (nonatomic, copy) void (^sizeBlock)(int64_t totalBytes);
 @end
 
 @implementation VzInstallDownloadDelegate
@@ -32,6 +34,14 @@
 totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
     (void)session; (void)downloadTask; (void)bytesWritten;
     if (totalBytesExpectedToWrite <= 0) return;
+    if (!self.reportedSize) {
+        self.reportedSize = YES;
+        void (^sb)(int64_t) = self.sizeBlock;
+        if (sb) {
+            int64_t total = totalBytesExpectedToWrite;
+            dispatch_async(dispatch_get_main_queue(), ^{ sb(total); });
+        }
+    }
     VzInstallProgressBlock block = self.progress;
     if (!block) return;
     double frac = (double)totalBytesWritten / (double)totalBytesExpectedToWrite;
@@ -119,9 +129,11 @@ didCompleteWithError:(NSError *)error {
 + (void)downloadRestoreImageFromURL:(NSURL *)remoteURL
                               toURL:(NSURL *)localURL
                            progress:(VzInstallProgressBlock)progress
+                               size:(void (^)(int64_t totalBytes))sizeBlock
                          completion:(VzInstallCompletionBlock)completion {
     VzInstallDownloadDelegate *delegate = [[VzInstallDownloadDelegate alloc] init];
     delegate.progress = progress;
+    delegate.sizeBlock = sizeBlock;
     delegate.completion = completion;
     delegate.destinationURL = localURL;
 
