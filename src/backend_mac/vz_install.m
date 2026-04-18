@@ -230,13 +230,11 @@ didCompleteWithError:(NSError *)error {
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            VZVirtualMachine *machine = [[VZVirtualMachine alloc] initWithConfiguration:config];
-            VZMacOSInstaller *installer =
+            __block VZVirtualMachine *machine = [[VZVirtualMachine alloc] initWithConfiguration:config];
+            __block VZMacOSInstaller *installer =
                 [[VZMacOSInstaller alloc] initWithVirtualMachine:machine
                                                  restoreImageURL:restoreImageURL];
 
-            /* Retain the observer for the duration of the install by capturing it
-             * in the completion block below. */
             VzInstallProgressObserver *obs = [[VzInstallProgressObserver alloc] init];
             obs.observed = installer.progress;
             obs.progress = progress;
@@ -244,8 +242,11 @@ didCompleteWithError:(NSError *)error {
 
             [installer installWithCompletionHandler:^(NSError * _Nullable installErr) {
                 [obs stopObserving];
-                (void)obs;
-                dispatch_async(dispatch_get_main_queue(), ^{ completion(installErr); });
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    installer = nil;
+                    machine = nil;
+                    completion(installErr);
+                });
             }];
         });
     }];
