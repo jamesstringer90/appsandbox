@@ -23,7 +23,7 @@
     self.completion = nil;
     self.progress = nil;
     if (done) {
-        dispatch_async(dispatch_get_main_queue(), ^{ done(error); });
+        dispatch_async(dispatch_get_main_queue(), ^{ done(error, nil); });
     }
 }
 
@@ -157,7 +157,7 @@ didCompleteWithError:(NSError *)error {
                   completion:(VzInstallCompletionBlock)completion {
     NSError *err = nil;
     if (![VmDir ensureDirectoryFor:name error:&err]) {
-        completion(err);
+        completion(err, nil);
         return;
     }
 
@@ -166,7 +166,7 @@ didCompleteWithError:(NSError *)error {
     [VZMacOSRestoreImage loadFileURL:restoreImageURL
                     completionHandler:^(VZMacOSRestoreImage * _Nullable image, NSError * _Nullable loadErr) {
         if (loadErr || !image) {
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(loadErr); });
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(loadErr, nil); });
             return;
         }
 
@@ -175,7 +175,7 @@ didCompleteWithError:(NSError *)error {
             NSError *e = [NSError errorWithDomain:@"VzInstall" code:10
                                           userInfo:@{NSLocalizedDescriptionKey:
                                                         @"Restore image has no supported configuration on this host"}];
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(e); });
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(e, nil); });
             return;
         }
 
@@ -187,7 +187,7 @@ didCompleteWithError:(NSError *)error {
         uint64_t diskBytes = (uint64_t)hddGb * 1024ULL * 1024ULL * 1024ULL;
         NSError *diskErr = nil;
         if (![VzDisk createDiskImageAtURL:diskURL sizeBytes:diskBytes error:&diskErr]) {
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(diskErr); });
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(diskErr, nil); });
             return;
         }
 
@@ -197,7 +197,7 @@ didCompleteWithError:(NSError *)error {
             NSError *e = [NSError errorWithDomain:@"VzInstall" code:11
                                           userInfo:@{NSLocalizedDescriptionKey:
                                                         @"Failed to write hardware model"}];
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(e); });
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(e, nil); });
             return;
         }
 
@@ -211,7 +211,7 @@ didCompleteWithError:(NSError *)error {
                                                             options:VZMacAuxiliaryStorageInitializationOptionAllowOverwrite
                                                               error:&auxErr];
         if (!aux) {
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(auxErr); });
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(auxErr, nil); });
             return;
         }
 
@@ -225,13 +225,13 @@ didCompleteWithError:(NSError *)error {
                                            cpuCount:cpus
                                               error:&buildErr];
         if (!config) {
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(buildErr); });
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(buildErr, nil); });
             return;
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            __block VZVirtualMachine *machine = [[VZVirtualMachine alloc] initWithConfiguration:config];
-            __block VZMacOSInstaller *installer =
+            VZVirtualMachine *machine = [[VZVirtualMachine alloc] initWithConfiguration:config];
+            VZMacOSInstaller *installer =
                 [[VZMacOSInstaller alloc] initWithVirtualMachine:machine
                                                  restoreImageURL:restoreImageURL];
 
@@ -242,10 +242,9 @@ didCompleteWithError:(NSError *)error {
 
             [installer installWithCompletionHandler:^(NSError * _Nullable installErr) {
                 [obs stopObserving];
+                (void)installer;
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    installer = nil;
-                    machine = nil;
-                    completion(installErr);
+                    completion(installErr, installErr ? nil : machine);
                 });
             }];
         });
