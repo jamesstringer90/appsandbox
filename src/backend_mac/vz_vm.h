@@ -17,8 +17,6 @@ typedef void (^VzVmStateChangeBlock)(VZVirtualMachineState state);
 
 /* Build a VZVirtualMachineConfiguration from on-disk state for the named VM.
  * Returns a ready-to-start wrapper, or nil on error. */
-/* Build a VZVirtualMachineConfiguration from on-disk state for the named VM.
- * Returns a ready-to-start wrapper, or nil on error. */
 + (nullable VzVm *)loadVmNamed:(NSString *)name
                          ramMb:(int)ramMb
                       cpuCores:(int)cpuCores
