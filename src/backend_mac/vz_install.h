@@ -10,8 +10,7 @@
 NS_ASSUME_NONNULL_BEGIN
 
 typedef void (^VzInstallProgressBlock)(double fraction, NSString *stage);
-typedef void (^VzInstallCompletionBlock)(NSError * _Nullable error,
-                                         VZVirtualMachine * _Nullable machine);
+typedef void (^VzInstallCompletionBlock)(NSError * _Nullable error);
 typedef void (^VzRestoreImageURLBlock)(NSURL * _Nullable url, NSError * _Nullable error);
 
 @interface VzInstall : NSObject
