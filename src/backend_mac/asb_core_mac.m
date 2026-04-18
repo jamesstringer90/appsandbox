@@ -283,7 +283,7 @@ static void update_install_progress(int idx, double frac, NSString *stage) {
     post_list_changed();
 }
 
-static void finish_install(int idx, NSError *error) {
+static void finish_install(int idx, NSError *error, VZVirtualMachine *machine) {
     if (idx < 0 || idx >= g_vm_count) return;
     if (error) {
         g_vms[idx].install_progress = -1;
@@ -297,12 +297,38 @@ static void finish_install(int idx, NSError *error) {
         g_vms[idx].install_progress = 100;
         strlcpy(g_vms[idx].install_status, "Install complete", sizeof(g_vms[idx].install_status));
         save_vm_list();
-        post_log("[%s] macOS install complete, starting VM...", g_vms[idx].name);
+        post_log("[%s] macOS install complete", g_vms[idx].name);
         post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, 100, "Install complete");
         post_event(CORE_VM_EVENT_PROGRESS, g_vms[idx].name, 100, NULL);
-        post_list_changed();
-        asb_mac_vm_start(g_vms[idx].name);
-        return;
+
+        if (machine) {
+            NSString *nsName = [NSString stringWithUTF8String:g_vms[idx].name];
+            VzVm *vm = [VzVm wrapMachine:machine name:nsName];
+            g_vz_refs[idx] = vm;
+            g_vms[idx].vz_handle = vm;
+
+            vm.onStateChange = ^(VZVirtualMachineState state) {
+                run_on_main(^{
+                    int i = vm_index_of(nsName.UTF8String);
+                    if (i >= 0) handle_vm_state_change(i, state);
+                });
+            };
+
+            [vm startWithCompletion:^(NSError * _Nullable startErr) {
+                run_on_main(^{
+                    if (startErr) {
+                        int i = vm_index_of(nsName.UTF8String);
+                        if (i >= 0) {
+                            g_vz_refs[i] = nil;
+                            g_vms[i].vz_handle = nil;
+                            post_log("[%s] Auto-start failed: %s", g_vms[i].name,
+                                     startErr.localizedDescription.UTF8String);
+                            post_list_changed();
+                        }
+                    }
+                });
+            }];
+        }
     }
     post_list_changed();
 }
@@ -329,10 +355,10 @@ static void start_install_flow(int idx, NSURL *restoreURL) {
             if (i >= 0) update_install_progress(i, frac, stage);
         });
     }
-                         completion:^(NSError * _Nullable err) {
+                         completion:^(NSError * _Nullable err, VZVirtualMachine * _Nullable machine) {
         run_on_main(^{
             int i = vm_index_of(nsName.UTF8String);
-            if (i >= 0) finish_install(i, err);
+            if (i >= 0) finish_install(i, err, machine);
         });
     }];
 }
@@ -410,7 +436,7 @@ int asb_mac_vm_create(const char *name, const char *os_type,
                 int i = vm_index_of(nsName.UTF8String);
                 if (i >= 0) {
                     finish_install(i, fetchErr ?: [NSError errorWithDomain:@"VzInstall" code:20
-                        userInfo:@{NSLocalizedDescriptionKey: @"No supported restore image available"}]);
+                        userInfo:@{NSLocalizedDescriptionKey: @"No supported restore image available"}], nil);
                 }
             });
             return;
@@ -429,12 +455,13 @@ int asb_mac_vm_create(const char *name, const char *os_type,
             double gb = (double)totalBytes / (1024.0 * 1024.0 * 1024.0);
             post_log("Restore image size: %.1f GB", gb);
         }
-                                    completion:^(NSError * _Nullable dlErr) {
+                                    completion:^(NSError * _Nullable dlErr, VZVirtualMachine * _Nullable _m) {
+            (void)_m;
             if (dlErr) {
                 post_log("Download failed: %s", dlErr.localizedDescription.UTF8String);
                 run_on_main(^{
                     int i = vm_index_of(nsName.UTF8String);
-                    if (i >= 0) finish_install(i, dlErr);
+                    if (i >= 0) finish_install(i, dlErr, nil);
                 });
                 return;
             }
