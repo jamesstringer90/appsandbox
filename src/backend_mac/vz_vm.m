@@ -86,14 +86,6 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
     }
 }
 
-+ (VzVm *)wrapMachine:(VZVirtualMachine *)machine name:(NSString *)name {
-    VzVm *vm = [[VzVm alloc] init];
-    vm.name = name;
-    vm.machine = machine;
-    [vm setupObservation];
-    return vm;
-}
-
 + (VZVirtualMachineConfiguration *)buildInstallConfigurationForName:(NSString *)name
                                                       hardwareModel:(VZMacHardwareModel *)hardwareModel
                                                    auxiliaryStorage:(VZMacAuxiliaryStorage *)aux

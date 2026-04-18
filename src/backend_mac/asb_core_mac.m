@@ -267,6 +267,8 @@ static void handle_vm_state_change(int idx, VZVirtualMachineState state) {
 
 /* ---- Install flow ---- */
 
+static void auto_start_vm(NSString *nsName, int retries_left);
+
 static void update_install_progress(int idx, double frac, NSString *stage) {
     if (idx < 0 || idx >= g_vm_count) return;
     int pct = (int)(frac * 100.0);
@@ -283,7 +285,7 @@ static void update_install_progress(int idx, double frac, NSString *stage) {
     post_list_changed();
 }
 
-static void finish_install(int idx, NSError *error, VZVirtualMachine *machine) {
+static void finish_install(int idx, NSError *error) {
     if (idx < 0 || idx >= g_vm_count) return;
     if (error) {
         g_vms[idx].install_progress = -1;
@@ -292,45 +294,77 @@ static void finish_install(int idx, NSError *error, VZVirtualMachine *machine) {
                  error.localizedDescription.UTF8String);
         post_alert(g_vms[idx].name, "Install failed: %s",
                    error.localizedDescription.UTF8String);
-    } else {
-        g_vms[idx].install_complete = YES;
-        g_vms[idx].install_progress = 100;
-        strlcpy(g_vms[idx].install_status, "Install complete", sizeof(g_vms[idx].install_status));
-        save_vm_list();
-        post_log("[%s] macOS install complete", g_vms[idx].name);
-        post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, 100, "Install complete");
-        post_event(CORE_VM_EVENT_PROGRESS, g_vms[idx].name, 100, NULL);
-
-        if (machine) {
-            NSString *nsName = [NSString stringWithUTF8String:g_vms[idx].name];
-            VzVm *vm = [VzVm wrapMachine:machine name:nsName];
-            g_vz_refs[idx] = vm;
-            g_vms[idx].vz_handle = vm;
-
-            vm.onStateChange = ^(VZVirtualMachineState state) {
-                run_on_main(^{
-                    int i = vm_index_of(nsName.UTF8String);
-                    if (i >= 0) handle_vm_state_change(i, state);
-                });
-            };
-
-            [vm startWithCompletion:^(NSError * _Nullable startErr) {
-                run_on_main(^{
-                    if (startErr) {
-                        int i = vm_index_of(nsName.UTF8String);
-                        if (i >= 0) {
-                            g_vz_refs[i] = nil;
-                            g_vms[i].vz_handle = nil;
-                            post_log("[%s] Auto-start failed: %s", g_vms[i].name,
-                                     startErr.localizedDescription.UTF8String);
-                            post_list_changed();
-                        }
-                    }
-                });
-            }];
-        }
+        post_list_changed();
+        return;
     }
+
+    g_vms[idx].install_complete = YES;
+    g_vms[idx].install_progress = 100;
+    strlcpy(g_vms[idx].install_status, "Install complete", sizeof(g_vms[idx].install_status));
+    save_vm_list();
+    post_log("[%s] macOS install complete, starting VM...", g_vms[idx].name);
+    post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, 100, "Install complete");
+    post_event(CORE_VM_EVENT_PROGRESS, g_vms[idx].name, 100, NULL);
     post_list_changed();
+
+    NSString *nsName = [NSString stringWithUTF8String:g_vms[idx].name];
+    auto_start_vm(nsName, 5);
+}
+
+#define AUTO_START_RETRY_INTERVAL_NS (1 * NSEC_PER_SEC)
+
+static void auto_start_vm(NSString *nsName, int retries_left) {
+    int idx = vm_index_of(nsName.UTF8String);
+    if (idx < 0 || g_vms[idx].running) return;
+
+    NSError *err = nil;
+    VzVm *vm = [VzVm loadVmNamed:nsName
+                            ramMb:g_vms[idx].ram_mb
+                         cpuCores:g_vms[idx].cpu_cores
+                            error:&err];
+    if (!vm) {
+        if (retries_left > 0) {
+            post_log("[%s] Waiting for install resources to release...", nsName.UTF8String);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)AUTO_START_RETRY_INTERVAL_NS),
+                           dispatch_get_main_queue(), ^{
+                auto_start_vm(nsName, retries_left - 1);
+            });
+            return;
+        }
+        post_log("[%s] Auto-start failed: %s", nsName.UTF8String,
+                 err ? err.localizedDescription.UTF8String : "unknown");
+        post_alert(nsName.UTF8String, "Auto-start failed: %s",
+                   err ? err.localizedDescription.UTF8String : "unknown");
+        return;
+    }
+
+    idx = vm_index_of(nsName.UTF8String);
+    if (idx < 0) return;
+
+    g_vz_refs[idx] = vm;
+    g_vms[idx].vz_handle = vm;
+
+    vm.onStateChange = ^(VZVirtualMachineState state) {
+        run_on_main(^{
+            int i = vm_index_of(nsName.UTF8String);
+            if (i >= 0) handle_vm_state_change(i, state);
+        });
+    };
+
+    [vm startWithCompletion:^(NSError * _Nullable startErr) {
+        run_on_main(^{
+            if (startErr) {
+                int i = vm_index_of(nsName.UTF8String);
+                if (i >= 0) {
+                    g_vz_refs[i] = nil;
+                    g_vms[i].vz_handle = nil;
+                    post_log("[%s] Auto-start failed: %s", g_vms[i].name,
+                             startErr.localizedDescription.UTF8String);
+                    post_list_changed();
+                }
+            }
+        });
+    }];
 }
 
 static void start_install_flow(int idx, NSURL *restoreURL) {
@@ -355,10 +389,10 @@ static void start_install_flow(int idx, NSURL *restoreURL) {
             if (i >= 0) update_install_progress(i, frac, stage);
         });
     }
-                         completion:^(NSError * _Nullable err, VZVirtualMachine * _Nullable machine) {
+                         completion:^(NSError * _Nullable err) {
         run_on_main(^{
             int i = vm_index_of(nsName.UTF8String);
-            if (i >= 0) finish_install(i, err, machine);
+            if (i >= 0) finish_install(i, err);
         });
     }];
 }
@@ -436,7 +470,7 @@ int asb_mac_vm_create(const char *name, const char *os_type,
                 int i = vm_index_of(nsName.UTF8String);
                 if (i >= 0) {
                     finish_install(i, fetchErr ?: [NSError errorWithDomain:@"VzInstall" code:20
-                        userInfo:@{NSLocalizedDescriptionKey: @"No supported restore image available"}], nil);
+                        userInfo:@{NSLocalizedDescriptionKey: @"No supported restore image available"}]);
                 }
             });
             return;
@@ -455,13 +489,12 @@ int asb_mac_vm_create(const char *name, const char *os_type,
             double gb = (double)totalBytes / (1024.0 * 1024.0 * 1024.0);
             post_log("Restore image size: %.1f GB", gb);
         }
-                                    completion:^(NSError * _Nullable dlErr, VZVirtualMachine * _Nullable _m) {
-            (void)_m;
+                                    completion:^(NSError * _Nullable dlErr) {
             if (dlErr) {
                 post_log("Download failed: %s", dlErr.localizedDescription.UTF8String);
                 run_on_main(^{
                     int i = vm_index_of(nsName.UTF8String);
-                    if (i >= 0) finish_install(i, dlErr, nil);
+                    if (i >= 0) finish_install(i, dlErr);
                 });
                 return;
             }
