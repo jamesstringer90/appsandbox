@@ -396,18 +396,12 @@ void ui_handle_message(NSString *json) {
          * script. No AppleScript, no Apple-Events TCC prompt. */
         NSString *user = [NSString stringWithUTF8String:
             vm->admin_user[0] ? vm->admin_user : "user"];
-        /* - \033c full-reset clears the "Last login" banner + the
-         *   auto-echoed path Terminal types before running a .command.
-         * - UserKnownHostsFile=/dev/null: don't pollute ~/.ssh/known_hosts.
-         * - StrictHostKeyChecking=no: don't prompt about unknown host.
-         * - LogLevel=ERROR: suppress the "Permanently added …" INFO line. */
+        /* \033c full-reset clears Terminal's "Last login" banner and the
+         * auto-echoed path it types before running a .command. */
         NSString *body = [NSString stringWithFormat:
             @"#!/bin/sh\n"
             @"printf '\\033c'\n"
-            @"exec ssh -o StrictHostKeyChecking=no "
-                    @"-o UserKnownHostsFile=/dev/null "
-                    @"-o LogLevel=ERROR "
-                    @"%@@127.0.0.1 -p %d\n",
+            @"exec ssh %@@127.0.0.1 -p %d\n",
             user, vm->ssh_port];
         NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
             [NSString stringWithFormat:@"appsandbox-ssh-%@-%u.command",

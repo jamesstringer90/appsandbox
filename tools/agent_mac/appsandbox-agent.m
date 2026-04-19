@@ -519,6 +519,18 @@ static void handle_client(int client) {
             send_reply(client, tag, "ok");
         } else if (strcmp(cmd, "ssh_enable") == 0) {
             handle_ssh_enable(client, tag);
+        } else if (strcmp(cmd, "shutdown") == 0) {
+            /* Reply first so the host hears "ok" before shutdown kills us.
+             * Then fork+exec /sbin/shutdown -h now so it runs independently
+             * of this process; we return to the read loop and exit cleanly
+             * when SIGTERM arrives from launchd during the shutdown. */
+            send_reply(client, tag, "ok");
+            agent_log("shutdown requested; spawning /sbin/shutdown -h now");
+            pid_t pid = fork();
+            if (pid == 0) {
+                execl("/sbin/shutdown", "shutdown", "-h", "now", (char *)NULL);
+                _exit(127);
+            }
         } else {
             send_reply(client, tag, "error:unknown_command");
         }
