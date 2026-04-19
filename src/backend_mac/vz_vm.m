@@ -120,6 +120,7 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
                                 [[VZUSBScreenCoordinatePointingDeviceConfiguration alloc] init]];
     config.keyboards = @[[[VZUSBKeyboardConfiguration alloc] init]];
     config.audioDevices = @[BuildAudio(YES)];
+    config.socketDevices = @[[[VZVirtioSocketDeviceConfiguration alloc] init]];
 
     if (![config validateWithError:error]) return nil;
     return config;
@@ -176,6 +177,7 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
                                 [[VZUSBScreenCoordinatePointingDeviceConfiguration alloc] init]];
     config.keyboards = @[[[VZUSBKeyboardConfiguration alloc] init]];
     config.audioDevices = @[BuildAudio(YES)];
+    config.socketDevices = @[[[VZVirtioSocketDeviceConfiguration alloc] init]];
 
     if (![config validateWithError:error]) return nil;
 

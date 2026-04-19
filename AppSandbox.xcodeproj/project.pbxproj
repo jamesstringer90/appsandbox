@@ -12,6 +12,7 @@
 		2003000000000000000000AA /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = 1003000000000000000000AA /* AppDelegate.m */; };
 		2005000000000000000000AA /* MainWindowController.m in Sources */ = {isa = PBXBuildFile; fileRef = 1005000000000000000000AA /* MainWindowController.m */; };
 		2007000000000000000000AA /* ui.m in Sources */ = {isa = PBXBuildFile; fileRef = 1007000000000000000000AA /* ui.m */; };
+		2008000000000000000000AA /* EventLogWindow.m in Sources */ = {isa = PBXBuildFile; fileRef = 1050000000000000000000AA /* EventLogWindow.m */; };
 		/* App target — Frameworks */
 		4001000000000000000000AA /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3001000000000000000000AA /* Cocoa.framework */; };
 		4002000000000000000000AA /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3002000000000000000000AA /* WebKit.framework */; };
@@ -25,15 +26,36 @@
 		2028000000000000000000BB /* asb_core_mac.m in Sources */ = {isa = PBXBuildFile; fileRef = 1019000000000000000000AA /* asb_core_mac.m */; };
 		2021000000000000000000BB /* host_info.m in Sources */ = {isa = PBXBuildFile; fileRef = 100A000000000000000000AA /* host_info.m */; };
 		2022000000000000000000BB /* vm_dir.m in Sources */ = {isa = PBXBuildFile; fileRef = 100C000000000000000000AA /* vm_dir.m */; };
-		2023000000000000000000BB /* vz_disk.m in Sources */ = {isa = PBXBuildFile; fileRef = 100E000000000000000000AA /* vz_disk.m */; };
 		2024000000000000000000BB /* vz_display.m in Sources */ = {isa = PBXBuildFile; fileRef = 1010000000000000000000AA /* vz_display.m */; };
-		2025000000000000000000BB /* vz_install.m in Sources */ = {isa = PBXBuildFile; fileRef = 1012000000000000000000AA /* vz_install.m */; };
 		2026000000000000000000BB /* vz_network.m in Sources */ = {isa = PBXBuildFile; fileRef = 1014000000000000000000AA /* vz_network.m */; };
 		2027000000000000000000BB /* vz_vm.m in Sources */ = {isa = PBXBuildFile; fileRef = 1016000000000000000000AA /* vz_vm.m */; };
+		2029000000000000000000BB /* vm_agent_mac.m in Sources */ = {isa = PBXBuildFile; fileRef = 101C000000000000000000AA /* vm_agent_mac.m */; };
+		2030000000000000000000BB /* iso_patch_mac.m in Sources */ = {isa = PBXBuildFile; fileRef = 101E000000000000000000AA /* iso_patch_mac.m */; };
+		2031000000000000000000BB /* vm_ssh_proxy_mac.m in Sources */ = {isa = PBXBuildFile; fileRef = 1020000000000000000000AA /* vm_ssh_proxy_mac.m */; };
+		2032000000000000000000BB /* vm_clipboard_mac.m in Sources */ = {isa = PBXBuildFile; fileRef = 1022000000000000000000AA /* vm_clipboard_mac.m */; };
+		/* appsandbox-clipboard CLI target */
+		2040000000000000000000EE /* appsandbox-clipboard.m in Sources */ = {isa = PBXBuildFile; fileRef = 1040000000000000000000EE /* appsandbox-clipboard.m */; };
+		4040000000000000000000EE /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3006000000000000000000AA /* Foundation.framework */; };
+		4041000000000000000000EE /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3001000000000000000000AA /* Cocoa.framework */; };
+		6034000000000000000000DD /* appsandbox-clipboard in Embed agent_mac */ = {isa = PBXBuildFile; fileRef = C040000000000000000000EE /* appsandbox-clipboard */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		6035000000000000000000DD /* com.appsandbox.clipboard.plist in Embed agent_mac */ = {isa = PBXBuildFile; fileRef = 1034000000000000000000DD /* com.appsandbox.clipboard.plist */; };
+		/* iso-patch-mac CLI target */
+		2020000000000000000000CC /* iso-patch-mac.m in Sources */ = {isa = PBXBuildFile; fileRef = 1020000000000000000000CC /* iso-patch-mac.m */; };
+		4020000000000000000000CC /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3006000000000000000000AA /* Foundation.framework */; };
+		4021000000000000000000CC /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3003000000000000000000AA /* Virtualization.framework */; };
+		6020000000000000000000CC /* iso-patch-mac in Embed Resources */ = {isa = PBXBuildFile; fileRef = C020000000000000000000CC /* iso-patch-mac */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		/* appsandbox-agent CLI target */
+		2030000000000000000000DD /* appsandbox-agent.m in Sources */ = {isa = PBXBuildFile; fileRef = 1030000000000000000000DD /* appsandbox-agent.m */; };
+		4030000000000000000000DD /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3006000000000000000000AA /* Foundation.framework */; };
+		6030000000000000000000DD /* appsandbox-agent in Embed agent_mac */ = {isa = PBXBuildFile; fileRef = C030000000000000000000DD /* appsandbox-agent */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		6031000000000000000000DD /* com.appsandbox.agent.plist in Embed agent_mac */ = {isa = PBXBuildFile; fileRef = 1031000000000000000000DD /* com.appsandbox.agent.plist */; };
+		6032000000000000000000DD /* com.appsandbox.firstboot.plist in Embed agent_mac */ = {isa = PBXBuildFile; fileRef = 1032000000000000000000DD /* com.appsandbox.firstboot.plist */; };
+		6033000000000000000000DD /* firstboot.sh in Embed agent_mac */ = {isa = PBXBuildFile; fileRef = 1033000000000000000000DD /* firstboot.sh */; };
 		/* Framework target — Frameworks */
 		4011000000000000000000BB /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3001000000000000000000AA /* Cocoa.framework */; };
 		4012000000000000000000BB /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3003000000000000000000AA /* Virtualization.framework */; };
 		4013000000000000000000BB /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3004000000000000000000AA /* Metal.framework */; };
+		4014000000000000000000BB /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3005000000000000000000AA /* Security.framework */; };
 		/* Framework target — Headers (public) */
 		6012000000000000000000BB /* asb_types.h in Headers */ = {isa = PBXBuildFile; fileRef = 1018000000000000000000AA /* asb_types.h */; settings = {ATTRIBUTES = (Public, ); }; };
 /* End PBXBuildFile section */
@@ -45,6 +67,27 @@
 			proxyType = 1;
 			remoteGlobalIDString = 8010000000000000000000BB;
 			remoteInfo = AppSandboxCore;
+		};
+		D020000000000000000000CC /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B001000000000000000000AA /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 8020000000000000000000CC;
+			remoteInfo = "iso-patch-mac";
+		};
+		D030000000000000000000DD /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B001000000000000000000AA /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 8030000000000000000000DD;
+			remoteInfo = "appsandbox-agent";
+		};
+		D040000000000000000000EE /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B001000000000000000000AA /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 8040000000000000000000EE;
+			remoteInfo = "appsandbox-clipboard";
 		};
 /* End PBXContainerItemProxy section */
 
@@ -60,6 +103,33 @@
 			name = "Embed Frameworks";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A022000000000000000000CC /* Embed iso-patch-mac */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 7;
+			files = (
+				6020000000000000000000CC /* iso-patch-mac in Embed Resources */,
+			);
+			name = "Embed iso-patch-mac";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A032000000000000000000DD /* Embed agent_mac */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = agent_mac;
+			dstSubfolderSpec = 7;
+			files = (
+				6030000000000000000000DD /* appsandbox-agent in Embed agent_mac */,
+				6031000000000000000000DD /* com.appsandbox.agent.plist in Embed agent_mac */,
+				6032000000000000000000DD /* com.appsandbox.firstboot.plist in Embed agent_mac */,
+				6033000000000000000000DD /* firstboot.sh in Embed agent_mac */,
+				6034000000000000000000DD /* appsandbox-clipboard in Embed agent_mac */,
+				6035000000000000000000DD /* com.appsandbox.clipboard.plist in Embed agent_mac */,
+			);
+			name = "Embed agent_mac";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
@@ -70,28 +140,47 @@
 		1005000000000000000000AA /* MainWindowController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = MainWindowController.m; sourceTree = "<group>"; };
 		1006000000000000000000AA /* ui.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ui.h; sourceTree = "<group>"; };
 		1007000000000000000000AA /* ui.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ui.m; sourceTree = "<group>"; };
+		1050000000000000000000AA /* EventLogWindow.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = EventLogWindow.m; sourceTree = "<group>"; };
+		1051000000000000000000AA /* EventLogWindow.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = EventLogWindow.h; sourceTree = "<group>"; };
 		1019000000000000000000AA /* asb_core_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = asb_core_mac.m; sourceTree = "<group>"; };
 		101A000000000000000000AA /* asb_core_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_core_mac.h; sourceTree = "<group>"; };
 		1009000000000000000000AA /* host_info.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = host_info.h; sourceTree = "<group>"; };
 		100A000000000000000000AA /* host_info.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = host_info.m; sourceTree = "<group>"; };
 		100B000000000000000000AA /* vm_dir.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_dir.h; sourceTree = "<group>"; };
 		100C000000000000000000AA /* vm_dir.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_dir.m; sourceTree = "<group>"; };
-		100D000000000000000000AA /* vz_disk.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_disk.h; sourceTree = "<group>"; };
-		100E000000000000000000AA /* vz_disk.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_disk.m; sourceTree = "<group>"; };
 		100F000000000000000000AA /* vz_display.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_display.h; sourceTree = "<group>"; };
 		1010000000000000000000AA /* vz_display.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_display.m; sourceTree = "<group>"; };
-		1011000000000000000000AA /* vz_install.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_install.h; sourceTree = "<group>"; };
-		1012000000000000000000AA /* vz_install.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_install.m; sourceTree = "<group>"; };
 		1013000000000000000000AA /* vz_network.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_network.h; sourceTree = "<group>"; };
 		1014000000000000000000AA /* vz_network.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_network.m; sourceTree = "<group>"; };
 		1015000000000000000000AA /* vz_vm.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_vm.h; sourceTree = "<group>"; };
 		1016000000000000000000AA /* vz_vm.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_vm.m; sourceTree = "<group>"; };
+		101B000000000000000000AA /* vm_agent_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_agent_mac.h; sourceTree = "<group>"; };
+		101C000000000000000000AA /* vm_agent_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_agent_mac.m; sourceTree = "<group>"; };
+		101D000000000000000000AA /* iso_patch_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = iso_patch_mac.h; sourceTree = "<group>"; };
+		101E000000000000000000AA /* iso_patch_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = iso_patch_mac.m; sourceTree = "<group>"; };
+		101F000000000000000000AA /* vm_ssh_proxy_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_ssh_proxy_mac.h; sourceTree = "<group>"; };
+		1020000000000000000000AA /* vm_ssh_proxy_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_ssh_proxy_mac.m; sourceTree = "<group>"; };
+		1021000000000000000000AA /* vm_clipboard_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_clipboard_mac.h; sourceTree = "<group>"; };
+		1022000000000000000000AA /* vm_clipboard_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_clipboard_mac.m; sourceTree = "<group>"; };
+		1034000000000000000000DD /* com.appsandbox.clipboard.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = com.appsandbox.clipboard.plist; sourceTree = "<group>"; };
+		1040000000000000000000EE /* appsandbox-clipboard.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "appsandbox-clipboard.m"; sourceTree = "<group>"; };
+		C040000000000000000000EE /* appsandbox-clipboard */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "appsandbox-clipboard"; sourceTree = BUILT_PRODUCTS_DIR; };
 		1018000000000000000000AA /* asb_types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_types.h; sourceTree = "<group>"; };
 		1020000000000000000000BB /* AppSandboxCore-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "AppSandboxCore-Info.plist"; sourceTree = "<group>"; };
 		3001000000000000000000AA /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = System/Library/Frameworks/Cocoa.framework; sourceTree = SDKROOT; };
 		3002000000000000000000AA /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		3003000000000000000000AA /* Virtualization.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Virtualization.framework; path = System/Library/Frameworks/Virtualization.framework; sourceTree = SDKROOT; };
 		3004000000000000000000AA /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		3005000000000000000000AA /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		3006000000000000000000AA /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
+		1020000000000000000000CC /* iso-patch-mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "iso-patch-mac.m"; sourceTree = "<group>"; };
+		1021000000000000000000CC /* iso-patch-mac.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "iso-patch-mac.entitlements"; sourceTree = "<group>"; };
+		C020000000000000000000CC /* iso-patch-mac */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "iso-patch-mac"; sourceTree = BUILT_PRODUCTS_DIR; };
+		1030000000000000000000DD /* appsandbox-agent.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "appsandbox-agent.m"; sourceTree = "<group>"; };
+		1031000000000000000000DD /* com.appsandbox.agent.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = com.appsandbox.agent.plist; sourceTree = "<group>"; };
+		1032000000000000000000DD /* com.appsandbox.firstboot.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = com.appsandbox.firstboot.plist; sourceTree = "<group>"; };
+		1033000000000000000000DD /* firstboot.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = firstboot.sh; sourceTree = "<group>"; };
+		C030000000000000000000DD /* appsandbox-agent */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "appsandbox-agent"; sourceTree = BUILT_PRODUCTS_DIR; };
 		5001000000000000000000AA /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		5002000000000000000000AA /* AppSandbox.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = AppSandbox.entitlements; sourceTree = "<group>"; };
 		5003000000000000000000AA /* web */ = {isa = PBXFileReference; lastKnownFileType = folder; path = web; sourceTree = SOURCE_ROOT; };
@@ -118,6 +207,33 @@
 				4011000000000000000000BB /* Cocoa.framework in Frameworks */,
 				4012000000000000000000BB /* Virtualization.framework in Frameworks */,
 				4013000000000000000000BB /* Metal.framework in Frameworks */,
+				4014000000000000000000BB /* Security.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A021000000000000000000CC /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4020000000000000000000CC /* Foundation.framework in Frameworks */,
+				4021000000000000000000CC /* Virtualization.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A031000000000000000000DD /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4030000000000000000000DD /* Foundation.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A041000000000000000000EE /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4040000000000000000000EE /* Foundation.framework in Frameworks */,
+				4041000000000000000000EE /* Cocoa.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -128,11 +244,45 @@
 			isa = PBXGroup;
 			children = (
 				7005000000000000000000AA /* src */,
+				7019000000000000000000AA /* tools */,
 				5003000000000000000000AA /* web */,
 				7008000000000000000000AA /* Frameworks */,
 				7009000000000000000000AA /* Products */,
 			);
 			sourceTree = "<group>";
+		};
+		7019000000000000000000AA /* tools */ = {
+			isa = PBXGroup;
+			children = (
+				7020000000000000000000CC /* iso-patch-mac */,
+				7030000000000000000000DD /* agent_mac */,
+			);
+			name = tools;
+			sourceTree = "<group>";
+		};
+		7020000000000000000000CC /* iso-patch-mac */ = {
+			isa = PBXGroup;
+			children = (
+				1020000000000000000000CC /* iso-patch-mac.m */,
+				1021000000000000000000CC /* iso-patch-mac.entitlements */,
+			);
+			name = "iso-patch-mac";
+			path = "tools/iso-patch-mac";
+			sourceTree = SOURCE_ROOT;
+		};
+		7030000000000000000000DD /* agent_mac */ = {
+			isa = PBXGroup;
+			children = (
+				1030000000000000000000DD /* appsandbox-agent.m */,
+				1031000000000000000000DD /* com.appsandbox.agent.plist */,
+				1032000000000000000000DD /* com.appsandbox.firstboot.plist */,
+				1033000000000000000000DD /* firstboot.sh */,
+				1034000000000000000000DD /* com.appsandbox.clipboard.plist */,
+				1040000000000000000000EE /* appsandbox-clipboard.m */,
+			);
+			name = agent_mac;
+			path = tools/agent_mac;
+			sourceTree = SOURCE_ROOT;
 		};
 		7003000000000000000000AA /* app_mac */ = {
 			isa = PBXGroup;
@@ -144,6 +294,8 @@
 				1005000000000000000000AA /* MainWindowController.m */,
 				1006000000000000000000AA /* ui.h */,
 				1007000000000000000000AA /* ui.m */,
+				1051000000000000000000AA /* EventLogWindow.h */,
+				1050000000000000000000AA /* EventLogWindow.m */,
 				5001000000000000000000AA /* Info.plist */,
 				5002000000000000000000AA /* AppSandbox.entitlements */,
 				5004000000000000000000AA /* Assets.xcassets */,
@@ -181,16 +333,20 @@
 				100A000000000000000000AA /* host_info.m */,
 				100B000000000000000000AA /* vm_dir.h */,
 				100C000000000000000000AA /* vm_dir.m */,
-				100D000000000000000000AA /* vz_disk.h */,
-				100E000000000000000000AA /* vz_disk.m */,
 				100F000000000000000000AA /* vz_display.h */,
 				1010000000000000000000AA /* vz_display.m */,
-				1011000000000000000000AA /* vz_install.h */,
-				1012000000000000000000AA /* vz_install.m */,
 				1013000000000000000000AA /* vz_network.h */,
 				1014000000000000000000AA /* vz_network.m */,
 				1015000000000000000000AA /* vz_vm.h */,
 				1016000000000000000000AA /* vz_vm.m */,
+				101B000000000000000000AA /* vm_agent_mac.h */,
+				101C000000000000000000AA /* vm_agent_mac.m */,
+				101D000000000000000000AA /* iso_patch_mac.h */,
+				101E000000000000000000AA /* iso_patch_mac.m */,
+				101F000000000000000000AA /* vm_ssh_proxy_mac.h */,
+				1020000000000000000000AA /* vm_ssh_proxy_mac.m */,
+				1021000000000000000000AA /* vm_clipboard_mac.h */,
+				1022000000000000000000AA /* vm_clipboard_mac.m */,
 			);
 			name = backend_mac;
 			path = src/backend_mac;
@@ -203,6 +359,8 @@
 				3002000000000000000000AA /* WebKit.framework */,
 				3003000000000000000000AA /* Virtualization.framework */,
 				3004000000000000000000AA /* Metal.framework */,
+				3005000000000000000000AA /* Security.framework */,
+				3006000000000000000000AA /* Foundation.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -212,6 +370,9 @@
 			children = (
 				C001000000000000000000AA /* AppSandbox.app */,
 				C002000000000000000000BB /* AppSandboxCore.framework */,
+				C020000000000000000000CC /* iso-patch-mac */,
+				C030000000000000000000DD /* appsandbox-agent */,
+				C040000000000000000000EE /* appsandbox-clipboard */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -234,20 +395,73 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 8002000000000000000000AA /* Build configuration list for PBXNativeTarget "AppSandbox" */;
 			buildPhases = (
+				A007000000000000000000AA /* Mark bin/ as clean-safe */,
 				A001000000000000000000AA /* Sources */,
 				A002000000000000000000AA /* Frameworks */,
 				A003000000000000000000AA /* Resources */,
 				A004000000000000000000BB /* Embed Frameworks */,
+				A022000000000000000000CC /* Embed iso-patch-mac */,
+				A032000000000000000000DD /* Embed agent_mac */,
 			);
 			buildRules = (
 			);
 			dependencies = (
 				D001000000000000000000BB /* PBXTargetDependency */,
+				E020000000000000000000CC /* PBXTargetDependency */,
+				E030000000000000000000DD /* PBXTargetDependency */,
 			);
 			name = AppSandbox;
 			productName = AppSandbox;
 			productReference = C001000000000000000000AA /* AppSandbox.app */;
 			productType = "com.apple.product-type.application";
+		};
+		8020000000000000000000CC /* iso-patch-mac */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 8022000000000000000000CC /* Build configuration list for PBXNativeTarget "iso-patch-mac" */;
+			buildPhases = (
+				A020000000000000000000CC /* Sources */,
+				A021000000000000000000CC /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "iso-patch-mac";
+			productName = "iso-patch-mac";
+			productReference = C020000000000000000000CC /* iso-patch-mac */;
+			productType = "com.apple.product-type.tool";
+		};
+		8030000000000000000000DD /* appsandbox-agent */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 8032000000000000000000DD /* Build configuration list for PBXNativeTarget "appsandbox-agent" */;
+			buildPhases = (
+				A030000000000000000000DD /* Sources */,
+				A031000000000000000000DD /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "appsandbox-agent";
+			productName = "appsandbox-agent";
+			productReference = C030000000000000000000DD /* appsandbox-agent */;
+			productType = "com.apple.product-type.tool";
+		};
+		8040000000000000000000EE /* appsandbox-clipboard */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 8042000000000000000000EE /* Build configuration list for PBXNativeTarget "appsandbox-clipboard" */;
+			buildPhases = (
+				A040000000000000000000EE /* Sources */,
+				A041000000000000000000EE /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "appsandbox-clipboard";
+			productName = "appsandbox-clipboard";
+			productReference = C040000000000000000000EE /* appsandbox-clipboard */;
+			productType = "com.apple.product-type.tool";
 		};
 		8010000000000000000000BB /* AppSandboxCore */ = {
 			isa = PBXNativeTarget;
@@ -281,6 +495,15 @@
 					8010000000000000000000BB = {
 						CreatedOnToolsVersion = 15.0;
 					};
+					8020000000000000000000CC = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					8030000000000000000000DD = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					8040000000000000000000EE = {
+						CreatedOnToolsVersion = 15.0;
+					};
 				};
 			};
 			buildConfigurationList = 8001000000000000000000AA /* Build configuration list for PBXProject "AppSandbox" */;
@@ -298,9 +521,34 @@
 			targets = (
 				8003000000000000000000AA /* AppSandbox */,
 				8010000000000000000000BB /* AppSandboxCore */,
+				8020000000000000000000CC /* iso-patch-mac */,
+				8030000000000000000000DD /* appsandbox-agent */,
+				8040000000000000000000EE /* appsandbox-clipboard */,
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A007000000000000000000AA /* Mark bin/ as clean-safe */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Mark bin/ as clean-safe";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "# Xcode's clean only deletes directories it created itself (marked\n# with com.apple.xcode.CreatedByBuildSystem). Since SYMROOT=$SRCROOT/bin\n# is a source-tree path that may pre-exist, we tag it here so Product >\n# Clean Build Folder can remove it cleanly.\nif [ -d \"$SYMROOT\" ]; then\n  xattr -w com.apple.xcode.CreatedByBuildSystem true \"$SYMROOT\" 2>/dev/null || true\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXResourcesBuildPhase section */
 		A003000000000000000000AA /* Resources */ = {
@@ -323,6 +571,7 @@
 				2003000000000000000000AA /* AppDelegate.m in Sources */,
 				2005000000000000000000AA /* MainWindowController.m in Sources */,
 				2007000000000000000000AA /* ui.m in Sources */,
+				2008000000000000000000AA /* EventLogWindow.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -333,11 +582,37 @@
 				2028000000000000000000BB /* asb_core_mac.m in Sources */,
 				2021000000000000000000BB /* host_info.m in Sources */,
 				2022000000000000000000BB /* vm_dir.m in Sources */,
-				2023000000000000000000BB /* vz_disk.m in Sources */,
 				2024000000000000000000BB /* vz_display.m in Sources */,
-				2025000000000000000000BB /* vz_install.m in Sources */,
 				2026000000000000000000BB /* vz_network.m in Sources */,
 				2027000000000000000000BB /* vz_vm.m in Sources */,
+				2029000000000000000000BB /* vm_agent_mac.m in Sources */,
+				2030000000000000000000BB /* iso_patch_mac.m in Sources */,
+				2031000000000000000000BB /* vm_ssh_proxy_mac.m in Sources */,
+				2032000000000000000000BB /* vm_clipboard_mac.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A020000000000000000000CC /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2020000000000000000000CC /* iso-patch-mac.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A030000000000000000000DD /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2030000000000000000000DD /* appsandbox-agent.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A040000000000000000000EE /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2040000000000000000000EE /* appsandbox-clipboard.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -348,6 +623,21 @@
 			isa = PBXTargetDependency;
 			target = 8010000000000000000000BB /* AppSandboxCore */;
 			targetProxy = D002000000000000000000BB /* PBXContainerItemProxy */;
+		};
+		E020000000000000000000CC /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 8020000000000000000000CC /* iso-patch-mac */;
+			targetProxy = D020000000000000000000CC /* PBXContainerItemProxy */;
+		};
+		E030000000000000000000DD /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 8030000000000000000000DD /* appsandbox-agent */;
+			targetProxy = D030000000000000000000DD /* PBXContainerItemProxy */;
+		};
+		E040000000000000000000EE /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 8040000000000000000000EE /* appsandbox-clipboard */;
+			targetProxy = D040000000000000000000EE /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -571,6 +861,97 @@
 			};
 			name = Release;
 		};
+		/* iso-patch-mac CLI — Debug */
+		9020000000000000000000CC /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_ENTITLEMENTS = "tools/iso-patch-mac/iso-patch-mac.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGNING_ALLOWED = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				ONLY_ACTIVE_ARCH = NO;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.appsandbox.iso-patch-mac";
+				PRODUCT_NAME = "iso-patch-mac";
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		/* iso-patch-mac CLI — Release */
+		9021000000000000000000CC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_ENTITLEMENTS = "tools/iso-patch-mac/iso-patch-mac.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGNING_ALLOWED = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				ONLY_ACTIVE_ARCH = NO;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.appsandbox.iso-patch-mac";
+				PRODUCT_NAME = "iso-patch-mac";
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
+		/* appsandbox-agent CLI — Debug (guest-bound, arm64 only) */
+		9030000000000000000000DD /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGNING_ALLOWED = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				ONLY_ACTIVE_ARCH = NO;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.appsandbox.appsandbox-agent";
+				PRODUCT_NAME = "appsandbox-agent";
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		/* appsandbox-agent CLI — Release */
+		9031000000000000000000DD /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGNING_ALLOWED = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				ONLY_ACTIVE_ARCH = NO;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.appsandbox.appsandbox-agent";
+				PRODUCT_NAME = "appsandbox-agent";
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
+		/* appsandbox-clipboard CLI (guest-bound, arm64 only) — Debug */
+		9040000000000000000000EE /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGNING_ALLOWED = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				ONLY_ACTIVE_ARCH = NO;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.appsandbox.appsandbox-clipboard";
+				PRODUCT_NAME = "appsandbox-clipboard";
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		9041000000000000000000EE /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGNING_ALLOWED = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				ONLY_ACTIVE_ARCH = NO;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.appsandbox.appsandbox-clipboard";
+				PRODUCT_NAME = "appsandbox-clipboard";
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -597,6 +978,33 @@
 			buildConfigurations = (
 				9010000000000000000000BB /* Debug */,
 				9011000000000000000000BB /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		8022000000000000000000CC /* Build configuration list for PBXNativeTarget "iso-patch-mac" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9020000000000000000000CC /* Debug */,
+				9021000000000000000000CC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		8032000000000000000000DD /* Build configuration list for PBXNativeTarget "appsandbox-agent" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9030000000000000000000DD /* Debug */,
+				9031000000000000000000DD /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		8042000000000000000000EE /* Build configuration list for PBXNativeTarget "appsandbox-clipboard" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9040000000000000000000EE /* Debug */,
+				9041000000000000000000EE /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

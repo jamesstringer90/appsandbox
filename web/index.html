@@ -128,24 +128,24 @@
                 <select id="net-adapter"></select>
             </div>
 
-            <label class="win-only">Username:</label>
-            <div class="cred-row win-only">
-                <input type="text" id="admin-user" value="User" class="input-md">
+            <label>Username:</label>
+            <div class="cred-row">
+                <input type="text" id="admin-user" value="user" class="input-md" autocomplete="off">
                 <span class="field-warn" id="admin-user-warn"></span>
             </div>
 
-            <label class="win-only">Password:</label>
-            <div class="cred-row win-only">
+            <label>Password:</label>
+            <div class="cred-row">
                 <input type="password" id="admin-pass" value="test123">
                 <label>Confirm:</label>
                 <input type="password" id="admin-confirm" value="test123">
                 <span class="toggle-pass" onmousedown="showPassword()" onmouseup="hidePassword()" onmouseleave="hidePassword()">&#x1F441;</span>
             </div>
 
-            <label class="win-only">Options:</label>
-            <div class="form-row win-only">
-                <label title="Disables Secure Boot — required for test-signed VDD driver"><input type="checkbox" id="test-mode" checked> Test Mode</label>
-                <label title="Installs OpenSSH Server, tunnelled over HV socket"><input type="checkbox" id="ssh-enabled"> SSH Server</label>
+            <label>Options:</label>
+            <div class="form-row">
+                <label class="win-only" title="Disables Secure Boot — required for test-signed VDD driver"><input type="checkbox" id="test-mode" checked> Test Mode</label>
+                <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled"> SSH Server</label>
             </div>
         </div>
         <div class="modal-buttons">

@@ -11,13 +11,15 @@
 
 #import <Foundation/Foundation.h>
 
-@class VzVm, VzDisplayWindow;
+@class VzVm, VzDisplayWindow, VmAgentMac, VmSshProxyMac;
 
 #define ASB_MAX_VMS 32
 
 typedef struct {
     char    name[256];
     char    os_type[32];
+    char    admin_user[64];
+    char    admin_pass[128];
     int     ram_mb;
     int     hdd_gb;
     int     cpu_cores;
@@ -26,10 +28,17 @@ typedef struct {
     BOOL    running;
     BOOL    shutting_down;
     BOOL    install_complete;
+    BOOL    agent_online;
+    uint64_t agent_last_heartbeat_ms;
+    BOOL    ssh_enabled;            /* user-configured at create time */
+    int     ssh_port;               /* host loopback port, 0 = unassigned */
+    int     ssh_state;              /* 0=off 1=installing 2=ready 3=failed */
     int     install_progress;
     char    install_status[128];
     VzVm            *__unsafe_unretained vz_handle;
     VzDisplayWindow *__unsafe_unretained display;
+    VmAgentMac      *__unsafe_unretained agent;
+    VmSshProxyMac   *__unsafe_unretained ssh_proxy;
 } AsbVmMac;
 
 void asb_mac_init(void);
@@ -42,7 +51,10 @@ AsbVmMac    *asb_mac_vm_find(const char *name);
 int  asb_mac_vm_create(const char *name, const char *os_type,
                         int ram_mb, int hdd_gb, int cpu_cores,
                         int gpu_mode, int network_mode,
-                        const char *image_path);
+                        const char *image_path,
+                        const char *admin_user,
+                        const char *admin_pass,
+                        BOOL ssh_enabled);
 int  asb_mac_vm_start(const char *name);
 int  asb_mac_vm_stop(const char *name, int force);
 int  asb_mac_vm_delete(const char *name);
