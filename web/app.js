@@ -399,13 +399,11 @@ function onCreateVm() {
     var cfg = gatherConfig();
     var nameErr = validateVmName(cfg.name);
     if (nameErr) { sendCmd('log', { message: nameErr }); return; }
-    if (!hostBridge.isMac) {
-        var userErr = validateUsername(cfg.adminUser);
-        if (userErr) { sendCmd('log', { message: userErr }); return; }
-        if (cfg.adminPass !== cfg.adminConfirm) {
-            sendCmd('log', { message: 'Passwords do not match.' });
-            return;
-        }
+    var userErr = validateUsername(cfg.adminUser);
+    if (userErr) { sendCmd('log', { message: userErr }); return; }
+    if (cfg.adminPass !== cfg.adminConfirm) {
+        sendCmd('log', { message: 'Passwords do not match.' });
+        return;
     }
     sendCmd('createVm', cfg);
     clearCreateForm();
@@ -436,7 +434,7 @@ function openCreateModal() {
     document.getElementById('hdd-size').value = 64;
     document.getElementById('gpu-mode').value = '1';
     document.getElementById('net-mode').value = '1';
-    document.getElementById('admin-user').value = 'User';
+    document.getElementById('admin-user').value = 'user';
     document.getElementById('admin-pass').value = 'test123';
     document.getElementById('admin-confirm').value = 'test123';
     document.getElementById('test-mode').checked = true;

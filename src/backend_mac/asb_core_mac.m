@@ -10,9 +10,12 @@
 #import "asb_core_mac.h"
 #import "vm_dir.h"
 #import "vz_vm.h"
-#import "vz_install.h"
 #import "vz_display.h"
 #import "vz_network.h"
+#import "vm_agent_mac.h"
+#import "vm_ssh_proxy_mac.h"
+#import "vm_clipboard_mac.h"
+#import "iso_patch_mac.h"
 #import "host_info.h"
 
 #include "asb_types.h"
@@ -31,6 +34,9 @@ static AsbMacEventCallback g_event_cb = NULL;
  * The struct stores __unsafe_unretained pointers; these arrays keep them alive. */
 static id g_vz_refs[ASB_MAX_VMS];
 static id g_display_refs[ASB_MAX_VMS];
+static id g_agent_refs[ASB_MAX_VMS];
+static id g_ssh_proxy_refs[ASB_MAX_VMS];
+static id g_clipboard_refs[ASB_MAX_VMS];
 
 /* ---- Helpers ---- */
 
@@ -51,6 +57,17 @@ static void post_log(const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     post_event(CORE_VM_EVENT_LOG, NULL, 0, buf);
+}
+
+/* Technical / protocol events destined for the Event Log window only.
+ * Not emitted to the WebView main log (matches Windows' IDD-log split). */
+static void post_diag(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    post_event(CORE_VM_EVENT_DIAG, NULL, 0, buf);
 }
 
 static void post_alert(const char *vm_name, const char *fmt, ...) {
@@ -103,6 +120,13 @@ static void save_vm_list(void) {
         fprintf(f, "CpuCores=%d\n", g_vms[i].cpu_cores);
         fprintf(f, "GpuMode=%d\n", g_vms[i].gpu_mode);
         fprintf(f, "NetworkMode=%d\n", g_vms[i].network_mode);
+        if (g_vms[i].admin_user[0])
+            fprintf(f, "AdminUser=%s\n", g_vms[i].admin_user);
+        /* admin_pass intentionally NOT persisted — matches Windows. */
+        if (g_vms[i].ssh_enabled)
+            fprintf(f, "SshEnabled=1\n");
+        if (g_vms[i].ssh_port > 0)
+            fprintf(f, "SshPort=%d\n", g_vms[i].ssh_port);
         if (g_vms[i].install_complete)
             fprintf(f, "InstallComplete=1\n");
         fprintf(f, "\n");
@@ -164,6 +188,12 @@ static void load_vm_list(void) {
             vm->gpu_mode = atoi(line + 8);
         else if (strncmp(line, "NetworkMode=", 12) == 0)
             vm->network_mode = atoi(line + 12);
+        else if (strncmp(line, "AdminUser=", 10) == 0)
+            strlcpy(vm->admin_user, line + 10, sizeof(vm->admin_user));
+        else if (strncmp(line, "SshEnabled=", 11) == 0)
+            vm->ssh_enabled = (atoi(line + 11) != 0);
+        else if (strncmp(line, "SshPort=", 8) == 0)
+            vm->ssh_port = atoi(line + 8);
         else if (strncmp(line, "InstallComplete=", 16) == 0)
             vm->install_complete = (atoi(line + 16) != 0);
     }
@@ -177,17 +207,27 @@ void asb_mac_init(void) {
     memset(g_vms, 0, sizeof(g_vms));
     memset(g_vz_refs, 0, sizeof(g_vz_refs));
     memset(g_display_refs, 0, sizeof(g_display_refs));
+    memset(g_agent_refs, 0, sizeof(g_agent_refs));
+    memset(g_ssh_proxy_refs, 0, sizeof(g_ssh_proxy_refs));
+    memset(g_clipboard_refs, 0, sizeof(g_clipboard_refs));
     g_vm_count = 0;
     load_vm_list();
 }
 
 void asb_mac_cleanup(void) {
     for (int i = 0; i < g_vm_count; i++) {
+        if (g_clipboard_refs[i]) [(VmClipboardMac *)g_clipboard_refs[i] stop];
+        g_clipboard_refs[i] = nil;
+        if (g_ssh_proxy_refs[i]) [(VmSshProxyMac *)g_ssh_proxy_refs[i] stop];
+        g_ssh_proxy_refs[i] = nil;
+        if (g_agent_refs[i]) [(VmAgentMac *)g_agent_refs[i] stop];
+        g_agent_refs[i] = nil;
         g_vz_refs[i] = nil;
         g_display_refs[i] = nil;
     }
     g_vm_count = 0;
     g_event_cb = NULL;
+    [IsoPatchMac releaseAuthorization];
 }
 
 /* ---- Public: array access ---- */
@@ -204,6 +244,179 @@ AsbVmMac *asb_mac_vm_get(int index) {
 AsbVmMac *asb_mac_vm_find(const char *name) {
     int idx = vm_index_of(name);
     return idx >= 0 ? &g_vms[idx] : NULL;
+}
+
+/* ---- Agent resources ---- */
+
+static NSString *agent_resource_directory(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    /* 1. Bundled: <App>/Contents/Resources/agent_mac */
+    NSString *bundle = [[NSBundle mainBundle].resourcePath
+                          stringByAppendingPathComponent:@"agent_mac"];
+    if (bundle &&
+        [fm fileExistsAtPath:[bundle stringByAppendingPathComponent:@"appsandbox-agent"]]) {
+        return bundle;
+    }
+
+    /* 2. Dev fallback: walk up from bundle to find tools/agent_mac with
+     *    a built binary under build/. */
+    NSString *cur = [NSBundle mainBundle].bundlePath;
+    for (int i = 0; i < 6 && cur.length > 1; i++) {
+        NSString *candidate = [cur stringByAppendingPathComponent:@"tools/agent_mac"];
+        NSString *bin = [candidate stringByAppendingPathComponent:@"build/appsandbox-agent"];
+        if ([fm fileExistsAtPath:bin]) return candidate;
+        cur = [cur stringByDeletingLastPathComponent];
+    }
+    return nil;
+}
+
+/* ---- Agent lifecycle ---- */
+
+static void stop_ssh_proxy_for(int idx) {
+    if (idx < 0 || idx >= g_vm_count) return;
+    VmSshProxyMac *proxy = g_ssh_proxy_refs[idx];
+    if (!proxy) return;
+    [proxy stop];
+    g_ssh_proxy_refs[idx] = nil;
+    g_vms[idx].ssh_proxy = nil;
+    g_vms[idx].ssh_state = 0;
+}
+
+static void stop_clipboard_for(int idx) {
+    if (idx < 0 || idx >= g_vm_count) return;
+    VmClipboardMac *clip = g_clipboard_refs[idx];
+    if (!clip) return;
+    [clip stop];
+    g_clipboard_refs[idx] = nil;
+}
+
+static void start_clipboard_for(int idx) {
+    if (idx < 0 || idx >= g_vm_count) return;
+    if (g_clipboard_refs[idx]) return;
+    VzVm *vzvm = g_vz_refs[idx];
+    if (!vzvm || !vzvm.machine) return;
+    VZVirtioSocketDevice *vsock = nil;
+    for (id d in vzvm.machine.socketDevices) {
+        if ([d isKindOfClass:[VZVirtioSocketDevice class]]) { vsock = d; break; }
+    }
+    if (!vsock) return;
+    NSString *nsName = [NSString stringWithUTF8String:g_vms[idx].name];
+    VmClipboardMac *clip = [[VmClipboardMac alloc] initWithName:nsName
+                                                    socketDevice:vsock];
+    clip.onLog = ^(NSString *line) {
+        post_diag("[%s] clipboard: %s", nsName.UTF8String, line.UTF8String);
+    };
+    g_clipboard_refs[idx] = clip;
+    [clip start];
+}
+
+static void stop_agent_for(int idx) {
+    if (idx < 0 || idx >= g_vm_count) return;
+    stop_clipboard_for(idx);
+    stop_ssh_proxy_for(idx);
+    VmAgentMac *agent = g_agent_refs[idx];
+    if (!agent) return;
+    [agent stop];
+    g_agent_refs[idx] = nil;
+    g_vms[idx].agent = nil;
+    if (g_vms[idx].agent_online) {
+        g_vms[idx].agent_online = NO;
+        post_event(CORE_VM_EVENT_AGENT_STATUS, g_vms[idx].name, 0, NULL);
+    }
+}
+
+static void start_ssh_proxy_for(int idx) {
+    if (idx < 0 || idx >= g_vm_count) return;
+    if (!g_vms[idx].ssh_enabled) return;
+    if (g_ssh_proxy_refs[idx]) return;
+
+    VzVm *vzvm = g_vz_refs[idx];
+    if (!vzvm || !vzvm.machine) return;
+
+    VZVirtioSocketDevice *vsock = nil;
+    for (id d in vzvm.machine.socketDevices) {
+        if ([d isKindOfClass:[VZVirtioSocketDevice class]]) { vsock = d; break; }
+    }
+    if (!vsock) return;
+
+    NSString *nsName = [NSString stringWithUTF8String:g_vms[idx].name];
+    VmSshProxyMac *proxy = [[VmSshProxyMac alloc] initWithName:nsName
+                                                   socketDevice:vsock
+                                                    initialPort:g_vms[idx].ssh_port];
+    proxy.onPortAssigned = ^(int port) {
+        int i = vm_index_of(nsName.UTF8String);
+        if (i < 0) return;
+        if (g_vms[i].ssh_port != port) {
+            g_vms[i].ssh_port = port;
+            save_vm_list();
+        }
+        post_log("[%s] SSH proxy listening on 127.0.0.1:%d", g_vms[i].name, port);
+        post_event(CORE_VM_EVENT_AGENT_STATUS, g_vms[i].name, 1, NULL);
+        post_list_changed();
+    };
+    proxy.onLog = ^(NSString *line) {
+        post_diag("[%s] ssh: %s", nsName.UTF8String, line.UTF8String);
+    };
+    g_ssh_proxy_refs[idx] = proxy;
+    g_vms[idx].ssh_proxy = proxy;
+    [proxy start];
+}
+
+static void start_agent_for(int idx) {
+    if (idx < 0 || idx >= g_vm_count) return;
+    if (g_agent_refs[idx]) return;
+    VzVm *vzvm = g_vz_refs[idx];
+    if (!vzvm || !vzvm.machine) return;
+    NSArray *devs = vzvm.machine.socketDevices;
+    VZVirtioSocketDevice *vsock = nil;
+    for (id d in devs) {
+        if ([d isKindOfClass:[VZVirtioSocketDevice class]]) { vsock = d; break; }
+    }
+    if (!vsock) {
+        post_log("[%s] No VZVirtioSocketDevice on VM; agent not started", g_vms[idx].name);
+        return;
+    }
+
+    NSString *nsName = [NSString stringWithUTF8String:g_vms[idx].name];
+    VmAgentMac *agent = [[VmAgentMac alloc] initWithName:nsName
+                                            socketDevice:vsock];
+    agent.sshEnabled = g_vms[idx].ssh_enabled;
+    agent.onOnlineChange = ^(BOOL online) {
+        int i = vm_index_of(nsName.UTF8String);
+        if (i < 0) return;
+        g_vms[i].agent_online = online;
+        if (online) g_vms[i].agent_last_heartbeat_ms = 0;
+        post_event(CORE_VM_EVENT_AGENT_STATUS, g_vms[i].name, online ? 1 : 0, NULL);
+        post_list_changed();
+
+        /* Mirror the Windows behavior: first successful agent connection
+         * is the strong signal that install actually worked end-to-end. */
+        if (online && !g_vms[i].install_complete) {
+            g_vms[i].install_complete = YES;
+            save_vm_list();
+            post_log("[%s] Install complete (agent reached).", g_vms[i].name);
+        }
+
+        /* Clipboard is always-on — start when the agent comes up. */
+        if (online) start_clipboard_for(i);
+        else        stop_clipboard_for(i);
+    };
+    agent.onSshStateChange = ^(int state) {
+        int i = vm_index_of(nsName.UTF8String);
+        if (i < 0) return;
+        g_vms[i].ssh_state = state;
+        post_event(CORE_VM_EVENT_AGENT_STATUS, g_vms[i].name, state, NULL);
+        post_list_changed();
+        if (state == 2) start_ssh_proxy_for(i);
+    };
+    agent.onLog = ^(NSString *line) {
+        post_diag("agent: %s", line.UTF8String);
+    };
+
+    g_agent_refs[idx] = agent;
+    g_vms[idx].agent = agent;
+    [agent start];
 }
 
 /* ---- State change handling ---- */
@@ -237,6 +450,8 @@ static void handle_vm_state_change(int idx, VZVirtualMachineState state) {
         g_vms[idx].shutting_down = NO;
         g_vms[idx].running = NO;
 
+        stop_agent_for(idx);
+
         if (g_display_refs[idx]) {
             VzDisplayWindow *display = g_display_refs[idx];
             [display.window close];
@@ -259,6 +474,8 @@ static void handle_vm_state_change(int idx, VZVirtualMachineState state) {
             g_vms[idx].display = display;
             [display showDisplay];
         }
+
+        start_agent_for(idx);
 
         post_event(CORE_VM_EVENT_STATE_CHANGED, g_vms[idx].name, 1, NULL);
         post_list_changed();
@@ -292,15 +509,75 @@ static void finish_install(int idx, NSError *error) {
                  error.localizedDescription.UTF8String);
         post_alert(g_vms[idx].name, "Install failed: %s",
                    error.localizedDescription.UTF8String);
-    } else {
-        g_vms[idx].install_complete = YES;
-        g_vms[idx].install_progress = 100;
-        strlcpy(g_vms[idx].install_status, "Install complete", sizeof(g_vms[idx].install_status));
-        save_vm_list();
-        post_log("[%s] macOS install complete", g_vms[idx].name);
-        post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, 100, "Install complete");
-        post_event(CORE_VM_EVENT_PROGRESS, g_vms[idx].name, 100, NULL);
+        post_list_changed();
+        return;
     }
+
+    /* macOS install succeeded, but we haven't staged the agent yet.
+     * Leave install_complete = NO so the UI's Start guard blocks the user
+     * from trying to start while hdiutil has the disk attached for stage.
+     * install_complete flips to YES in the stage completion below. */
+    strlcpy(g_vms[idx].install_status, "Staging guest agent",
+            sizeof(g_vms[idx].install_status));
+    post_log("[%s] macOS install complete; staging guest agent...", g_vms[idx].name);
+    post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, 100, "Staging guest agent");
+    post_event(CORE_VM_EVENT_PROGRESS, g_vms[idx].name, 100, NULL);
+
+    NSString *nsName = [NSString stringWithUTF8String:g_vms[idx].name];
+    NSURL *diskURL = [VmDir diskImageURLFor:nsName];
+    NSString *agentDir = agent_resource_directory();
+    if (!agentDir) {
+        post_log("[%s] Agent resources not found; skipping agent stage", g_vms[idx].name);
+        g_vms[idx].install_complete = YES;
+        save_vm_list();
+        post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, 100, "Install complete");
+        post_list_changed();
+        return;
+    }
+
+    NSString *adminUser = [NSString stringWithUTF8String:g_vms[idx].admin_user];
+    NSString *adminPass = [NSString stringWithUTF8String:g_vms[idx].admin_pass];
+
+    BOOL sshEnabled = g_vms[idx].ssh_enabled;
+
+    [IsoPatchMac stageAgentIntoDiskAtURL:diskURL
+                        agentResourceDir:agentDir
+                               adminUser:adminUser
+                               adminPass:adminPass
+                             sshEnabled:sshEnabled
+                                progress:^(double frac, NSString *step) {
+        (void)frac;
+        int i = vm_index_of(nsName.UTF8String);
+        if (i >= 0 && step.length) {
+            strlcpy(g_vms[i].install_status, step.UTF8String,
+                    sizeof(g_vms[i].install_status));
+            post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[i].name, 100, step.UTF8String);
+        }
+    }
+                              completion:^(NSError * _Nullable stageErr) {
+        int i = vm_index_of(nsName.UTF8String);
+        if (i < 0) return;
+        if (stageErr) {
+            post_log("[%s] Guest agent stage failed: %s",
+                     g_vms[i].name, stageErr.localizedDescription.UTF8String);
+            post_alert(g_vms[i].name, "Guest agent stage failed: %s",
+                       stageErr.localizedDescription.UTF8String);
+        } else {
+            post_log("[%s] Guest agent staged.", g_vms[i].name);
+        }
+        /* Zero out the in-memory password buffer now that stage is done
+         * (matches Windows' SecureZeroMemory behavior). */
+        memset(g_vms[i].admin_pass, 0, sizeof(g_vms[i].admin_pass));
+        /* Flip install_complete regardless of stage outcome — the VM is
+         * usable either way; a stage failure just means no agent. */
+        g_vms[i].install_complete = YES;
+        strlcpy(g_vms[i].install_status, "Install complete",
+                sizeof(g_vms[i].install_status));
+        save_vm_list();
+        post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[i].name, 100, "Install complete");
+        post_list_changed();
+    }];
+
     post_list_changed();
 }
 
@@ -309,28 +586,26 @@ static void start_install_flow(int idx, NSURL *restoreURL) {
     int hddGb = g_vms[idx].hdd_gb;
     int cpus  = g_vms[idx].cpu_cores;
     NSString *nsName = [NSString stringWithUTF8String:g_vms[idx].name];
+    NSURL *vmDir = [VmDir directoryForVm:nsName];
 
     post_log("[%s] Starting macOS install (%d cores, %d MB RAM, %d GB disk)",
              nsName.UTF8String, cpus, ramMb, hddGb);
     post_event(CORE_VM_EVENT_INSTALL_STATUS, nsName.UTF8String, 0, "Starting install");
     post_list_changed();
 
-    [VzInstall installMacOSWithName:nsName
-                    restoreImageURL:restoreURL
-                              ramMb:ramMb
-                              hddGb:hddGb
-                           cpuCores:cpus
-                           progress:^(double frac, NSString *stage) {
-        run_on_main(^{
-            int i = vm_index_of(nsName.UTF8String);
-            if (i >= 0) update_install_progress(i, frac, stage);
-        });
+    [IsoPatchMac installMacOSWithName:nsName
+                                vmDir:vmDir
+                              ipswURL:restoreURL
+                                ramMb:ramMb
+                                 cpus:cpus
+                               diskGb:hddGb
+                             progress:^(double frac, NSString *stage) {
+        int i = vm_index_of(nsName.UTF8String);
+        if (i >= 0) update_install_progress(i, frac, stage);
     }
-                         completion:^(NSError * _Nullable err) {
-        run_on_main(^{
-            int i = vm_index_of(nsName.UTF8String);
-            if (i >= 0) finish_install(i, err);
-        });
+                           completion:^(NSError * _Nullable err) {
+        int i = vm_index_of(nsName.UTF8String);
+        if (i >= 0) finish_install(i, err);
     }];
 }
 
@@ -339,7 +614,10 @@ static void start_install_flow(int idx, NSURL *restoreURL) {
 int asb_mac_vm_create(const char *name, const char *os_type,
                        int ram_mb, int hdd_gb, int cpu_cores,
                        int gpu_mode, int network_mode,
-                       const char *image_path) {
+                       const char *image_path,
+                       const char *admin_user,
+                       const char *admin_pass,
+                       BOOL ssh_enabled) {
     if (!name || !os_type) return BACKEND_ERR_INVALID_ARG;
     if (vm_index_of(name) >= 0) {
         post_alert(name, "A VM named '%s' already exists", name);
@@ -347,6 +625,16 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     }
     if (g_vm_count >= ASB_MAX_VMS) {
         post_alert(name, "Maximum number of VMs reached");
+        return BACKEND_ERR_FAILED;
+    }
+
+    /* Prompt for admin up front so the user isn't blocked 20 minutes into
+     * the install. Token is cached for the process lifetime; subsequent
+     * VM creations reuse it silently. */
+    NSError *authErr = nil;
+    if (![IsoPatchMac preauthorize:&authErr]) {
+        post_alert(name, "Admin authorization required to create VM: %s",
+                   authErr.localizedDescription.UTF8String ?: "user cancelled");
         return BACKEND_ERR_FAILED;
     }
 
@@ -360,6 +648,13 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     vm->cpu_cores = cpu_cores > 0 ? cpu_cores : 4;
     vm->gpu_mode = gpu_mode;
     vm->network_mode = network_mode;
+    strlcpy(vm->admin_user,
+            (admin_user && admin_user[0]) ? admin_user : "user",
+            sizeof(vm->admin_user));
+    strlcpy(vm->admin_pass,
+            (admin_pass && admin_pass[0]) ? admin_pass : "test123",
+            sizeof(vm->admin_pass));
+    vm->ssh_enabled = ssh_enabled;
     vm->install_progress = 0;
     strlcpy(vm->install_status, "Preparing", sizeof(vm->install_status));
     g_vm_count++;
@@ -401,46 +696,21 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     post_log("No cached restore image found, fetching latest from Apple...");
     post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, 0, "Fetching latest restore image");
 
-    [VzInstall fetchLatestRestoreImageURLWithCompletion:^(NSURL * _Nullable url, NSError * _Nullable fetchErr) {
-        if (!url) {
-            run_on_main(^{
-                int i = vm_index_of(nsName.UTF8String);
-                if (i >= 0) {
-                    finish_install(i, fetchErr ?: [NSError errorWithDomain:@"VzInstall" code:20
-                        userInfo:@{NSLocalizedDescriptionKey: @"No supported restore image available"}]);
-                }
-            });
+    [IsoPatchMac fetchLatestIpswToURL:cachedIpsw
+                              progress:^(double frac, NSString *stage) {
+        int i = vm_index_of(nsName.UTF8String);
+        if (i >= 0) update_install_progress(i, frac, stage);
+    }
+                            completion:^(NSError * _Nullable dlErr) {
+        if (dlErr) {
+            post_log("Fetch failed: %s", dlErr.localizedDescription.UTF8String);
+            int i = vm_index_of(nsName.UTF8String);
+            if (i >= 0) finish_install(i, dlErr);
             return;
         }
-        post_log("Downloading restore image — this may take a while");
-        post_log("Source: %s", url.absoluteString.UTF8String);
-        [VzInstall downloadRestoreImageFromURL:url
-                                         toURL:cachedIpsw
-                                      progress:^(double frac, NSString *stage) {
-            run_on_main(^{
-                int i = vm_index_of(nsName.UTF8String);
-                if (i >= 0) update_install_progress(i, frac, stage);
-            });
-        }
-                                          size:^(int64_t totalBytes) {
-            double gb = (double)totalBytes / (1024.0 * 1024.0 * 1024.0);
-            post_log("Restore image size: %.1f GB", gb);
-        }
-                                    completion:^(NSError * _Nullable dlErr) {
-            if (dlErr) {
-                post_log("Download failed: %s", dlErr.localizedDescription.UTF8String);
-                run_on_main(^{
-                    int i = vm_index_of(nsName.UTF8String);
-                    if (i >= 0) finish_install(i, dlErr);
-                });
-                return;
-            }
-            post_log("Restore image downloaded, starting install...");
-            run_on_main(^{
-                int i = vm_index_of(nsName.UTF8String);
-                if (i >= 0) start_install_flow(i, cachedIpsw);
-            });
-        }];
+        post_log("Restore image downloaded, starting install...");
+        int i = vm_index_of(nsName.UTF8String);
+        if (i >= 0) start_install_flow(i, cachedIpsw);
     }];
 
     return BACKEND_OK;
@@ -563,6 +833,7 @@ int asb_mac_vm_delete(const char *name) {
         return BACKEND_ERR_FAILED;
     }
 
+    stop_agent_for(idx);
     g_vz_refs[idx] = nil;
     g_display_refs[idx] = nil;
 
@@ -570,11 +841,17 @@ int asb_mac_vm_delete(const char *name) {
         g_vms[i] = g_vms[i + 1];
         g_vz_refs[i] = g_vz_refs[i + 1];
         g_display_refs[i] = g_display_refs[i + 1];
+        g_agent_refs[i] = g_agent_refs[i + 1];
+        g_ssh_proxy_refs[i] = g_ssh_proxy_refs[i + 1];
+        g_clipboard_refs[i] = g_clipboard_refs[i + 1];
     }
     g_vm_count--;
     memset(&g_vms[g_vm_count], 0, sizeof(AsbVmMac));
     g_vz_refs[g_vm_count] = nil;
     g_display_refs[g_vm_count] = nil;
+    g_agent_refs[g_vm_count] = nil;
+    g_ssh_proxy_refs[g_vm_count] = nil;
+    g_clipboard_refs[g_vm_count] = nil;
 
     save_vm_list();
     post_log("[%s] VM deleted", name);

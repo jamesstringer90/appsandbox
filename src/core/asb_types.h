@@ -71,6 +71,8 @@ typedef struct CoreVmInfo {
 #define CORE_VM_EVENT_ALERT           4   /* str_value: user-visible error */
 #define CORE_VM_EVENT_INSTALL_STATUS  5   /* str_value: phase string */
 #define CORE_VM_EVENT_LIST_CHANGED    6   /* entire VM list changed */
+#define CORE_VM_EVENT_AGENT_STATUS    7   /* int_value: 1=online, 0=offline */
+#define CORE_VM_EVENT_DIAG            8   /* protocol/diag — Event Log only */
 
 typedef struct CoreVmEvent {
     int         type;
