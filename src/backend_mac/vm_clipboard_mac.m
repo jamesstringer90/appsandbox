@@ -27,6 +27,7 @@
 #define CLIP_MSG_FILE_DATA_V2        8u
 #define CLIP_MSG_FORMAT_DATA_CHUNK   9u
 #define CLIP_MSG_FORMAT_DATA_END    10u
+#define CLIP_MSG_SYNC_ENABLE        12u   /* body: 1 byte (0 or 1) */
 
 #define CLIP_MAX_PAYLOAD            (256u * 1024u * 1024u)
 #define CLIP_FILE_CHUNK             (1u * 1024u * 1024u)
@@ -106,11 +107,13 @@ typedef struct __attribute__((packed)) {
 @property (nonatomic, strong) VZVirtioSocketDevice *socketDevice;
 @property (nonatomic, copy)   NSString *vmName;
 @property (nonatomic, assign) BOOL running;
+@property (atomic,    assign) BOOL syncEnabled;
 @property (nonatomic, strong) NSString *cacheBase;
 - (void)logFmt:(NSString *)fmt, ...;
 @end
 
 @implementation VmClipboardMac
+@synthesize syncEnabled = _syncEnabled;
 
 - (instancetype)initWithName:(NSString *)vmName
                 socketDevice:(VZVirtioSocketDevice *)device {
@@ -194,8 +197,17 @@ typedef struct __attribute__((packed)) {
     if (self.running) return;
     self.running = YES;
 
-    /* Accept/read loop on a background queue. */
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    /* The read loop fulfills V2 pending requests, which the pasteboard
+     * data-provider callback on the main thread blocks on. Running the
+     * reader at a lower QoS creates a priority inversion — the main
+     * thread (User-interactive) waits on a lower-QoS thread. Use a
+     * dedicated serial queue with explicit User-initiated QoS so the
+     * level is guaranteed regardless of how the thread is scheduled. */
+    dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
+        DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
+    dispatch_queue_t readQueue = dispatch_queue_create(
+        "com.appsandbox.clipboard.read", attr);
+    dispatch_async(readQueue, ^{
         [self runReadLoop];
     });
 
@@ -221,6 +233,33 @@ typedef struct __attribute__((packed)) {
     int s = _sock;
     _sock = -1;
     if (s >= 0) { shutdown(s, SHUT_RDWR); close(s); }
+}
+
+/* Paired getter needed because the atomic synthesis won't mix a
+ * user-defined setter with a synthesized getter. Plain BOOL load is
+ * atomic on Apple platforms. */
+- (BOOL)syncEnabled {
+    return _syncEnabled;
+}
+
+- (void)setSyncEnabled:(BOOL)enabled {
+    BOOL prev = _syncEnabled;
+    _syncEnabled = enabled;
+    if (enabled && !prev) {
+        /* Focus just arrived on a VM window — push the current host
+         * clipboard now so the guest has it ready for a paste. Reset
+         * the change tracker so the next poll tick treats it as new. */
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_lastChangeSeen = -1;
+        });
+    }
+    /* Tell the guest so it mirrors the gate for guest→host syncing. */
+    if (_sock >= 0) {
+        uint8_t flag = enabled ? 1 : 0;
+        [self sendMessage:CLIP_MSG_SYNC_ENABLE format:nil
+                     data:[NSData dataWithBytes:&flag length:1]];
+    }
+    [self logFmt:@"clipboard sync %@", enabled ? @"enabled" : @"disabled"];
 }
 
 #pragma mark - Vsock connect
@@ -457,6 +496,11 @@ static int wr_full(int fd, const void *buf, size_t n) {
 
 - (void)pollPasteboard {
     if (_sock < 0) return;
+    /* Only sync while a VM window is focused on the host. When unfocused
+     * we don't push FORMAT_LIST_V2 to the guest at all, so system daemons
+     * in the guest (Universal Clipboard, Spotlight, clipboard managers)
+     * have no lazy items to probe and no fetches can be triggered. */
+    if (!self.syncEnabled) return;
     NSPasteboard *pb = NSPasteboard.generalPasteboard;
     NSInteger now = pb.changeCount;
     if (now == _lastChangeSeen) return;
@@ -870,6 +914,13 @@ static int wr_full(int fd, const void *buf, size_t n) {
     NSArray<NSPasteboardItem *> *items = pb.pasteboardItems;
     [self logFmt:@"host → guest DATA_REQ_V2 seq=%u item=%u %@",
         seq, itemIndex, format];
+
+    /* Intentionally NOT gated on syncEnabled. The gate only suppresses
+     * proactive announcements (FORMAT_LIST_V2 from the host's poll). This
+     * handler runs because something is actively pasting on the guest,
+     * which is a user-initiated action — serve from the host pasteboard
+     * regardless of focus. Without this, VM-to-VM paste-through-host
+     * would break after a focus switch. */
 
     if (itemIndex >= items.count) {
         [self logFmt:@"DATA_REQ_V2 item %u out of range (count %lu)",
@@ -1433,6 +1484,13 @@ static int wr_full(int fd, const void *buf, size_t n) {
         _lastChangeSeen = NSPasteboard.generalPasteboard.changeCount;
         [self logFmt:@"connected to guest clipboard (vsock :%d)",
             VM_CLIPBOARD_VSOCK_PORT];
+        /* Tell the guest our current focus state on every connect so a
+         * freshly-booted or reconnecting helper starts in the right mode. */
+        {
+            uint8_t flag = self.syncEnabled ? 1 : 0;
+            [self sendMessage:CLIP_MSG_SYNC_ENABLE format:nil
+                         data:[NSData dataWithBytes:&flag length:1]];
+        }
         while (self.running) {
             if ([self handleInbound] <= 0) break;
         }

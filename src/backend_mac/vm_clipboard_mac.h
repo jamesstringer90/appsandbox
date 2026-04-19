@@ -34,6 +34,12 @@ typedef void (^VmClipboardLog)(NSString *line);
 - (void)start;
 - (void)stop;
 
+/* Enable/disable clipboard sync. When disabled: host stops sending
+ * FORMAT_LIST_V2 on host pasteboard changes, and also stops servicing
+ * DATA_REQ_V2 from the guest (returns empty). Disabled is the safe
+ * default — only flip on when the user is actively using the VM. */
+- (void)setSyncEnabled:(BOOL)enabled;
+
 @end
 
 NS_ASSUME_NONNULL_END
