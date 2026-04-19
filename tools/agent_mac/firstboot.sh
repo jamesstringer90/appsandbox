@@ -44,6 +44,11 @@ fi
 # which works without Full Disk Access (unlike systemsetup -setremotelogin).
 /bin/launchctl load -w /System/Library/LaunchDaemons/ssh.plist >> "$LOG" 2>&1 || true
 
+# Disable all sleep modes so the VM display/CPU never power down — a
+# sandbox VM is expected to be driven by the host, not idle the way a
+# laptop does. pmset persists in /Library/Preferences/com.apple.PowerManagement.plist.
+/usr/bin/pmset -a displaysleep 0 sleep 0 disksleep 0 >> "$LOG" 2>&1 || true
+
 # Computer name. The host drops /Library/AppSandbox/computer-name with the
 # user's chosen VM name; scutil is the canonical way to set these (wraps
 # SCDynamicStoreSetComputerName / SCPreferencesSetLocalHostName). The
