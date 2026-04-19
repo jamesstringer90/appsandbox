@@ -62,6 +62,17 @@ int  asb_mac_vm_edit(const char *name, const char *field, const char *value);
 
 void asb_mac_save(void);
 
+/* Send a mute/unmute command to the VM's guest agent. Called from the
+ * display window's open/close hooks so the guest stops/starts driving
+ * audio when nobody is watching. No-op if the agent isn't online. */
+void asb_mac_vm_set_audio_muted(const char *name, BOOL muted);
+
+/* Toggle per-VM clipboard syncing. The display window flips this on
+ * becomeKey / resignKey so host clipboard data is only shared with the
+ * guest while the user is actually using the VM — avoids background
+ * leakage when the user is working in other apps on the host. */
+void asb_mac_vm_set_clipboard_sync(const char *name, BOOL enabled);
+
 typedef void (*AsbMacEventCallback)(int type, const char *vm_name,
                                      int int_value, const char *str_value);
 void asb_mac_set_event_cb(AsbMacEventCallback cb);

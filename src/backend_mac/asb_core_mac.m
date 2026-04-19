@@ -401,6 +401,26 @@ static void start_agent_for(int idx) {
         /* Clipboard is always-on — start when the agent comes up. */
         if (online) start_clipboard_for(i);
         else        stop_clipboard_for(i);
+
+        /* Catch-up: the display window may have been opened before the
+         * agent was reachable. showDisplay fires once at window-open and
+         * bails silently if the agent isn't online yet, which leaves the
+         * guest stuck in whatever audio / sync state was persisted from
+         * last session. Push the current state now. */
+        if (online) {
+            VzDisplayWindow *disp = g_display_refs[i];
+            if (disp) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    int j = vm_index_of(nsName.UTF8String);
+                    if (j < 0) return;
+                    NSWindow *w = [(VzDisplayWindow *)g_display_refs[j] window];
+                    BOOL windowVisible = w.isVisible && !w.isMiniaturized;
+                    BOOL windowKey     = w.isKeyWindow;
+                    asb_mac_vm_set_audio_muted(g_vms[j].name, !windowVisible);
+                    asb_mac_vm_set_clipboard_sync(g_vms[j].name, windowKey);
+                });
+            }
+        }
     };
     agent.onSshStateChange = ^(int state) {
         int i = vm_index_of(nsName.UTF8String);
@@ -775,6 +795,30 @@ int asb_mac_vm_start(const char *name) {
     }];
 
     return BACKEND_OK;
+}
+
+void asb_mac_vm_set_clipboard_sync(const char *name, BOOL enabled) {
+    if (!name) return;
+    int idx = vm_index_of(name);
+    if (idx < 0) return;
+    VmClipboardMac *clip = g_clipboard_refs[idx];
+    if (!clip) return;
+    [clip setSyncEnabled:enabled];
+}
+
+void asb_mac_vm_set_audio_muted(const char *name, BOOL muted) {
+    if (!name) return;
+    int idx = vm_index_of(name);
+    if (idx < 0) return;
+    VmAgentMac *agent = g_agent_refs[idx];
+    if (!agent || !g_vms[idx].agent_online) return;
+    NSString *cmd = muted ? @"mute" : @"unmute";
+    /* Fire-and-forget on a background queue — we don't care about the
+     * reply, and we don't want to block the main thread of whoever is
+     * closing the window. */
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [agent sendCommand:cmd timeout:3.0];
+    });
 }
 
 int asb_mac_vm_stop(const char *name, int force) {

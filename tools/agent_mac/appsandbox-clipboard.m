@@ -59,6 +59,7 @@
 #define CLIP_MSG_FILE_DATA_V2        8u
 #define CLIP_MSG_FORMAT_DATA_CHUNK   9u   /* streaming body for RESP_V2 */
 #define CLIP_MSG_FORMAT_DATA_END     10u  /* terminates chunk stream */
+#define CLIP_MSG_SYNC_ENABLE         12u  /* body: 1 byte (0 or 1) */
 
 #define CLIP_MAX_PAYLOAD            (256u * 1024u * 1024u)
 #define CLIP_FILE_CHUNK             (1u * 1024u * 1024u)
@@ -89,6 +90,11 @@ static int g_client_sock = -1;
 static volatile sig_atomic_t g_stop = 0;
 static NSInteger g_last_seen_change = -1;
 static _Atomic NSInteger g_suppress_change = -1;
+/* Host tells us via CLIP_MSG_SYNC_ENABLE whether to actively sync. While
+ * disabled, pb_poll_thread stops sending FORMAT_LIST_V2 on guest
+ * pasteboard changes. Default NO so there's no leakage before the host
+ * explicitly signals focus. */
+static _Atomic BOOL g_sync_enabled = NO;
 static NSString *g_cache_base;   /* ~/Library/Caches/com.appsandbox.clipboard */
 
 /* ---- V2 pending-request dispatcher ---------------------------------
@@ -255,6 +261,12 @@ static NSString *alloc_tree_cache_dir(void);
  * fetches for clipboards the user has since replaced. */
 static _Atomic uint64_t g_lazy_generation = 1;
 
+/* Sentinel UTI we add to every lazy pasteboard item we write. pb_poll_thread
+ * checks for it via `item.types` (non-triggering) and skips those items —
+ * we don't want our own poll to fire our own providers, which it could do
+ * via the size_hint data reads if echo suppression races. */
+static NSString * const kLazySentinelUTI = @"com.appsandbox.clipboard.lazy";
+
 /* ---- Per-item provider ----
  * One instance per NSPasteboardItem we write. Each knows which item index
  * on the host side it represents and serves ALL types for that item —
@@ -339,6 +351,11 @@ static _Atomic uint64_t g_lazy_generation = 1;
 
 - (void)pasteboard:(NSPasteboard *)pb item:(NSPasteboardItem *)item
 provideDataForType:(NSString *)type {
+    /* Sentinel is ours — return empty immediately, never fetch. */
+    if ([type isEqualToString:kLazySentinelUTI]) {
+        [item setData:[NSData data] forType:type];
+        return;
+    }
     if (self.generation != atomic_load(&g_lazy_generation)) {
         clip_log(@"provider: stale gen for item %u type %@",
                  self.itemIndex, type);
@@ -415,7 +432,9 @@ static void write_lazy_pasteboard(NSArray<NSDictionary *> *items) {
         provider.sizeHints  = hints;
 
         NSPasteboardItem *pi = [NSPasteboardItem new];
-        [pi setDataProvider:provider forTypes:types];
+        NSArray<NSString *> *typesWithSentinel =
+            [types arrayByAddingObject:kLazySentinelUTI];
+        [pi setDataProvider:provider forTypes:typesWithSentinel];
         [writables addObject:pi];
     }
 
@@ -484,56 +503,6 @@ static BOOL read_v2_seq(int fd, ClipHeader *h, uint32_t *outSeq) {
     *outSeq = ntohl(be);
     h->data_size -= 4;
     return YES;
-}
-
-/* ---- Pasteboard helpers ---- */
-
-/* Filter NSPasteboard types → UTI strings we actually transport. */
-static NSArray<NSString *> *wanted_formats(NSPasteboard *pb) {
-    static NSArray *kTransport;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        kTransport = @[
-            NSPasteboardTypeFileURL,     /* prefer files first */
-            NSPasteboardTypePNG,
-            NSPasteboardTypeTIFF,
-            NSPasteboardTypeRTF,
-            NSPasteboardTypeHTML,
-            NSPasteboardTypeString,
-        ];
-    });
-    NSMutableArray *out = [NSMutableArray array];
-    NSArray *actual = pb.types ?: @[];
-    for (NSString *want in kTransport) {
-        if ([actual containsObject:want]) [out addObject:want];
-    }
-    /* Don't send file-url alongside PNG/TIFF even if both are offered —
-     * they carry the same semantic on macOS (Finder does that for screen
-     * captures). Files win. */
-    if ([out containsObject:NSPasteboardTypeFileURL]) {
-        [out removeObject:NSPasteboardTypePNG];
-        [out removeObject:NSPasteboardTypeTIFF];
-    }
-    return out;
-}
-
-/* ---- Outbound: announce local pasteboard change ---- */
-
-static void send_format_list(int fd, NSArray<NSString *> *utis) {
-    NSMutableData *buf = [NSMutableData data];
-    uint32_t count = htonl((uint32_t)utis.count);
-    [buf appendBytes:&count length:4];
-    for (NSString *uti in utis) {
-        NSData *u = [uti dataUsingEncoding:NSUTF8StringEncoding];
-        uint32_t len = htonl((uint32_t)u.length);
-        [buf appendBytes:&len length:4];
-        [buf appendData:u];
-    }
-    if (send_message(fd, CLIP_MSG_FORMAT_LIST, nil, buf) <= 0) {
-        clip_log(@"send FORMAT_LIST failed");
-    } else {
-        clip_log(@"sent FORMAT_LIST (%d formats)", (int)utis.count);
-    }
 }
 
 /* ---- Outbound: respond to DATA_REQ ---- */
@@ -904,7 +873,15 @@ static int send_file_tree_v2(int fd, uint32_t seq, NSURL *top) {
 /* V2 request handler: host is asking the guest for one specific item's
  * typed data. Looks up pb.pasteboardItems[itemIndex] and responds with
  * that item's data. For file-url, counts the subtree rooted at that
- * item's URL and streams a single FILE_DATA_V2 sequence covering it. */
+ * item's URL and streams a single FILE_DATA_V2 sequence covering it.
+ *
+ * Intentionally NOT gated on g_sync_enabled. The gate only suppresses
+ * proactive announcements (FORMAT_LIST_V2 from our poll thread). This
+ * handler runs in response to a paste the user actively initiated on
+ * the other side of the link, and serves data from whatever we last
+ * advertised. That lets VM → host → VM chain work after a focus
+ * switch: VM A's last clipboard remains serveable while VM B is the
+ * focused window pulling it. */
 static void handle_data_request_v2(int fd, NSString *format, uint32_t seq,
                                     uint32_t itemIndex) {
     NSPasteboard *pb = NSPasteboard.generalPasteboard;
@@ -1321,6 +1298,23 @@ static int handle_inbound(int fd) {
         }
         return 1;
     }
+
+    /* Host telling us whether to actively sync. Body is a single byte. */
+    if (h.msg_type == CLIP_MSG_SYNC_ENABLE) {
+        uint8_t flag = 0;
+        if (h.data_size >= 1) {
+            if (read_full(fd, &flag, 1) <= 0) return -1;
+            uint32_t rest = h.data_size - 1;
+            if (rest) {
+                NSMutableData *trash = [NSMutableData dataWithLength:rest];
+                read_full(fd, trash.mutableBytes, rest);
+            }
+        }
+        atomic_store(&g_sync_enabled, flag ? YES : NO);
+        clip_log(@"recv SYNC_ENABLE=%u", flag);
+        return 1;
+    }
+
     if (h.msg_type == CLIP_MSG_FORMAT_DATA_RESP_V2 ||
         h.msg_type == CLIP_MSG_FORMAT_DATA_CHUNK   ||
         h.msg_type == CLIP_MSG_FORMAT_DATA_END     ||
@@ -1559,6 +1553,9 @@ static void *pb_poll_thread(void *arg) {
     while (!g_stop) {
         usleep(250 * 1000);
         if (g_client_sock < 0) continue;
+        /* Only sync guest→host while host has told us the VM window is
+         * focused. Mirror of the host-side gate. */
+        if (!atomic_load(&g_sync_enabled)) continue;
         NSInteger now = pb.changeCount;
         if (now == g_last_seen_change) continue;
         g_last_seen_change = now;
@@ -1570,6 +1567,22 @@ static void *pb_poll_thread(void *arg) {
         }
 
         if (pb.pasteboardItems.count == 0) continue;
+
+        /* Belt-and-braces on top of g_suppress_change: if any item on the
+         * pasteboard carries our sentinel type, these are lazy items we
+         * wrote ourselves. Reading their data via size_hint_for_item_type
+         * would fire our own providers. Skip. `item.types` is a
+         * non-triggering read. */
+        BOOL isOurs = NO;
+        for (NSPasteboardItem *it in pb.pasteboardItems) {
+            if ([it.types containsObject:kLazySentinelUTI]) { isOurs = YES; break; }
+        }
+        if (isOurs) {
+            clip_log(@"poll: skipping our own lazy items at changeCount=%ld",
+                     (long)now);
+            continue;
+        }
+
         send_format_list_v2(g_client_sock, pb);
     }
     return NULL;

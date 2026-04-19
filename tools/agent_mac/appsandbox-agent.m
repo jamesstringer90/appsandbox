@@ -252,17 +252,6 @@ static void start_ssh_proxy(void) {
     }
 }
 
-static void stop_ssh_proxy(void) {
-    if (!g_ssh_proxy_running) return;
-    g_ssh_proxy_running = 0;
-    if (g_ssh_listen_sock >= 0) {
-        shutdown(g_ssh_listen_sock, SHUT_RDWR);
-        close(g_ssh_listen_sock);
-        g_ssh_listen_sock = -1;
-    }
-    pthread_join(g_ssh_proxy_thread, NULL);
-}
-
 /* ---- Clipboard: vsock :5 → XPC hand-off to the user helper ----
  *
  * We (root) bind vsock :5 because AF_VSOCK bind requires root on Darwin.
@@ -402,17 +391,6 @@ static void start_clip_accept(void) {
     }
 }
 
-static void stop_clip_accept(void) {
-    if (!g_clip_accept_running) return;
-    g_clip_accept_running = 0;
-    if (g_clip_listen_sock >= 0) {
-        shutdown(g_clip_listen_sock, SHUT_RDWR);
-        close(g_clip_listen_sock);
-        g_clip_listen_sock = -1;
-    }
-    pthread_join(g_clip_accept_thread, NULL);
-}
-
 /* sshd is flipped on offline by the host-side stage (disabled.plist
  * override), so by the time we handle ssh_enable the daemon is already
  * listening — just start the proxy and answer ready. */
@@ -529,6 +507,23 @@ static void handle_client(int client) {
             pid_t pid = fork();
             if (pid == 0) {
                 execl("/sbin/shutdown", "shutdown", "-h", "now", (char *)NULL);
+                _exit(127);
+            }
+        } else if (strcmp(cmd, "mute") == 0 || strcmp(cmd, "unmute") == 0) {
+            /* Apple's VZ framework doesn't expose a "viewer attached"
+             * signal to the guest, so the host sends us mute/unmute when
+             * the VZVirtualMachineView window is shown / hidden. We run
+             * the AppleScript volume toggle — reaches the system volume
+             * without needing per-app audio control. */
+            BOOL muted = (strcmp(cmd, "mute") == 0);
+            send_reply(client, tag, "ok");
+            agent_log("%s requested; spawning osascript", cmd);
+            pid_t pid = fork();
+            if (pid == 0) {
+                const char *script = muted
+                    ? "set volume with output muted"
+                    : "set volume without output muted";
+                execl("/usr/bin/osascript", "osascript", "-e", script, (char *)NULL);
                 _exit(127);
             }
         } else {
