@@ -361,6 +361,7 @@ static dispatch_source_t g_authKeepAlive = NULL;
                agentResourceDir:(NSString *)agentResDir
                        adminUser:(NSString *)adminUser
                        adminPass:(NSString *)adminPass
+                    computerName:(NSString *)computerName
                      sshEnabled:(BOOL)sshEnabled
                        progress:(IsoPatchProgress)progressBlock
                      completion:(IsoPatchCompletion)completion {
@@ -428,6 +429,10 @@ static dispatch_source_t g_authKeepAlive = NULL;
         @"--auto-login",
     ] mutableCopy];
     if (sshEnabled) [args addObject:@"--enable-ssh"];
+    if (computerName.length) {
+        [args addObject:@"--computer-name"];
+        [args addObject:computerName];
+    }
 
     [self runPrivilegedArgs:args
                    progress:progressBlock

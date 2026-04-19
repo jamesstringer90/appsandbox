@@ -44,6 +44,23 @@ fi
 # which works without Full Disk Access (unlike systemsetup -setremotelogin).
 /bin/launchctl load -w /System/Library/LaunchDaemons/ssh.plist >> "$LOG" 2>&1 || true
 
+# Computer name. The host drops /Library/AppSandbox/computer-name with the
+# user's chosen VM name; scutil is the canonical way to set these (wraps
+# SCDynamicStoreSetComputerName / SCPreferencesSetLocalHostName). The
+# validator constrains input to [A-Za-z0-9-], so all three names can be
+# identical and DNS-safe.
+NAME_FILE=/Library/AppSandbox/computer-name
+if [ -f "$NAME_FILE" ]; then
+    NAME=$(tr -d '\r\n' < "$NAME_FILE")
+    if [ -n "$NAME" ]; then
+        /usr/sbin/scutil --set ComputerName  "$NAME" >> "$LOG" 2>&1 || true
+        /usr/sbin/scutil --set HostName      "$NAME" >> "$LOG" 2>&1 || true
+        /usr/sbin/scutil --set LocalHostName "$NAME" >> "$LOG" 2>&1 || true
+        echo "Set computer name to $NAME" >> "$LOG"
+    fi
+    rm -f "$NAME_FILE"
+fi
+
 # Remove ourselves so we only run once.
 rm -f /Library/LaunchDaemons/com.appsandbox.firstboot.plist
 launchctl bootout system/com.appsandbox.firstboot >> "$LOG" 2>&1 || true

@@ -702,6 +702,36 @@ static BOOL enable_autologin(NSString *mountPt, NSString *shortname,
     return YES;
 }
 
+/* Drop a sidecar file with the user's chosen display name so firstboot.sh
+ * can apply it via `scutil --set` on first boot. Writing the SystemConfig
+ * preferences.plist offline does not work: configd owns that file and
+ * regenerates it at boot from its own state, falling back to the hardware
+ * model name ("Apple Virtual Machine") if it never saw a live API call.
+ * The canonical path is SCDynamicStoreSetComputerName /
+ * SCPreferencesSetLocalHostName, which scutil wraps. */
+static BOOL set_computer_name(NSString *mountPt, NSString *displayName,
+                              NSString **errOut) {
+    emit_status([NSString stringWithFormat:@"Queueing computer name (%@)",
+                                            displayName]);
+
+    NSString *dir = [mountPt stringByAppendingPathComponent:
+        @"Library/AppSandbox"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES
+                                               attributes:nil error:nil];
+
+    NSString *path = [dir stringByAppendingPathComponent:@"computer-name"];
+    NSError *err = nil;
+    if (![displayName writeToFile:path atomically:YES
+                         encoding:NSUTF8StringEncoding error:&err]) {
+        if (errOut) *errOut = err.localizedDescription;
+        return NO;
+    }
+    chown(path.fileSystemRepresentation, 0, 0);
+    chmod(path.fileSystemRepresentation, 0644);
+    return YES;
+}
+
 /* ---- Global state for signal-safe cleanup ---- */
 
 static MountState g_mount = {0};
@@ -724,6 +754,7 @@ static int cmd_stage(int argc, char **argv) {
     NSString *userReal  = nil;
     int userUid = 501;
     NSString *passFile = nil;
+    NSString *computerName = nil;
     BOOL skipSA = NO;
     BOOL autoLogin = NO;
     BOOL sshOn = NO;
@@ -740,6 +771,8 @@ static int cmd_stage(int argc, char **argv) {
             userUid = atoi(argv[++i]);
         else if (strcmp(argv[i], "--user-password-file") == 0 && i + 1 < argc)
             passFile = [NSString stringWithUTF8String:argv[++i]];
+        else if (strcmp(argv[i], "--computer-name") == 0 && i + 1 < argc)
+            computerName = [NSString stringWithUTF8String:argv[++i]];
         else if (strcmp(argv[i], "--skip-setup-assistant") == 0)
             skipSA = YES;
         else if (strcmp(argv[i], "--auto-login") == 0)
@@ -844,6 +877,16 @@ static int cmd_stage(int argc, char **argv) {
             memset(passBuf, 0, sizeof(passBuf));
             emit_error(err);
             return 9;
+        }
+    }
+
+    if (computerName.length) {
+        emit_progress(94, @"Setting computer name");
+        if (!set_computer_name(g_mount.mountPt, computerName, &err)) {
+            unmount_and_detach(&g_mount);
+            memset(passBuf, 0, sizeof(passBuf));
+            emit_error(err);
+            return 10;
         }
     }
 

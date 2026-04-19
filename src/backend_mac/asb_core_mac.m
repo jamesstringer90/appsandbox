@@ -544,6 +544,7 @@ static void finish_install(int idx, NSError *error) {
                         agentResourceDir:agentDir
                                adminUser:adminUser
                                adminPass:adminPass
+                            computerName:nsName
                              sshEnabled:sshEnabled
                                 progress:^(double frac, NSString *step) {
         (void)frac;

@@ -46,11 +46,13 @@ typedef void (^IsoPatchCompletion)(NSError * _Nullable error);
 /* Stage the agent bundle + inject a pre-created admin user + skip Setup
  * Assistant + enable auto-login, all in one privileged (AEWP) mount cycle.
  * Pass sshEnabled=YES to also flip sshd's launchd override so the SSH
- * proxy can reach 127.0.0.1:22 on first boot. */
+ * proxy can reach 127.0.0.1:22 on first boot. computerName is the free-form
+ * display name shown inside the guest (Sharing prefs, hostname, Bonjour). */
 + (void)stageAgentIntoDiskAtURL:(NSURL *)diskURL
                agentResourceDir:(NSString *)agentResDir
                        adminUser:(NSString *)adminUser
                        adminPass:(NSString *)adminPass
+                    computerName:(NSString *)computerName
                      sshEnabled:(BOOL)sshEnabled
                        progress:(nullable IsoPatchProgress)progress
                      completion:(IsoPatchCompletion)completion;
