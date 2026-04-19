@@ -369,6 +369,7 @@ function clearCreateForm() {
 function validateVmName(name) {
     if (!name) return 'VM name is required.';
     if (!hostBridge.isMac && name.length > 15) return 'VM name cannot exceed 15 characters (NetBIOS limit).';
+    if (hostBridge.isMac && name.length > 63) return 'VM name cannot exceed 63 characters (macOS LocalHostName limit).';
     if (/[^a-zA-Z0-9-]/.test(name)) return 'VM name can only contain letters, digits, and hyphens.';
     if (/^\d+$/.test(name)) return 'VM name cannot be only digits.';
     if (name.startsWith('-') || name.endsWith('-')) return 'VM name cannot start or end with a hyphen.';
