@@ -801,6 +801,41 @@ int asb_mac_vm_stop(const char *name, int force) {
 
     if (force) {
         [vm stopWithCompletion:onError];
+        return BACKEND_OK;
+    }
+
+    /* Prefer the agent path: `shutdown` is handled by our LaunchDaemon,
+     * which execs /sbin/shutdown -h now as root. That bypasses the guest's
+     * "Are you sure you want to shut down?" dialog that VZ's requestStop
+     * triggers (equivalent to a power-button press). Fall back to VZ
+     * requestStop only if the agent isn't reachable. */
+    VmAgentMac *agent = g_agent_refs[idx];
+    if (agent && g_vms[idx].agent_online) {
+        post_log("[%s] Requesting graceful shutdown via agent...", name);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSString *resp = [agent sendCommand:@"shutdown" timeout:5.0];
+            if ([resp isEqualToString:@"ok"]) {
+                /* Flip UI to "shutting down" immediately — the guest's
+                 * shutdown -h now takes several seconds before VZ notices
+                 * the power-off and emits VZVirtualMachineStateStopping. */
+                run_on_main(^{
+                    int i = vm_index_of(nsName.UTF8String);
+                    if (i < 0) return;
+                    g_vms[i].shutting_down = YES;
+                    post_list_changed();
+                });
+                return;
+            }
+            run_on_main(^{
+                int i = vm_index_of(nsName.UTF8String);
+                if (i < 0) return;
+                VzVm *cur = g_vms[i].vz_handle;
+                if (!cur) return;
+                post_log("[%s] Agent shutdown unresponsive; using VZ stop.",
+                         g_vms[i].name);
+                [cur requestStopWithCompletion:onError];
+            });
+        });
     } else {
         [vm requestStopWithCompletion:onError];
     }
