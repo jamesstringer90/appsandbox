@@ -1,71 +1,66 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
-    <Filter Include="Source Files">
+    <Filter Include="App">
       <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
       <Extensions>c;cpp;def;odl;idl;hpj;bat;asm;asmx</Extensions>
     </Filter>
-    <Filter Include="Header Files">
+    <Filter Include="Backend Win">
+      <UniqueIdentifier>{5EA1B8E2-8F3C-4A25-B21D-6E7D9C0A1234}</UniqueIdentifier>
+      <Extensions>c;cpp;h;hpp</Extensions>
+    </Filter>
+    <Filter Include="Headers">
       <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
       <Extensions>h;hh;hpp;hxx;hm;inl;inc;ipp;xsd</Extensions>
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="src\main.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="src\app_win\main.c">
+      <Filter>App</Filter>
     </ClCompile>
-    <ClCompile Include="src\ui.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="src\app_win\ui.c">
+      <Filter>App</Filter>
     </ClCompile>
-    <ClCompile Include="src\hcs_vm.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="src\app_win\webview2_bridge.c">
+      <Filter>App</Filter>
     </ClCompile>
-    <ClCompile Include="src\hcn_network.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="src\backend_win\vm_display.c">
+      <Filter>Backend Win</Filter>
     </ClCompile>
-    <ClCompile Include="src\gpu_enum.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\disk_util.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\snapshot.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\vm_display.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\prereq.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="src\backend_win\vm_display_idd.c">
+      <Filter>Backend Win</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\resource.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\app_win\resource.h">
+      <Filter>Headers</Filter>
     </ClInclude>
-    <ClInclude Include="src\ui.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\app_win\ui.h">
+      <Filter>Headers</Filter>
     </ClInclude>
-    <ClInclude Include="src\prereq.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\app_win\webview2_bridge.h">
+      <Filter>App</Filter>
     </ClInclude>
-    <ClInclude Include="src\hcs_vm.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\backend_win\asb_core.h">
+      <Filter>Backend Win</Filter>
     </ClInclude>
-    <ClInclude Include="src\hcn_network.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\backend_win\asb_display.h">
+      <Filter>Backend Win</Filter>
     </ClInclude>
-    <ClInclude Include="src\gpu_enum.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\backend_win\hcs_vm.h">
+      <Filter>Backend Win</Filter>
     </ClInclude>
-    <ClInclude Include="src\disk_util.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\backend_win\hcn_network.h">
+      <Filter>Backend Win</Filter>
     </ClInclude>
-    <ClInclude Include="src\snapshot.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\backend_win\snapshot.h">
+      <Filter>Backend Win</Filter>
     </ClInclude>
-    <ClInclude Include="src\vm_display.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\backend_win\vm_display.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
+    <ClInclude Include="src\backend_win\vm_display_idd.h">
+      <Filter>Backend Win</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

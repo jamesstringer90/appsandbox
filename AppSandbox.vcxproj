@@ -90,7 +90,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\app_win;$(ProjectDir)src\backend_win;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -116,7 +116,7 @@ xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)"
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\app_win;$(ProjectDir)src\backend_win;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -144,7 +144,7 @@ xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)"
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\app_win;$(ProjectDir)src\backend_win;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -174,7 +174,7 @@ xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)"
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\app_win;$(ProjectDir)src\backend_win;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -195,26 +195,26 @@ xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)"
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\main.c" />
-    <ClCompile Include="src\ui.c" />
-    <ClCompile Include="src\vm_display.c" />
-    <ClCompile Include="src\vm_display_idd.c" />
-    <ClCompile Include="src\webview2_bridge.c" />
+    <ClCompile Include="src\app_win\main.c" />
+    <ClCompile Include="src\app_win\ui.c" />
+    <ClCompile Include="src\backend_win\vm_display.c" />
+    <ClCompile Include="src\backend_win\vm_display_idd.c" />
+    <ClCompile Include="src\app_win\webview2_bridge.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\resource.h" />
-    <ClInclude Include="src\asb_core.h" />
-    <ClInclude Include="src\asb_display.h" />
-    <ClInclude Include="src\ui.h" />
-    <ClInclude Include="src\webview2_bridge.h" />
-    <ClInclude Include="src\hcs_vm.h" />
-    <ClInclude Include="src\hcn_network.h" />
-    <ClInclude Include="src\snapshot.h" />
-    <ClInclude Include="src\vm_display.h" />
-    <ClInclude Include="src\vm_display_idd.h" />
+    <ClInclude Include="src\app_win\resource.h" />
+    <ClInclude Include="src\app_win\ui.h" />
+    <ClInclude Include="src\backend_win\asb_core.h" />
+    <ClInclude Include="src\backend_win\asb_display.h" />
+    <ClInclude Include="src\app_win\webview2_bridge.h" />
+    <ClInclude Include="src\backend_win\hcs_vm.h" />
+    <ClInclude Include="src\backend_win\hcn_network.h" />
+    <ClInclude Include="src\backend_win\snapshot.h" />
+    <ClInclude Include="src\backend_win\vm_display.h" />
+    <ClInclude Include="src\backend_win\vm_display_idd.h" />
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="src\appsandbox.rc" />
+    <ResourceCompile Include="src\app_win\appsandbox.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

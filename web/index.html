@@ -26,7 +26,7 @@
                 <th>HDD (GB)</th>
                 <th>GPU</th>
                 <th>Network</th>
-                <th>Snapshot</th>
+                <th class="win-only">Snapshot</th>
                 <th class="icon-col">&#x25B6;&#xFE0F;</th>
                 <th class="icon-col" title="IDD Display">&#x1F4FA;</th>
                 <th class="icon-col" title="SSH">&gt;_</th>
@@ -73,11 +73,12 @@
             <div class="form-row">
                 <select id="os-type">
                     <option value="Windows" selected>Windows</option>
+                    <option value="macOS">macOS</option>
                 </select>
             </div>
 
-            <label>OS Image:</label>
-            <div class="image-row">
+            <label class="win-only">OS Image:</label>
+            <div class="image-row win-only">
                 <input type="text" id="image-path" placeholder="Path to ISO or VHDX...">
                 <button id="btn-browse" onclick="sendCmd('browseImage')">Browse...</button>
                 <span class="or-separator">OR</span>
@@ -107,8 +108,8 @@
                 <span class="host-info" id="host-cpu"></span>
             </div>
 
-            <label for="gpu-mode">GPU:</label>
-            <div class="form-row">
+            <label for="gpu-mode" class="win-only">GPU:</label>
+            <div class="form-row win-only">
                 <select id="gpu-mode">
                     <option value="0">None</option>
                     <option value="1" selected>Default GPU</option>
@@ -129,7 +130,7 @@
 
             <label>Username:</label>
             <div class="cred-row">
-                <input type="text" id="admin-user" value="User" class="input-md">
+                <input type="text" id="admin-user" value="user" class="input-md" autocomplete="off">
                 <span class="field-warn" id="admin-user-warn"></span>
             </div>
 
@@ -143,13 +144,13 @@
 
             <label>Options:</label>
             <div class="form-row">
-                <label title="Disables Secure Boot — required for test-signed VDD driver"><input type="checkbox" id="test-mode" checked> Test Mode</label>
-                <label title="Installs OpenSSH Server, tunnelled over HV socket"><input type="checkbox" id="ssh-enabled"> SSH Server</label>
+                <label class="win-only" title="Disables Secure Boot — required for test-signed VDD driver"><input type="checkbox" id="test-mode" checked> Test Mode</label>
+                <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled"> SSH Server</label>
             </div>
         </div>
         <div class="modal-buttons">
             <button onclick="closeCreateModal()">Cancel</button>
-            <button id="btn-create-template" disabled onclick="onCreateTemplate()">Build Template</button>
+            <button id="btn-create-template" class="win-only" disabled onclick="onCreateTemplate()">Build Template</button>
             <button id="btn-create" class="primary" disabled onclick="onCreateVm()">Create Sandbox</button>
         </div>
     </div>

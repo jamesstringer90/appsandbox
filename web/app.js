@@ -29,14 +29,56 @@ function toggleSection(id) {
 
 const netNames = ['None', 'NAT', 'External', 'Internal'];
 
-/* ---- Message bridge ---- */
+/* ---- Message bridge ----
+ *
+ * Two host environments are supported:
+ *   - WebView2 on Windows  (window.chrome.webview)
+ *   - WKWebView on macOS   (window.webkit.messageHandlers.host)
+ *
+ * Native code on both platforms calls window.onHostMessage(obj) with a
+ * parsed message object; the JS side only sees one uniform surface. On
+ * Windows we keep using the native chrome.webview event path because it
+ * is the existing, tested route — onHostMessage is simply wired into the
+ * same listener.
+ */
 
-function sendCmd(action, data) {
-    window.chrome.webview.postMessage(Object.assign({ action: action }, data || {}));
+var hostBridge = (function() {
+    var isWebView2 = !!(window.chrome && window.chrome.webview);
+    var isWKWebView = !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.host);
+
+    function send(action, data) {
+        var msg = Object.assign({ action: action }, data || {});
+        if (isWebView2) {
+            window.chrome.webview.postMessage(msg);
+        } else if (isWKWebView) {
+            /* WKWebView only accepts JSON-serializable values; strings round-trip
+             * most reliably so we hand the native side the raw JSON text. */
+            window.webkit.messageHandlers.host.postMessage(JSON.stringify(msg));
+        } else {
+            console.warn('[hostBridge] no native host available; dropping', msg);
+        }
+    }
+
+    return { send: send, isWebView2: isWebView2, isWKWebView: isWKWebView, isMac: isWKWebView };
+})();
+
+function sendCmd(action, data) { hostBridge.send(action, data); }
+
+/* Hide Windows-only form fields when running on macOS. */
+if (hostBridge.isMac) {
+    var winOnly = document.querySelectorAll('.win-only');
+    for (var i = 0; i < winOnly.length; i++) winOnly[i].style.display = 'none';
+    var osSelect = document.getElementById('os-type');
+    osSelect.value = 'macOS';
+    osSelect.disabled = true;
 }
 
-window.chrome.webview.addEventListener('message', function(event) {
-    var msg = event.data;
+/* Unified dispatch. Native code on either platform calls
+ * window.onHostMessage(obj) with an already-parsed object. WebView2 also
+ * delivers messages through chrome.webview.addEventListener('message'),
+ * which we route into the same handler so both paths end up in one place. */
+window.onHostMessage = function(msg) {
+    if (!msg || typeof msg !== 'object') return;
     switch (msg.type) {
         case 'fullState':     onFullState(msg); break;
         case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); break;
@@ -54,7 +96,15 @@ window.chrome.webview.addEventListener('message', function(event) {
         case 'prereqProgress': onPrereqProgress(msg); break;
         case 'prereqResult':   onPrereqResult(msg); break;
     }
-});
+};
+
+/* WebView2 delivers events as DOM CustomEvents; forward them into
+ * window.onHostMessage so both transports converge on the same handler. */
+if (hostBridge.isWebView2) {
+    window.chrome.webview.addEventListener('message', function(event) {
+        window.onHostMessage(event.data);
+    });
+}
 
 /* ---- Initial state ---- */
 
@@ -230,7 +280,7 @@ function onBrowseResult(path) {
 function updateCreateButtons() {
     var hasImage = document.getElementById('image-path').value.trim() !== '';
     var hasTpl = document.getElementById('template-select').value !== '';
-    document.getElementById('btn-create').disabled = !(hasImage || hasTpl);
+    document.getElementById('btn-create').disabled = hostBridge.isMac ? false : !(hasImage || hasTpl);
     document.getElementById('btn-create-template').disabled = !hasImage;
 }
 
@@ -318,7 +368,8 @@ function clearCreateForm() {
 
 function validateVmName(name) {
     if (!name) return 'VM name is required.';
-    if (name.length > 15) return 'VM name cannot exceed 15 characters (NetBIOS limit).';
+    if (!hostBridge.isMac && name.length > 15) return 'VM name cannot exceed 15 characters (NetBIOS limit).';
+    if (hostBridge.isMac && name.length > 63) return 'VM name cannot exceed 63 characters (macOS LocalHostName limit).';
     if (/[^a-zA-Z0-9-]/.test(name)) return 'VM name can only contain letters, digits, and hyphens.';
     if (/^\d+$/.test(name)) return 'VM name cannot be only digits.';
     if (name.startsWith('-') || name.endsWith('-')) return 'VM name cannot start or end with a hyphen.';
@@ -384,7 +435,7 @@ function openCreateModal() {
     document.getElementById('hdd-size').value = 64;
     document.getElementById('gpu-mode').value = '1';
     document.getElementById('net-mode').value = '1';
-    document.getElementById('admin-user').value = 'User';
+    document.getElementById('admin-user').value = 'user';
     document.getElementById('admin-pass').value = 'test123';
     document.getElementById('admin-confirm').value = 'test123';
     document.getElementById('test-mode').checked = true;
@@ -444,7 +495,9 @@ function updateStatusCell(td, vm) {
         className = 'status-building';
     } else if (vm.running && !vm.installComplete && !vm.isTemplate) {
         needsSpinner = true;
-        label = 'Installing Windows ';
+        label = (vm.installStatus && vm.installStatus.length > 0)
+            ? (vm.installStatus + ' ')
+            : ((vm.osType === 'macOS' ? 'Installing macOS ' : 'Installing Windows '));
         className = 'status-building';
     } else if (vm.running) {
         className = 'status-running';
@@ -514,7 +567,7 @@ function buildRowCells(vm, i, statusTd) {
         else sshBtn.title = 'SSH: waiting for the in-VM agent to come online';
     }
 
-    return [
+    var cells = [
         makeCell(vm.name, i, 0),
         makeCell(vm.osType, i, 1),
         statusTd,
@@ -524,7 +577,9 @@ function buildRowCells(vm, i, statusTd) {
         makeCell(vm.hddGb + ' GB', i, 6, 'Virtual disk size, in gigabytes'),
         makeCell(vm.gpuName || (vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7, 'GPU passed through to the VM via GPU-PV, or None'),
         makeCell(netNames[vm.networkMode] || 'None', i, 8, 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
-        makeSnapCell(vm, i),
+    ];
+    if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
+    cells.push(
         makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, (function(vmIdx, sv, vmObj) { return function() {
             var p = parseSnapValue(sv);
             if ((p.snapIndex >= 0 || p.snapIndex === -2) && p.branchIndex < 0) {
@@ -551,7 +606,8 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
         makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped'),
-    ];
+    );
+    return cells;
 }
 
 function renderVmTable() {
@@ -562,7 +618,7 @@ function renderVmTable() {
         tbody.innerHTML = '';
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 17;
+        td.colSpan = hostBridge.isMac ? 16 : 17;
         td.className = 'empty-state';
         var btn = document.createElement('button');
         btn.className = 'primary empty-state-btn';

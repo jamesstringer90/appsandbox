@@ -11,6 +11,13 @@ tools/vdd/certs/
 # Claude
 .claude/
 
+# macOS Finder metadata
+.DS_Store
+
+# Xcode per-user state
+**/xcuserdata/
+*.xcuserstate
+
 python/
 
 # User-specific files
