@@ -121,7 +121,7 @@ src/
     vz_vm.m                   VZVirtualMachine wrapper (load/start/stop)
     vz_display.m              VZVirtualMachineView display window
     vz_network.m              VZNetworkDeviceConfiguration helpers
-    iso_patch_mac.m           Disk build + agent staging (drives iso-patch-mac CLI)
+    iso_patch_mac.m           Host-side wrapper that drives the iso-patch-mac CLI
     vm_agent_mac.m            Guest agent connector (virtio-vsock)
     vm_ssh_proxy_mac.m        TCP-to-vsock SSH relay
     vm_clipboard_mac.m        Clipboard sync (virtio-vsock)
@@ -136,7 +136,7 @@ tools/
   agent/                    Windows guest agent
   agent_mac/                macOS guest agent + clipboard helper + firstboot
   iso-patch/                Windows ISO to VHDX converter
-  iso-patch-mac/            macOS disk build + agent staging CLI
+  iso-patch-mac/            macOS disk build + agent staging CLI (iso-patch-mac.m)
   vdd/                      Windows Indirect Display Driver (IddCx)
   vad/                      Windows Virtual Audio Driver
 ```
