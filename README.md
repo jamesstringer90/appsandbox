@@ -26,7 +26,7 @@ The macOS port uses Apple's Virtualization framework to run macOS guests on Appl
 ### macOS
 - Apple Silicon Mac (M1 or later)
 - macOS 26 Tahoe or later
-- Administrator privileges (prompted once during sandbox creation for agent staging)
+- Administrator privileges
 
 ## Setup
 
