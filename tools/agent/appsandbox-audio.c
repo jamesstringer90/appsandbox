@@ -92,8 +92,8 @@ static const wchar_t VAD_DEVICE_NAME[] = L"App Sandbox Virtual Audio";
 /* Capture poll interval — 5 ms gives good latency without burning CPU. */
 #define AUDIO_POLL_MS       5
 
-/* WASAPI requested buffer size (100-ns units). 20 ms = 200000. */
-#define AUDIO_BUFFER_HNS    200000
+/* WASAPI requested buffer size (100-ns units). 40 ms = 400000. */
+#define AUDIO_BUFFER_HNS    400000
 
 /* ---- Logging ---- */
 
