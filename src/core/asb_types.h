@@ -37,7 +37,7 @@ typedef struct CoreVmConfig {
     int         ram_mb;
     int         hdd_gb;
     int         cpu_cores;
-    int         gpu_mode;       /* 0=none, 1=default */
+    int         gpu_mode;       /* 0=none, 1=default, 2=mirror */
     int         network_mode;   /* 0=none, 1=NAT, 2=bridged, 3=internal */
     const char *net_adapter;    /* for bridged, or NULL */
     const char *username;

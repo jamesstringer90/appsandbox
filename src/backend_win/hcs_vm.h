@@ -20,6 +20,7 @@ typedef void *HCS_OPERATION;
 /* GPU assignment modes */
 #define GPU_NONE     0
 #define GPU_DEFAULT  1
+#define GPU_MIRROR   2
 
 /* Network modes */
 #define NET_NONE     0
@@ -36,7 +37,7 @@ typedef struct {
     DWORD   ram_mb;
     DWORD   hdd_gb;
     DWORD   cpu_cores;
-    int     gpu_mode;             /* GPU_NONE or GPU_DEFAULT */
+    int     gpu_mode;             /* GPU_NONE, GPU_DEFAULT, or GPU_MIRROR */
     int     network_mode;         /* NET_NONE, NET_NAT, NET_EXTERNAL, or NET_INTERNAL */
     wchar_t admin_user[128];      /* Guest local admin username */
     wchar_t admin_pass[128];      /* Guest local admin password */

@@ -575,7 +575,7 @@ function buildRowCells(vm, i, statusTd) {
         makeCell(vm.cpuCores, i, 4, 'Number of virtual CPU cores assigned to this VM'),
         makeCell(vm.ramMb + ' MB', i, 5, 'Memory allocated to this VM, in megabytes'),
         makeCell(vm.hddGb + ' GB', i, 6, 'Virtual disk size, in gigabytes'),
-        makeCell(vm.gpuName || (vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7, 'GPU passed through to the VM via GPU-PV, or None'),
+        makeCell(vm.gpuName || (vm.gpuMode === 2 ? 'Try all' : vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7, 'GPU passed through to the VM via GPU-PV, or None'),
         makeCell(netNames[vm.networkMode] || 'None', i, 8, 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
     ];
     if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
@@ -751,7 +751,7 @@ function startInlineEdit(row, col, td) {
     if (col === 7) {
         /* GPU combo */
         var sel = document.createElement('select');
-        sel.innerHTML = '<option value="0">None</option><option value="1">Default GPU</option>';
+        sel.innerHTML = '<option value="0">None</option><option value="1">Default GPU</option><option value="2">Try all</option>';
         sel.value = String(vm.gpuMode);
         sel.onclick = function(e) { e.stopPropagation(); };
         sel.onchange = function() { commitInlineEdit(); };

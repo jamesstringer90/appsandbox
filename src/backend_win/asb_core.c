@@ -778,7 +778,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         }
     }
 
-    if (args->config.gpu_mode == GPU_DEFAULT)
+    if (args->config.gpu_mode == GPU_DEFAULT || args->config.gpu_mode == GPU_MIRROR)
         gpu_get_driver_shares(&g_gpu_list, &args->config.gpu_shares);
 
     asb_log(L"Re-creating HCS compute system for \"%s\"...", vm->name);
@@ -1413,7 +1413,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     swprintf_s(cfg.vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
 
     /* GPU driver shares */
-    if (cfg.gpu_mode == GPU_DEFAULT && !is_template_create)
+    if ((cfg.gpu_mode == GPU_DEFAULT || cfg.gpu_mode == GPU_MIRROR) && !is_template_create)
         gpu_get_driver_shares(&g_gpu_list, &cfg.gpu_shares);
 
     /* ---- VHDX-first path (Windows, from ISO) ---- */
@@ -1434,7 +1434,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->hdd_gb = cfg.hdd_gb;
             inst->cpu_cores = cfg.cpu_cores;
             inst->gpu_mode = cfg.gpu_mode;
-            wcscpy_s(inst->gpu_name, 256, (cfg.gpu_mode == GPU_DEFAULT) ? L"Default GPU" : L"None");
+            wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
+                                          cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
             inst->network_mode = cfg.network_mode;
             inst->is_template = is_template_create;
             inst->test_mode = cfg.test_mode;
@@ -1578,7 +1579,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         return hr;
     }
 
-    wcscpy_s(inst->gpu_name, 256, (cfg.gpu_mode == GPU_DEFAULT) ? L"Default GPU" : L"None");
+    wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
+                                  cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
     wcscpy_s(inst->resources_iso_path, MAX_PATH, cfg.resources_iso_path);
 
     { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
@@ -1969,7 +1971,8 @@ ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode)
     if (idx < 0) return E_INVALIDARG;
     if (g_vms[idx].running) return E_ACCESSDENIED;
     g_vms[idx].gpu_mode = gpu_mode;
-    wcscpy_s(g_vms[idx].gpu_name, 256, (gpu_mode == GPU_DEFAULT) ? L"Default GPU" : L"None");
+    wcscpy_s(g_vms[idx].gpu_name, 256, gpu_mode == GPU_MIRROR ? L"Try all" :
+                                        gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
     return S_OK;

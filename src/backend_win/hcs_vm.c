@@ -916,7 +916,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     /* Plan9 shares — GPU driver directories for agent p9copy.
        Skip for template VMs (no GPU assigned during template creation). */
     plan9_section[0] = L'\0';
-    if (config->gpu_mode == GPU_DEFAULT && !config->is_template) {
+    if ((config->gpu_mode == GPU_DEFAULT || config->gpu_mode == GPU_MIRROR) && !config->is_template) {
         wchar_t esc_buf[MAX_PATH * 2];
         wchar_t shares[8192];
         int share_count = 0;
@@ -1275,8 +1275,18 @@ static HRESULT hcs_apply_gpu(VmInstance *instance)
                 L"\"AllowVendorExtension\":true"
             L"}"
             L"}");
+    } else if (instance->gpu_mode == GPU_MIRROR) {
+        wcscpy_s(modify_json, 2048,
+            L"{"
+            L"\"ResourcePath\":\"VirtualMachine/ComputeTopology/Gpu\","
+            L"\"RequestType\":\"Update\","
+            L"\"Settings\":{"
+                L"\"AssignmentMode\":\"Mirror\","
+                L"\"AllowVendorExtension\":true"
+            L"}"
+            L"}");
     } else {
-        return S_OK; /* No GPU to apply */
+        return S_OK;
     }
 
     ui_log(L"Applying GPU-PV...");
