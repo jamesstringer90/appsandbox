@@ -755,11 +755,12 @@ static void kill_clipboard_helper(void)
 
 static BOOL spawn_clipboard_in_session(DWORD session_id)
 {
-    HANDLE cur_token = NULL, dup_token = NULL;
+    HANDLE user_token = NULL;
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     wchar_t exe_path[MAX_PATH];
     wchar_t *slash;
+    LPVOID env = NULL;
 
     GetModuleFileNameW(NULL, exe_path, MAX_PATH);
     slash = wcsrchr(exe_path, L'\\');
@@ -771,25 +772,15 @@ static BOOL spawn_clipboard_in_session(DWORD session_id)
         return FALSE;
     }
 
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &cur_token)) {
-        agent_log("Clipboard helper: OpenProcessToken failed (%lu).", GetLastError());
-        return FALSE;
-    }
-
-    if (!DuplicateTokenEx(cur_token, TOKEN_ALL_ACCESS, NULL,
-                           SecurityImpersonation, TokenPrimary, &dup_token)) {
-        agent_log("Clipboard helper: DuplicateTokenEx failed (%lu).", GetLastError());
-        CloseHandle(cur_token);
-        return FALSE;
-    }
-    CloseHandle(cur_token);
-
-    if (!SetTokenInformation(dup_token, TokenSessionId,
-                              &session_id, sizeof(session_id))) {
-        agent_log("Clipboard helper: SetTokenInformation(session=%lu) failed (%lu).",
+    if (!WTSQueryUserToken(session_id, &user_token)) {
+        agent_log("Clipboard helper: WTSQueryUserToken(session=%lu) failed (%lu).",
                    session_id, GetLastError());
-        CloseHandle(dup_token);
         return FALSE;
+    }
+
+    if (!CreateEnvironmentBlock(&env, user_token, FALSE)) {
+        agent_log("Clipboard helper: CreateEnvironmentBlock failed (%lu).", GetLastError());
+        env = NULL;
     }
 
     ZeroMemory(&si, sizeof(si));
@@ -797,18 +788,23 @@ static BOOL spawn_clipboard_in_session(DWORD session_id)
     si.lpDesktop = L"WinSta0\\Default";
     ZeroMemory(&pi, sizeof(pi));
 
-    if (!CreateProcessAsUserW(dup_token, exe_path, NULL, NULL, NULL,
-                               FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    if (!CreateProcessAsUserW(user_token, exe_path, NULL, NULL, NULL,
+                               FALSE,
+                               CREATE_NO_WINDOW | (env ? CREATE_UNICODE_ENVIRONMENT : 0),
+                               env, NULL, &si, &pi)) {
         agent_log("Clipboard helper: CreateProcessAsUserW failed (%lu).", GetLastError());
-        CloseHandle(dup_token);
+        if (env) DestroyEnvironmentBlock(env);
+        CloseHandle(user_token);
         return FALSE;
     }
 
-    agent_log("Clipboard helper: spawned PID %lu in session %lu.", pi.dwProcessId, session_id);
+    agent_log("Clipboard helper: spawned PID %lu in session %lu (as user).",
+               pi.dwProcessId, session_id);
     g_clipboard_process = pi.hProcess;
     g_clipboard_session = session_id;
     CloseHandle(pi.hThread);
-    CloseHandle(dup_token);
+    if (env) DestroyEnvironmentBlock(env);
+    CloseHandle(user_token);
     return TRUE;
 }
 

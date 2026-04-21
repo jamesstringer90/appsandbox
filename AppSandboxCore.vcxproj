@@ -178,6 +178,7 @@
     <ClCompile Include="src\backend_win\vm_agent.c" />
     <ClCompile Include="src\backend_win\prereq.c" />
     <ClCompile Include="src\backend_win\vm_ssh_proxy.c" />
+    <ClCompile Include="src\backend_win\vm_clipboard.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\core\asb_types.h" />
@@ -193,6 +194,7 @@
     <ClInclude Include="src\backend_win\vm_agent.h" />
     <ClInclude Include="src\backend_win\prereq.h" />
     <ClInclude Include="src\backend_win\vm_ssh_proxy.h" />
+    <ClInclude Include="src\backend_win\vm_clipboard.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

@@ -4,8 +4,9 @@
  * Connects to the guest VM over AF_HYPERV sockets:
  *   :0002  Frame channel — receives frames, renders via D3D11 textured quad
  *   :0003  Input channel — forwards keyboard/mouse events to guest
- *   :0005  Clipboard writer — sends host clipboard to guest (host→guest)
- *   :0006  Clipboard reader — receives guest clipboard from reader (guest→host)
+ *   :0004  Audio channel — receives audio from guest, renders via WASAPI
+ *
+ * Clipboard sync (:0005/:0006) is handled by vm_clipboard.c.
  *
  * Pure C, compiled as C.
  */
@@ -30,6 +31,7 @@
 #include <stdarg.h>
 
 #include "vm_display_idd.h"
+#include "vm_clipboard.h"
 #include "vm_agent.h"
 #include "ui.h"
 #include "resource.h"
@@ -38,7 +40,6 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
-#pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ole32.lib")
 
@@ -46,8 +47,6 @@
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
-#include <shellapi.h>
-#include <shlobj.h>
 
 /* ---- Hyper-V socket definitions ---- */
 
@@ -67,14 +66,6 @@ static const GUID FRAME_SERVICE_GUID =
 /* Input channel service GUID — connects to agent for SendInput injection */
 static const GUID INPUT_SERVICE_GUID =
     { 0xa5b0cafe, 0x0003, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
-
-/* Clipboard channel service GUID — connects to guest clipboard writer (host→guest) */
-static const GUID CLIPBOARD_SERVICE_GUID =
-    { 0xa5b0cafe, 0x0005, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
-
-/* Clipboard reader channel — connects to guest clipboard reader (guest→host) */
-static const GUID CLIPBOARD_READER_SERVICE_GUID =
-    { 0xa5b0cafe, 0x0006, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
 /* Audio capture channel — connects to guest audio helper (guest→host) */
 static const GUID AUDIO_SERVICE_GUID =
@@ -99,53 +90,8 @@ typedef struct AudioFrameHeader {
 } AudioFrameHeader;
 #pragma pack(pop)
 
-/* ---- Clipboard protocol ---- */
-
-#define CLIP_MAGIC          0x504C4341  /* "ACLP" little-endian */
-#define CLIP_READY_MAGIC    0x59444C43  /* "CLDY" little-endian */
-
-/* Protocol: delayed rendering (like MS-RDPECLIP).
-   On clipboard change, only the format list is sent.
-   Actual data is fetched on demand via request/response. */
-#define CLIP_MSG_FORMAT_LIST      1  /* format list (clipboard changed) */
-#define CLIP_MSG_FORMAT_DATA_REQ  2  /* request data for a format */
-#define CLIP_MSG_FORMAT_DATA_RESP 3  /* response with data */
-#define CLIP_MSG_FILE_DATA        4  /* file content (part of CF_HDROP response) */
-
-#define CLIP_MAX_FORMATS    64
-#define CLIP_MAX_PAYLOAD    (64 * 1024 * 1024)  /* 64 MB */
-
-#define WM_CLIP_READER_APPLY (WM_APP + 11)  /* reader recv thread -> wndproc: apply reader data */
-
-#pragma pack(push, 1)
-typedef struct ClipHeader {
-    UINT32 magic;
-    UINT32 msg_type;
-    UINT32 format;
-    UINT32 data_size;
-} ClipHeader;
-#pragma pack(pop)
-
-/* Format entry: maps local↔remote IDs and holds fetched data */
-typedef struct {
-    UINT   local_id;
-    UINT   remote_id;
-    BYTE  *data;
-    UINT32 data_size;
-    BOOL   is_hdrop;   /* TRUE = files in temp dir, build DROPFILES */
-} ClipFmtEntry;
-
-/* File transfer for CF_HDROP — sends actual file contents across VM boundary */
-#define CLIP_FILE_CHUNK     (1024 * 1024)  /* 1 MB — HV socket is basically memcpy */
-static wchar_t g_clip_temp_dir[MAX_PATH];
-
-#pragma pack(push, 1)
-typedef struct ClipFileInfo {
-    UINT32 path_len;     /* relative path length in bytes (UTF-16LE, no null) */
-    UINT64 file_size;    /* file data bytes that follow (0 for directories) */
-    UINT8  is_directory; /* 1 = directory entry, 0 = regular file */
-} ClipFileInfo;
-#pragma pack(pop)
+/* Clipboard reader-apply message (posted by vm_clipboard.c to our wndproc) */
+#define WM_CLIP_READER_APPLY (WM_APP + 11)
 
 /* ---- Frame protocol constants ---- */
 
@@ -296,25 +242,8 @@ struct VmDisplayIdd {
     HWND           log_list_hwnd;   /* listbox inside log window */
     HWND           render_hwnd;     /* child window for D3D11 rendering */
 
-    /* Clipboard writer channel (:0005 — host→guest, delayed rendering) */
-    volatile SOCKET  clip_socket;
-    volatile LONG    clip_suppress;
-    HANDLE           clip_recv_thread;
-    CRITICAL_SECTION clip_cs;
-
-    /* Format data: filled by recv thread, applied by wndproc */
-    ClipFmtEntry     clip_fmts[CLIP_MAX_FORMATS];
-    int              clip_fmt_count;
-    int              clip_fetch_idx;  /* next format to request; == count means all fetched */
-
-    /* Clipboard reader channel (:0006 — guest→host) */
-    volatile SOCKET  clip_reader_socket;
-    HANDLE           clip_reader_recv_thread;
-    volatile LONG    clip_reader_suppress;
-    CRITICAL_SECTION clip_reader_cs;
-    ClipFmtEntry     clip_reader_fmts[CLIP_MAX_FORMATS];
-    int              clip_reader_fmt_count;
-    int              clip_reader_fetch_idx;
+    /* Clipboard (extracted to vm_clipboard.c) */
+    VmClipboard      clipboard;
 
     /* Audio playback channel (:0004 — guest→host render) */
     volatile SOCKET  audio_socket;
@@ -885,864 +814,6 @@ session_cleanup:
     return 0;
 }
 
-/* ==================================================================
- * Clipboard sync — host ↔ guest
- * ================================================================== */
-
-/* Skip non-transferable clipboard formats (GDI handles, owner-display, etc.)
-   CF_HDROP IS transferable via the file-data sub-protocol. */
-static BOOL clip_should_skip(UINT fmt)
-{
-    switch (fmt) {
-    case 0:
-    case CF_BITMAP:            /* GDI handle — use CF_DIB instead */
-    case CF_PALETTE:           /* GDI handle */
-    case CF_OWNERDISPLAY:
-    case CF_METAFILEPICT:      /* GDI handle */
-    case CF_ENHMETAFILE:       /* GDI handle */
-    case CF_DSPTEXT:
-    case CF_DSPBITMAP:
-    case CF_DSPMETAFILEPICT:
-    case CF_DSPENHMETAFILE:
-        return TRUE;
-    default:
-        return FALSE;
-    }
-}
-
-static BOOL clip_send_all(SOCKET s, const void *buf, int len)
-{
-    const char *p = (const char *)buf;
-    int remaining = len;
-    while (remaining > 0) {
-        int n = send(s, p, remaining, 0);
-        if (n <= 0) return FALSE;
-        p += n;
-        remaining -= n;
-    }
-    return TRUE;
-}
-
-static void clip_init_temp_dir(void)
-{
-    wchar_t tmp[MAX_PATH];
-    GetTempPathW(MAX_PATH, tmp);
-    swprintf_s(g_clip_temp_dir, MAX_PATH, L"%sAppSandboxClip", tmp);
-    CreateDirectoryW(g_clip_temp_dir, NULL);
-}
-
-/* ---- File transfer helpers ---- */
-
-static void clip_remove_dir_recursive(const wchar_t *dir)
-{
-    WIN32_FIND_DATAW fd;
-    wchar_t pattern[MAX_PATH];
-    HANDLE h;
-
-    swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
-    h = FindFirstFileW(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        wchar_t path[MAX_PATH];
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        swprintf_s(path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            clip_remove_dir_recursive(path);
-        else
-            DeleteFileW(path);
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    RemoveDirectoryW(dir);
-}
-
-static void clip_ensure_parent_dir(const wchar_t *file_path)
-{
-    wchar_t dir[MAX_PATH];
-    wchar_t *p;
-    wcscpy_s(dir, MAX_PATH, file_path);
-    p = wcsrchr(dir, L'\\');
-    if (!p) return;
-    *p = L'\0';
-    for (p = dir; *p; p++) {
-        if (*p == L'\\' && p > dir && *(p - 1) != L':') {
-            *p = L'\0';
-            CreateDirectoryW(dir, NULL);
-            *p = L'\\';
-        }
-    }
-    CreateDirectoryW(dir, NULL);
-}
-
-static BOOL clip_path_is_safe(const wchar_t *rel_path)
-{
-    if (wcsstr(rel_path, L"..")) return FALSE;
-    if (rel_path[0] == L'\\' || rel_path[0] == L'/') return FALSE;
-    if (wcslen(rel_path) > MAX_PATH - 50) return FALSE;
-    return TRUE;
-}
-
-/* Send one file or directory (recursive) as CLIP_MSG_FILE_DATA messages */
-static BOOL clip_send_file_entry(SOCKET s, const wchar_t *full_path,
-                                  const wchar_t *rel_path)
-{
-    ClipHeader hdr;
-    ClipFileInfo fi;
-    DWORD attrs = GetFileAttributesW(full_path);
-    UINT32 path_bytes;
-
-    if (attrs == INVALID_FILE_ATTRIBUTES) return TRUE; /* skip missing */
-
-    path_bytes = (UINT32)(wcslen(rel_path) * sizeof(wchar_t));
-    fi.path_len = path_bytes;
-
-    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
-        WIN32_FIND_DATAW fd;
-        wchar_t search[MAX_PATH];
-        HANDLE h;
-
-        fi.file_size = 0;
-        fi.is_directory = 1;
-
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FILE_DATA;
-        hdr.format = 0;
-        hdr.data_size = (UINT32)sizeof(fi) + path_bytes;
-
-        if (!clip_send_all(s, &hdr, sizeof(hdr))) return FALSE;
-        if (!clip_send_all(s, &fi, sizeof(fi))) return FALSE;
-        if (path_bytes > 0 && !clip_send_all(s, rel_path, (int)path_bytes)) return FALSE;
-
-        /* Recurse into directory */
-        swprintf_s(search, MAX_PATH, L"%s\\*", full_path);
-        h = FindFirstFileW(search, &fd);
-        if (h != INVALID_HANDLE_VALUE) {
-            do {
-                wchar_t child_full[MAX_PATH], child_rel[MAX_PATH];
-                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-                swprintf_s(child_full, MAX_PATH, L"%s\\%s", full_path, fd.cFileName);
-                swprintf_s(child_rel, MAX_PATH, L"%s\\%s", rel_path, fd.cFileName);
-                if (!clip_send_file_entry(s, child_full, child_rel)) {
-                    FindClose(h);
-                    return FALSE;
-                }
-            } while (FindNextFileW(h, &fd));
-            FindClose(h);
-        }
-    } else {
-        /* Regular file — stream contents */
-        HANDLE hFile = CreateFileW(full_path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        LARGE_INTEGER size;
-        BYTE *chunk;
-        UINT64 remaining;
-
-        if (hFile == INVALID_HANDLE_VALUE) return TRUE; /* skip unreadable */
-
-        chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
-        if (!chunk) { CloseHandle(hFile); return FALSE; }
-
-        GetFileSizeEx(hFile, &size);
-        fi.file_size = (UINT64)size.QuadPart;
-        fi.is_directory = 0;
-
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FILE_DATA;
-        hdr.format = 0;
-        hdr.data_size = (UINT32)sizeof(fi) + path_bytes;
-
-        if (!clip_send_all(s, &hdr, sizeof(hdr)) ||
-            !clip_send_all(s, &fi, sizeof(fi)) ||
-            (path_bytes > 0 && !clip_send_all(s, rel_path, (int)path_bytes))) {
-            HeapFree(GetProcessHeap(), 0, chunk);
-            CloseHandle(hFile);
-            return FALSE;
-        }
-
-        remaining = fi.file_size;
-        while (remaining > 0) {
-            DWORD to_read = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : (DWORD)remaining;
-            DWORD bytes_read;
-            if (!ReadFile(hFile, chunk, to_read, &bytes_read, NULL) || bytes_read == 0) {
-                HeapFree(GetProcessHeap(), 0, chunk);
-                CloseHandle(hFile);
-                return FALSE;
-            }
-            if (!clip_send_all(s, chunk, (int)bytes_read)) {
-                HeapFree(GetProcessHeap(), 0, chunk);
-                CloseHandle(hFile);
-                return FALSE;
-            }
-            remaining -= bytes_read;
-        }
-        HeapFree(GetProcessHeap(), 0, chunk);
-        CloseHandle(hFile);
-    }
-    return TRUE;
-}
-
-/* Build CF_HDROP (DROPFILES) from top-level items in temp dir */
-static HGLOBAL clip_build_hdrop_from_temp(void)
-{
-    WIN32_FIND_DATAW fd;
-    wchar_t pattern[MAX_PATH];
-    HANDLE h;
-    wchar_t paths[CLIP_MAX_FORMATS][MAX_PATH];
-    int count = 0;
-    SIZE_T total_size;
-    HGLOBAL hMem;
-    DROPFILES *df;
-    wchar_t *ptr;
-    int i;
-
-    swprintf_s(pattern, MAX_PATH, L"%s\\*", g_clip_temp_dir);
-    h = FindFirstFileW(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return NULL;
-
-    do {
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        swprintf_s(paths[count], MAX_PATH, L"%s\\%s", g_clip_temp_dir, fd.cFileName);
-        count++;
-        if (count >= CLIP_MAX_FORMATS) break;
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-
-    if (count == 0) return NULL;
-
-    /* DROPFILES + null-terminated wide strings + double null */
-    total_size = sizeof(DROPFILES);
-    for (i = 0; i < count; i++)
-        total_size += (wcslen(paths[i]) + 1) * sizeof(wchar_t);
-    total_size += sizeof(wchar_t);
-
-    hMem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_size);
-    if (!hMem) return NULL;
-
-    df = (DROPFILES *)GlobalLock(hMem);
-    if (!df) { GlobalFree(hMem); return NULL; }
-
-    df->pFiles = sizeof(DROPFILES);
-    df->fWide = TRUE;
-
-    ptr = (wchar_t *)((BYTE *)df + sizeof(DROPFILES));
-    for (i = 0; i < count; i++) {
-        wcscpy_s(ptr, MAX_PATH, paths[i]);
-        ptr += wcslen(paths[i]) + 1;
-    }
-    *ptr = L'\0';
-
-    GlobalUnlock(hMem);
-    return hMem;
-}
-
-/* Send format list to guest (clipboard changed locally).
-   Only sends format IDs + names — no data yet (delayed rendering). */
-static void clip_send_format_list(VmDisplayIdd *d)
-{
-    ClipHeader hdr;
-    SOCKET s;
-    UINT fmt;
-    BYTE buf[16384];
-    int offset = 4;  /* skip count field */
-    UINT32 count = 0;
-
-    s = d->clip_socket;
-    if (s == INVALID_SOCKET) {
-        idd_log(d, L"CLIP: clip_send_format_list skipped — no socket.");
-        return;
-    }
-
-    if (!OpenClipboard(d->hwnd)) {
-        idd_log(d, L"CLIP: OpenClipboard failed (%lu).", GetLastError());
-        return;
-    }
-
-    /* Check if CF_HDROP is present — if so, only send CF_HDROP.
-       Other shell formats (Shell IDList Array, FileNameW, etc.) contain
-       host-local paths/PIDLs that are meaningless on the remote side. */
-    {
-        BOOL has_hdrop = IsClipboardFormatAvailable(CF_HDROP);
-
-        fmt = 0;
-        while ((fmt = EnumClipboardFormats(fmt)) != 0 && count < CLIP_MAX_FORMATS) {
-            char name[256];
-            int name_len = 0;
-
-            if (clip_should_skip(fmt)) continue;
-
-            /* When files are on the clipboard, only transfer CF_HDROP —
-               the file-data sub-protocol will deliver actual contents. */
-            if (has_hdrop && fmt != CF_HDROP) continue;
-
-            if (fmt >= 0xC000)
-                name_len = GetClipboardFormatNameA(fmt, name, sizeof(name));
-
-            /* Bounds check */
-            if (offset + 8 + name_len > 16384) break;
-
-            *(UINT32 *)(buf + offset) = fmt;       offset += 4;
-            *(UINT32 *)(buf + offset) = (UINT32)name_len; offset += 4;
-            if (name_len > 0) {
-                memcpy(buf + offset, name, name_len);
-                offset += name_len;
-            }
-            count++;
-        }
-    }
-    CloseClipboard();
-
-    *(UINT32 *)buf = count;
-
-    hdr.magic = CLIP_MAGIC;
-    hdr.msg_type = CLIP_MSG_FORMAT_LIST;
-    hdr.format = 0;
-    hdr.data_size = (UINT32)offset;
-
-    /* Suppress the echo: guest writer will apply this, triggering
-       WM_CLIPBOARDUPDATE in the guest reader which sends it back on :0006.
-       Tell the reader recv thread to ignore the next FORMAT_LIST. */
-    InterlockedExchange(&d->clip_reader_suppress, 1);
-
-    EnterCriticalSection(&d->clip_cs);
-    clip_send_all(s, &hdr, sizeof(hdr));
-    clip_send_all(s, buf, offset);
-    LeaveCriticalSection(&d->clip_cs);
-
-    idd_log(d, L"CLIP: Sent format list (%u formats).", count);
-}
-
-/* Handle FORMAT_DATA_REQ from guest: read local clipboard and send response.
-   Called from the recv thread. */
-static void clip_handle_data_request(VmDisplayIdd *d, UINT fmt)
-{
-    ClipHeader hdr;
-    SOCKET s = d->clip_socket;
-
-    if (s == INVALID_SOCKET) return;
-
-    /* CF_HDROP: send file contents, then empty response */
-    if (fmt == CF_HDROP) {
-        if (OpenClipboard(NULL)) {
-            HANDLE hData = GetClipboardData(CF_HDROP);
-            if (hData) {
-                HDROP hDrop = (HDROP)hData;
-                UINT file_count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
-                UINT fi;
-                idd_log(d, L"CLIP: Data request CF_HDROP — %u files.", file_count);
-                EnterCriticalSection(&d->clip_cs);
-                for (fi = 0; fi < file_count; fi++) {
-                    wchar_t path[MAX_PATH];
-                    wchar_t *name;
-                    DragQueryFileW(hDrop, fi, path, MAX_PATH);
-                    name = wcsrchr(path, L'\\');
-                    name = name ? name + 1 : path;
-                    clip_send_file_entry(s, path, name);
-                }
-                /* Signal end with empty response */
-                hdr.magic = CLIP_MAGIC;
-                hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-                hdr.format = CF_HDROP;
-                hdr.data_size = 0;
-                clip_send_all(s, &hdr, sizeof(hdr));
-                LeaveCriticalSection(&d->clip_cs);
-            } else {
-                idd_log(d, L"CLIP: GetClipboardData(CF_HDROP) returned NULL.");
-                goto send_empty;
-            }
-            CloseClipboard();
-        } else {
-            idd_log(d, L"CLIP: OpenClipboard failed for CF_HDROP (%lu).", GetLastError());
-            goto send_empty;
-        }
-        return;
-
-    send_empty:
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = 0;
-        EnterCriticalSection(&d->clip_cs);
-        clip_send_all(s, &hdr, sizeof(hdr));
-        LeaveCriticalSection(&d->clip_cs);
-        return;
-    }
-
-    /* Regular format: read and send */
-    if (OpenClipboard(NULL)) {
-        HANDLE hData = GetClipboardData(fmt);
-        void *ptr = hData ? GlobalLock(hData) : NULL;
-        SIZE_T size = ptr ? GlobalSize(hData) : 0;
-
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = (ptr && size <= CLIP_MAX_PAYLOAD) ? (UINT32)size : 0;
-
-        EnterCriticalSection(&d->clip_cs);
-        clip_send_all(s, &hdr, sizeof(hdr));
-        if (hdr.data_size > 0)
-            clip_send_all(s, ptr, (int)hdr.data_size);
-        LeaveCriticalSection(&d->clip_cs);
-
-        if (ptr) GlobalUnlock(hData);
-        CloseClipboard();
-        idd_log(d, L"CLIP: Responded format %u (%u bytes).", fmt, hdr.data_size);
-    } else {
-        /* Can't open clipboard — send empty response */
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = 0;
-        EnterCriticalSection(&d->clip_cs);
-        clip_send_all(s, &hdr, sizeof(hdr));
-        LeaveCriticalSection(&d->clip_cs);
-    }
-}
-
-/* Free all pending format data */
-static void clip_free_pending(VmDisplayIdd *d)
-{
-    int i;
-    for (i = 0; i < d->clip_fmt_count; i++) {
-        if (d->clip_fmts[i].data) {
-            HeapFree(GetProcessHeap(), 0, d->clip_fmts[i].data);
-            d->clip_fmts[i].data = NULL;
-        }
-    }
-}
-
-/* Handle a single clipboard protocol message. Returns TRUE to continue, FALSE on error. */
-static BOOL clip_handle_message(VmDisplayIdd *d, SOCKET s, const ClipHeader *hdr)
-{
-    switch (hdr->msg_type) {
-
-    case CLIP_MSG_FORMAT_DATA_REQ:
-        idd_log(d, L"CLIP: Data request for format %u.", hdr->format);
-        clip_handle_data_request(d, hdr->format);
-        return TRUE;
-
-    default:
-        idd_log(d, L"CLIP: Unknown msg_type %u.", hdr->msg_type);
-        if (hdr->data_size > 0) {
-            BYTE skip[256];
-            UINT32 remaining = hdr->data_size;
-            while (remaining > 0) {
-                int chunk = remaining > 256 ? 256 : (int)remaining;
-                if (!recv_exact(s, skip, chunk)) return FALSE;
-                remaining -= chunk;
-            }
-        }
-        return TRUE;
-    }
-}
-
-/* Clipboard recv thread — delayed rendering protocol with auto-reconnect */
-static DWORD WINAPI clip_recv_thread_proc(LPVOID param)
-{
-    VmDisplayIdd *d = (VmDisplayIdd *)param;
-    SOCKET s;
-    ClipHeader hdr;
-
-    idd_log(d, L"CLIP: Recv thread started.");
-
-    /* Outer loop: connection cycle (initial + reconnects) */
-    for (;;) {
-        s = d->clip_socket;
-
-        /* Message loop */
-        while (!d->stop) {
-            if (!recv_exact(s, &hdr, sizeof(hdr)))
-                break;
-            if (hdr.magic != CLIP_MAGIC) {
-                idd_log(d, L"CLIP: Bad magic 0x%08X.", hdr.magic);
-                break;
-            }
-            if (!clip_handle_message(d, s, &hdr))
-                break;
-        }
-
-        /* Cleanup after disconnect */
-        clip_free_pending(d);
-        clip_remove_dir_recursive(g_clip_temp_dir);
-        closesocket(d->clip_socket);
-        d->clip_socket = INVALID_SOCKET;
-
-        if (d->stop) break;
-        idd_log(d, L"CLIP: Disconnected, will retry...");
-
-        /* Reconnect loop */
-        while (!d->stop) {
-            int wait;
-            SOCKET clip_s;
-            for (wait = 0; wait < 3000 && !d->stop; wait += 500)
-                Sleep(500);
-            if (d->stop) break;
-
-            clip_s = connect_to_hv_service(&d->runtime_id, &CLIPBOARD_SERVICE_GUID, 2000);
-            if (clip_s != INVALID_SOCKET) {
-                UINT32 ready_magic = 0;
-                if (recv_exact(clip_s, &ready_magic, sizeof(ready_magic)) &&
-                    ready_magic == CLIP_READY_MAGIC) {
-                    DWORD no_timeout = 0;
-                    setsockopt(clip_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
-                    d->clip_socket = clip_s;
-                    idd_log(d, L"CLIP: Reconnected (GUID :0005).");
-                    break;  /* back to outer for loop → message loop */
-                }
-                closesocket(clip_s);
-            }
-        }
-
-        if (d->stop) break;
-    }
-
-    d->clip_recv_thread = NULL;
-    idd_log(d, L"CLIP: Recv thread exiting.");
-    return 0;
-}
-
-/* ==================================================================
- * Clipboard reader channel (:0006 — guest→host)
- * ================================================================== */
-
-/* Free reader pending format data */
-static void clip_reader_free_pending(VmDisplayIdd *d)
-{
-    int i;
-    for (i = 0; i < d->clip_reader_fmt_count; i++) {
-        if (d->clip_reader_fmts[i].data) {
-            HeapFree(GetProcessHeap(), 0, d->clip_reader_fmts[i].data);
-            d->clip_reader_fmts[i].data = NULL;
-        }
-    }
-}
-
-/* Send FORMAT_DATA_REQ for the next reader format, or post WM_CLIP_READER_APPLY if done. */
-static void clip_reader_request_next_format(VmDisplayIdd *d, SOCKET s)
-{
-    ClipHeader hdr;
-
-    if (d->clip_reader_fetch_idx >= d->clip_reader_fmt_count) {
-        idd_log(d, L"CLIP-R: All %d formats fetched, applying.", d->clip_reader_fmt_count);
-        if (d->hwnd && IsWindow(d->hwnd))
-            PostMessageW(d->hwnd, WM_CLIP_READER_APPLY, 0, 0);
-        return;
-    }
-
-    hdr.magic = CLIP_MAGIC;
-    hdr.msg_type = CLIP_MSG_FORMAT_DATA_REQ;
-    hdr.format = d->clip_reader_fmts[d->clip_reader_fetch_idx].remote_id;
-    hdr.data_size = 0;
-
-    EnterCriticalSection(&d->clip_reader_cs);
-    clip_send_all(s, &hdr, sizeof(hdr));
-    LeaveCriticalSection(&d->clip_reader_cs);
-
-    idd_log(d, L"CLIP-R: Requesting format %u (remote=%u) [%d/%d].",
-            d->clip_reader_fmts[d->clip_reader_fetch_idx].local_id,
-            d->clip_reader_fmts[d->clip_reader_fetch_idx].remote_id,
-            d->clip_reader_fetch_idx + 1, d->clip_reader_fmt_count);
-}
-
-/* Apply reader-fetched format data to the host clipboard. */
-static void clip_reader_apply_format_list(VmDisplayIdd *d)
-{
-    int i;
-
-    EnterCriticalSection(&d->clip_reader_cs);
-    if (d->clip_reader_fmt_count == 0) {
-        LeaveCriticalSection(&d->clip_reader_cs);
-        return;
-    }
-
-    InterlockedExchange(&d->clip_suppress, 1);
-
-    if (!OpenClipboard(d->hwnd)) {
-        idd_log(d, L"CLIP-R: OpenClipboard failed (%lu).", GetLastError());
-        InterlockedExchange(&d->clip_suppress, 0);
-        clip_reader_free_pending(d);
-        LeaveCriticalSection(&d->clip_reader_cs);
-        return;
-    }
-
-    EmptyClipboard();
-
-    for (i = 0; i < d->clip_reader_fmt_count; i++) {
-        if (d->clip_reader_fmts[i].is_hdrop) {
-            HGLOBAL hDrop = clip_build_hdrop_from_temp();
-            if (hDrop)
-                SetClipboardData(d->clip_reader_fmts[i].local_id, hDrop);
-        } else if (d->clip_reader_fmts[i].data && d->clip_reader_fmts[i].data_size > 0) {
-            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, d->clip_reader_fmts[i].data_size);
-            if (hMem) {
-                void *ptr = GlobalLock(hMem);
-                if (ptr) {
-                    memcpy(ptr, d->clip_reader_fmts[i].data, d->clip_reader_fmts[i].data_size);
-                    GlobalUnlock(hMem);
-                    SetClipboardData(d->clip_reader_fmts[i].local_id, hMem);
-                } else {
-                    GlobalFree(hMem);
-                }
-            }
-        }
-    }
-
-    CloseClipboard();
-    InterlockedExchange(&d->clip_suppress, 0);
-    idd_log(d, L"CLIP-R: Applied %d formats to clipboard.", d->clip_reader_fmt_count);
-    clip_reader_free_pending(d);
-    LeaveCriticalSection(&d->clip_reader_cs);
-}
-
-/* Receive and write a single FILE_DATA message from the reader channel. */
-static BOOL clip_reader_recv_file_data(VmDisplayIdd *d, SOCKET s, const ClipHeader *hdr)
-{
-    ClipFileInfo fi;
-    wchar_t rel_path[MAX_PATH], full_path[MAX_PATH];
-
-    if (hdr->data_size < sizeof(fi)) return FALSE;
-    if (!recv_exact(s, &fi, sizeof(fi))) return FALSE;
-
-    if (fi.path_len == 0 || fi.path_len > (MAX_PATH - 1) * sizeof(wchar_t)) {
-        UINT32 skip_hdr = hdr->data_size - (UINT32)sizeof(fi);
-        BYTE skip[4096];
-        while (skip_hdr > 0) {
-            int chunk = skip_hdr > 4096 ? 4096 : (int)skip_hdr;
-            if (!recv_exact(s, skip, chunk)) return FALSE;
-            skip_hdr -= chunk;
-        }
-        { UINT64 rem = fi.file_size;
-          while (rem > 0) { int c = rem > 4096 ? 4096 : (int)rem;
-          if (!recv_exact(s, skip, c)) return FALSE; rem -= c; } }
-        return TRUE;
-    }
-
-    if (!recv_exact(s, rel_path, (int)fi.path_len)) return FALSE;
-    rel_path[fi.path_len / sizeof(wchar_t)] = L'\0';
-
-    if (!clip_path_is_safe(rel_path)) {
-        BYTE skip[4096];
-        UINT64 rem = fi.file_size;
-        idd_log(d, L"CLIP-R: Rejected unsafe path.");
-        while (rem > 0) { int c = rem > 4096 ? 4096 : (int)rem;
-          if (!recv_exact(s, skip, c)) return FALSE; rem -= c; }
-        return TRUE;
-    }
-
-    swprintf_s(full_path, MAX_PATH, L"%s\\%s", g_clip_temp_dir, rel_path);
-
-    if (fi.is_directory) {
-        clip_ensure_parent_dir(full_path);
-        CreateDirectoryW(full_path, NULL);
-    } else {
-        HANDLE hFile;
-        clip_ensure_parent_dir(full_path);
-        hFile = CreateFileW(full_path, GENERIC_WRITE, 0, NULL,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            UINT64 remaining = fi.file_size;
-            BYTE *chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
-            if (!chunk) { CloseHandle(hFile); return FALSE; }
-            while (remaining > 0) {
-                DWORD to_read = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : (DWORD)remaining;
-                DWORD written;
-                if (!recv_exact(s, chunk, (int)to_read)) { HeapFree(GetProcessHeap(), 0, chunk); CloseHandle(hFile); return FALSE; }
-                WriteFile(hFile, chunk, to_read, &written, NULL);
-                remaining -= to_read;
-            }
-            HeapFree(GetProcessHeap(), 0, chunk);
-            CloseHandle(hFile);
-            idd_log(d, L"CLIP-R: File recv: %s (%llu bytes)", rel_path, fi.file_size);
-        } else {
-            UINT64 remaining = fi.file_size;
-            BYTE *chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
-            idd_log(d, L"CLIP-R: Failed to create %s (%lu)", full_path, GetLastError());
-            if (!chunk) return FALSE;
-            while (remaining > 0) {
-                int c = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : (int)remaining;
-                if (!recv_exact(s, chunk, c)) { HeapFree(GetProcessHeap(), 0, chunk); return FALSE; }
-                remaining -= c;
-            }
-            HeapFree(GetProcessHeap(), 0, chunk);
-        }
-    }
-    return TRUE;
-}
-
-/* Handle a single message from the reader channel (:0006). */
-static BOOL clip_reader_handle_message(VmDisplayIdd *d, SOCKET s, const ClipHeader *hdr)
-{
-    switch (hdr->msg_type) {
-
-    case CLIP_MSG_FORMAT_LIST: {
-        BYTE *buf;
-        UINT32 count, i;
-        int off;
-
-        if (hdr->data_size > 16384) return FALSE;
-        buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr->data_size);
-        if (!buf) return FALSE;
-        if (!recv_exact(s, buf, (int)hdr->data_size)) { HeapFree(GetProcessHeap(), 0, buf); return FALSE; }
-
-        /* Echo suppression: host just sent FORMAT_LIST on :0005, guest writer
-           applied it, guest reader echoed it back.  Discard. */
-        if (InterlockedExchange(&d->clip_reader_suppress, 0)) {
-            idd_log(d, L"CLIP-R: FORMAT_LIST suppressed (echo from host->guest).");
-            HeapFree(GetProcessHeap(), 0, buf);
-            return TRUE;
-        }
-
-        count = *(UINT32 *)buf;
-        if (count > CLIP_MAX_FORMATS) count = CLIP_MAX_FORMATS;
-        off = 4;
-
-        EnterCriticalSection(&d->clip_reader_cs);
-        clip_reader_free_pending(d);
-        d->clip_reader_fmt_count = 0;
-        for (i = 0; i < count && off + 8 <= (int)hdr->data_size; i++) {
-            UINT32 fmt_id   = *(UINT32 *)(buf + off); off += 4;
-            UINT32 name_len = *(UINT32 *)(buf + off); off += 4;
-            UINT local_id = fmt_id;
-
-            if (name_len > 0 && name_len < 256 && off + (int)name_len <= (int)hdr->data_size) {
-                char name[256];
-                memcpy(name, buf + off, name_len);
-                name[name_len] = '\0';
-                local_id = RegisterClipboardFormatA(name);
-                idd_log(d, L"CLIP-R: Format '%S' remote=%u local=%u.", name, fmt_id, local_id);
-            }
-            off += (int)name_len;
-
-            d->clip_reader_fmts[d->clip_reader_fmt_count].local_id = local_id;
-            d->clip_reader_fmts[d->clip_reader_fmt_count].remote_id = fmt_id;
-            d->clip_reader_fmts[d->clip_reader_fmt_count].data = NULL;
-            d->clip_reader_fmts[d->clip_reader_fmt_count].data_size = 0;
-            d->clip_reader_fmts[d->clip_reader_fmt_count].is_hdrop = FALSE;
-            d->clip_reader_fmt_count++;
-        }
-        d->clip_reader_fetch_idx = 0;
-        LeaveCriticalSection(&d->clip_reader_cs);
-
-        HeapFree(GetProcessHeap(), 0, buf);
-
-        idd_log(d, L"CLIP-R: Received format list (%u formats), fetching data...", d->clip_reader_fmt_count);
-
-        clip_remove_dir_recursive(g_clip_temp_dir);
-        CreateDirectoryW(g_clip_temp_dir, NULL);
-
-        clip_reader_request_next_format(d, s);
-        return TRUE;
-    }
-
-    case CLIP_MSG_FORMAT_DATA_RESP: {
-        int idx = d->clip_reader_fetch_idx;
-        idd_log(d, L"CLIP-R: Data response for format %u (%u bytes).", hdr->format, hdr->data_size);
-
-        if (idx >= 0 && idx < d->clip_reader_fmt_count) {
-            if (hdr->format == CF_HDROP && hdr->data_size == 0) {
-                d->clip_reader_fmts[idx].is_hdrop = TRUE;
-            } else if (hdr->data_size > 0 && hdr->data_size <= CLIP_MAX_PAYLOAD) {
-                BYTE *data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr->data_size);
-                if (data && recv_exact(s, data, (int)hdr->data_size)) {
-                    d->clip_reader_fmts[idx].data = data;
-                    d->clip_reader_fmts[idx].data_size = hdr->data_size;
-                } else {
-                    if (data) HeapFree(GetProcessHeap(), 0, data);
-                    return FALSE;
-                }
-            }
-            d->clip_reader_fetch_idx++;
-            clip_reader_request_next_format(d, s);
-        }
-        return TRUE;
-    }
-
-    case CLIP_MSG_FILE_DATA:
-        CreateDirectoryW(g_clip_temp_dir, NULL);
-        return clip_reader_recv_file_data(d, s, hdr);
-
-    default:
-        idd_log(d, L"CLIP-R: Unknown msg_type %u.", hdr->msg_type);
-        if (hdr->data_size > 0) {
-            BYTE skip[256];
-            UINT32 remaining = hdr->data_size;
-            while (remaining > 0) {
-                int chunk = remaining > 256 ? 256 : (int)remaining;
-                if (!recv_exact(s, skip, chunk)) return FALSE;
-                remaining -= chunk;
-            }
-        }
-        return TRUE;
-    }
-}
-
-/* Reader recv thread — handles guest→host clipboard via :0006 with auto-reconnect.
-   Unlike :0005, the reader process runs as the logged-in user and may not be
-   available at window creation time, so this thread handles initial connection
-   as well as reconnection. */
-static DWORD WINAPI clip_reader_recv_thread_proc(LPVOID param)
-{
-    VmDisplayIdd *d = (VmDisplayIdd *)param;
-    SOCKET s;
-    ClipHeader hdr;
-
-    idd_log(d, L"CLIP-R: Recv thread started.");
-
-    while (!d->stop) {
-        /* Connect (or reconnect) to :0006 */
-        while (!d->stop) {
-            int wait;
-            SOCKET rs;
-
-            /* If we already have a socket (initial connect succeeded), use it */
-            if (d->clip_reader_socket != INVALID_SOCKET) break;
-
-            rs = connect_to_hv_service(&d->runtime_id, &CLIPBOARD_READER_SERVICE_GUID, 2000);
-            if (rs != INVALID_SOCKET) {
-                UINT32 ready_magic = 0;
-                if (recv_exact(rs, &ready_magic, sizeof(ready_magic)) &&
-                    ready_magic == CLIP_READY_MAGIC) {
-                    DWORD no_timeout = 0;
-                    setsockopt(rs, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
-                    d->clip_reader_socket = rs;
-                    idd_log(d, L"CLIP-R: Connected (GUID :0006).");
-                    break;
-                }
-                closesocket(rs);
-            }
-
-            for (wait = 0; wait < 3000 && !d->stop; wait += 500)
-                Sleep(500);
-        }
-
-        if (d->stop) break;
-
-        /* Message loop */
-        s = d->clip_reader_socket;
-        while (!d->stop) {
-            if (!recv_exact(s, &hdr, sizeof(hdr)))
-                break;
-            if (hdr.magic != CLIP_MAGIC) {
-                idd_log(d, L"CLIP-R: Bad magic 0x%08X.", hdr.magic);
-                break;
-            }
-            if (!clip_reader_handle_message(d, s, &hdr))
-                break;
-        }
-
-        /* Cleanup after disconnect */
-        clip_reader_free_pending(d);
-        clip_remove_dir_recursive(g_clip_temp_dir);
-        closesocket(d->clip_reader_socket);
-        d->clip_reader_socket = INVALID_SOCKET;
-
-        if (d->stop) break;
-        idd_log(d, L"CLIP-R: Disconnected, will retry...");
-    }
-
-    d->clip_reader_recv_thread = NULL;
-    idd_log(d, L"CLIP-R: Recv thread exiting.");
-    return 0;
-}
 
 /* ==================================================================
  * D3D11 initialization and teardown
@@ -2179,6 +1250,12 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
  * Recv thread - connects to VM, receives frames, updates frame_buf
  * ================================================================== */
 
+static void clip_log_callback(const wchar_t *msg, void *user_data)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)user_data;
+    idd_log(d, L"%s", msg);
+}
+
 static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 {
     VmDisplayIdd *d = (VmDisplayIdd *)param;
@@ -2232,31 +1309,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             }
         }
 
-        /* Ensure clipboard writer channel is connected (:0005, host→guest) */
-        if (d->clip_socket == INVALID_SOCKET && !d->clip_recv_thread) {
-            SOCKET clip_s = connect_to_hv_service(&d->runtime_id, &CLIPBOARD_SERVICE_GUID, 1000);
-            if (clip_s != INVALID_SOCKET) {
-                UINT32 ready_magic = 0;
-                if (recv_exact(clip_s, &ready_magic, sizeof(ready_magic)) &&
-                    ready_magic == CLIP_READY_MAGIC) {
-                    DWORD no_timeout = 0;
-                    setsockopt(clip_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
-                    d->clip_socket = clip_s;
-                    d->clip_recv_thread = CreateThread(NULL, 0, clip_recv_thread_proc, d, 0, NULL);
-                    idd_log(d, L"Clipboard writer connected + ready (GUID :0005).");
-                } else {
-                    idd_log(d, L"Clipboard writer handshake failed - closing.");
-                    closesocket(clip_s);
-                }
-            }
-        }
-
-        /* Ensure clipboard reader recv thread is running (:0006, guest→host).
-           The thread handles connecting on its own — the reader process runs as
-           the logged-in user and may not be available yet at window creation. */
-        if (!d->clip_reader_recv_thread) {
-            d->clip_reader_recv_thread = CreateThread(NULL, 0, clip_reader_recv_thread_proc, d, 0, NULL);
-            idd_log(d, L"CLIP-R: Started recv thread (will connect when reader is available).");
+        /* Clipboard module (handles :0005 + :0006 internally) */
+        if (!d->clipboard) {
+            d->clipboard = vm_clipboard_create(&d->runtime_id, d->hwnd,
+                                               clip_log_callback, d);
+            if (d->clipboard)
+                idd_log(d, L"Clipboard module created.");
         }
 
         /* Ensure audio recv thread is running (:0004, guest→host).
@@ -2713,26 +1771,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             /* Stop recv threads */
             d->stop = TRUE;
 
-            /* Wait for clipboard writer recv thread (:0005) */
-            if (d->clip_recv_thread) {
-                if (d->clip_socket != INVALID_SOCKET) {
-                    closesocket(d->clip_socket);
-                    d->clip_socket = INVALID_SOCKET;
-                }
-                WaitForSingleObject(d->clip_recv_thread, 2000);
-                CloseHandle(d->clip_recv_thread);
-                d->clip_recv_thread = NULL;
-            }
-
-            /* Wait for clipboard reader recv thread (:0006) */
-            if (d->clip_reader_recv_thread) {
-                if (d->clip_reader_socket != INVALID_SOCKET) {
-                    closesocket(d->clip_reader_socket);
-                    d->clip_reader_socket = INVALID_SOCKET;
-                }
-                WaitForSingleObject(d->clip_reader_recv_thread, 2000);
-                CloseHandle(d->clip_reader_recv_thread);
-                d->clip_reader_recv_thread = NULL;
+            /* Destroy clipboard module */
+            if (d->clipboard) {
+                vm_clipboard_destroy(d->clipboard);
+                d->clipboard = NULL;
             }
 
             /* Wait for audio recv thread (:0004) */
@@ -2769,10 +1811,6 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 DestroyCursor(d->guest_cursor);
                 d->guest_cursor = NULL;
             }
-
-            /* Clean up clipboard pending data */
-            clip_free_pending(d);
-            clip_reader_free_pending(d);
 
             /* Notify main UI only if user closed the window */
             if (user_initiated && d->main_hwnd && d->vm)
@@ -2841,22 +1879,26 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_CLIPBOARDUPDATE:
-        if (d && d->clip_suppress) {
-            idd_log(d, L"CLIP: WM_CLIPBOARDUPDATE suppressed (echo).");
-            return 0;
-        }
-        if (d) {
-            idd_log(d, L"CLIP: WM_CLIPBOARDUPDATE — sending format list to guest.");
-            clip_send_format_list(d);
+        if (d && d->clipboard) {
+            vm_clipboard_on_clipboard_update(d->clipboard);
         }
         return 0;
 
     case WM_CLIP_READER_APPLY:
-        if (d) {
-            idd_log(d, L"CLIP-R: Applying reader clipboard data.");
-            clip_reader_apply_format_list(d);
+        if (d && d->clipboard) {
+            vm_clipboard_on_reader_apply(d->clipboard);
         }
         return 0;
+
+    case WM_SETFOCUS:
+        if (d && d->clipboard)
+            vm_clipboard_set_sync_enabled(d->clipboard, TRUE);
+        break;
+
+    case WM_KILLFOCUS:
+        if (d && d->clipboard)
+            vm_clipboard_set_sync_enabled(d->clipboard, FALSE);
+        break;
 
     case WM_ERASEBKGND:
         return 1;  /* We handle all painting via D3D11 */
@@ -2981,9 +2023,8 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->open         = TRUE;
     d->stop         = FALSE;
     d->input_socket       = INVALID_SOCKET;
-    d->clip_socket        = INVALID_SOCKET;
-    d->clip_reader_socket = INVALID_SOCKET;
     d->audio_socket       = INVALID_SOCKET;
+    d->clipboard          = NULL;
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;
@@ -2997,11 +2038,6 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     }
 
     InitializeCriticalSection(&d->frame_cs);
-    InitializeCriticalSection(&d->clip_cs);
-    InitializeCriticalSection(&d->clip_reader_cs);
-    d->clip_fetch_idx = 0;
-    d->clip_reader_fetch_idx = 0;
-    clip_init_temp_dir();
 
     /* Start the window thread (which will then start the recv thread) */
     d->window_thread = CreateThread(NULL, 0, idd_window_thread_proc, d, 0, NULL);
@@ -3051,24 +2087,10 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
         CloseHandle(display->recv_thread);
     }
 
-    /* clip_recv_thread is cleaned up by WM_CLOSE handler, but guard */
-    if (display->clip_recv_thread) {
-        if (display->clip_socket != INVALID_SOCKET) {
-            closesocket(display->clip_socket);
-            display->clip_socket = INVALID_SOCKET;
-        }
-        WaitForSingleObject(display->clip_recv_thread, 3000);
-        CloseHandle(display->clip_recv_thread);
-    }
-
-    /* clip_reader_recv_thread guard */
-    if (display->clip_reader_recv_thread) {
-        if (display->clip_reader_socket != INVALID_SOCKET) {
-            closesocket(display->clip_reader_socket);
-            display->clip_reader_socket = INVALID_SOCKET;
-        }
-        WaitForSingleObject(display->clip_reader_recv_thread, 3000);
-        CloseHandle(display->clip_reader_recv_thread);
+    /* Clipboard is cleaned up by WM_CLOSE handler, but guard */
+    if (display->clipboard) {
+        vm_clipboard_destroy(display->clipboard);
+        display->clipboard = NULL;
     }
 
     /* audio_recv_thread guard */
@@ -3082,10 +2104,11 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     }
 
     DeleteCriticalSection(&display->frame_cs);
-    DeleteCriticalSection(&display->clip_cs);
-    DeleteCriticalSection(&display->clip_reader_cs);
-    clip_free_pending(display);
-    clip_reader_free_pending(display);
+
+    if (display->clipboard) {
+        vm_clipboard_destroy(display->clipboard);
+        display->clipboard = NULL;
+    }
 
     if (display->frame_buf)
         HeapFree(GetProcessHeap(), 0, display->frame_buf);

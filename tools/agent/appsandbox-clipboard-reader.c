@@ -84,6 +84,18 @@ static CRITICAL_SECTION g_send_cs;
 static HWND g_msg_hwnd = NULL;
 static char g_log_path[MAX_PATH];
 
+/* Focus-gated sync: the clipboard writer (SYSTEM, :0005) creates this
+ * named event and sets/resets it when the host sends SYNC_ENABLE.
+ * We check it before sending FORMAT_LIST to the host. */
+static HANDLE g_sync_event = NULL;
+#define CLIP_SYNC_EVENT_NAME L"Global\\AppSandboxClipSync"
+
+static BOOL clip_sync_is_enabled(void)
+{
+    if (!g_sync_event) return TRUE;
+    return WaitForSingleObject(g_sync_event, 0) == WAIT_OBJECT_0;
+}
+
 #define WM_CLIP_DATA_REQ (WM_USER + 201)
 
 /* ---- Logging ---- */
@@ -461,6 +473,10 @@ static LRESULT CALLBACK clip_msg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
 {
     switch (msg) {
     case WM_CLIPBOARDUPDATE:
+        if (!clip_sync_is_enabled()) {
+            reader_log("WM_CLIPBOARDUPDATE ignored (sync disabled).");
+            break;
+        }
         reader_log("WM_CLIPBOARDUPDATE — sending format list to host.");
         clip_send_format_list();
         return 0;
@@ -563,6 +579,10 @@ int main(void)
     }
 
     InitializeCriticalSection(&g_send_cs);
+
+    g_sync_event = OpenEventW(SYNCHRONIZE, FALSE, CLIP_SYNC_EVENT_NAME);
+    if (!g_sync_event)
+        reader_log("Warning: could not open sync event (writer not running yet?).");
 
     /* Start message window thread (clipboard listener) */
     msg_th = CreateThread(NULL, 0, msg_window_thread, NULL, 0, NULL);

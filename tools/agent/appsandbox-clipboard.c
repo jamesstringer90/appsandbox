@@ -58,6 +58,7 @@ static const GUID CLIPBOARD_SERVICE_GUID =
 #define CLIP_MSG_FORMAT_DATA_REQ  2
 #define CLIP_MSG_FORMAT_DATA_RESP 3
 #define CLIP_MSG_FILE_DATA        4
+#define CLIP_MSG_SYNC_ENABLE      12
 
 #define CLIP_MAX_FORMATS    64
 #define CLIP_MAX_PAYLOAD    (64 * 1024 * 1024)  /* 64 MB */
@@ -101,6 +102,14 @@ static int          g_clip_fetch_idx = 0;
 
 /* Echo suppression */
 static volatile LONG g_suppress = 0;
+
+/* Focus-gated sync: host sends SYNC_ENABLE(0/1) on :0005.
+ * When disabled, we ignore FORMAT_LIST and don't apply to clipboard.
+ * The named event is shared with appsandbox-clipboard-reader.exe so
+ * it can gate guest->host FORMAT_LIST sending. */
+static volatile LONG g_sync_enabled = 0;
+static HANDLE g_sync_event = NULL;
+#define CLIP_SYNC_EVENT_NAME L"Global\\AppSandboxClipSync"
 
 /* Socket shared between threads */
 static volatile SOCKET g_client_sock = INVALID_SOCKET;
@@ -533,6 +542,27 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
 
         switch (hdr.msg_type) {
 
+        case CLIP_MSG_SYNC_ENABLE: {
+            UINT8 flag = 0;
+            if (hdr.data_size >= 1) {
+                if (!recv_exact(s, &flag, 1)) goto done;
+                if (hdr.data_size > 1) {
+                    BYTE skip[256];
+                    UINT32 rem = hdr.data_size - 1;
+                    while (rem > 0) {
+                        int c = rem > 256 ? 256 : (int)rem;
+                        if (!recv_exact(s, skip, c)) goto done;
+                        rem -= c;
+                    }
+                }
+            }
+            InterlockedExchange(&g_sync_enabled, flag ? 1 : 0);
+            if (flag && g_sync_event) SetEvent(g_sync_event);
+            else if (!flag && g_sync_event) ResetEvent(g_sync_event);
+            clip_log("SYNC_ENABLE %s", flag ? "ON" : "OFF");
+            break;
+        }
+
         case CLIP_MSG_FORMAT_LIST: {
             BYTE buf[16384];
             UINT32 count, i;
@@ -540,6 +570,11 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
 
             if (hdr.data_size > sizeof(buf)) goto done;
             if (!recv_exact(s, buf, (int)hdr.data_size)) goto done;
+
+            if (!g_sync_enabled) {
+                clip_log("FORMAT_LIST ignored (sync disabled).");
+                break;
+            }
 
             count = *(UINT32 *)buf;
             if (count > CLIP_MAX_FORMATS) count = CLIP_MAX_FORMATS;
@@ -684,6 +719,10 @@ int main(void)
     InitializeCriticalSection(&g_send_cs);
     g_clip_fetch_idx = 0;
     clip_init_temp_dir();
+
+    g_sync_event = CreateEventW(NULL, TRUE, FALSE, CLIP_SYNC_EVENT_NAME);
+    if (!g_sync_event)
+        clip_log("Warning: failed to create sync event (%lu).", GetLastError());
 
     /* Start message window thread (clipboard listener) */
     msg_th = CreateThread(NULL, 0, msg_window_thread, NULL, 0, NULL);
