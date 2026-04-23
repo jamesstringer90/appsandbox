@@ -11,7 +11,7 @@ let pendingConfirm = null; /* {resolve} */
 let minSizeReported = false;
 let lastHostInfo = null;
 let rowCache = {};          /* vm.name -> <tr> — persistent rows so the status spinner doesn't reset on every update */
-let rowSigCache = {};       /* vm.name -> signature string of last-rendered button-relevant fields */
+let rowSigCache = {};       /* vm.name -> last render signature; skip rebuild when unchanged */
 
 /* ---- Collapsible sections ---- */
 function toggleSection(id) {
@@ -652,19 +652,8 @@ function renderVmTable() {
         if (!cached) tbody.removeChild(c);
     });
 
-    /* Build or update each row in order.
-     *
-     * During an IPSW download / install, the backend emits vmListChanged
-     * events many times per second (progress ticks). The only fields that
-     * change between those events are vhdxProgress / installStatus — the
-     * action buttons' inputs (running, sshState, etc.) are stable. So we
-     * compute a signature of the button-relevant fields and skip the full
-     * cell rebuild if it hasn't changed. The status cell is always updated
-     * in place via updateStatusCell (it's designed for that).
-     *
-     * Without this dedup, every progress tick destroys and recreates every
-     * <button> in the row, so mouseup lands on a fresh node and the click
-     * event never fires — the user sees a dead delete button. */
+    /* Skip the cell rebuild when button-relevant fields are unchanged; the
+     * install progress tick would otherwise destroy the button DOM mid-click. */
     vms.forEach(function(vm, i) {
         var tr = rowCache[vm.name];
         var firstBuild = !tr;
@@ -673,8 +662,6 @@ function renderVmTable() {
             rowCache[vm.name] = tr;
         }
 
-        /* Status cell always reused — updateStatusCell mutates in place and
-           keeps the spinner animation alive across updates. */
         var statusTd = tr.children[2] || document.createElement('td');
         updateStatusCell(statusTd, vm);
 
@@ -689,9 +676,6 @@ function renderVmTable() {
         ].join('|');
 
         if (!firstBuild && rowSigCache[vm.name] === sig) {
-            /* Button-relevant inputs unchanged — leave existing DOM alone
-               so pending click gestures survive. Status cell was already
-               updated above. */
             if (tbody.children[i] !== tr) {
                 tbody.insertBefore(tr, tbody.children[i] || null);
             }

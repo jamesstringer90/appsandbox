@@ -215,9 +215,7 @@ static dispatch_source_t g_authKeepAlive = NULL;
 
 #pragma mark - Unprivileged (NSTask)
 
-/* Returns the launched task (for registration by callers that want to cancel
- * it later), or nil on launch failure (in which case completion has already
- * been invoked with the error). */
+/* Returns the launched task, or nil on failure (completion fired with error). */
 + (nullable NSTask *)runUnprivilegedArgs:(NSArray<NSString *> *)args
                                 progress:(IsoPatchProgress)progressBlock
                               completion:(IsoPatchCompletion)completion {
@@ -298,8 +296,7 @@ static dispatch_source_t g_authKeepAlive = NULL;
 
 #pragma mark - Public API
 
-/* Registry of in-flight fetch-ipsw subprocesses, keyed by VM name. Accessed
- * only from the serial queue below. */
+/* Keyed by VM name. Mutated only on s_fetchQueue. */
 static NSMutableDictionary<NSString *, NSTask *> *s_fetchTasks = nil;
 static dispatch_queue_t s_fetchQueue = NULL;
 

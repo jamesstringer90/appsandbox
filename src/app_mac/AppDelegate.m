@@ -1,7 +1,7 @@
 #import "AppDelegate.h"
 #import "MainWindowController.h"
 #import "EventLogWindow.h"
-#import <WebKit/WebKit.h>
+#import "asb_core_mac.h"
 
 @implementation AppDelegate
 
@@ -48,15 +48,6 @@
     logItem.target = self;
     logItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
     [viewItem.submenu addItem:logItem];
-
-    NSMenuItem *inspectItem = [[NSMenuItem alloc]
-        initWithTitle:@"Web Inspector"
-               action:@selector(openWebInspector:)
-        keyEquivalent:@"i"];
-    inspectItem.target = self;
-    inspectItem.keyEquivalentModifierMask = NSEventModifierFlagCommand
-                                          | NSEventModifierFlagOption;
-    [viewItem.submenu addItem:inspectItem];
 }
 
 - (void)toggleEventLog:(id)sender {
@@ -64,32 +55,47 @@
     [[EventLogWindow shared] toggle];
 }
 
-/* Open the WKWebView's Safari Web Inspector via the private -_inspector SPI.
- * Called by the View → Web Inspector menu item (⌘⌥I). Requires that the
- * webview has inspectable = YES (set in MainWindowController). */
-- (void)openWebInspector:(id)sender {
-    (void)sender;
-    WKWebView *wv = self.mainWindowController.webView;
-    if (!wv) return;
-    SEL inspectorSel = NSSelectorFromString(@"_inspector");
-    if (![wv respondsToSelector:inspectorSel]) {
-        NSLog(@"[inspector] _inspector SPI unavailable on this WKWebView");
-        return;
-    }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    id inspector = [wv performSelector:inspectorSel];
-    if (!inspector) return;
-    SEL showSel = NSSelectorFromString(@"show");
-    if ([inspector respondsToSelector:showSel]) {
-        [inspector performSelector:showSel];
-    }
-#pragma clang diagnostic pop
-}
-
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
     (void)sender;
     return YES;
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+    (void)sender;
+
+    NSMutableArray<NSString *> *inProgress = [NSMutableArray array];
+    int count = asb_mac_vm_count();
+    for (int i = 0; i < count; i++) {
+        AsbVmMac *vm = asb_mac_vm_get(i);
+        if (!vm) continue;
+        if (!vm->install_complete && vm->install_progress >= 0) {
+            [inProgress addObject:[NSString stringWithUTF8String:vm->name]];
+        }
+    }
+    if (inProgress.count == 0) return NSTerminateNow;
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleWarning;
+    alert.messageText = inProgress.count == 1
+        ? @"Quit while creating a VM?"
+        : @"Quit while creating VMs?";
+    NSString *names = [inProgress componentsJoinedByString:@", "];
+    NSString *listNoun = inProgress.count == 1 ? @"VM is" : @"VMs are";
+    NSString *objectPronoun = inProgress.count == 1 ? @"it" : @"them";
+    alert.informativeText = [NSString stringWithFormat:
+        @"The following %@ still being created: %@.\n\n"
+        @"Quitting now will cancel the download and delete %@.",
+        listNoun, names, objectPronoun];
+    [alert addButtonWithTitle:@"Quit and Delete"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    NSModalResponse resp = [alert runModal];
+    if (resp != NSAlertFirstButtonReturn) return NSTerminateCancel;
+
+    for (NSString *name in inProgress) {
+        asb_mac_vm_delete(name.UTF8String);
+    }
+    return NSTerminateNow;
 }
 
 @end

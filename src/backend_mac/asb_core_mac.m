@@ -894,11 +894,6 @@ int asb_mac_vm_delete(const char *name) {
     if (idx < 0) return BACKEND_ERR_NOT_FOUND;
 
     NSString *nsName = [NSString stringWithUTF8String:name];
-
-    /* Terminate any in-flight IPSW download for this VM. The NSURLSession
-     * task inside the subprocess holds its partial bytes in a system-managed
-     * temp file which the OS reaps on process exit, so nothing else to clean
-     * up here. */
     [IsoPatchMac cancelFetchForVm:nsName];
 
     if (g_vms[idx].running && g_vms[idx].vz_handle) {

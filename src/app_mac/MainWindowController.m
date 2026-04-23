@@ -25,14 +25,6 @@
     self.webView = [[WKWebView alloc] initWithFrame:frame configuration:config];
     self.webView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.webView.navigationDelegate = self;
-
-    /* Allow Safari's Web Inspector to attach. Since macOS 13.3 this must be
-     * opted in per-webview. Enable Safari > Settings > Advanced > "Show
-     * features for web developers", then Develop > <host> > App Sandbox. */
-    if (@available(macOS 13.3, *)) {
-        self.webView.inspectable = YES;
-    }
-
     window.contentView = self.webView;
 
     ui_set_webview(self.webView);

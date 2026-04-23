@@ -904,12 +904,49 @@ static int cmd_stage(int argc, char **argv) {
 /* ---- NSURLSession download delegate (fetch-ipsw) ---- */
 
 @interface IPSWDownloadDelegate : NSObject <NSURLSessionDownloadDelegate>
-@property (nonatomic, copy)   NSString *outputPath;
+@property (nonatomic, copy)   NSString                 *outputPath;
+@property (nonatomic, copy)   NSString                 *sidecarPath;
+@property (nonatomic, copy)   NSURL                    *sourceURL;
+@property (nonatomic, strong) NSURLSession             *session;
+@property (nonatomic, strong) NSURLSessionDownloadTask *currentTask;
 @property (nonatomic, copy)   void (^completionHandler)(NSError *);
-@property (nonatomic, assign) BOOL      reportedSize;
+@property (nonatomic, assign) BOOL                      reportedSize;
+@property (nonatomic, assign) int                       lastPct;
 @end
 
 @implementation IPSWDownloadDelegate
+
+/* Sidecar: 8-byte LE URL length, URL bytes, resume-data blob. */
+- (void)persistResumeData:(NSData *)data {
+    if (!data || !self.sidecarPath || !self.sourceURL) return;
+    NSData *urlData = [self.sourceURL.absoluteString dataUsingEncoding:NSUTF8StringEncoding];
+    uint64_t n = (uint64_t)urlData.length;
+    NSMutableData *out = [NSMutableData dataWithCapacity:8 + urlData.length + data.length];
+    [out appendBytes:&n length:sizeof(n)];
+    [out appendData:urlData];
+    [out appendData:data];
+    [out writeToFile:self.sidecarPath atomically:YES];
+}
+
+- (void)clearSidecar {
+    if (self.sidecarPath) {
+        [[NSFileManager defaultManager] removeItemAtPath:self.sidecarPath error:nil];
+    }
+}
+
++ (NSData *)resumeDataFromSidecarAt:(NSString *)path matchingURL:(NSURL *)url {
+    NSData *raw = [NSData dataWithContentsOfFile:path];
+    if (raw.length < 8) return nil;
+    uint64_t n = 0;
+    [raw getBytes:&n length:sizeof(n)];
+    if (n == 0 || raw.length < 8 + n) return nil;
+    NSData *urlData = [raw subdataWithRange:NSMakeRange(8, (NSUInteger)n)];
+    NSString *savedURL = [[NSString alloc] initWithData:urlData encoding:NSUTF8StringEncoding];
+    if (![savedURL isEqualToString:url.absoluteString]) return nil;
+    return [raw subdataWithRange:NSMakeRange(8 + (NSUInteger)n,
+                                             raw.length - 8 - (NSUInteger)n)];
+}
+
 - (void)URLSession:(NSURLSession *)session
       downloadTask:(NSURLSessionDownloadTask *)task
       didWriteData:(int64_t)bytes
@@ -923,8 +960,30 @@ totalBytesExpectedToWrite:(int64_t)totalExpected {
                   (double)totalExpected / 1073741824.0]);
     }
     int pct = (int)(100.0 * (double)totalWritten / (double)totalExpected);
+    if (pct == self.lastPct) return;
+    self.lastPct = pct;
     emit_progress(pct, [NSString stringWithFormat:@"Downloading (%d%%)", pct]);
 }
+
+- (void)URLSession:(NSURLSession *)session
+      downloadTask:(NSURLSessionDownloadTask *)task
+ didResumeAtOffset:(int64_t)fileOffset
+expectedTotalBytes:(int64_t)expectedTotalBytes {
+    (void)session; (void)task;
+    int pct = (expectedTotalBytes > 0)
+        ? (int)(100.0 * (double)fileOffset / (double)expectedTotalBytes)
+        : self.lastPct;
+    self.lastPct = pct;
+    emit_progress(pct, [NSString stringWithFormat:@"Resuming download (%d%%)", pct]);
+}
+
+- (void)URLSession:(NSURLSession *)session
+taskIsWaitingForConnectivity:(NSURLSessionTask *)task {
+    (void)session; (void)task;
+    emit_progress(self.lastPct,
+        [NSString stringWithFormat:@"Waiting for network (%d%%)", self.lastPct]);
+}
+
 - (void)URLSession:(NSURLSession *)session
       downloadTask:(NSURLSessionDownloadTask *)task
 didFinishDownloadingToURL:(NSURL *)location {
@@ -934,13 +993,38 @@ didFinishDownloadingToURL:(NSURL *)location {
     NSError *err = nil;
     if (![fm moveItemAtPath:location.path toPath:self.outputPath error:&err]) {
         if (self.completionHandler) { self.completionHandler(err); self.completionHandler = nil; }
+        return;
     }
-    /* Success path: let didCompleteWithError fire the completion. */
+    [self clearSidecar];
 }
+
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
 didCompleteWithError:(NSError *)error {
     (void)session; (void)task;
-    if (self.completionHandler) { self.completionHandler(error); self.completionHandler = nil; }
+
+    if (!error) {
+        if (self.completionHandler) { self.completionHandler(nil); self.completionHandler = nil; }
+        return;
+    }
+
+    if (error.code == NSURLErrorCancelled) {
+        if (self.completionHandler) { self.completionHandler(error); self.completionHandler = nil; }
+        return;
+    }
+
+    NSData *resumeData = error.userInfo[NSURLSessionDownloadTaskResumeData];
+    if (resumeData) [self persistResumeData:resumeData];
+
+    emit_log([NSString stringWithFormat:@"Download interrupted (%@); reconnecting",
+              error.localizedDescription]);
+    emit_progress(self.lastPct,
+        [NSString stringWithFormat:@"Reconnecting (%d%%)", self.lastPct]);
+
+    NSURLSessionDownloadTask *next = resumeData
+        ? [self.session downloadTaskWithResumeData:resumeData]
+        : [self.session downloadTaskWithURL:self.sourceURL];
+    self.currentTask = next;
+    [next resume];
 }
 @end
 
@@ -948,16 +1032,19 @@ didCompleteWithError:(NSError *)error {
 
 @interface InstallProgressObserver : NSObject
 @property (nonatomic, strong) NSProgress *observed;
+@property (nonatomic, assign) int lastPct;
 @end
 @implementation InstallProgressObserver
+- (instancetype)init { self = [super init]; if (self) _lastPct = -1; return self; }
 - (void)observeValueForKeyPath:(NSString *)keyPath
                       ofObject:(id)object
                         change:(NSDictionary *)change
                        context:(void *)context {
     (void)object; (void)change; (void)context;
     if (![keyPath isEqualToString:@"fractionCompleted"]) return;
-    double frac = self.observed.fractionCompleted;
-    int pct = (int)(frac * 100.0);
+    int pct = (int)(self.observed.fractionCompleted * 100.0);
+    if (pct == self.lastPct) return;
+    self.lastPct = pct;
     emit_progress(pct, [NSString stringWithFormat:@"Installing macOS (%d%%)", pct]);
 }
 @end
@@ -972,7 +1059,27 @@ static int cmd_fetch_ipsw(int argc, char **argv) {
     }
     if (!outPath) { emit_error(@"fetch-ipsw: --output required"); return 2; }
 
+    NSString *sidecar = [outPath stringByAppendingPathExtension:@"resume"];
     __block int exitCode = 0;
+    __block IPSWDownloadDelegate *activeDelegate = nil;
+
+    /* On SIGTERM, persist resume data so a later run can pick up here. */
+    signal(SIGTERM, SIG_IGN);
+    dispatch_source_t sigSrc = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL,
+                                                       SIGTERM, 0,
+                                                       dispatch_get_main_queue());
+    dispatch_source_set_event_handler(sigSrc, ^{
+        IPSWDownloadDelegate *d = activeDelegate;
+        if (!d.currentTask) {
+            CFRunLoopStop(CFRunLoopGetMain());
+            return;
+        }
+        [d.currentTask cancelByProducingResumeData:^(NSData * _Nullable data) {
+            if (data) [d persistResumeData:data];
+            CFRunLoopStop(CFRunLoopGetMain());
+        }];
+    });
+    dispatch_resume(sigSrc);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         emit_status(@"Querying Apple for latest restore image");
@@ -986,8 +1093,20 @@ static int cmd_fetch_ipsw(int argc, char **argv) {
             }
             emit_log([NSString stringWithFormat:@"Source: %@", img.URL.absoluteString]);
 
+            /* Only reuse the sidecar if Apple hasn't rotated the IPSW URL. */
+            NSData *priorResume = [IPSWDownloadDelegate
+                resumeDataFromSidecarAt:sidecar matchingURL:img.URL];
+            if (priorResume) {
+                emit_log(@"Found prior resume data; attempting to resume");
+            } else if ([[NSFileManager defaultManager] fileExistsAtPath:sidecar]) {
+                [[NSFileManager defaultManager] removeItemAtPath:sidecar error:nil];
+                emit_log(@"Discarded stale resume data (source URL changed)");
+            }
+
             IPSWDownloadDelegate *del = [[IPSWDownloadDelegate alloc] init];
-            del.outputPath = outPath;
+            del.outputPath  = outPath;
+            del.sidecarPath = sidecar;
+            del.sourceURL   = img.URL;
             del.completionHandler = ^(NSError *dlErr) {
                 if (dlErr) {
                     emit_error(dlErr.localizedDescription);
@@ -1000,10 +1119,18 @@ static int cmd_fetch_ipsw(int argc, char **argv) {
             NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
             cfg.timeoutIntervalForRequest  = 0;
             cfg.timeoutIntervalForResource = 0;
+            cfg.waitsForConnectivity       = YES;
             NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg
                                                                   delegate:del
                                                              delegateQueue:nil];
-            [[session downloadTaskWithURL:img.URL] resume];
+            del.session = session;
+
+            NSURLSessionDownloadTask *task = priorResume
+                ? [session downloadTaskWithResumeData:priorResume]
+                : [session downloadTaskWithURL:img.URL];
+            del.currentTask = task;
+            activeDelegate  = del;
+            [task resume];
         }];
     });
 
