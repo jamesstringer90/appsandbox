@@ -215,15 +215,18 @@ static dispatch_source_t g_authKeepAlive = NULL;
 
 #pragma mark - Unprivileged (NSTask)
 
-+ (void)runUnprivilegedArgs:(NSArray<NSString *> *)args
-                    progress:(IsoPatchProgress)progressBlock
-                  completion:(IsoPatchCompletion)completion {
+/* Returns the launched task (for registration by callers that want to cancel
+ * it later), or nil on launch failure (in which case completion has already
+ * been invoked with the error). */
++ (nullable NSTask *)runUnprivilegedArgs:(NSArray<NSString *> *)args
+                                progress:(IsoPatchProgress)progressBlock
+                              completion:(IsoPatchCompletion)completion {
     NSString *tool = [self toolPath];
     if (!tool) {
         completion([NSError errorWithDomain:@"IsoPatchMac" code:1
                      userInfo:@{NSLocalizedDescriptionKey:
                                 @"iso-patch-mac binary not found"}]);
-        return;
+        return nil;
     }
 
     NSTask *task = [[NSTask alloc] init];
@@ -236,13 +239,14 @@ static dispatch_source_t g_authKeepAlive = NULL;
     NSError *launchErr = nil;
     if (![task launchAndReturnError:&launchErr]) {
         completion(launchErr);
-        return;
+        return nil;
     }
 
     [self drainFileHandle:outPipe.fileHandleForReading
                    pipeFP:NULL
                  progress:progressBlock
                completion:completion];
+    return task;
 }
 
 #pragma mark - Privileged (AEWP)
@@ -294,12 +298,52 @@ static dispatch_source_t g_authKeepAlive = NULL;
 
 #pragma mark - Public API
 
+/* Registry of in-flight fetch-ipsw subprocesses, keyed by VM name. Accessed
+ * only from the serial queue below. */
+static NSMutableDictionary<NSString *, NSTask *> *s_fetchTasks = nil;
+static dispatch_queue_t s_fetchQueue = NULL;
+
+static void ensure_fetch_registry(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s_fetchTasks = [NSMutableDictionary dictionary];
+        s_fetchQueue = dispatch_queue_create("com.appsandbox.iso-patch.fetch",
+                                             DISPATCH_QUEUE_SERIAL);
+    });
+}
+
 + (void)fetchLatestIpswToURL:(NSURL *)ipswURL
+                        forVm:(NSString *)vmName
                      progress:(IsoPatchProgress)progressBlock
                    completion:(IsoPatchCompletion)completion {
-    [self runUnprivilegedArgs:@[@"fetch-ipsw", @"--output", ipswURL.path]
-                     progress:progressBlock
-                   completion:completion];
+    ensure_fetch_registry();
+
+    NSString *key = [vmName copy];
+    IsoPatchCompletion wrapped = ^(NSError *err) {
+        dispatch_async(s_fetchQueue, ^{ [s_fetchTasks removeObjectForKey:key]; });
+        if (completion) completion(err);
+    };
+
+    NSTask *task = [self runUnprivilegedArgs:@[@"fetch-ipsw", @"--output", ipswURL.path]
+                                     progress:progressBlock
+                                   completion:wrapped];
+    if (task) {
+        dispatch_async(s_fetchQueue, ^{ s_fetchTasks[key] = task; });
+    }
+}
+
++ (void)cancelFetchForVm:(NSString *)vmName {
+    ensure_fetch_registry();
+    NSString *key = [vmName copy];
+    dispatch_async(s_fetchQueue, ^{
+        NSTask *task = s_fetchTasks[key];
+        if (!task) return;
+        [s_fetchTasks removeObjectForKey:key];
+        if (task.isRunning) {
+            @try { [task terminate]; }
+            @catch (NSException *e) { (void)e; }
+        }
+    });
 }
 
 + (void)installMacOSWithName:(NSString *)name

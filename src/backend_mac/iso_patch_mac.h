@@ -27,10 +27,17 @@ typedef void (^IsoPatchCompletion)(NSError * _Nullable error);
  * user cancels. The ref is cached for the process lifetime. */
 + (BOOL)preauthorize:(NSError * _Nullable * _Nullable)error;
 
-/* Download the latest supported macOS restore image to ipswURL (unprivileged). */
+/* Download the latest supported macOS restore image to ipswURL (unprivileged).
+ * vmName keys the launched NSTask so cancelFetchForVm: can terminate it if
+ * the VM is deleted mid-download. */
 + (void)fetchLatestIpswToURL:(NSURL *)ipswURL
+                        forVm:(NSString *)vmName
                      progress:(nullable IsoPatchProgress)progress
                    completion:(IsoPatchCompletion)completion;
+
+/* Terminate any in-flight fetch-ipsw subprocess registered under vmName.
+ * No-op if there is no active fetch. */
++ (void)cancelFetchForVm:(NSString *)vmName;
 
 /* Create disk.img/aux/hwmodel/machine-id in vmDir and run VZMacOSInstaller
  * (unprivileged). */

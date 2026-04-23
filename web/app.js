@@ -11,6 +11,7 @@ let pendingConfirm = null; /* {resolve} */
 let minSizeReported = false;
 let lastHostInfo = null;
 let rowCache = {};          /* vm.name -> <tr> — persistent rows so the status spinner doesn't reset on every update */
+let rowSigCache = {};       /* vm.name -> signature string of last-rendered button-relevant fields */
 
 /* ---- Collapsible sections ---- */
 function toggleSection(id) {
@@ -615,6 +616,7 @@ function renderVmTable() {
 
     if (vms.length === 0) {
         rowCache = {};
+        rowSigCache = {};
         tbody.innerHTML = '';
         var tr = document.createElement('tr');
         var td = document.createElement('td');
@@ -638,6 +640,7 @@ function renderVmTable() {
             var stale = rowCache[name];
             if (stale.parentNode) stale.parentNode.removeChild(stale);
             delete rowCache[name];
+            delete rowSigCache[name];
         }
     });
 
@@ -649,13 +652,52 @@ function renderVmTable() {
         if (!cached) tbody.removeChild(c);
     });
 
-    /* Build or update each row in order. */
+    /* Build or update each row in order.
+     *
+     * During an IPSW download / install, the backend emits vmListChanged
+     * events many times per second (progress ticks). The only fields that
+     * change between those events are vhdxProgress / installStatus — the
+     * action buttons' inputs (running, sshState, etc.) are stable. So we
+     * compute a signature of the button-relevant fields and skip the full
+     * cell rebuild if it hasn't changed. The status cell is always updated
+     * in place via updateStatusCell (it's designed for that).
+     *
+     * Without this dedup, every progress tick destroys and recreates every
+     * <button> in the row, so mouseup lands on a fresh node and the click
+     * event never fires — the user sees a dead delete button. */
     vms.forEach(function(vm, i) {
         var tr = rowCache[vm.name];
+        var firstBuild = !tr;
         if (!tr) {
             tr = document.createElement('tr');
             rowCache[vm.name] = tr;
         }
+
+        /* Status cell always reused — updateStatusCell mutates in place and
+           keeps the spinner animation alive across updates. */
+        var statusTd = tr.children[2] || document.createElement('td');
+        updateStatusCell(statusTd, vm);
+
+        var sig = [
+            i === selectedVm, editModeRow === i,
+            vm.running, vm.buildingVhdx, vm.shuttingDown, vm.agentOnline,
+            vm.installComplete, vm.isTemplate,
+            vm.sshEnabled, vm.sshState, vm.sshPort,
+            vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
+            vm.gpuMode, vm.gpuName, vm.networkMode,
+            selectedSnap[i] || 'current'
+        ].join('|');
+
+        if (!firstBuild && rowSigCache[vm.name] === sig) {
+            /* Button-relevant inputs unchanged — leave existing DOM alone
+               so pending click gestures survive. Status cell was already
+               updated above. */
+            if (tbody.children[i] !== tr) {
+                tbody.insertBefore(tr, tbody.children[i] || null);
+            }
+            return;
+        }
+        rowSigCache[vm.name] = sig;
 
         tr.className = (i === selectedVm ? 'selected ' : '') +
                        (vm.running ? 'running' : 'stopped');
@@ -666,10 +708,6 @@ function renderVmTable() {
             selectVm(i);
         };
 
-        /* Reuse the existing status <td> so the spinner inside it is never
-           detached from the document — this is what keeps its CSS animation
-           from restarting when staging-file updates arrive. */
-        var statusTd = tr.children[2] || document.createElement('td');
         var cells = buildRowCells(vm, i, statusTd);
 
         for (var c = 0; c < cells.length; c++) {

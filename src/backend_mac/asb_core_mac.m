@@ -718,6 +718,7 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, 0, "Fetching latest restore image");
 
     [IsoPatchMac fetchLatestIpswToURL:cachedIpsw
+                                forVm:nsName
                               progress:^(double frac, NSString *stage) {
         int i = vm_index_of(nsName.UTF8String);
         if (i >= 0) update_install_progress(i, frac, stage);
@@ -892,6 +893,14 @@ int asb_mac_vm_delete(const char *name) {
     int idx = vm_index_of(name);
     if (idx < 0) return BACKEND_ERR_NOT_FOUND;
 
+    NSString *nsName = [NSString stringWithUTF8String:name];
+
+    /* Terminate any in-flight IPSW download for this VM. The NSURLSession
+     * task inside the subprocess holds its partial bytes in a system-managed
+     * temp file which the OS reaps on process exit, so nothing else to clean
+     * up here. */
+    [IsoPatchMac cancelFetchForVm:nsName];
+
     if (g_vms[idx].running && g_vms[idx].vz_handle) {
         post_log("[%s] Stopping VM before delete...", name);
         [g_vms[idx].vz_handle stopWithCompletion:^(NSError * _Nullable err) { (void)err; }];
@@ -904,8 +913,6 @@ int asb_mac_vm_delete(const char *name) {
     }
 
     post_log("[%s] Deleting VM...", name);
-
-    NSString *nsName = [NSString stringWithUTF8String:name];
     NSError *err = nil;
     if (![VmDir deleteVm:nsName error:&err]) {
         post_log("[%s] Delete failed: %s", name, err.localizedDescription.UTF8String);
