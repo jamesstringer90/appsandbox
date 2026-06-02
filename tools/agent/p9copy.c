@@ -121,7 +121,9 @@ static void pack_u64(BYTE **p, UINT64 v)
 
 static void pack_str(BYTE **p, const char *s)
 {
-    UINT16 len = (UINT16)strlen(s);
+    size_t slen = strlen(s);
+    if (slen > P9_MSIZE - 2) slen = P9_MSIZE - 2;
+    UINT16 len = (UINT16)slen;
     pack_u16(p, len);
     memcpy(*p, s, len);
     *p += len;
