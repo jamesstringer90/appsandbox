@@ -171,12 +171,17 @@ function onFullState(msg) {
     }
 }
 
+/* Hyper-V/HCS requires VM memory aligned to 2 MB, so RAM (MB) must be even;
+   round an odd value down by 1. (HCS enforces this — hcsshim's NormalizeMemorySize
+   does the same — and we call HCS directly, so we align here.) */
+function alignRamMb(mb) { return mb - (mb % 2); }
+
 function applySmartDefaults(info) {
     var ram = Math.min(Math.floor(info.hostRamMb / 2), 16384);
     var cores = Math.min(Math.floor(info.hostCores / 2), 8);
     if (ram < 512) ram = 512;
     if (cores < 1) cores = 1;
-    document.getElementById('ram-size').value = ram;
+    document.getElementById('ram-size').value = alignRamMb(ram);
     document.getElementById('cpu-cores').value = cores;
 }
 
@@ -354,6 +359,12 @@ document.getElementById('image-path').addEventListener('input', function() {
     updateCreateButtons();
 });
 
+/* RAM must be 2 MB-aligned: snap an odd entry down by 1 when the field is committed. */
+document.getElementById('ram-size').addEventListener('change', function() {
+    var mb = parseInt(this.value, 10);
+    if (!isNaN(mb)) this.value = alignRamMb(mb);
+});
+
 function revalidateVmName() {
     var name = document.getElementById('vm-name').value.trim();
     document.getElementById('vm-name-warn').textContent = validateVmName(name) || '';
@@ -423,7 +434,7 @@ function gatherConfig() {
         imagePath:   imagePath,
         templateName: document.getElementById('template-select').value,
         hddGb:       parseInt(document.getElementById('hdd-size').value) || 64,
-        ramMb:       parseInt(document.getElementById('ram-size').value) || 16384,
+        ramMb:       alignRamMb(parseInt(document.getElementById('ram-size').value) || 16384),
         cpuCores:    parseInt(document.getElementById('cpu-cores').value) || 8,
         gpuMode:     parseInt(document.getElementById('gpu-mode').value),
         networkMode: parseInt(document.getElementById('net-mode').value),
@@ -585,9 +596,17 @@ function closeCreateModal() {
     document.getElementById('create-vm-overlay').classList.remove('active');
 }
 
-/* Close on backdrop click */
+/* Close on backdrop click — but only when the press also STARTED on the backdrop.
+   A click targets the common ancestor of the mousedown and mouseup, so pressing
+   inside the modal (e.g. selecting text in a field) and releasing on the backdrop
+   would otherwise close it. */
+let createBackdropPress = false;
+document.getElementById('create-vm-overlay').addEventListener('mousedown', function(e) {
+    createBackdropPress = (e.target === this);
+});
 document.getElementById('create-vm-overlay').addEventListener('click', function(e) {
-    if (e.target === this) closeCreateModal();
+    if (e.target === this && createBackdropPress) closeCreateModal();
+    createBackdropPress = false;
 });
 
 /* Close on Escape */
@@ -961,6 +980,12 @@ function commitInlineEdit() {
     else if (col === 5) field = 'ramMb';
     else if (col === 7) field = 'gpuMode';
     else if (col === 8) field = 'networkMode';
+
+    /* RAM must be 2 MB-aligned (HCS requirement): round an odd entry down by 1. */
+    if (field === 'ramMb') {
+        var mb = parseInt(value, 10);
+        if (!isNaN(mb)) value = String(alignRamMb(mb));
+    }
 
     if (field) {
         sendCmd('editVm', { vmIndex: row, field: field, value: value });
