@@ -94,6 +94,13 @@
                 </div>
             </div>
 
+            <label class="win-only" for="storage-folder">Storage Folder:</label>
+            <div class="form-row win-only">
+                <input type="text" id="storage-folder" placeholder="%ProgramData%\AppSandbox (default)" class="input-md" style="flex:1">
+                <button id="btn-browse-storage" onclick="sendCmd('browseStorageFolder')">Browse...</button>
+                <span class="field-warn" id="storage-folder-warn"></span>
+            </div>
+
             <label class="needs-linux-version">Distribution:</label>
             <div class="form-row needs-linux-version">
                 <select id="linux-version">

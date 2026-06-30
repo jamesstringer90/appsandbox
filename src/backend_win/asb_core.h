@@ -62,6 +62,10 @@ typedef struct {
     BOOL   ssh_enabled;            /* TRUE = install OpenSSH Server in guest */
     BOOL   ssh_deploy_key;         /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
     BOOL   is_template;            /* TRUE = create as template VM */
+    /* Optional: folder under which `<storage_folder>\<name>\disk.vhdx` will
+       live. NULL or empty = use default `%ProgramData%\AppSandbox\<name>\`.
+       Ignored for templates (which always live in ProgramData). Windows only. */
+    const wchar_t *storage_folder;
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */

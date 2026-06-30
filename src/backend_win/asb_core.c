@@ -2599,6 +2599,79 @@ ASB_API void asb_detach(void)
     g_initialized = FALSE;
 }
 
+/* Validate a user-supplied storage folder, and (as a side effect) create
+   the target sandbox folder if it doesn't exist. Returns S_OK if OK or
+   empty; E_INVALIDARG with an asb_log explanation on failure. Empty folder
+   is OK (caller falls through to the default ProgramData path). Creates
+   parent directories recursively via SHCreateDirectoryExW so multi-level
+   paths like R:\new\nested\sandboxes work in one call. The later
+   single-level CreateDirectoryW in asb_vm_create still runs but is then
+   a harmless redundant call (returns ERROR_ALREADY_EXISTS, ignored). */
+static HRESULT validate_storage_folder(const wchar_t *folder, const wchar_t *vm_name)
+{
+    wchar_t root[4];
+    wchar_t target_disk[MAX_PATH];
+    UINT drive_type;
+    DWORD attrs;
+    int sh_rc;
+
+    if (!folder || !folder[0]) return S_OK;  /* empty = use default; nothing to validate */
+
+    /* 1. Absolute Windows path: <letter>:\... */
+    if (wcslen(folder) < 3 ||
+        !((folder[0] >= L'A' && folder[0] <= L'Z') || (folder[0] >= L'a' && folder[0] <= L'z')) ||
+        folder[1] != L':' || folder[2] != L'\\') {
+        asb_log(L"Error: Storage folder must be an absolute path like R:\\sandboxes (got: %s)", folder);
+        return E_INVALIDARG;
+    }
+
+    /* 2. Drive is a local fixed volume. */
+    root[0] = folder[0]; root[1] = L':'; root[2] = L'\\'; root[3] = L'\0';
+    drive_type = GetDriveTypeW(root);
+    if (drive_type != DRIVE_FIXED) {
+        asb_log(L"Error: Storage folder must be on a local fixed drive, not network/removable (%s, type=%u)",
+                root, drive_type);
+        return E_INVALIDARG;
+    }
+
+    /* 3. Combined path fits in MAX_PATH. The downstream construction is
+       <folder>\<name>\disk.vhdx — 11 fixed chars (separator + "\\disk.vhdx").
+       Reject early so swprintf_s never silently empties the buffer. */
+    if (wcslen(folder) + wcslen(vm_name) + 11 >= MAX_PATH) {
+        asb_log(L"Error: Storage folder path is too long; folder + sandbox name + \\disk.vhdx must fit in %d characters.",
+                MAX_PATH);
+        return E_INVALIDARG;
+    }
+
+    /* 4. The target sandbox folder is creatable (recursively). Use
+       SHCreateDirectoryExW so that something like R:\new\nested\path\<name>
+       gets all intermediate levels created in one call. Treat
+       ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS as success. */
+    {
+        wchar_t target_dir[MAX_PATH];
+        swprintf_s(target_dir, MAX_PATH, L"%s\\%s", folder, vm_name);
+        sh_rc = SHCreateDirectoryExW(NULL, target_dir, NULL);
+        if (sh_rc != ERROR_SUCCESS &&
+            sh_rc != ERROR_FILE_EXISTS &&
+            sh_rc != ERROR_ALREADY_EXISTS) {
+            asb_log(L"Error: Can't create storage folder %s (Win32 error %d)",
+                    target_dir, sh_rc);
+            return E_INVALIDARG;
+        }
+    }
+
+    /* 5. No existing disk.vhdx at the target sandbox folder. */
+    swprintf_s(target_disk, MAX_PATH, L"%s\\%s\\disk.vhdx", folder, vm_name);
+    attrs = GetFileAttributesW(target_disk);
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        asb_log(L"Error: A sandbox already exists at %s. Pick a different folder or sandbox name.",
+                target_disk);
+        return E_INVALIDARG;
+    }
+
+    return S_OK;
+}
+
 /* ---- VM Create ---- */
 
 ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
@@ -2627,6 +2700,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (config->image_path) wcscpy_s(cfg.image_path, MAX_PATH, config->image_path);
     if (config->username) wcscpy_s(cfg.admin_user, 128, config->username);
     if (config->password) wcscpy_s(cfg.admin_pass, 128, config->password);
+    if (config->storage_folder) wcscpy_s(cfg.storage_folder, MAX_PATH, config->storage_folder);
     cfg.ram_mb = config->ram_mb;
     cfg.hdd_gb = config->hdd_gb;
     cfg.cpu_cores = config->cpu_cores;
@@ -2643,6 +2717,12 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     }
     is_template_create = config->is_template;
     cfg.is_template = is_template_create;
+
+    /* Validate user-supplied storage folder (if any). Empty folder is OK. */
+    if (!is_template_create) {
+        HRESULT vhr = validate_storage_folder(cfg.storage_folder, cfg.name);
+        if (FAILED(vhr)) return vhr;
+    }
 
     /* Defaults */
     if (cfg.hdd_gb == 0) cfg.hdd_gb = 64;
@@ -2750,10 +2830,15 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         CreateDirectoryW(vhdx_dir, NULL);
 
         if (is_template_create) {
+            /* Templates always live host-wide in ProgramData. */
             swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates", base_dir);
             CreateDirectoryW(vhdx_dir, NULL);
             swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates\\%s", base_dir, cfg.name);
+        } else if (cfg.storage_folder[0]) {
+            /* User-chosen folder: <storage_folder>\<name>. */
+            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\%s", cfg.storage_folder, cfg.name);
         } else {
+            /* Default: %ProgramData%\AppSandbox\<name>. */
             swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\%s", base_dir, cfg.name);
         }
     }

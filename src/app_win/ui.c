@@ -892,6 +892,7 @@ static void on_webview2_message(const wchar_t *json)
         wchar_t name_buf[256] = {0}, os_buf[32] = {0}, img_buf[MAX_PATH] = {0};
         wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[128] = {0};
         wchar_t adapter_buf[256] = {0};
+        wchar_t storage_buf[MAX_PATH] = {0};
         int val;
         BOOL is_tpl = FALSE;
 
@@ -902,6 +903,7 @@ static void on_webview2_message(const wchar_t *json)
         json_get_string(json, L"adminUser", user_buf, 128);
         json_get_string(json, L"adminPass", pass_buf, 128);
         json_get_string(json, L"netAdapter", adapter_buf, 256);
+        json_get_string(json, L"storageFolder", storage_buf, MAX_PATH);
         json_get_bool(json, L"isTemplate", &is_tpl);
 
         ZeroMemory(&cfg, sizeof(cfg));
@@ -912,6 +914,7 @@ static void on_webview2_message(const wchar_t *json)
         cfg.username = user_buf;
         cfg.password = pass_buf;
         cfg.net_adapter = adapter_buf;
+        cfg.storage_folder = storage_buf;
         cfg.is_template = is_tpl;
 
         if (json_get_int(json, L"hddGb", &val)) cfg.hdd_gb = (DWORD)val;
@@ -1074,6 +1077,67 @@ static void on_webview2_message(const wchar_t *json)
             jb_object_end(&jb);
             webview2_post(json_buf);
         }
+    } else if (wcscmp(action, L"browseStorageFolder") == 0) {
+        IFileOpenDialog *dlg = NULL;
+        if (SUCCEEDED(CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_ALL,
+                                       &IID_IFileOpenDialog, (void **)&dlg))) {
+            DWORD opts = 0;
+            dlg->lpVtbl->GetOptions(dlg, &opts);
+            dlg->lpVtbl->SetOptions(dlg, opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+            dlg->lpVtbl->SetTitle(dlg, L"Choose storage folder");
+            if (SUCCEEDED(dlg->lpVtbl->Show(dlg, g_hwnd_main))) {
+                IShellItem *item = NULL;
+                if (SUCCEEDED(dlg->lpVtbl->GetResult(dlg, &item))) {
+                    PWSTR path = NULL;
+                    if (SUCCEEDED(item->lpVtbl->GetDisplayName(item, SIGDN_FILESYSPATH, &path))) {
+                        wchar_t json_buf[MAX_PATH + 128];
+                        JsonBuilder jb;
+                        jb_init(&jb, json_buf, _countof(json_buf));
+                        jb_object_begin(&jb);
+                        jb_string(&jb, L"type", L"storageFolderPicked");
+                        jb_string(&jb, L"path", path);
+                        jb_object_end(&jb);
+                        webview2_post(json_buf);
+                        CoTaskMemFree(path);
+                    }
+                    item->lpVtbl->Release(item);
+                }
+            }
+            dlg->lpVtbl->Release(dlg);
+        }
+    } else if (wcscmp(action, L"getDriveFreeSpace") == 0) {
+        wchar_t path_buf[MAX_PATH] = {0};
+        ULARGE_INTEGER free_bytes = { 0 };
+        wchar_t root[4] = {0};
+        wchar_t json_buf[MAX_PATH + 128];
+        JsonBuilder jb;
+
+        json_get_string(json, L"path", path_buf, MAX_PATH);
+        if (path_buf[0] == 0) return;
+
+        /* Derive drive root: e.g. "R:\sandboxes" -> "R:\" */
+        if (wcslen(path_buf) >= 2 && path_buf[1] == L':') {
+            root[0] = path_buf[0]; root[1] = L':'; root[2] = L'\\'; root[3] = 0;
+        } else {
+            return; /* not an absolute path; JS will catch this */
+        }
+
+        if (!GetDiskFreeSpaceExW(root, &free_bytes, NULL, NULL)) return;
+
+        jb_init(&jb, json_buf, _countof(json_buf));
+        jb_object_begin(&jb);
+        jb_string(&jb, L"type", L"driveFreeSpace");
+        jb_string(&jb, L"path", path_buf);
+        /* JsonBuilder has only jb_int (32-bit). Serialize uint64 as a decimal
+           string so JS can Number() it without precision loss (Number handles
+           integers up to 2^53 safely). */
+        {
+            wchar_t num[32];
+            _snwprintf_s(num, _countof(num), _TRUNCATE, L"%llu", free_bytes.QuadPart);
+            jb_string(&jb, L"freeBytes", num);
+        }
+        jb_object_end(&jb);
+        webview2_post(json_buf);
     } else if (wcscmp(action, L"snapTake") == 0) {
         int vi;
         wchar_t sname[128] = {0};

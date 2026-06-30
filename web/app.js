@@ -8,6 +8,8 @@ let selectedSnap = {};  /* vmIndex -> string value: 'current', 'base', 'base-N',
 let editModeRow = -1;
 let editingCell = null; /* {row, col, element} */
 let pendingConfirm = null; /* {resolve} */
+let pendingFreeSpace = null; /* {resolve} for in-flight getDriveFreeSpace */
+let storageFolderDriveQuery = null; /* {drive} of the latest display-refresh query */
 let minSizeReported = false;
 let lastHostInfo = null;
 let rowCache = {};          /* vm.name -> <tr> — persistent rows so the status spinner doesn't reset on every update */
@@ -137,6 +139,22 @@ window.onHostMessage = function(msg) {
         case 'log':           appendLog(msg.message); break;
         case 'hostInfo':      updateHostInfo(msg); break;
         case 'browseResult':  onBrowseResult(msg.path); break;
+        case 'storageFolderPicked': onStorageFolderPicked(msg.path); break;
+        case 'driveFreeSpace':
+            if (pendingFreeSpace) {
+                pendingFreeSpace.resolve({ path: msg.path, freeBytes: Number(msg.freeBytes) });
+                pendingFreeSpace = null;
+            }
+            /* Display refresh: only apply if this response matches the
+               drive we last queried for the host-hdd line. */
+            if (storageFolderDriveQuery && msg.path &&
+                msg.path.charAt(0).toUpperCase() === storageFolderDriveQuery.drive) {
+                var bytes = Number(msg.freeBytes);
+                var freeGb = Math.floor(bytes / (1024 * 1024 * 1024));
+                var label = storageFolderDriveQuery.drive + ':\\';
+                setHostHddText(freeGb, lastHostInfo ? lastHostInfo.vmHddGb : 0, label);
+            }
+            break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
@@ -202,8 +220,33 @@ function updateHostInfo(info) {
     if (el) el.textContent = 'Host: ' + info.hostCores + ' cores | VMs using: ' + info.vmCores;
     el = document.getElementById('host-ram');
     if (el) el.textContent = 'Host: ' + info.hostRamMb + ' MB | VMs using: ' + info.vmRamMb + ' MB';
-    el = document.getElementById('host-hdd');
-    if (el) el.textContent = 'Free: ' + info.freeGb + ' GB | VMs allocated: ' + info.vmHddGb + ' GB';
+    /* If the storage-folder field is empty, show default-drive free space.
+       Otherwise leave the host-hdd display alone — refreshStorageDriveFree
+       owns it while a custom folder is set. */
+    var sf = document.getElementById('storage-folder');
+    if (!sf || !sf.value.trim()) setHostHddText(info.freeGb, info.vmHddGb, null);
+}
+
+function setHostHddText(freeGb, vmHddGb, driveLabel) {
+    var el = document.getElementById('host-hdd');
+    if (!el) return;
+    var suffix = driveLabel ? (' on ' + driveLabel) : '';
+    el.textContent = 'Free: ' + freeGb + ' GB' + suffix + ' | VMs allocated: ' + vmHddGb + ' GB';
+}
+
+/* When the storage-folder field changes (typed or picker), update the
+   "Free: X GB" display to reflect the chosen drive. Empty / invalid path
+   reverts to the cached default-drive figure from hostInfo. */
+function refreshStorageDriveFree() {
+    var sf = document.getElementById('storage-folder');
+    var path = sf ? sf.value.trim() : '';
+    if (!path || !/^[A-Za-z]:\\/.test(path)) {
+        storageFolderDriveQuery = null;
+        if (lastHostInfo) setHostHddText(lastHostInfo.freeGb, lastHostInfo.vmHddGb, null);
+        return;
+    }
+    storageFolderDriveQuery = { drive: path.charAt(0).toUpperCase() };
+    sendCmd('getDriveFreeSpace', { path: path });
 }
 
 /* ---- Adapters ---- */
@@ -337,6 +380,53 @@ function onBrowseResult(path) {
     }
 }
 
+function onStorageFolderPicked(path) {
+    if (path) {
+        document.getElementById('storage-folder').value = path;
+        validateStorageFolder();
+        updateCreateButtons();
+        refreshStorageDriveFree();
+    }
+}
+
+/* Synchronous cheap validation of the storage-folder field. Returns null
+   on OK (including empty = use default), or an error string. Mirrors the
+   native check in validate_storage_folder so UX rejects bad input early. */
+function validateStorageFolder() {
+    var input = document.getElementById('storage-folder');
+    var warn = document.getElementById('storage-folder-warn');
+    if (!input) return null; /* macOS — field is hidden / absent */
+    var value = input.value.trim();
+    var err = null;
+    if (value) {
+        if (value.indexOf('\\\\') === 0) {
+            err = 'Network/UNC paths are not supported.';
+        } else if (!/^[A-Za-z]:\\/.test(value)) {
+            err = 'Must be an absolute path like R:\\sandboxes.';
+        } else if (/[<>|?*"]/.test(value)) {
+            err = 'Path contains invalid characters.';
+        }
+    }
+    if (warn) warn.textContent = err || '';
+    return err;
+}
+
+/* Ask the host for free space on the drive containing `path`. Returns a
+   Promise<{path, freeBytes}>. Resolves with freeBytes=0 after 2s if the
+   host never replies — that way submit is never indefinitely blocked. */
+function getDriveFreeSpace(path) {
+    return new Promise(function(resolve) {
+        pendingFreeSpace = { resolve: resolve };
+        setTimeout(function() {
+            if (pendingFreeSpace) {
+                pendingFreeSpace.resolve({ path: path, freeBytes: 0 });
+                pendingFreeSpace = null;
+            }
+        }, 2000);
+        sendCmd('getDriveFreeSpace', { path: path });
+    });
+}
+
 /* ---- Create buttons state ---- */
 
 function updateCreateButtons() {
@@ -363,6 +453,18 @@ document.getElementById('ram-size').addEventListener('change', function() {
     var mb = parseInt(this.value, 10);
     if (!isNaN(mb)) this.value = alignRamMb(mb);
 });
+
+(function wireStorageFolderInput() {
+    var el = document.getElementById('storage-folder');
+    if (!el) return;
+    var debounce = null;
+    el.addEventListener('input', function() {
+        validateStorageFolder();
+        updateCreateButtons();
+        if (debounce) clearTimeout(debounce);
+        debounce = setTimeout(refreshStorageDriveFree, 250);
+    });
+})();
 
 function revalidateVmName() {
     var name = document.getElementById('vm-name').value.trim();
@@ -443,7 +545,8 @@ function gatherConfig() {
         adminConfirm: document.getElementById('admin-confirm').value,
         testMode:    document.getElementById('test-mode').checked,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
-        sshDeployKey: document.getElementById('ssh-deploy-key').checked
+        sshDeployKey: document.getElementById('ssh-deploy-key').checked,
+        storageFolder: (document.getElementById('storage-folder') ? document.getElementById('storage-folder').value.trim() : '')
     };
 }
 
@@ -549,9 +652,37 @@ function onCreateVm() {
         sendCmd('log', { message: 'Passwords do not match.' });
         return;
     }
-    sendCmd('createVm', cfg);
-    clearCreateForm();
-    closeCreateModal();
+    var sfErr = validateStorageFolder();
+    if (sfErr) { sendCmd('log', { message: 'Storage folder: ' + sfErr }); return; }
+
+    function submit() {
+        sendCmd('createVm', cfg);
+        clearCreateForm();
+        closeCreateModal();
+    }
+
+    /* Free-space pre-flight only when a custom folder is set. Default
+       drive (ProgramData / C:) is not gated here. */
+    if (cfg.storageFolder) {
+        getDriveFreeSpace(cfg.storageFolder).then(function(r) {
+            var requested = cfg.hddGb;
+            var freeGb = Math.floor(r.freeBytes / (1024 * 1024 * 1024));
+            if (r.freeBytes > 0 && freeGb < requested) {
+                showModal(
+                    'Low disk space',
+                    'Only ' + freeGb + ' GB free on ' + r.path[0] + ':\\; sandbox is configured for ' + requested + ' GB.\n\nContinue anyway? VHDX files are dynamic — they grow over time, so a tight fit is not necessarily wrong.',
+                    'Continue',
+                    { confirmClass: 'primary' }
+                ).then(function(ok) {
+                    if (ok) submit();
+                });
+            } else {
+                submit();
+            }
+        });
+    } else {
+        submit();
+    }
 }
 
 function onCreateTemplate() {
@@ -574,6 +705,11 @@ function openCreateModal() {
     /* Reset to defaults every time the modal opens */
     document.getElementById('vm-name').value = 'MyAppSandbox';
     document.getElementById('image-path').value = '';
+    var sf = document.getElementById('storage-folder');
+    if (sf) sf.value = '';
+    var sfw = document.getElementById('storage-folder-warn');
+    if (sfw) sfw.textContent = '';
+    refreshStorageDriveFree();  /* revert host-hdd line to default-drive view */
     selectTemplate('', templateDefaultLabel());
     document.getElementById('hdd-size').value = 64;
     document.getElementById('gpu-mode').value = '1';
