@@ -847,7 +847,7 @@ static int do_to_vhdx(const wchar_t *iso_path_arg, int image_index, int size_gb,
         const char *detected_lang = "en-US";  /* fallback */
         GetSystemDirectoryW(sys_dir, MAX_PATH);
         swprintf_s(dism_cmd, 1024,
-            L"%s\\dism.exe /Get-WimInfo /WimFile:\"%s\" /Index:%d",
+            L"%s\\dism.exe /English /Get-WimInfo /WimFile:\"%s\" /Index:%d",
             sys_dir, wim_path, image_index);
         if (run_command_capture(dism_cmd, dism_output, sizeof(dism_output)) == 0) {
             /* Look for "xx-YY (Default)" pattern in DISM output */
