@@ -535,6 +535,12 @@ static const char *validate_create(const wchar_t *name, const wchar_t *os,
                 int r; for (r = 0; r < (int)(sizeof(res)/sizeof(res[0])); r++)
                     if (_wcsicmp(user, res[r]) == 0) return "Username is a reserved name.";
             }
+            /* The VM name becomes the guest ComputerName; a user named like
+               the machine cannot be added to local groups during the unattend
+               pass (ERROR_NO_SUCH_MEMBER), so the account ends up group-less
+               and the agent never installs. */
+            if (_wcsicmp(user, name) == 0)
+                return "Username cannot be the same as the VM name.";
         }
         if (is_linux) {
             if (!pass || !pass[0]) return "Password is required.";
