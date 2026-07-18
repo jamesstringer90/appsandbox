@@ -378,6 +378,8 @@ function revalidateVmName() {
     document.getElementById('vm-name-warn').textContent = validateVmName(name) || '';
 }
 document.getElementById('vm-name').addEventListener('input', revalidateVmName);
+/* Username validity depends on the VM name (Windows: username != VM name). */
+document.getElementById('vm-name').addEventListener('input', revalidateUsername);
 
 function revalidateUsername() {
     var u = document.getElementById('admin-user').value.trim();
@@ -524,6 +526,18 @@ function validateUsername(name) {
         'COM1','COM2','COM3','COM4','COM5','COM6','COM7','COM8','COM9',
         'LPT1','LPT2','LPT3','LPT4','LPT5','LPT6','LPT7','LPT8','LPT9'];
     if (reserved.indexOf(name.toUpperCase()) >= 0) return 'Username is a reserved name.';
+    /* Windows guests: the VM name becomes the guest ComputerName, and a user
+       named like the machine cannot be added to local groups during the
+       unattend pass (LookupAccountName resolves the machine object first,
+       NetLocalGroupAddMembers fails with ERROR_NO_SUCH_MEMBER). The account
+       ends up group-less, OOBE autologs defaultuser0 instead and the agent
+       never installs. */
+    if (osType === 'Windows') {
+        var vmNameEl = document.getElementById('vm-name');
+        var vmName = vmNameEl ? vmNameEl.value.trim() : '';
+        if (vmName && name.toLowerCase() === vmName.toLowerCase())
+            return 'Username cannot be the same as the VM name.';
+    }
     return null;
 }
 

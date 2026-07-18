@@ -372,6 +372,12 @@ static NSString *validate_create_mac(NSString *name, NSString *os,
         @"LPT1",@"LPT2",@"LPT3",@"LPT4",@"LPT5",@"LPT6",@"LPT7",@"LPT8",@"LPT9"];
     if ([reserved containsObject:user.uppercaseString])
         return @"Username is a reserved name.";
+    /* Windows guests: the VM name becomes the guest ComputerName; a user named
+       like the machine cannot be added to local groups during the unattend pass
+       (ERROR_NO_SUCH_MEMBER), so the account ends up group-less and the agent
+       never installs. */
+    if (is_win && [user caseInsensitiveCompare:name] == NSOrderedSame)
+        return @"Username cannot be the same as the VM name.";
 
     /* numeric ranges (0 = unset -> the core fills a default). The even-RAM
        rule is kept for interface parity with the GUI/Windows daemon. */
