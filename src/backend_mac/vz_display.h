@@ -16,5 +16,6 @@
 
 - (instancetype)initWithVzVm:(VzVm *)vm;
 - (void)showDisplay;
+- (void)toggleBorderlessFullscreen:(id)sender;
 
 @end

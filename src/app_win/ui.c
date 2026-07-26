@@ -42,6 +42,11 @@ static int g_selected_vm = -1;
 static int g_min_width = 0;
 static int g_min_height = 0;
 
+/* Borderless fullscreen state. */
+static BOOL g_borderless_fullscreen = FALSE;
+static LONG_PTR g_windowed_style = 0;
+static WINDOWPLACEMENT g_windowed_placement = { sizeof(WINDOWPLACEMENT) };
+
 /* Display windows (indexed parallel to the library's VM array) */
 static VmDisplay *g_displays[ASB_MAX_VMS];
 static VmDisplayIdd *g_idd_displays[ASB_MAX_VMS];
@@ -101,6 +106,42 @@ static void send_vm_list(void);
 static void send_full_state(void);
 static void send_adapters(void);
 static void send_templates(void);
+static void toggle_borderless_fullscreen(HWND hwnd);
+static void on_webview2_accelerator(UINT virtual_key);
+
+static void toggle_borderless_fullscreen(HWND hwnd)
+{
+    if (!g_borderless_fullscreen) {
+        MONITORINFO monitor = { sizeof(monitor) };
+        HMONITOR hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+
+        if (!GetWindowPlacement(hwnd, &g_windowed_placement) ||
+            !GetMonitorInfoW(hmonitor, &monitor))
+            return;
+
+        g_windowed_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        SetWindowLongPtrW(hwnd, GWL_STYLE,
+                          (g_windowed_style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(hwnd, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
+                     monitor.rcMonitor.right - monitor.rcMonitor.left,
+                     monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        g_borderless_fullscreen = TRUE;
+    } else {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, g_windowed_style);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        SetWindowPlacement(hwnd, &g_windowed_placement);
+        g_borderless_fullscreen = FALSE;
+    }
+}
+
+static void on_webview2_accelerator(UINT virtual_key)
+{
+    if (virtual_key == VK_F11 && g_hwnd_main)
+        toggle_borderless_fullscreen(g_hwnd_main);
+}
 
 /* ---- Safe display teardown ---- */
 
@@ -1244,6 +1285,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         vm_agent_set_hwnd(hwnd);
         asb_idd_probe_set_hwnd(hwnd);
         webview2_set_message_callback(on_webview2_message);
+        webview2_set_accelerator_callback(on_webview2_accelerator);
         if (!webview2_init(hwnd, g_hInstance)) {
             MessageBoxW(hwnd, L"WebView2 initialization failed.\nPlease install Microsoft Edge WebView2 Runtime.",
                         L"App Sandbox", MB_ICONERROR);
@@ -1254,6 +1296,13 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE:
         webview2_resize(hwnd);
         return 0;
+
+    case WM_KEYDOWN:
+        if (wp == VK_F11 && !(lp & (1L << 30))) {
+            toggle_borderless_fullscreen(hwnd);
+            return 0;
+        }
+        break;
 
     case WM_MEASUREITEM:
         if (((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_MENU) {

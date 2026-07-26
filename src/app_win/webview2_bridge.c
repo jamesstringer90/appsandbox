@@ -50,9 +50,14 @@ static int g_queue_count;
 /* ---- Forward declarations ---- */
 
 static WebView2MessageCallback g_message_callback;
+static WebView2AcceleratorCallback g_accelerator_callback;
 
 void webview2_set_message_callback(WebView2MessageCallback cb) {
     g_message_callback = cb;
+}
+
+void webview2_set_accelerator_callback(WebView2AcceleratorCallback cb) {
+    g_accelerator_callback = cb;
 }
 
 /* ---- COM callback: Environment Created ---- */
@@ -169,6 +174,64 @@ static ICoreWebView2WebMessageReceivedEventHandlerVtbl g_msgVtbl = {
     MsgH_QI, MsgH_AddRef, MsgH_Release, MsgH_Invoke
 };
 
+/* ---- COM callback: Accelerator Key Pressed ---- */
+
+typedef struct {
+    ICoreWebView2AcceleratorKeyPressedEventHandlerVtbl *lpVtbl;
+    LONG ref;
+} AcceleratorHandler;
+
+static HRESULT STDMETHODCALLTYPE AcceleratorH_QI(
+    ICoreWebView2AcceleratorKeyPressedEventHandler *This, REFIID riid, void **ppv)
+{
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ICoreWebView2AcceleratorKeyPressedEventHandler)) {
+        *ppv = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE AcceleratorH_AddRef(
+    ICoreWebView2AcceleratorKeyPressedEventHandler *This)
+{
+    return InterlockedIncrement(&((AcceleratorHandler *)This)->ref);
+}
+static ULONG STDMETHODCALLTYPE AcceleratorH_Release(
+    ICoreWebView2AcceleratorKeyPressedEventHandler *This)
+{
+    LONG ref = InterlockedDecrement(&((AcceleratorHandler *)This)->ref);
+    if (ref == 0) free(This);
+    return ref;
+}
+static HRESULT STDMETHODCALLTYPE AcceleratorH_Invoke(
+    ICoreWebView2AcceleratorKeyPressedEventHandler *This,
+    ICoreWebView2Controller *sender,
+    ICoreWebView2AcceleratorKeyPressedEventArgs *args)
+{
+    UINT key = 0;
+    COREWEBVIEW2_KEY_EVENT_KIND kind;
+    INT lparam = 0;
+    (void)This;
+    (void)sender;
+
+    if (SUCCEEDED(args->lpVtbl->get_VirtualKey(args, &key)) &&
+        SUCCEEDED(args->lpVtbl->get_KeyEventKind(args, &kind)) &&
+        SUCCEEDED(args->lpVtbl->get_KeyEventLParam(args, &lparam)) &&
+        key == VK_F11 && kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN &&
+        !(lparam & (1 << 30))) {
+        args->lpVtbl->put_Handled(args, TRUE);
+        if (g_accelerator_callback)
+            g_accelerator_callback(key);
+    }
+    return S_OK;
+}
+
+static ICoreWebView2AcceleratorKeyPressedEventHandlerVtbl g_acceleratorVtbl = {
+    AcceleratorH_QI, AcceleratorH_AddRef, AcceleratorH_Release, AcceleratorH_Invoke
+};
+
 /* ---- Callback implementations ---- */
 
 static HRESULT STDMETHODCALLTYPE EnvH_Invoke(
@@ -200,6 +263,7 @@ static HRESULT STDMETHODCALLTYPE CtrlH_Invoke(
     ICoreWebView2 *webview = NULL;
     ICoreWebView2Settings *settings = NULL;
     MsgHandler *mh;
+    AcceleratorHandler *ah;
     EventRegistrationToken token;
     wchar_t html_path[MAX_PATH];
     wchar_t url[MAX_PATH + 16];
@@ -238,6 +302,15 @@ static HRESULT STDMETHODCALLTYPE CtrlH_Invoke(
         mh->ref = 1;
         webview->lpVtbl->add_WebMessageReceived(webview,
             (ICoreWebView2WebMessageReceivedEventHandler *)mh, &token);
+    }
+
+    ah = (AcceleratorHandler *)calloc(1, sizeof(AcceleratorHandler));
+    if (ah) {
+        ah->lpVtbl = &g_acceleratorVtbl;
+        ah->ref = 1;
+        controller->lpVtbl->add_AcceleratorKeyPressed(controller,
+            (ICoreWebView2AcceleratorKeyPressedEventHandler *)ah, &token);
+        ah->lpVtbl->Release((ICoreWebView2AcceleratorKeyPressedEventHandler *)ah);
     }
 
     /* Resize to fill parent */

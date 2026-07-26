@@ -252,6 +252,9 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 @property (nonatomic, strong) AsbIvshmemTransport *transport;
 @property (nonatomic, strong) IddDisplayView *view;
 @property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic) BOOL borderlessFullscreen;
+@property (nonatomic) NSWindowStyleMask windowedStyleMask;
+@property (nonatomic) NSRect windowedFrame;
 
 /* ch2/ch3/ch4/ch5/ch6 reader loops, run on pthreads via the C trampolines below. */
 - (void)displayLoop;
@@ -488,6 +491,23 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
         _surfTex[i] = [_mtlDev newTextureWithDescriptor:td iosurface:_surf[i] plane:0];
     }
     _surfW = w; _surfH = h; _frontValid = NO; _frontIdx = 0;
+}
+
+- (void)toggleBorderlessFullscreen:(id)sender {
+    (void)sender;
+    NSWindow *window = self.window;
+
+    if (!self.borderlessFullscreen) {
+        self.windowedStyleMask = window.styleMask;
+        self.windowedFrame = window.frame;
+        window.styleMask = NSWindowStyleMaskBorderless;
+        [window setFrame:window.screen.frame display:YES];
+        self.borderlessFullscreen = YES;
+    } else {
+        window.styleMask = self.windowedStyleMask;
+        [window setFrame:self.windowedFrame display:YES];
+        self.borderlessFullscreen = NO;
+    }
 }
 
 - (void)showDisplay {
