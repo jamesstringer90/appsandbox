@@ -210,6 +210,9 @@ struct VmDisplayIdd {
     HWND         hwnd;
     volatile BOOL open;
     volatile BOOL stop;
+    BOOL          borderless_fullscreen;
+    LONG_PTR      windowed_style;
+    WINDOWPLACEMENT windowed_placement;
 
     /* D3D11 */
     ID3D11Device            *device;
@@ -278,6 +281,7 @@ struct VmDisplayIdd {
 static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static DWORD WINAPI     idd_window_thread_proc(LPVOID param);
 static DWORD WINAPI     idd_recv_thread_proc(LPVOID param);
+static void             idd_toggle_borderless_fullscreen(VmDisplayIdd *d, HWND hwnd);
 
 /* ---- Window class ---- */
 
@@ -289,6 +293,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
+#define IDM_BORDERLESS_FULLSCREEN 0x1030
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 
@@ -1908,6 +1913,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
+            AppendMenuW(sysmenu, MF_STRING, IDM_BORDERLESS_FULLSCREEN, L"Toggle Borderless Fullscreen\tF11");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
@@ -2014,6 +2020,46 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
  * Window procedure
  * ================================================================== */
 
+static void idd_toggle_borderless_fullscreen(VmDisplayIdd *d, HWND hwnd)
+{
+    HMENU sysmenu;
+
+    if (!d->borderless_fullscreen) {
+        MONITORINFO monitor = { sizeof(monitor) };
+        HMONITOR hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+
+        d->windowed_placement.length = sizeof(d->windowed_placement);
+        if (!GetWindowPlacement(hwnd, &d->windowed_placement) ||
+            !GetMonitorInfoW(hmonitor, &monitor))
+            return;
+
+        d->windowed_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        SetWindowLongPtrW(hwnd, GWL_STYLE,
+                          (d->windowed_style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(hwnd, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
+                     monitor.rcMonitor.right - monitor.rcMonitor.left,
+                     monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        d->borderless_fullscreen = TRUE;
+    } else {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, d->windowed_style);
+        SetWindowPlacement(hwnd, &d->windowed_placement);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        d->borderless_fullscreen = FALSE;
+    }
+
+    sysmenu = GetSystemMenu(hwnd, FALSE);
+    if (sysmenu) {
+        CheckMenuItem(sysmenu, IDM_BORDERLESS_FULLSCREEN,
+                      MF_BYCOMMAND | (d->borderless_fullscreen ? MF_CHECKED : MF_UNCHECKED));
+    }
+    idd_log(d, d->borderless_fullscreen
+                   ? L"Borderless fullscreen: ON."
+                   : L"Borderless fullscreen: OFF.");
+}
+
 static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     VmDisplayIdd *d;
@@ -2029,6 +2075,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     switch (msg) {
     case WM_SYSCOMMAND:
+        if (d && (wp & 0xFFF0) == IDM_BORDERLESS_FULLSCREEN) {
+            idd_toggle_borderless_fullscreen(d, hwnd);
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_AUDIO_MUTE) {
             HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
             wchar_t title[300];
@@ -2338,6 +2388,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SYSKEYUP:
     {
         UINT32 scan = (UINT32)((lp >> 16) & 0xFF);
+        if (wp == VK_F11) {
+            if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) &&
+                !(lp & (1L << 30)) && d)
+                idd_toggle_borderless_fullscreen(d, hwnd);
+            return 0;  /* Never forward F11 to the guest. */
+        }
         BOOL ext = (lp & (1 << 24)) != 0;
         BOOL up  = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
         if (!d) break;

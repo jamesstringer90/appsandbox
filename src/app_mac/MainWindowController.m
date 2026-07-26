@@ -1,6 +1,12 @@
 #import "MainWindowController.h"
 #import "ui.h"
 
+@interface MainWindowController ()
+@property (nonatomic) BOOL borderlessFullscreen;
+@property (nonatomic) NSWindowStyleMask windowedStyleMask;
+@property (nonatomic) NSRect windowedFrame;
+@end
+
 @implementation MainWindowController
 
 - (instancetype)init {
@@ -51,6 +57,23 @@
     (void)userContentController;
     if ([message.body isKindOfClass:[NSString class]]) {
         ui_handle_message((NSString *)message.body);
+    }
+}
+
+- (void)toggleBorderlessFullscreen:(id)sender {
+    (void)sender;
+    NSWindow *window = self.window;
+
+    if (!self.borderlessFullscreen) {
+        self.windowedStyleMask = window.styleMask;
+        self.windowedFrame = window.frame;
+        window.styleMask = NSWindowStyleMaskBorderless;
+        [window setFrame:window.screen.frame display:YES];
+        self.borderlessFullscreen = YES;
+    } else {
+        window.styleMask = self.windowedStyleMask;
+        [window setFrame:self.windowedFrame display:YES];
+        self.borderlessFullscreen = NO;
     }
 }
 

@@ -27,6 +27,10 @@ BOOL webview2_is_ready(void);
 typedef void (*WebView2MessageCallback)(const wchar_t *json);
 void webview2_set_message_callback(WebView2MessageCallback cb);
 
+/* Set callback for accelerator keys handled by the native window. */
+typedef void (*WebView2AcceleratorCallback)(UINT virtual_key);
+void webview2_set_accelerator_callback(WebView2AcceleratorCallback cb);
+
 /* ---- JSON builder helpers ---- */
 
 typedef struct {

@@ -62,6 +62,22 @@
     logItem.target = self;
     logItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
     [viewItem.submenu addItem:logItem];
+
+    NSMenuItem *borderlessItem = [[NSMenuItem alloc]
+        initWithTitle:@"Toggle Borderless Full Screen"
+               action:@selector(toggleBorderlessFullscreen:)
+        keyEquivalent:[NSString stringWithFormat:@"%C", NSF11FunctionKey]];
+    borderlessItem.target = self;
+    [viewItem.submenu addItem:borderlessItem];
+}
+
+- (void)toggleBorderlessFullscreen:(id)sender {
+    id controller = NSApp.keyWindow.windowController;
+    if (controller && [controller respondsToSelector:_cmd]) {
+        [controller toggleBorderlessFullscreen:sender];
+    } else {
+        [self.mainWindowController toggleBorderlessFullscreen:sender];
+    }
 }
 
 - (void)toggleEventLog:(id)sender {
