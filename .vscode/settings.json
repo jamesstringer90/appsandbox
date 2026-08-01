@@ -1,0 +1,5 @@
+{
+  "C_Cpp.errorSquiggles": "enabled",
+  "C_Cpp.loggingLevel": "Debug",
+  "C_Cpp.default.enableConfigurationSquiggles": true
+}
