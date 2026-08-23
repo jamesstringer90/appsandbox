@@ -43,6 +43,7 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "imm32.lib")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -1929,6 +1930,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             WS_CHILD | WS_VISIBLE,
             0, 0, rc.right, rc.bottom,
             d->hwnd, NULL, d->hInstance, NULL);
+        if (d->render_hwnd)
+            ImmAssociateContextEx(d->render_hwnd, NULL, 0);
     }
 
     /* Separate top-level log window */
@@ -2022,6 +2025,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         CREATESTRUCTW *cs = (CREATESTRUCTW *)lp;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
         AddClipboardFormatListener(hwnd);
+        ImmAssociateContextEx(hwnd, NULL, 0);
         return 0;
     }
 
