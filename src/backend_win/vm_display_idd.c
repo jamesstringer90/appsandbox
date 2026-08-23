@@ -1930,6 +1930,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             WS_CHILD | WS_VISIBLE,
             0, 0, rc.right, rc.bottom,
             d->hwnd, NULL, d->hInstance, NULL);
+        if (d->render_hwnd)
+            ImmAssociateContextEx(d->render_hwnd, NULL, 0);
     }
 
     /* Separate top-level log window */
