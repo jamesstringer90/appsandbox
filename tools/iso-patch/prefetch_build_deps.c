@@ -1,7 +1,9 @@
 /* prefetch_build_deps.c - see header for design.
  *
  * Pipeline:
- *   1. WinHTTP-download Packages.xz for <codename>/main/binary-<arch>
+ *   1. WinHTTP-download Packages.xz for the release, updates, and
+ *      security pockets under main/binary-<arch>.  Append them from
+ *      lowest to highest priority so the latest parsed record wins.
  *   2. Decompress it in-process with the vendored xz-embedded decoder
  *      (xz_decompress_file_to_file below; Packages.gz is raw-gzipped
  *      text that tar.exe rejects, so we target the .xz instead).
@@ -92,6 +94,58 @@ static BOOL u_rmdir_recursive(const wchar_t *path)
     swprintf_s(cmd, 1024, L"cmd.exe /c rd /s /q \"%s\" 2>nul", path);
     u_run_cmd(cmd);
     return TRUE;
+}
+
+/* Append src to dst, with a blank-line stanza separator.  Packages
+ * indexes are concatenated from lowest to highest pocket priority;
+ * parse_packages() prepends records to each hash bucket, so lookups
+ * then select the record from the newest available pocket. */
+static int append_file(const wchar_t *src, const wchar_t *dst, BOOL truncate)
+{
+    HANDLE hIn = CreateFileW(src, GENERIC_READ, FILE_SHARE_READ, NULL,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hIn == INVALID_HANDLE_VALUE) {
+        log_err(L"prefetch: open %s failed: %lu", src, GetLastError());
+        return -1;
+    }
+
+    HANDLE hOut = CreateFileW(dst, GENERIC_WRITE, 0, NULL,
+                              truncate ? CREATE_ALWAYS : OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hOut == INVALID_HANDLE_VALUE) {
+        log_err(L"prefetch: open %s failed: %lu", dst, GetLastError());
+        CloseHandle(hIn);
+        return -1;
+    }
+    if (!truncate) {
+        LARGE_INTEGER zero = { 0 };
+        SetFilePointerEx(hOut, zero, NULL, FILE_END);
+    }
+
+    BYTE buf[65536];
+    DWORD br = 0;
+    int rc = 0;
+    for (;;) {
+        if (!ReadFile(hIn, buf, sizeof(buf), &br, NULL)) {
+            log_err(L"prefetch: append read failed: %lu", GetLastError());
+            rc = -1;
+            break;
+        }
+        if (br == 0) break;
+        DWORD wr = 0;
+        if (!WriteFile(hOut, buf, br, &wr, NULL) || wr != br) {
+            log_err(L"prefetch: append write failed: %lu", GetLastError());
+            rc = -1;
+            break;
+        }
+    }
+    if (rc == 0) {
+        DWORD wr = 0;
+        if (!WriteFile(hOut, "\n\n", 2, &wr, NULL) || wr != 2) rc = -1;
+    }
+    CloseHandle(hOut);
+    CloseHandle(hIn);
+    return rc;
 }
 
 /* ====================================================================
@@ -372,7 +426,7 @@ cleanup:
  * Memory model: read the entire Packages file into one big malloc'd
  * buffer; each pkg_record_t holds pointers + lengths INTO that buffer.
  * The pkg_table_t hashtable maps Package name (uppercased+hashed) to
- * the first record with that name.
+ * the latest parsed record with that name.
  * ==================================================================== */
 
 typedef struct pkg_record {
@@ -699,24 +753,49 @@ int do_prefetch_build_deps(const wchar_t *codename,
     u_mkdir_p(out_dir);
     const wchar_t *staging = out_dir;
 
-    /* ---- 1. Download Packages.xz ---- */
-    wchar_t pkgs_xz[MAX_PATH], pkgs[MAX_PATH];
-    swprintf_s(pkgs_xz, MAX_PATH, L"%s\\Packages.xz", staging);
-    swprintf_s(pkgs,    MAX_PATH, L"%s\\Packages",    staging);
+    /* ---- 1-2. Download + merge release pocket indexes ----
+       A point-release squashfs already contains packages from -updates
+       and -security.  Resolving dependencies only against the base
+       pocket can therefore select older exact-version dependencies and
+       make apt reject the whole offline transaction. */
+    wchar_t pkgs[MAX_PATH];
+    swprintf_s(pkgs, MAX_PATH, L"%s\\Packages.indexes", staging);
+    const wchar_t *security_mirror = mirror_arg
+        ? mirror
+        : L"http://security.ubuntu.com/ubuntu";
+    for (int pocket_i = 0; pocket_i < 3; pocket_i++) {
+        wchar_t pocket[128];
+        const wchar_t *pocket_mirror = mirror;
+        if (pocket_i == 0) {
+            wcsncpy_s(pocket, ARRAYSIZE(pocket), codename, _TRUNCATE);
+        } else if (pocket_i == 1) {
+            swprintf_s(pocket, ARRAYSIZE(pocket), L"%s-updates", codename);
+        } else {
+            swprintf_s(pocket, ARRAYSIZE(pocket), L"%s-security", codename);
+            pocket_mirror = security_mirror;
+        }
 
-    wchar_t url[1024];
-    swprintf_s(url, 1024, L"%s/dists/%s/main/binary-" IP_DEB_ARCH L"/Packages.xz",
-               mirror, codename);
-    log_msg(L"prefetch: GET %s", url);
-    if (http_download(url, pkgs_xz) != 0) {
-        log_err(L"prefetch: download Packages.xz failed");
-        return -1;
-    }
-
-    /* ---- 2. In-process xz decompression via vendored xz-embedded ---- */
-    if (xz_decompress_file_to_file(pkgs_xz, pkgs) != 0) {
-        log_err(L"prefetch: xz decompress failed");
-        return -1;
+        wchar_t pkgs_xz[MAX_PATH], pkgs_part[MAX_PATH], url[1024];
+        swprintf_s(pkgs_xz, MAX_PATH, L"%s\\Packages.%d.xz", staging, pocket_i);
+        swprintf_s(pkgs_part, MAX_PATH, L"%s\\Packages.%d", staging, pocket_i);
+        swprintf_s(url, ARRAYSIZE(url),
+                   L"%s/dists/%s/main/binary-" IP_DEB_ARCH L"/Packages.xz",
+                   pocket_mirror, pocket);
+        log_msg(L"prefetch: GET %s", url);
+        if (http_download(url, pkgs_xz) != 0) {
+            log_err(L"prefetch: download index for %s failed", pocket);
+            return -1;
+        }
+        if (xz_decompress_file_to_file(pkgs_xz, pkgs_part) != 0) {
+            log_err(L"prefetch: decompress index for %s failed", pocket);
+            return -1;
+        }
+        if (append_file(pkgs_part, pkgs, pocket_i == 0) != 0) {
+            log_err(L"prefetch: merge index for %s failed", pocket);
+            return -1;
+        }
+        DeleteFileW(pkgs_xz);
+        DeleteFileW(pkgs_part);
     }
 
     /* ---- 3. Slurp Packages into memory + parse ---- */
@@ -741,14 +820,20 @@ int do_prefetch_build_deps(const wchar_t *codename,
 
     /* ---- 4. Mark seeds in_closure ---- */
     const char *seeds[] = {
+        "build-essential", "dkms",
         "libasound2-dev", "libxcb1-dev", "libxcb-xfixes0-dev",
         "libdrm-dev", "pkg-config",
         "openssh-server"  /* for ssh_enabled VMs; firstboot installs conditionally */
     };
     int closure_count = 0;
+    int missing_required = 0;
     for (size_t i = 0; i < sizeof(seeds) / sizeof(seeds[0]); i++) {
         pkg_record_t *r = lookup_pkg(&T, seeds[i], strlen(seeds[i]));
-        if (!r) { log_msg(L"prefetch: WARN seed '%hs' not in archive", seeds[i]); continue; }
+        if (!r) {
+            log_err(L"prefetch: required seed '%hs' not in archive", seeds[i]);
+            missing_required = 1;
+            continue;
+        }
         if (!r->in_closure) { r->in_closure = 1; closure_count++; }
     }
     /* Also linux-headers-<kver>. */
@@ -758,8 +843,15 @@ int do_prefetch_build_deps(const wchar_t *codename,
         WideCharToMultiByte(CP_UTF8, 0, kernel_ver, -1, kver_utf8, sizeof(kver_utf8), NULL, NULL);
         snprintf(hdr, sizeof(hdr), "linux-headers-%s", kver_utf8);
         pkg_record_t *r = lookup_pkg(&T, hdr, strlen(hdr));
-        if (r && !r->in_closure) { r->in_closure = 1; closure_count++; }
+        if (!r) {
+            log_err(L"prefetch: required kernel headers '%hs' not in archive", hdr);
+            missing_required = 1;
+        } else if (!r->in_closure) {
+            r->in_closure = 1;
+            closure_count++;
+        }
     }
+    if (missing_required) return -1;
 
     /* ---- 5. BFS until stable ---- */
     int total_added = closure_count;
@@ -841,9 +933,9 @@ int do_prefetch_build_deps(const wchar_t *codename,
         write_closure_json(&T, cj, codename, kernel_ver);
     }
 
-    /* Clean up Packages.xz — we don't ship it (we wrote our own
-       synthetic Packages with closure entries only). */
-    DeleteFileW(pkgs_xz);
+    /* Do not ship the merged upstream indexes; only the synthetic
+       closure index belongs in the guest staging manifest. */
+    DeleteFileW(pkgs);
 
     free(T.buf);
     free(T.records);
