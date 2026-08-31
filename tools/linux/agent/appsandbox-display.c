@@ -193,7 +193,13 @@ static int drm_acquire_fb(struct capture_ctx *c)
             goto out;
         }
 
-        drmModeFB2 *fb2 = drmModeGetFB2(c->fd, p->fb_id);
+        /* Preserve the framebuffer id before freeing the plane.  Mutter
+         * rotates primary buffers continuously; reading p->fb_id after
+         * drmModeFreePlane() can tag the new mapping with stale heap data,
+         * making subsequent flips reuse the wrong (often initial blank)
+         * framebuffer. */
+        uint32_t fb_id = p->fb_id;
+        drmModeFB2 *fb2 = drmModeGetFB2(c->fd, fb_id);
         drmModeFreePlane(p);
         if (!fb2) continue;
 
@@ -223,7 +229,7 @@ static int drm_acquire_fb(struct capture_ctx *c)
         }
 
         drm_release_fb(c);
-        c->fb_id_last = p->fb_id;
+        c->fb_id_last = fb_id;
         c->width  = width;
         c->height = height;
         c->stride = pitch;

@@ -4,8 +4,8 @@
  * Runs as a new iso-patch.exe mode (--prefetch-build-deps) so we
  * don't depend on PowerShell being available on the host (corporate
  * AppLocker / ExecutionPolicy / etc. routinely block it). Pure
- * Win32 C: WinHTTP for downloads, tar.exe shell-out for gunzip,
- * BCrypt for SHA256.
+ * Win32 C: WinHTTP for downloads, vendored xz-embedded for index
+ * decompression, BCrypt for SHA256.
  */
 #ifndef PREFETCH_BUILD_DEPS_H
 #define PREFETCH_BUILD_DEPS_H
