@@ -266,12 +266,17 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
 static int build_host_info(char *buf, int cap)
 {
     SYSTEM_INFO si; MEMORYSTATUSEX ms; ULARGE_INTEGER freeB;
-    wchar_t pd[MAX_PATH];
+    wchar_t pd[MAX_PATH], vm_dir[MAX_PATH];
     int i, count, vmCores = 0, vmRamMb = 0, vmHddGb = 0;
     GetSystemInfo(&si);
     ms.dwLength = sizeof(ms); GlobalMemoryStatusEx(&ms);
-    if (!GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH)) wcscpy_s(pd, MAX_PATH, L"C:\\");
-    freeB.QuadPart = 0; GetDiskFreeSpaceExW(pd, &freeB, NULL, NULL);
+    /* Free space on the volume backing %ProgramData%\AppSandbox (follows a
+       junction when VM storage was redirected); fall back to the root. */
+    if (!GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH)) wcscpy_s(pd, MAX_PATH, L"C:\\ProgramData");
+    swprintf_s(vm_dir, MAX_PATH, L"%s\\AppSandbox", pd);
+    freeB.QuadPart = 0;
+    if (!GetDiskFreeSpaceExW(vm_dir, &freeB, NULL, NULL))
+        GetDiskFreeSpaceExW(pd, &freeB, NULL, NULL);
     count = asb_vm_count();
     for (i = 0; i < count; i++) {
         VmInstance *v = asb_vm_instance(asb_vm_get(i));

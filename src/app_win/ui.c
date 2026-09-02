@@ -131,7 +131,7 @@ static void build_host_info_json(JsonBuilder *jb)
     MEMORYSTATUSEX ms;
     DWORD host_cores, host_ram_mb;
     DWORD vm_cores = 0, vm_ram_mb = 0, vm_hdd_gb = 0;
-    wchar_t base_dir[MAX_PATH];
+    wchar_t base_dir[MAX_PATH], vm_dir[MAX_PATH];
     ULARGE_INTEGER free_bytes;
     DWORD free_gb = 0;
     int i, count = asb_vm_count();
@@ -148,9 +148,16 @@ static void build_host_info_json(JsonBuilder *jb)
         if (v) vm_hdd_gb += v->hdd_gb;
     }
 
+    /* Report free space on the volume that actually backs the VM data
+       directory (%ProgramData%\AppSandbox), not the %ProgramData% root.
+       Querying the leaf directory lets GetDiskFreeSpaceEx follow a junction /
+       mount point when the user has redirected VM storage to another drive.
+       Fall back to the root when the directory does not exist yet. */
     if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
         wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
-    if (GetDiskFreeSpaceExW(base_dir, &free_bytes, NULL, NULL))
+    swprintf_s(vm_dir, MAX_PATH, L"%s\\AppSandbox", base_dir);
+    if (GetDiskFreeSpaceExW(vm_dir, &free_bytes, NULL, NULL) ||
+        GetDiskFreeSpaceExW(base_dir, &free_bytes, NULL, NULL))
         free_gb = (DWORD)(free_bytes.QuadPart / (1024ULL * 1024 * 1024));
 
     jb_int(jb, L"hostCores", (int)host_cores);
