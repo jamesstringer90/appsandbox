@@ -20,8 +20,20 @@
 WSL_MESA=/opt/wsl-mesa
 WSL_MESA_LIB="$WSL_MESA/lib/x86_64-linux-gnu"
 WSL_LIB=/usr/lib/wsl/lib
+# Distro Mesa's own d3d12 gallium driver (Ubuntu builds it for WSL). Used
+# when no wsl-mesa prebuilt exists for this release (only 26.04 ships one;
+# firstboot removes an ABI-incompatible one). Needs libdxcore/libd3d12,
+# which firstboot puts on the loader path from /opt/appsandbox/wsl-deps.
+STOCK_D3D12=/usr/lib/x86_64-linux-gnu/dri/d3d12_dri.so
 
-if [ -e /dev/dxg ] && [ -d "$WSL_MESA_LIB" ]; then
+if [ -e /dev/dxg ] && [ ! -d "$WSL_MESA_LIB" ] && [ -e "$STOCK_D3D12" ]; then
+    echo "LD_LIBRARY_PATH=$WSL_LIB"
+    echo "GALLIUM_DRIVER=d3d12"
+    echo "MESA_LOADER_DRIVER_OVERRIDE=d3d12"
+    echo "__GLX_VENDOR_LIBRARY_NAME=mesa"
+    # No VK_DRIVER_FILES: stock mesa-vulkan-drivers has no dzn ICD on
+    # 24.04, so Vulkan stays on lavapipe. OpenGL apps still hit the GPU.
+elif [ -e /dev/dxg ] && [ -d "$WSL_MESA_LIB" ]; then
     # LD_LIBRARY_PATH covers two needs:
     #   - $WSL_MESA_LIB picks Mesa's d3d12 gallium + dzn Vulkan over stock.
     #   - $WSL_LIB lets apps that dlopen the WSL NVIDIA userspace libs by

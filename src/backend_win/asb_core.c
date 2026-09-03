@@ -1807,12 +1807,46 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
     return n;
 }
 
+/* Read the kernel release ("6.17.0-14-generic") out of an x86 bzImage's
+ * setup header: "HdrS" at 0x202, and the u16 at 0x20E is the offset (less
+ * 0x200) of a NUL-terminated "<release> (<builder>) #<n> ..." string.
+ * Returns FALSE for anything that is not a bzImage (e.g. an arm64 Image),
+ * in which case the caller falls back to scanning pool/. */
+static BOOL read_bzimage_release(const wchar_t *path, wchar_t *out, size_t cap)
+{
+    unsigned char *hdr = (unsigned char *)malloc(0x10000);
+    HANDLE h;
+    DWORD got = 0;
+    BOOL ok = FALSE;
+    size_t n = 0;
+    unsigned off;
+
+    if (!hdr) return FALSE;
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        ok = ReadFile(h, hdr, 0x10000, &got, NULL);
+        CloseHandle(h);
+    }
+    if (!ok || got < 0x210 || memcmp(hdr + 0x202, "HdrS", 4) != 0) { free(hdr); return FALSE; }
+    off = (unsigned)hdr[0x20E] | ((unsigned)hdr[0x20F] << 8);
+    if (off == 0) { free(hdr); return FALSE; }
+    off += 0x200;
+    while (off + n < got && hdr[off + n] > ' ' && n + 1 < cap) {
+        out[n] = (wchar_t)hdr[off + n];
+        n++;
+    }
+    out[n] = 0;
+    free(hdr);
+    return n > 0;
+}
+
 /* ---- Detect the Ubuntu release codename + kernel version from an ISO.
  *
  * Mounts the ISO read-only via VirtDisk, reads:
  *   - the only subdir under <iso>:\dists\        -> codename (e.g. "resolute")
- *   - <iso>:\pool\main\l\linux\linux-image-*-generic_*.deb
- *     -> kernel version (e.g. "7.0.0-14-generic") parsed from filename
+ *   - <iso>:\casper\vmlinuz                       -> kernel version (e.g.
+ *     "7.0.0-14-generic") from the bzImage header; falls back to the
+ *     linux-headers-*-generic_*.deb filename under <iso>:\pool\main\l\linux\
  *
  * Returns 0 on success and fills the two output buffers; non-zero on
  * any error (caller logs + skips the build-deps prefetch).
@@ -1930,7 +1964,24 @@ static int detect_iso_kernel(const wchar_t *iso_path,
         }
     }
 
-    /* 2. Kernel version from linux-headers-<X.Y.Z-generic>_*_amd64.deb
+    /* 2a. Preferred: the kernel that will actually boot. iso-patch stages
+     *     whatever /boot/vmlinuz-* it finds (minimal.squashfs on 26.04, the
+     *     live overlay on 24.04) and on Ubuntu ISOs that is the same build
+     *     as casper/vmlinuz. Reading the release out of the bzImage header
+     *     keeps the prefetched linux-headers-<kver> in step with the guest's
+     *     uname -r. (On 24.04 pool/main/l/linux/ holds the GA 6.8 headers
+     *     while the ISO boots the HWE 6.17 kernel, so the pool scan below
+     *     would pick the wrong one.) */
+    {
+        wchar_t vmlinuz[MAX_PATH];
+        swprintf_s(vmlinuz, MAX_PATH, L"%c:\\casper\\vmlinuz", iso_drive);
+        if (read_bzimage_release(vmlinuz, kver_out, kver_cap))
+            asb_log(L"detect_iso_kernel: casper/vmlinuz is %s", kver_out);
+        else
+            kver_out[0] = 0;
+    }
+
+    /* 2b. Fallback: kernel version from linux-headers-<X.Y.Z-generic>_*_amd64.deb
      *    in pool/main/l/linux/. We use linux-headers- not linux-image-
      *    because the image .deb lives under pool/main/l/linux-signed/
      *    on signed-kernel Ubuntu releases, but the headers (which we
@@ -1942,7 +1993,7 @@ static int detect_iso_kernel(const wchar_t *iso_path,
      *
      *    FindFirstFileW doesn't reliably handle multi-`*` patterns on
      *    ISO 9660; glob with single wildcard and filter for "-generic_". */
-    {
+    if (!kver_out[0]) {
         wchar_t spec[MAX_PATH];
         swprintf_s(spec, MAX_PATH,
             L"%c:\\pool\\main\\l\\linux\\linux-headers-*.deb", iso_drive);
@@ -2003,15 +2054,59 @@ static int spawn_iso_patch_prefetch(const wchar_t *args)
     swprintf_s(cmdline, 2048,
         L"\"%s\\iso-patch.exe\" %s", exe_dir, args);
 
+    /* Capture stdout/stderr so a failed prefetch says WHY in the app log
+       (previously the child's output went nowhere and the only trace was
+       "WARN: prefetch-... failed"). Per-file "GET" chatter is dropped;
+       summary STATUS: lines and every ERROR: line are forwarded. */
+    HANDLE hRead = INVALID_HANDLE_VALUE, hWrite = INVALID_HANDLE_VALUE;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    BOOL capture = CreatePipe(&hRead, &hWrite, &sa, 0);
+    if (capture) SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
+    if (capture) {
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+        si.hStdOutput = hWrite;
+        si.hStdError  = hWrite;
+    }
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, capture,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         asb_log(L"prefetch: CreateProcess failed (%lu) for: %s",
                 GetLastError(), cmdline);
+        if (capture) { CloseHandle(hRead); CloseHandle(hWrite); }
         return -1;
+    }
+    if (capture) {
+        CloseHandle(hWrite);
+        char buf[4096];
+        int pos = 0;
+        DWORD n = 0;
+        while (ReadFile(hRead, buf + pos, (DWORD)(sizeof(buf) - pos - 1), &n, NULL) && n > 0) {
+            int end = pos + (int)n, start = 0;
+            buf[end] = '\0';
+            for (int i = 0; i < end; i++) {
+                if (buf[i] != '\n' && buf[i] != '\r') continue;
+                buf[i] = '\0';
+                if (i > start) {
+                    const char *line = buf + start;
+                    if (strncmp(line, "ERROR:", 6) == 0)
+                        asb_log(L"iso-patch: ERROR: %S", line + 6);
+                    else if (strncmp(line, "STATUS:", 7) == 0 &&
+                             strncmp(line + 7, "prefetch: GET ", 14) != 0 &&
+                             strncmp(line + 7, "xz_decompress", 13) != 0)
+                        asb_log(L"iso-patch: %S", line + 7);
+                }
+                start = i + 1;
+            }
+            if (start < end) { memmove(buf, buf + start, end - start); pos = end - start; }
+            else pos = 0;
+            if (pos >= (int)sizeof(buf) - 1) pos = 0;   /* overlong line: drop it */
+        }
+        CloseHandle(hRead);
     }
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD ec = 1;
@@ -2119,11 +2214,19 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
                             if (g_progress_cb && pvm)
                                 g_progress_cb(vm_handle(pvm), pct, is_staging, g_progress_ud);
                         } else if (strncmp(line, "ERROR:", 6) == 0) {
+                            asb_log(L"iso-patch: ERROR: %S", line + 6);
                             if (error_msg && error_msg[0] == L'\0')
                                 MultiByteToWideChar(CP_ACP, 0, line + 6, -1, error_msg, (int)error_msg_cap);
                             result = E_FAIL;
                         } else if (strncmp(line, "DONE:", 5) == 0) {
                             result = S_OK;
+                        } else if (strncmp(line, "STATUS:", 7) == 0) {
+                            /* Unlike the Windows --to-vhdx path there is no
+                               in-guest installer log to fall back on, so the
+                               iso-patch status lines (source squashfs, detected
+                               kernel, ingest totals, ...) are the only host-side
+                               record of how the Linux disk was built. */
+                            asb_log(L"iso-patch: %S", line + 7);
                         }
                     }
                     start = ci + 1;

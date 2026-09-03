@@ -32,6 +32,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -230,14 +231,31 @@ static int parse_url(const wchar_t *url,
     return 0;
 }
 
+/* log_err() or log_msg() depending on `quiet`: a failed attempt that is
+ * going to be retried, or an optional resource, should not surface as an
+ * ERROR: line in the app log. */
+static void dl_log(int quiet, const wchar_t *fmt, ...)
+{
+    wchar_t buf[2304];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnwprintf_s(buf, ARRAYSIZE(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    if (quiet) log_msg(L"%s", buf);
+    else       log_err(L"%s", buf);
+}
+
 /* HTTP GET <url> -> file. Returns 0 on success. Uses a persistent
- * connection per-call (simple; for one-shot fetches this is fine). */
-static int http_download(const wchar_t *url, const wchar_t *out_path)
+ * connection per-call (simple; for one-shot fetches this is fine).
+ * quiet_http: report failures as STATUS: instead of ERROR: - for
+ * optional resources (e.g. a -updates pocket that may not exist) and
+ * for attempts that will be retried. */
+static int http_download_ex(const wchar_t *url, const wchar_t *out_path, int quiet_http)
 {
     wchar_t host[256], path[2048];
     INTERNET_PORT port = 80;
     if (parse_url(url, host, ARRAYSIZE(host), &port, path, ARRAYSIZE(path)) != 0) {
-        log_err(L"prefetch: bad URL: %s", url);
+        dl_log(quiet_http, L"prefetch: bad URL: %s", url);
         return -1;
     }
 
@@ -245,26 +263,26 @@ static int http_download(const wchar_t *url, const wchar_t *out_path)
                                      WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                      WINHTTP_NO_PROXY_NAME,
                                      WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) { log_err(L"prefetch: WinHttpOpen failed: %lu", GetLastError()); return -1; }
+    if (!hSession) { dl_log(quiet_http, L"prefetch: WinHttpOpen failed: %lu", GetLastError()); return -1; }
 
     int rc = -1;
     HINTERNET hConn = WinHttpConnect(hSession, host, port, 0);
-    if (!hConn) { log_err(L"prefetch: WinHttpConnect %s:%u failed: %lu", host, port, GetLastError()); goto cleanup_sess; }
+    if (!hConn) { dl_log(quiet_http, L"prefetch: WinHttpConnect %s:%u failed: %lu", host, port, GetLastError()); goto cleanup_sess; }
 
     DWORD reqFlags = (port == 443) ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET hReq = WinHttpOpenRequest(hConn, L"GET", path, NULL,
                                         WINHTTP_NO_REFERER,
                                         WINHTTP_DEFAULT_ACCEPT_TYPES,
                                         reqFlags);
-    if (!hReq) { log_err(L"prefetch: WinHttpOpenRequest failed: %lu", GetLastError()); goto cleanup_conn; }
+    if (!hReq) { dl_log(quiet_http, L"prefetch: WinHttpOpenRequest failed: %lu", GetLastError()); goto cleanup_conn; }
 
     if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                             WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-        log_err(L"prefetch: WinHttpSendRequest %s failed: %lu", url, GetLastError());
+        dl_log(quiet_http, L"prefetch: WinHttpSendRequest %s failed: %lu", url, GetLastError());
         goto cleanup_req;
     }
     if (!WinHttpReceiveResponse(hReq, NULL)) {
-        log_err(L"prefetch: WinHttpReceiveResponse failed: %lu", GetLastError());
+        dl_log(quiet_http, L"prefetch: WinHttpReceiveResponse failed: %lu", GetLastError());
         goto cleanup_req;
     }
 
@@ -274,14 +292,15 @@ static int http_download(const wchar_t *url, const wchar_t *out_path)
                         WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusLen,
                         WINHTTP_NO_HEADER_INDEX);
     if (status != 200) {
-        log_err(L"prefetch: HTTP %lu for %s", status, url);
+        if (quiet_http) log_msg(L"prefetch: HTTP %lu for %s", status, url);
+        else            dl_log(quiet_http, L"prefetch: HTTP %lu for %s", status, url);
         goto cleanup_req;
     }
 
     HANDLE hFile = CreateFileW(out_path, GENERIC_WRITE, 0, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
-        log_err(L"prefetch: CreateFileW(%s) failed: %lu", out_path, GetLastError());
+        dl_log(quiet_http, L"prefetch: CreateFileW(%s) failed: %lu", out_path, GetLastError());
         goto cleanup_req;
     }
 
@@ -290,20 +309,20 @@ static int http_download(const wchar_t *url, const wchar_t *out_path)
     for (;;) {
         DWORD avail = 0;
         if (!WinHttpQueryDataAvailable(hReq, &avail)) {
-            log_err(L"prefetch: WinHttpQueryDataAvailable failed: %lu", GetLastError());
+            dl_log(quiet_http, L"prefetch: WinHttpQueryDataAvailable failed: %lu", GetLastError());
             CloseHandle(hFile); goto cleanup_req;
         }
         if (avail == 0) break;
         DWORD n = avail > sizeof(buf) ? sizeof(buf) : avail;
         DWORD read = 0;
         if (!WinHttpReadData(hReq, buf, n, &read)) {
-            log_err(L"prefetch: WinHttpReadData failed: %lu", GetLastError());
+            dl_log(quiet_http, L"prefetch: WinHttpReadData failed: %lu", GetLastError());
             CloseHandle(hFile); goto cleanup_req;
         }
         if (read == 0) break;
         DWORD wrote = 0;
         if (!WriteFile(hFile, buf, read, &wrote, NULL) || wrote != read) {
-            log_err(L"prefetch: WriteFile failed: %lu", GetLastError());
+            dl_log(quiet_http, L"prefetch: WriteFile failed: %lu", GetLastError());
             CloseHandle(hFile); goto cleanup_req;
         }
         total += read;
@@ -315,6 +334,52 @@ cleanup_req:  WinHttpCloseHandle(hReq);
 cleanup_conn: WinHttpCloseHandle(hConn);
 cleanup_sess: WinHttpCloseHandle(hSession);
     return rc;
+}
+
+/* Retry transient failures (DNS hiccups, dropped connections, mirror
+ * 5xx): 3 attempts with a short back-off. Only the last attempt is
+ * allowed to log ERROR:. One flaky GET out of ~180 used to abort the
+ * whole prefetch and leave the guest without any build tools. */
+#define DL_ATTEMPTS 3
+static int http_download_retry(const wchar_t *url, const wchar_t *out_path, int quiet_http)
+{
+    for (int attempt = 1; attempt <= DL_ATTEMPTS; attempt++) {
+        int last = (attempt == DL_ATTEMPTS);
+        if (http_download_ex(url, out_path, quiet_http || !last) == 0) return 0;
+        DeleteFileW(out_path);
+        if (!last) {
+            log_msg(L"prefetch: retry %d/%d for %s", attempt + 1, DL_ATTEMPTS, url);
+            Sleep(2000UL * (DWORD)attempt);
+        }
+    }
+    return -1;
+}
+
+static int http_download(const wchar_t *url, const wchar_t *out_path)
+{
+    return http_download_retry(url, out_path, 0);
+}
+
+/* Read a whole file into a malloc'd, NUL-terminated buffer. */
+static int slurp_file(const wchar_t *path, char **buf_out, size_t *len_out)
+{
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart > 0x7fffffff) { CloseHandle(h); return -1; }
+    size_t len = (size_t)sz.QuadPart;
+    char *buf = (char *)malloc(len + 1);
+    if (!buf) { CloseHandle(h); return -1; }
+    DWORD br = 0;
+    if (len > 0 && (!ReadFile(h, buf, (DWORD)len, &br, NULL) || br != len)) {
+        free(buf); CloseHandle(h); return -1;
+    }
+    CloseHandle(h);
+    buf[len] = 0;
+    *buf_out = buf;
+    *len_out = len;
+    return 0;
 }
 
 /* ====================================================================
@@ -683,10 +748,10 @@ static int write_closure_json(pkg_table_t *t,
  * Main entry point
  * ==================================================================== */
 
-int do_prefetch_build_deps(const wchar_t *codename,
-                           const wchar_t *kernel_ver,
-                           const wchar_t *out_dir,
-                           const wchar_t *mirror_arg)
+static int prefetch_build_deps_inner(const wchar_t *codename,
+                                     const wchar_t *kernel_ver,
+                                     const wchar_t *out_dir,
+                                     const wchar_t *mirror_arg)
 {
     const wchar_t *mirror = mirror_arg ? mirror_arg
                                        : L"http://archive.ubuntu.com/ubuntu";
@@ -719,22 +784,55 @@ int do_prefetch_build_deps(const wchar_t *codename,
         return -1;
     }
 
-    /* ---- 3. Slurp Packages into memory + parse ---- */
+    /* ---- 2b. <codename>-updates as well.
+       Point-release ISOs (24.04.4, ...) are built from the -updates
+       pocket, so the base system already carries e.g. libasound2t64
+       1.2.11-1ubuntu0.1 while the release pocket's libasound2-dev pins
+       "= 1.2.11-1build2": apt in the guest then refuses the whole build
+       tool set. Merging the -updates index (preferred over the release
+       one, see step 3) keeps the closure in step with the ISO. A fresh
+       LTS without a -updates pocket yet simply skips this. ---- */
+    wchar_t pkgs_upd_xz[MAX_PATH], pkgs_upd[MAX_PATH];
+    int have_updates = 0;
+    swprintf_s(pkgs_upd_xz, MAX_PATH, L"%s\\Packages-updates.xz", staging);
+    swprintf_s(pkgs_upd,    MAX_PATH, L"%s\\Packages-updates",    staging);
+    swprintf_s(url, 1024, L"%s/dists/%s-updates/main/binary-" IP_DEB_ARCH L"/Packages.xz",
+               mirror, codename);
+    log_msg(L"prefetch: GET %s", url);
+    if (http_download_retry(url, pkgs_upd_xz, 1) == 0 &&
+        xz_decompress_file_to_file(pkgs_upd_xz, pkgs_upd) == 0) {
+        have_updates = 1;
+    } else {
+        log_msg(L"prefetch: WARN no usable %s-updates index - using the release pocket only",
+                codename);
+    }
+
+    /* ---- 3. Slurp Packages (+ Packages-updates) into memory + parse ---- */
     pkg_table_t T = { 0 };
     {
-        HANDLE h = CreateFileW(pkgs, GENERIC_READ, FILE_SHARE_READ, NULL,
-                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (h == INVALID_HANDLE_VALUE) { log_err(L"prefetch: open Packages failed"); return -1; }
-        LARGE_INTEGER sz; GetFileSizeEx(h, &sz);
-        T.buf_len = (size_t)sz.QuadPart;
-        T.buf = (char *)malloc(T.buf_len + 1);
-        if (!T.buf) { CloseHandle(h); return -1; }
-        DWORD br = 0;
-        if (!ReadFile(h, T.buf, (DWORD)T.buf_len, &br, NULL) || br != T.buf_len) {
-            log_err(L"prefetch: read Packages failed"); CloseHandle(h); return -1;
+        char *base_buf = NULL, *upd_buf = NULL;
+        size_t base_len = 0, upd_len = 0;
+        if (slurp_file(pkgs, &base_buf, &base_len) != 0) {
+            log_err(L"prefetch: read Packages failed");
+            return -1;
         }
+        if (have_updates && slurp_file(pkgs_upd, &upd_buf, &upd_len) != 0) {
+            log_msg(L"prefetch: WARN read Packages-updates failed - ignoring it");
+            upd_buf = NULL; upd_len = 0;
+        }
+        /* Release pocket first, -updates after it. parse_packages()
+           prepends every stanza to its hash chain, so for a name present
+           in both pockets lookup_pkg() returns the -updates record. */
+        T.buf_len = base_len + 2 + upd_len;
+        T.buf = (char *)malloc(T.buf_len + 1);
+        if (!T.buf) { free(base_buf); free(upd_buf); return -1; }
+        memcpy(T.buf, base_buf, base_len);
+        T.buf[base_len] = '\n';
+        T.buf[base_len + 1] = '\n';
+        if (upd_len) memcpy(T.buf + base_len + 2, upd_buf, upd_len);
         T.buf[T.buf_len] = 0;
-        CloseHandle(h);
+        free(base_buf);
+        free(upd_buf);
     }
     if (parse_packages(&T) != 0) { log_err(L"prefetch: parse failed"); return -1; }
     log_msg(L"prefetch: parsed %zu package records", T.n_records);
@@ -743,7 +841,18 @@ int do_prefetch_build_deps(const wchar_t *codename,
     const char *seeds[] = {
         "libasound2-dev", "libxcb1-dev", "libxcb-xfixes0-dev",
         "libdrm-dev", "pkg-config",
-        "openssh-server"  /* for ssh_enabled VMs; firstboot installs conditionally */
+        "openssh-server",  /* for ssh_enabled VMs; firstboot installs conditionally */
+        /* The ISO pool carries build-essential/gcc/dkms but not always their
+           whole closure (24.04.4: no libstdc++-13-dev / libgcc-13-dev /
+           cpp-13), and on point releases the pool is a -updates snapshot,
+           so the closure has to come from the same pocket to satisfy the
+           strict "= version" Depends. Seeding them here (rather than
+           relying on the pool) makes firstboot STEP 7.4 self-contained. */
+        "build-essential", "dkms",
+        /* Layered ISOs (24.04): the kernel is staged from the ISO's live layer
+           and firstboot STEP 7.6 tries to register it with dpkg. linux-image
+           needs initramfs-tools + linux-base, which the 24.04 ISO pool lacks. */
+        "initramfs-tools", "linux-base"
     };
     int closure_count = 0;
     for (size_t i = 0; i < sizeof(seeds) / sizeof(seeds[0]); i++) {
@@ -842,11 +951,34 @@ int do_prefetch_build_deps(const wchar_t *codename,
     }
 
     /* Clean up Packages.xz — we don't ship it (we wrote our own
-       synthetic Packages with closure entries only). */
+       synthetic Packages with closure entries only). Same for the
+       -updates index. */
     DeleteFileW(pkgs_xz);
+    DeleteFileW(pkgs_upd_xz);
+    DeleteFileW(pkgs_upd);
 
     free(T.buf);
     free(T.records);
     log_msg(L"prefetch: OK -> %s", out_dir);
     return 0;
+}
+
+int do_prefetch_build_deps(const wchar_t *codename,
+                           const wchar_t *kernel_ver,
+                           const wchar_t *out_dir,
+                           const wchar_t *mirror_arg)
+{
+    int rc = prefetch_build_deps_inner(codename, kernel_ver, out_dir, mirror_arg);
+    if (rc != 0) {
+        /* A partial staging dir is worse than none: the raw Packages index
+           downloaded in step 1 lists the release-pocket versions with
+           archive Filename: paths, and apt in the guest happily picks
+           those "= version" candidates over the ISO pool - then fails on
+           every build tool. Leave an empty dir so firstboot reports
+           "no local-apt-extras (host prefetch failed)" instead. */
+        log_msg(L"prefetch: failed - discarding partial output in %s", out_dir);
+        u_rmdir_recursive(out_dir);
+        u_mkdir_p(out_dir);
+    }
+    return rc;
 }

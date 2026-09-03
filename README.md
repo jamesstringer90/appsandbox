@@ -7,7 +7,7 @@ App Sandbox is a virtual machine app for Windows and macOS that's focused on per
 
 Windows features:
 - Works on Windows 11 Home or Pro, without Hyper-V
-- Windows 11 or Ubuntu 26.04 LTS VM Support
+- Windows 11 or Ubuntu 24.04 / 26.04 LTS VM Support
 - Zero touch install
 - Copy and Paste
 - 2 Channel Audio

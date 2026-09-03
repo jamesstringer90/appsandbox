@@ -23,8 +23,17 @@ WSL_MESA=/opt/wsl-mesa
 WSL_MESA_LIB="$WSL_MESA/lib/x86_64-linux-gnu"
 WSL_MESA_VK_ICD="$WSL_MESA/share/vulkan/icd.d/dzn_icd.x86_64.json"
 WSL_LIB=/usr/lib/wsl/lib
+# Distro Mesa's d3d12 driver: the fallback when this release has no
+# wsl-mesa prebuilt (see 50-appsandbox-gpu). OpenGL only; Vulkan stays
+# on lavapipe because stock mesa-vulkan-drivers ships no dzn ICD.
+STOCK_D3D12=/usr/lib/x86_64-linux-gnu/dri/d3d12_dri.so
 
-if [ -e /dev/dxg ] && [ -d "$WSL_MESA_LIB" ]; then
+if [ -e /dev/dxg ] && [ ! -d "$WSL_MESA_LIB" ] && [ -e "$STOCK_D3D12" ]; then
+    export LD_LIBRARY_PATH="$WSL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export __GLX_VENDOR_LIBRARY_NAME=mesa
+    export GALLIUM_DRIVER=d3d12
+    export MESA_LOADER_DRIVER_OVERRIDE=d3d12
+elif [ -e /dev/dxg ] && [ -d "$WSL_MESA_LIB" ]; then
     # LD_LIBRARY_PATH covers two needs:
     #   - $WSL_MESA_LIB picks Mesa's d3d12 gallium + dzn Vulkan over stock.
     #   - $WSL_LIB lets apps that dlopen the WSL NVIDIA userspace libs by

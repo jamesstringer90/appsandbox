@@ -581,6 +581,13 @@ typedef struct {
     uint32_t           total_entries;
 
     char               kernel_version[64];
+    uint64_t           kernel_size;     /* size of the /boot/vmlinuz-* seen */
+
+    /* Optional include filter: NULL-terminated list of path prefixes. When
+       set, the producer only ingests entries whose path starts with one of
+       them. Used by the layered-ISO fallback to pull just the kernel +
+       modules out of the live overlay. NULL = ingest everything. */
+    const char *const *include_prefixes;
 
     work_queue_t       wq;
     HANDLE             workers[DECOMPRESS_WORKERS_MAX];
@@ -719,6 +726,14 @@ static int producer_cb(const sqfs_entry_t *e, void *user)
 
     if (e->path[0] == 0) return 0;
 
+    if (p->include_prefixes) {
+        int keep = 0;
+        for (const char *const *pp = p->include_prefixes; *pp; pp++) {
+            if (strncmp(e->path, *pp, strlen(*pp)) == 0) { keep = 1; break; }
+        }
+        if (!keep) return 0;
+    }
+
     if (p->kernel_version[0] == 0) {
         const char *m = strstr(e->path, "/boot/vmlinuz-");
         if (m) {
@@ -727,6 +742,7 @@ static int producer_cb(const sqfs_entry_t *e, void *user)
             while (v[n] && v[n] != '/' && n < sizeof(p->kernel_version) - 1) n++;
             memcpy(p->kernel_version, v, n);
             p->kernel_version[n] = 0;
+            p->kernel_size = e->size;
             log_msg(L"detected kernel from squashfs: %hs (path=%hs)",
                     p->kernel_version, e->path);
         }
@@ -820,13 +836,15 @@ static DWORD WINAPI consumer_thread(LPVOID arg)
                the post-ingest phases (grub modules install, manifest
                staging, ESP setup) which together take ~10-15 s vs the
                ~2-minute ingest. */
-            int pct = 10;
+            /* total_entries == 0 means "no meaningful total" (filtered
+               ingest of an overlay layer): keep the previous percentage
+               instead of snapping the bar back to 10. */
             if (p->total_entries > 0) {
                 uint64_t frac = ((uint64_t)p->n_processed * 65ULL) / p->total_entries;
-                pct = 10 + (int)frac;
+                int pct = 10 + (int)frac;
                 if (pct > 75) pct = 75;
+                log_progress(pct, L"Building rootfs");
             }
-            log_progress(pct, L"Building rootfs");
             last_progress = now;
         }
 
@@ -1313,6 +1331,33 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "    apt-cache policy $APT_OPTS 2>&1 | head -30\n"
         "fi\n"
         "\n"
+        "# --- STEP 7.6: register the ISO-staged kernel with dpkg (layered ISOs) ---\n"
+        "# On ISOs whose minimal.squashfs has no kernel (24.04), iso-patch staged\n"
+        "# /boot/vmlinuz-$KVER + /usr/lib/modules/$KVER from the live layer and\n"
+        "# casper/initrd as /boot/initrd.img-$KVER. That boots (boot=local), but\n"
+        "# dpkg knows nothing about it. If the local mirrors can satisfy the\n"
+        "# kernel packages, install them so dpkg owns the files and a regular\n"
+        "# initrd gets generated. Best-effort: on any failure the ISO initrd +\n"
+        "# the boot=local grub drop-in keep working.\n"
+        "if [ -f /etc/appsandbox-kernel-from-iso ]; then\n"
+        "    echo \"==== STEP 7.6: register ISO-staged kernel $TGT_KVER with dpkg ====\"\n"
+        "    KPKGS=\"linux-image-$TGT_KVER linux-modules-$TGT_KVER linux-modules-extra-$TGT_KVER\"\n"
+        "    cp -f \"/boot/initrd.img-$TGT_KVER\" \"/boot/initrd.img-$TGT_KVER.iso\" 2>/dev/null || true\n"
+        "    if DEBIAN_FRONTEND=noninteractive apt-get install -y $APT_OPTS --dry-run $KPKGS >/dev/null 2>&1; then\n"
+        "        if DEBIAN_FRONTEND=noninteractive apt-get install -y $APT_OPTS $KPKGS 2>&1 | tail -10; then\n"
+        "            echo \"OK: kernel packages registered with dpkg\"\n"
+        "        else\n"
+        "            echo \"WARN: kernel package install failed (rc=$?) - keeping ISO initrd\"\n"
+        "        fi\n"
+        "    else\n"
+        "        echo \"SKIP STEP 7.6: kernel packages not resolvable from local apt - keeping ISO initrd\"\n"
+        "    fi\n"
+        "    if [ ! -s \"/boot/initrd.img-$TGT_KVER\" ] && [ -s \"/boot/initrd.img-$TGT_KVER.iso\" ]; then\n"
+        "        cp -f \"/boot/initrd.img-$TGT_KVER.iso\" \"/boot/initrd.img-$TGT_KVER\"\n"
+        "        echo \"WARN: restored ISO initrd\"\n"
+        "    fi\n"
+        "fi\n"
+        "\n"
         "# --- STEP 7.5: optional openssh-server (gated on host marker) ---\n"
         "# Host drops /etc/appsandbox-ssh-enabled in the manifest when the\n"
         "# user requested SSH. openssh-server came in through prefetch-build-deps.\n"
@@ -1452,11 +1497,28 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "        zstd -d \"$EXTRAS/wsl-mesa.tar.zst\" -c | tar -C / -x \\\n"
         "          && echo \"OK: wsl-mesa extracted to /opt/wsl-mesa\" \\\n"
         "          || echo \"FAIL: wsl-mesa extract\"\n"
-        "        echo /opt/wsl-mesa/lib/" IP_MULTIARCH_A " > /etc/ld.so.conf.d/wsl-mesa.conf\n"
-        "        install -d /etc/vulkan/icd.d\n"
-        "        if [ -f /opt/wsl-mesa/share/vulkan/icd.d/" IP_DZN_ICD_A " ]; then\n"
-        "            ln -sf /opt/wsl-mesa/share/vulkan/icd.d/" IP_DZN_ICD_A " \\\n"
-        "                   /etc/vulkan/icd.d/" IP_DZN_ICD_A "\n"
+        "        # The prebuilt is tied to the release it was built on (26.04:\n"
+        "        # Mesa 25.3 against LLVM 21). Putting it on ld.so.conf shadows the\n"
+        "        # distro Mesa for every process, so if its libraries do not\n"
+        "        # resolve here mutter cannot even create a GBM device and the\n"
+        "        # desktop never comes up (black display). Check before activating;\n"
+        "        # on a mismatch drop it and stay on stock Mesa, whose own d3d12\n"
+        "        # driver still gives OpenGL apps the host GPU (see 50-appsandbox-gpu).\n"
+        "        MISSING=$(ldd /opt/wsl-mesa/lib/" IP_MULTIARCH_A "/libgallium-*.so \\\n"
+        "                      /opt/wsl-mesa/lib/" IP_MULTIARCH_A "/libgbm.so.1 2>/dev/null \\\n"
+        "                  | grep 'not found' | awk '{print $1}' | sort -u | tr '\\n' ' ')\n"
+        "        if [ -n \"$MISSING\" ]; then\n"
+        "            echo \"WARN: wsl-mesa prebuilt needs libraries this release lacks: $MISSING\"\n"
+        "            echo \"WARN: removing /opt/wsl-mesa - desktop + apps use the distro Mesa\"\n"
+        "            rm -rf /opt/wsl-mesa\n"
+        "            rm -f /etc/ld.so.conf.d/wsl-mesa.conf\n"
+        "        else\n"
+        "            echo /opt/wsl-mesa/lib/" IP_MULTIARCH_A " > /etc/ld.so.conf.d/wsl-mesa.conf\n"
+        "            install -d /etc/vulkan/icd.d\n"
+        "            if [ -f /opt/wsl-mesa/share/vulkan/icd.d/" IP_DZN_ICD_A " ]; then\n"
+        "                ln -sf /opt/wsl-mesa/share/vulkan/icd.d/" IP_DZN_ICD_A " \\\n"
+        "                       /etc/vulkan/icd.d/" IP_DZN_ICD_A "\n"
+        "            fi\n"
         "        fi\n"
         "    fi\n"
         "else\n"
@@ -1645,6 +1707,26 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "echo \"  timezone: $(cat /etc/timezone 2>/dev/null)\"\n"
         "set -x\n"
         "\n"
+        "# --- STEP 98: ext4 journal for / ---\n"
+        "# iso-patch's ext4 writer lays the root fs down without a journal. That\n"
+        "# is fine for the build, but an unclean stop of the running VM (Force\n"
+        "# Stop, host crash) then needs a full fsck, and a journal-less fs is\n"
+        "# far more likely to end up 'not clean with errors' and stall the next\n"
+        "# boot at a maintenance prompt. tune2fs can add the journal to the\n"
+        "# mounted root (it lands as a regular file and is adopted by the kernel\n"
+        "# on the next mount). fsck.repair=yes on the cmdline covers the rest.\n"
+        "echo \"==== STEP 98: ext4 journal on / ====\"\n"
+        "ROOTDEV=$(findmnt -n -o SOURCE / 2>/dev/null)\n"
+        "if [ -b \"$ROOTDEV\" ] && ! tune2fs -l \"$ROOTDEV\" 2>/dev/null | grep -q has_journal; then\n"
+        "    if tune2fs -O has_journal \"$ROOTDEV\" 2>&1 | tail -3; then\n"
+        "        echo \"OK: journal added to $ROOTDEV\"\n"
+        "    else\n"
+        "        echo \"WARN: tune2fs -O has_journal $ROOTDEV failed (rc=$?)\"\n"
+        "    fi\n"
+        "else\n"
+        "    echo \"SKIP STEP 98: $ROOTDEV already has a journal (or not a block device)\"\n"
+        "fi\n"
+        "\n"
         "# --- STEP 99: Mark done + reboot ---\n"
         "echo \"==== STEP 99: mark done + reboot ====\"\n"
         "mkdir -p /var/lib || true\n"
@@ -1765,6 +1847,269 @@ static int stage_manifest_into_rootfs(const wchar_t *manifest_path,
     }
     fclose(f);
     return count;
+}
+
+/* ======================================================================
+ *  Squashfs -> ext4 ingest driver.
+ *
+ *  Runs the producer / decompress-worker / consumer pipeline over one
+ *  squashfs. include_prefixes == NULL ingests everything (the rootfs
+ *  layer); a NULL-terminated prefix list ingests only matching paths
+ *  (used to lift the kernel + modules out of an overlay layer).
+ *
+ *  Returns 0 when the walk completed with no per-entry errors, else -1.
+ *  On return all threads are joined and the sync objects destroyed; the
+ *  caller still owns sq and ew. kernel_ver is only written when a
+ *  /boot/vmlinuz-<ver> was seen.
+ * ====================================================================== */
+static int ingest_squashfs(sqfs_ctx_t *sq, ext4_writer_t *ew,
+                           const char *const *include_prefixes,
+                           char *kernel_ver, size_t kernel_ver_cap,
+                           uint64_t *kernel_size_out)
+{
+    pipeline_t pl = { 0 };
+    pl.sq = sq;
+    pl.ew = ew;
+    pl.include_prefixes = include_prefixes;
+    /* Drives the progress %. A filtered walk has no meaningful total
+       (most entries are skipped), so leave it 0 = "don't report". */
+    pl.total_entries = include_prefixes ? 0 : sqfs_sb(sq)->inode_count;
+    InitializeCriticalSection(&pl.cs);
+    InitializeConditionVariable(&pl.cv_consumer);
+    InitializeConditionVariable(&pl.cv_producer);
+    InitializeCriticalSection(&pl.wq.cs);
+    InitializeConditionVariable(&pl.wq.cv_worker);
+    InitializeConditionVariable(&pl.wq.cv_walker);
+    pl.n_workers = decide_worker_count();
+    log_msg(L"ingest: %d decompress workers", pl.n_workers);
+
+    for (int wi = 0; wi < pl.n_workers; wi++) {
+        DWORD tid;
+        pl.workers[wi] = CreateThread(NULL, 0, decompress_worker, &pl, 0, &tid);
+        if (!pl.workers[wi]) {
+            log_err(L"CreateThread(worker) failed");
+            /* Stop + join the workers already created so they don't
+               dereference the stack-local 'pl' after we return. */
+            EnterCriticalSection(&pl.wq.cs);
+            pl.wq.stop = 1;
+            WakeAllConditionVariable(&pl.wq.cv_worker);
+            LeaveCriticalSection(&pl.wq.cs);
+            if (wi > 0) {
+                WaitForMultipleObjects(wi, pl.workers, TRUE, INFINITE);
+                for (int wj = 0; wj < wi; wj++) CloseHandle(pl.workers[wj]);
+            }
+            DeleteCriticalSection(&pl.cs);
+            DeleteCriticalSection(&pl.wq.cs);
+            return -1;
+        }
+    }
+    DWORD ctid;
+    HANDLE consumer = CreateThread(NULL, 0, consumer_thread, &pl, 0, &ctid);
+    if (!consumer) {
+        log_err(L"CreateThread(consumer) failed");
+        /* Stop + join all workers (no slots pushed yet; they are
+           blocked in work_queue_pop) before the stack-local 'pl' dies. */
+        EnterCriticalSection(&pl.wq.cs);
+        pl.wq.stop = 1;
+        WakeAllConditionVariable(&pl.wq.cv_worker);
+        LeaveCriticalSection(&pl.wq.cs);
+        WaitForMultipleObjects(pl.n_workers, pl.workers, TRUE, INFINITE);
+        for (int wi = 0; wi < pl.n_workers; wi++) CloseHandle(pl.workers[wi]);
+        DeleteCriticalSection(&pl.cs);
+        DeleteCriticalSection(&pl.wq.cs);
+        return -1;
+    }
+
+    int walk_rc = sqfs_walk(sq, producer_cb, &pl);
+    EnterCriticalSection(&pl.wq.cs);
+    pl.wq.stop = 1;
+    WakeAllConditionVariable(&pl.wq.cv_worker);
+    LeaveCriticalSection(&pl.wq.cs);
+    WaitForMultipleObjects(pl.n_workers, pl.workers, TRUE, INFINITE);
+    for (int wi = 0; wi < pl.n_workers; wi++) CloseHandle(pl.workers[wi]);
+
+    EnterCriticalSection(&pl.cs);
+    pl.stop = 1;
+    WakeConditionVariable(&pl.cv_consumer);
+    LeaveCriticalSection(&pl.cs);
+    WaitForSingleObject(consumer, INFINITE);
+    CloseHandle(consumer);
+
+    DeleteCriticalSection(&pl.cs);
+    DeleteCriticalSection(&pl.wq.cs);
+    log_msg(L"ingest: walk=%d files=%zu dirs=%zu syms=%zu special=%zu errors=%zu bytes=%.1f MiB",
+            walk_rc, pl.n_files, pl.n_dirs, pl.n_syms, pl.n_special, pl.n_errors,
+            (double)pl.bytes_total / (1024.0 * 1024.0));
+    /* The squashfs reader is the integrity detector: a non-zero walk_rc
+       means a structural traversal failure and n_errors counts per-file
+       data/decompress failures. Either one means the rootfs is only
+       partially ingested, so refuse to finalise it as success (leaving
+       exit_code = 1 deletes the incomplete VHDX in cleanup). */
+    if (walk_rc != 0 || pl.n_errors != 0) {
+        log_err(L"squashfs ingest incomplete (walk=%d errors=%zu): "
+                L"aborting, source image may be truncated or corrupt",
+                walk_rc, pl.n_errors);
+        return -1;
+    }
+    if (kernel_ver && pl.kernel_version[0]) {
+        strncpy(kernel_ver, pl.kernel_version, kernel_ver_cap - 1);
+        kernel_ver[kernel_ver_cap - 1] = 0;
+    }
+    if (kernel_size_out) *kernel_size_out = pl.kernel_size;
+    return 0;
+}
+
+/* Read a whole host file into a malloc'd buffer. Returns NULL on failure. */
+static void *u_read_whole_file(const wchar_t *path, uint64_t *size_out)
+{
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 0x7fffffff) {
+        CloseHandle(h);
+        return NULL;
+    }
+    void *buf = malloc((size_t)sz.QuadPart);
+    DWORD br = 0;
+    if (!buf || !ReadFile(h, buf, (DWORD)sz.QuadPart, &br, NULL) || br != sz.QuadPart) {
+        free(buf);
+        CloseHandle(h);
+        return NULL;
+    }
+    CloseHandle(h);
+    if (size_out) *size_out = (uint64_t)sz.QuadPart;
+    return buf;
+}
+
+/* ======================================================================
+ *  Layered-ISO kernel fallback.
+ *
+ *  Ubuntu Desktop ISOs from 23.04 on are "fsimage-layered": the installer
+ *  stacks casper/minimal.squashfs (base) + minimal.standard.squashfs +
+ *  minimal.standard.live.squashfs. On 26.04 the base layer already holds
+ *  /boot/vmlinuz-* + /boot/initrd.img-* + /usr/lib/modules/*, so the plain
+ *  ingest is bootable. On 24.04 the base layer has no kernel at all: it is
+ *  only in the live overlay, and the initrd only exists as casper/initrd.
+ *
+ *  This stages exactly those pieces on top of the already-ingested base:
+ *    /boot/vmlinuz-<ver>, /boot/System.map-<ver>, /boot/config-<ver>
+ *    /usr/lib/modules/<ver>/...            from the live overlay
+ *    /boot/initrd.img-<ver>                 = casper/initrd (the live initrd)
+ *
+ *  The live initrd defaults to BOOT=casper but honours boot= on the kernel
+ *  command line, so the bootstrap grub.cfg gets "boot=local" and a
+ *  /etc/default/grub.d drop-in keeps it there after update-grub. A marker
+ *  file lets the first-boot script register the kernel with dpkg when the
+ *  local apt mirrors can satisfy it (best-effort; the ISO initrd keeps
+ *  working either way).
+ *
+ *  Returns 0 and fills kernel_ver on success, -1 if the ISO has no usable
+ *  live layer / initrd.
+ * ====================================================================== */
+static int stage_kernel_from_live_layer(wchar_t iso_drive, ext4_writer_t *ew,
+                                        char *kernel_ver, size_t kernel_ver_cap)
+{
+    static const wchar_t *const layers[] = {
+        L"minimal.standard.live.squashfs",   /* 24.04 desktop */
+        L"minimal.live.squashfs",
+        L"filesystem.squashfs",              /* legacy single-layer ISOs */
+    };
+    static const char *const prefixes[] = {
+        "/boot/vmlinuz-",
+        "/boot/System.map-",
+        "/boot/config-",
+        "/usr/lib/modules/",
+        NULL
+    };
+    wchar_t sqfs_path[MAX_PATH] = { 0 };
+    const wchar_t *layer = NULL;
+
+    for (size_t i = 0; i < sizeof(layers) / sizeof(layers[0]); i++) {
+        swprintf(sqfs_path, MAX_PATH, L"%c:\\casper\\%s", iso_drive, layers[i]);
+        if (GetFileAttributesW(sqfs_path) != INVALID_FILE_ATTRIBUTES) {
+            layer = layers[i];
+            break;
+        }
+    }
+    if (!layer) {
+        log_msg(L"layered ISO: no live overlay layer found under casper/");
+        return -1;
+    }
+    log_msg(L"layered ISO: staging kernel + modules from casper/%s", layer);
+
+    /* The base layer of a layered ISO usually has no /usr/lib/modules at
+       all; the overlay's entries need their parent to exist. Idempotent. */
+    ext4_mkdir_p(ew, "/usr/lib/modules");
+
+    sqfs_ctx_t *sq = sqfs_open(sqfs_path);
+    if (!sq) {
+        log_msg(L"layered ISO: sqfs_open(%s) failed", sqfs_path);
+        return -1;
+    }
+    uint64_t kernel_size = 0;
+    int rc = ingest_squashfs(sq, ew, prefixes, kernel_ver, kernel_ver_cap, &kernel_size);
+    sqfs_close(sq);
+    if (rc != 0) return -1;
+    if (kernel_ver[0] == 0) {
+        log_msg(L"layered ISO: casper/%s has no /boot/vmlinuz-* either", layer);
+        return -1;
+    }
+
+    /* Initrd: the live one under casper/. Sanity-check that casper/vmlinuz
+       is the same build as the kernel we just staged (same size) - on
+       official Ubuntu ISOs they are identical files. */
+    {
+        wchar_t p[MAX_PATH];
+        swprintf(p, MAX_PATH, L"%c:\\casper\\vmlinuz", iso_drive);
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(p, GetFileExInfoStandard, &fad)) {
+            uint64_t sz = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+            if (sz != kernel_size)
+                log_msg(L"WARN: casper/vmlinuz (%llu bytes) differs from /boot/vmlinuz-%hs (%llu bytes); "
+                        L"casper/initrd may not match the staged kernel",
+                        (unsigned long long)sz, kernel_ver, (unsigned long long)kernel_size);
+        }
+    }
+    {
+        wchar_t p[MAX_PATH];
+        uint64_t initrd_size = 0;
+        swprintf(p, MAX_PATH, L"%c:\\casper\\initrd", iso_drive);
+        void *initrd = u_read_whole_file(p, &initrd_size);
+        if (!initrd) {
+            log_msg(L"layered ISO: cannot read %s", p);
+            return -1;
+        }
+        char dst[128];
+        snprintf(dst, sizeof(dst), "/boot/initrd.img-%s", kernel_ver);
+        int arc = ext4_writer_add_file(ew, dst, 0644, 0, 0, (uint32_t)time(NULL),
+                                       initrd, initrd_size);
+        free(initrd);
+        if (arc != 0) {
+            log_msg(L"layered ISO: staging %hs failed", dst);
+            return -1;
+        }
+        log_msg(L"layered ISO: casper/initrd (%.1f MiB) staged as %hs",
+                (double)initrd_size / (1024.0 * 1024.0), dst);
+    }
+
+    /* Keep boot=local on the cmdline after the guest regenerates grub.cfg,
+       and leave a marker for the first-boot script (STEP 7.6). */
+    {
+        static const char dropin[] =
+            "# Written by AppSandbox iso-patch: the kernel and initrd were staged\n"
+            "# from the ISO's live layer. The live initrd defaults to BOOT=casper\n"
+            "# unless told otherwise, so keep boot=local on the kernel cmdline.\n"
+            "GRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX boot=local\"\n";
+        ext4_mkdir_p(ew, "/etc/default/grub.d");
+        ext4_writer_add_file(ew, "/etc/default/grub.d/90-appsandbox-iso-kernel.cfg",
+                             0644, 0, 0, (uint32_t)time(NULL), dropin, sizeof(dropin) - 1);
+        char marker[80];
+        int n = snprintf(marker, sizeof(marker), "%s\n", kernel_ver);
+        ext4_writer_add_file(ew, "/etc/appsandbox-kernel-from-iso",
+                             0644, 0, 0, (uint32_t)time(NULL), marker, (uint64_t)n);
+    }
+    return 0;
 }
 
 /* ======================================================================
@@ -1990,6 +2335,7 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
     log_msg(L"root UUID: %hs", uuid_text);
 
     char kernel_ver[64] = { 0 };
+    int  kernel_from_iso = 0;
     {
         sqfs_ctx_t *sq = sqfs_open(sqfs_path);
         if (!sq) {
@@ -1997,92 +2343,36 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
             ext4_writer_close(ew);
             goto cleanup;
         }
-        pipeline_t pl = { 0 };
-        pl.sq = sq;
-        pl.ew = ew;
-        pl.total_entries = sqfs_sb(sq)->inode_count;   /* drives progress % */
-        InitializeCriticalSection(&pl.cs);
-        InitializeConditionVariable(&pl.cv_consumer);
-        InitializeConditionVariable(&pl.cv_producer);
-        InitializeCriticalSection(&pl.wq.cs);
-        InitializeConditionVariable(&pl.wq.cv_worker);
-        InitializeConditionVariable(&pl.wq.cv_walker);
-        pl.n_workers = decide_worker_count();
-        log_msg(L"ingest: %d decompress workers", pl.n_workers);
-
-        for (int wi = 0; wi < pl.n_workers; wi++) {
-            DWORD tid;
-            pl.workers[wi] = CreateThread(NULL, 0, decompress_worker, &pl, 0, &tid);
-            if (!pl.workers[wi]) {
-                log_err(L"CreateThread(worker) failed");
-                /* Stop + join the workers already created so they don't
-                   dereference the stack-local 'pl' after we return. */
-                EnterCriticalSection(&pl.wq.cs);
-                pl.wq.stop = 1;
-                WakeAllConditionVariable(&pl.wq.cv_worker);
-                LeaveCriticalSection(&pl.wq.cs);
-                if (wi > 0) {
-                    WaitForMultipleObjects(wi, pl.workers, TRUE, INFINITE);
-                    for (int wj = 0; wj < wi; wj++) CloseHandle(pl.workers[wj]);
-                }
-                DeleteCriticalSection(&pl.cs);
-                DeleteCriticalSection(&pl.wq.cs);
-                sqfs_close(sq); ext4_writer_close(ew); goto cleanup;
-            }
-        }
-        DWORD ctid;
-        HANDLE consumer = CreateThread(NULL, 0, consumer_thread, &pl, 0, &ctid);
-        if (!consumer) {
-            log_err(L"CreateThread(consumer) failed");
-            /* Stop + join all workers (no slots pushed yet; they are
-               blocked in work_queue_pop) before the stack-local 'pl' dies. */
-            EnterCriticalSection(&pl.wq.cs);
-            pl.wq.stop = 1;
-            WakeAllConditionVariable(&pl.wq.cv_worker);
-            LeaveCriticalSection(&pl.wq.cs);
-            WaitForMultipleObjects(pl.n_workers, pl.workers, TRUE, INFINITE);
-            for (int wi = 0; wi < pl.n_workers; wi++) CloseHandle(pl.workers[wi]);
-            DeleteCriticalSection(&pl.cs);
-            DeleteCriticalSection(&pl.wq.cs);
-            sqfs_close(sq); ext4_writer_close(ew); goto cleanup;
-        }
-
-        int walk_rc = sqfs_walk(sq, producer_cb, &pl);
-        EnterCriticalSection(&pl.wq.cs);
-        pl.wq.stop = 1;
-        WakeAllConditionVariable(&pl.wq.cv_worker);
-        LeaveCriticalSection(&pl.wq.cs);
-        WaitForMultipleObjects(pl.n_workers, pl.workers, TRUE, INFINITE);
-        for (int wi = 0; wi < pl.n_workers; wi++) CloseHandle(pl.workers[wi]);
-
-        EnterCriticalSection(&pl.cs);
-        pl.stop = 1;
-        WakeConditionVariable(&pl.cv_consumer);
-        LeaveCriticalSection(&pl.cs);
-        WaitForSingleObject(consumer, INFINITE);
-        CloseHandle(consumer);
-
-        DeleteCriticalSection(&pl.cs);
-        DeleteCriticalSection(&pl.wq.cs);
-        log_msg(L"ingest: walk=%d files=%zu dirs=%zu syms=%zu special=%zu errors=%zu bytes=%.1f MiB",
-                walk_rc, pl.n_files, pl.n_dirs, pl.n_syms, pl.n_special, pl.n_errors,
-                (double)pl.bytes_total / (1024.0 * 1024.0));
-        /* The squashfs reader is the integrity detector: a non-zero walk_rc
-           means a structural traversal failure and n_errors counts per-file
-           data/decompress failures. Either one means the rootfs is only
-           partially ingested, so refuse to finalise it as success (leaving
-           exit_code = 1 deletes the incomplete VHDX in cleanup). */
-        if (walk_rc != 0 || pl.n_errors != 0) {
-            log_err(L"squashfs ingest incomplete (walk=%d errors=%zu): "
-                    L"aborting, source image may be truncated or corrupt",
-                    walk_rc, pl.n_errors);
-            sqfs_close(sq);
+        int rc = ingest_squashfs(sq, ew, NULL, kernel_ver, sizeof(kernel_ver), NULL);
+        sqfs_close(sq);
+        if (rc != 0) {
             ext4_writer_close(ew);
             goto cleanup;
         }
-        strncpy(kernel_ver, pl.kernel_version, sizeof(kernel_ver) - 1);
-        sqfs_close(sq);
     }
+
+    /* ---- Step 5b: Layered-ISO fallback.
+       minimal.squashfs carries the kernel on the 26.04 desktop ISO. On
+       24.04 (and other "fsimage-layered" ISOs) it does not: the kernel and
+       its modules live only in the minimal.standard.live overlay and the
+       initrd only under casper/. Without this the bootstrap grub.cfg would
+       point at "/boot/vmlinuz-" and the VM would sit at the GRUB prompt
+       forever (jamesstringer90/appsandbox#66). Pull the kernel pieces out
+       of the ISO instead; if even that fails, refuse to build a disk that
+       cannot boot. ---- */
+    if (kernel_ver[0] == 0) {
+        log_msg(L"no /boot/vmlinuz-* in %s (layered ISO) - staging the kernel from the live layer", sqfs_path);
+        if (stage_kernel_from_live_layer(iso_drive, ew, kernel_ver, sizeof(kernel_ver)) != 0) {
+            log_err(L"no kernel (/boot/vmlinuz-*) found in %s and none could be staged "
+                    L"from the ISO's live layer - the disk would not boot. "
+                    L"Use an Ubuntu Desktop 26.04 LTS or 24.04 LTS ISO.", sqfs_path);
+            ext4_writer_close(ew);
+            goto cleanup;
+        }
+        kernel_from_iso = 1;
+    }
+    log_msg(L"kernel: %hs%s", kernel_ver,
+            kernel_from_iso ? L" (staged from the ISO live layer)" : L"");
 
     /* ---- Step 6: Write /etc/fstab + mount points. ---- */
     {
@@ -2123,14 +2413,38 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
             "    insmod part_gpt\n"
             "    insmod ext2\n"
             "    set root='hd0,gpt2'\n"
-            "    linux  /boot/vmlinuz-%s root=UUID=%s ro"
+            "    linux  /boot/vmlinuz-%s root=UUID=%s ro%s fsck.repair=yes"
             " " IP_EARLYCON_A "console=tty0 console=" IP_SERIAL_A ",115200\n"
             "    initrd /boot/initrd.img-%s\n"
             "}\n",
-            kernel_ver, uuid_text, kernel_ver);
+            kernel_ver, uuid_text,
+            /* The live initrd staged by the layered-ISO fallback defaults to
+               BOOT=casper; boot=local makes it mount root=UUID like a normal
+               initramfs-tools initrd. */
+            kernel_from_iso ? " boot=local" : "",
+            kernel_ver);
         ext4_writer_add_file(ew, "/boot/grub/grub.cfg", 0644, 0, 0,
                              (uint32_t)time(NULL),
                              boot_cfg, strlen(boot_cfg));
+    }
+
+    /* ---- Step 8b: keep the boot resilient after unclean stops.
+       update-grub in the guest regenerates grub.cfg from /etc/default/grub
+       + grub.d, so the bootstrap cmdline alone would lose fsck.repair=yes
+       on the second boot. ---- */
+    {
+        static const char dropin[] =
+            "# Written by AppSandbox iso-patch. The root ext4 is created by iso-patch's\n"
+            "# own ext4 writer, i.e. without a journal (first boot adds one), so an\n"
+            "# unclean stop (Force Stop, host crash) can leave it needing a full fsck.\n"
+            "# Let the boot-time fsck repair it automatically instead of dropping to a\n"
+            "# maintenance prompt nobody can see, and do not sit at the GRUB menu\n"
+            "# indefinitely after such a boot.\n"
+            "GRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX fsck.repair=yes\"\n"
+            "GRUB_RECORDFAIL_TIMEOUT=5\n";
+        ext4_mkdir_p(ew, "/etc/default/grub.d");
+        ext4_writer_add_file(ew, "/etc/default/grub.d/91-appsandbox-resilient-boot.cfg",
+                             0644, 0, 0, (uint32_t)time(NULL), dropin, sizeof(dropin) - 1);
     }
 
     /* ---- Step 9: First-boot service. ---- */
