@@ -2081,6 +2081,22 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
             goto cleanup;
         }
         strncpy(kernel_ver, pl.kernel_version, sizeof(kernel_ver) - 1);
+        if (kernel_ver[0] == 0) {
+            /* No /boot/vmlinuz-* was seen during the walk.  minimal.squashfs
+               carries the kernel on the 26.04 desktop ISO, but on 24.04 it
+               lives only in the minimal.standard.live overlay, so the rootfs
+               built here has nothing to boot.  Writing the bootstrap
+               grub.cfg with an empty version produces a disk that hangs at
+               the GRUB prompt while the UI shows "Installing Linux" forever
+               (jamesstringer90/appsandbox#66).  Fail loudly instead;
+               exit_code stays 1 so cleanup deletes the VHDX. */
+            log_err(L"no kernel (/boot/vmlinuz-*) found in %s - the disk would not boot. "
+                    L"Only Ubuntu Desktop 26.04 LTS ISOs are supported.", sqfs_path);
+            sqfs_close(sq);
+            ext4_writer_close(ew);
+            goto cleanup;
+        }
+        log_msg(L"kernel: %hs", kernel_ver);
         sqfs_close(sq);
     }
 

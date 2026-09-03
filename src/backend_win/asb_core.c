@@ -2119,11 +2119,19 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
                             if (g_progress_cb && pvm)
                                 g_progress_cb(vm_handle(pvm), pct, is_staging, g_progress_ud);
                         } else if (strncmp(line, "ERROR:", 6) == 0) {
+                            asb_log(L"iso-patch: ERROR: %S", line + 6);
                             if (error_msg && error_msg[0] == L'\0')
                                 MultiByteToWideChar(CP_ACP, 0, line + 6, -1, error_msg, (int)error_msg_cap);
                             result = E_FAIL;
                         } else if (strncmp(line, "DONE:", 5) == 0) {
                             result = S_OK;
+                        } else if (strncmp(line, "STATUS:", 7) == 0) {
+                            /* Unlike the Windows --to-vhdx path there is no
+                               in-guest installer log to fall back on, so the
+                               iso-patch status lines (source squashfs, detected
+                               kernel, ingest totals, ...) are the only host-side
+                               record of how the Linux disk was built. */
+                            asb_log(L"iso-patch: %S", line + 7);
                         }
                     }
                     start = ci + 1;
