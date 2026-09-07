@@ -242,7 +242,6 @@ HRESULT hcn_create_nat_network(GUID *network_id)
         L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
         L"\"Name\":\"AppSandboxNAT\","
         L"\"Type\":\"ICS\","
-        L"\"IsolateSwitch\":true,"
         L"\"Flags\":11"
         L"}");
 
