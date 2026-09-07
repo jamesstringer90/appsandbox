@@ -106,9 +106,34 @@ static const char *input_locale(const char *lang) {
     return "0409:00000409";
 }
 
+static int xml_escape_text(const char *text, char *out, size_t capacity) {
+    size_t used = 0;
+    if (!text || !out || !capacity) return 0;
+    while (*text) {
+        const char *replacement = NULL;
+        size_t count;
+        switch (*text) {
+            case '&': replacement = "&amp;"; break;
+            case '<': replacement = "&lt;"; break;
+            case '>': replacement = "&gt;"; break;
+            case '"': replacement = "&quot;"; break;
+            case '\'': replacement = "&apos;"; break;
+        }
+        count = replacement ? strlen(replacement) : 1;
+        if (used + count >= capacity) { out[0] = 0; return 0; }
+        memcpy(out + used, replacement ? replacement : text, count);
+        used += count;
+        text++;
+    }
+    out[used] = 0;
+    return 1;
+}
+
 int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const char *pass,
                            const char *arch, int test_mode, int is_arm64, const char *lang) {
     if (!f) return -1;
+    char user_xml[1024];
+    if (!xml_escape_text(user, user_xml, sizeof user_xml)) return -1;
     char comp[64];   /* up to 15 code points (NetBIOS), each <=4 UTF-8 bytes, + NUL */
     {
         const unsigned char *s = (const unsigned char *)vm_name;
@@ -231,7 +256,7 @@ int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const
         "        </component>\n"
         "    </settings>\n"
         "</unattend>\n",
-        arch, loc, lang, lang, lang, arch, user, b64, user, b64);
+        arch, loc, lang, lang, lang, arch, user_xml, b64, user_xml, b64);
     return 0;
 }
 

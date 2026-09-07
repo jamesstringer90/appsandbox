@@ -533,20 +533,45 @@ void jb_bool(JsonBuilder *jb, const wchar_t *key, BOOL val)
 
 /* ---- Simple JSON parser ---- */
 
+/* Skip quoted values so they cannot be mistaken for property names. */
+static const wchar_t *json_find_value(const wchar_t *json, const wchar_t *key)
+{
+    const wchar_t *p = json;
+    size_t key_len;
+    if (!json || !key) return NULL;
+    key_len = wcslen(key);
+    while (*p) {
+        const wchar_t *start, *end;
+        if (*p != L'"') { p++; continue; }
+        start = ++p;
+        while (*p && *p != L'"') {
+            if (*p == L'\\' && p[1]) p += 2;
+            else p++;
+        }
+        if (!*p) return NULL;
+        end = p++;
+        while (*p == L' ' || *p == L'\t' || *p == L'\n' || *p == L'\r') p++;
+        if (*p != L':' || (size_t)(end - start) != key_len ||
+            wcsncmp(start, key, key_len) != 0) continue;
+        p++;
+        while (*p == L' ' || *p == L'\t' || *p == L'\n' || *p == L'\r') p++;
+        return p;
+    }
+    return NULL;
+}
+
+BOOL json_has_key(const wchar_t *json, const wchar_t *key)
+{
+    return json_find_value(json, key) != NULL;
+}
+
 BOOL json_get_string(const wchar_t *json, const wchar_t *key,
                      wchar_t *out, size_t out_len)
 {
-    wchar_t pattern[300];
-    const wchar_t *p;
+    const wchar_t *p = json_find_value(json, key);
     size_t o = 0;
 
-    swprintf_s(pattern, 300, L"\"%s\"", key);
-    p = wcsstr(json, pattern);
-    if (!p) return FALSE;
-
-    p += wcslen(pattern);
-    while (*p == L' ' || *p == L':' || *p == L'\t' || *p == L'\n' || *p == L'\r') p++;
-    if (*p != L'"') return FALSE;
+    if (!p || !out || !out_len || *p != L'"') return FALSE;
     p++;
 
     /* Copy the value into `out`, DECODING JSON string escapes. \uXXXX -- what
@@ -571,41 +596,38 @@ BOOL json_get_string(const wchar_t *json, const wchar_t *key,
                 case L'u': {
                     unsigned v = 0; int i;
                     p++;
-                    for (i = 0; i < 4 && *p; i++) {
+                    for (i = 0; i < 4; i++) {
                         wchar_t h = *p;
                         if (h >= L'0' && h <= L'9') v = (v << 4) | (unsigned)(h - L'0');
                         else if (h >= L'a' && h <= L'f') v = (v << 4) | (unsigned)(h - L'a' + 10);
                         else if (h >= L'A' && h <= L'F') v = (v << 4) | (unsigned)(h - L'A' + 10);
-                        else break;
+                        else { out[0] = 0; return FALSE; }
                         p++;
                     }
                     ch = (wchar_t)v;
                     break;
                 }
-                default: ch = *p; p++; break;   /* unknown escape: keep the char literally */
+                default: out[0] = 0; return FALSE;
             }
         } else {
             ch = *p;
             p++;
+            if (ch < 0x20) { out[0] = 0; return FALSE; }
         }
+        /* Embedded NUL would silently turn a decoded path into its prefix. */
+        if (ch == 0) { out[0] = 0; return FALSE; }
         if (o + 1 >= out_len) { out[o] = 0; return FALSE; }
         out[o++] = ch;
     }
+    if (*p != L'"') { out[0] = 0; return FALSE; }
     out[o] = 0;
     return TRUE;
 }
 
 BOOL json_get_int(const wchar_t *json, const wchar_t *key, int *out)
 {
-    wchar_t pattern[300];
-    const wchar_t *p;
-
-    swprintf_s(pattern, 300, L"\"%s\"", key);
-    p = wcsstr(json, pattern);
-    if (!p) return FALSE;
-
-    p += wcslen(pattern);
-    while (*p == L' ' || *p == L':' || *p == L'\t' || *p == L'\n' || *p == L'\r') p++;
+    const wchar_t *p = json_find_value(json, key);
+    if (!p || !out) return FALSE;
 
     /* Handle quoted numbers from JS */
     if (*p == L'"') p++;
@@ -615,15 +637,8 @@ BOOL json_get_int(const wchar_t *json, const wchar_t *key, int *out)
 
 BOOL json_get_bool(const wchar_t *json, const wchar_t *key, BOOL *out)
 {
-    wchar_t pattern[300];
-    const wchar_t *p;
-
-    swprintf_s(pattern, 300, L"\"%s\"", key);
-    p = wcsstr(json, pattern);
-    if (!p) return FALSE;
-
-    p += wcslen(pattern);
-    while (*p == L' ' || *p == L':' || *p == L'\t' || *p == L'\n' || *p == L'\r') p++;
+    const wchar_t *p = json_find_value(json, key);
+    if (!p || !out) return FALSE;
     *out = (*p == L't' || *p == L'T') ? TRUE : FALSE;
     return TRUE;
 }

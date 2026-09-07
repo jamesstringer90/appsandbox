@@ -594,13 +594,8 @@ static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path)
  * Keyboard hotkey capture
  * ================================================================== */
 
-/* Maximal reserved-hotkey set: keys the host shell would normally consume.
-   In Default mode these are withheld from the guest (host handles them); in
-   Transmit mode they are captured and forwarded to the guest instead.
-   alt_down must reflect whether Alt is currently held (LLKHF_ALTDOWN from the
-   low-level hook, or GetKeyState(VK_MENU) from the wndproc path).
-   Note: Ctrl+Alt+Del and Win+L are secure (SAS) sequences that no user-mode
-   hook can intercept — they always reach the host. */
+/* Host shortcuts withheld from the guest in Default mode.
+   alt_down reflects GetKeyState(VK_MENU) in the window procedure. */
 static BOOL idd_is_reserved_hotkey(DWORD vk, BOOL alt_down)
 {
     switch (vk) {
@@ -666,15 +661,13 @@ static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
     VmDisplayIdd *d = t_hook_display;
 
     if (code == HC_ACTION && d && !d->stop &&
-        d->input_focused && d->transmit_hotkeys) {
+        d->input_focused && d->transmit_hotkeys &&
+        GetForegroundWindow() == d->hwnd) {
         const KBDLLHOOKSTRUCT *k = (const KBDLLHOOKSTRUCT *)lp;
         BOOL up  = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
-        BOOL alt = (k->flags & LLKHF_ALTDOWN) != 0;
-        if (idd_is_reserved_hotkey(k->vkCode, alt)) {
-            idd_forward_key(d, k->vkCode, k->scanCode,
-                            (k->flags & LLKHF_EXTENDED) != 0, up);
-            return 1;  /* swallow so the host shell doesn't act on it */
-        }
+        idd_forward_key(d, k->vkCode, k->scanCode,
+                        (k->flags & LLKHF_EXTENDED) != 0, up);
+        return 1;
     }
     return CallNextHookEx(NULL, code, wp, lp);
 }
@@ -1348,7 +1341,9 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
                       B,G,R = XOR color values.
            We extract A into a 1bpp monochrome hbmMask and BGR into hbmColor. */
         UINT mask_row_bytes = (width + 7) / 8;
-        UINT mask_pitch = ((mask_row_bytes + 3) & ~3u);
+        /* CreateBitmap consumes WORD-aligned rows, unlike a DWORD-aligned
+           DIB. A 48-pixel cursor needs 6 bytes per mask row, not 8. */
+        UINT mask_pitch = (mask_row_bytes + 1) & ~1u;
         void *color_bits = NULL;
         BYTE *mask_buf;
         UINT row, col;
@@ -1462,9 +1457,9 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
                    dst_pitch);
         }
 
-        /* AND mask, 1bpp, DWORD-aligned rows. Bit set = transparent. */
+        /* AND mask, 1bpp, WORD-aligned for CreateBitmap. Bit set = transparent. */
         mask_row_bytes = (width + 7) / 8;
-        mask_pitch     = (mask_row_bytes + 3) & ~3u;
+        mask_pitch     = (mask_row_bytes + 1) & ~1u;
         mask_buf = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                       (size_t)mask_pitch * height);
         if (!mask_buf) {
@@ -2326,7 +2321,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     /* ---- Keyboard input forwarding (gated on window activation) ----
-       In Transmit mode reserved hotkeys are captured by the low-level hook
+       In Transmit mode key events are captured by the low-level hook
        and never reach here. The mode check below covers Default mode: a
        reserved hotkey is neither forwarded to the guest nor consumed — it
        falls through to DefWindowProc so the host handles it normally (this

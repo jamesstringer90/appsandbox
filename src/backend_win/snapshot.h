@@ -79,6 +79,9 @@ HRESULT snapshot_new_branch(SnapshotTree *tree, VmInstance *instance, int index)
    Sets instance->vhdx_path accordingly. */
 HRESULT snapshot_select_branch(SnapshotTree *tree, VmInstance *instance, int index, int branch_idx);
 
+/* Fork a frozen disk before booting. S_FALSE if the selected disk is unchanged. */
+HRESULT snapshot_ensure_writable(SnapshotTree *tree, VmInstance *instance);
+
 /* Delete a snapshot and all its branches. */
 HRESULT snapshot_delete(SnapshotTree *tree, VmInstance *instance, int index);
 

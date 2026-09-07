@@ -60,6 +60,20 @@ static void input_log(const char *fmt, ...)
     fclose(f);
 }
 
+/* Per-monitor DPI awareness keeps GetSystemMetrics in the same physical pixel
+ * space as the host framebuffer coordinates normalized for SendInput. */
+static BOOL initialize_dpi_awareness(void)
+{
+    if (SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+        return TRUE;
+    /* A manifest or compatibility setting may already have set the process
+     * default. Input is received/injected on this thread, so override it here. */
+    if (SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+        return TRUE;
+    input_log("Cannot enable per-monitor DPI awareness: %lu", GetLastError());
+    return FALSE;
+}
+
 /* ---- Desktop switching ---- */
 
 static void switch_to_input_desktop(void)
@@ -195,6 +209,8 @@ static void handle_conn(AsbConn *c)
 int main(void)
 {
     AsbListener *l;
+
+    if (!initialize_dpi_awareness()) return 1;
 
     input_log("Starting (PID=%lu, session=%lu).",
               GetCurrentProcessId(),

@@ -392,6 +392,7 @@ static void ensure_fetch_registry(void) {
         @"install",
         @"--name",     name,
         @"--vm-dir",   vmDir.path,
+        @"--disk-path", [VmDir diskImageURLFor:name].path,
         @"--ipsw",     ipswURL.path,
         @"--ram-mb",   [NSString stringWithFormat:@"%d", ramMb],
         @"--cpus",     [NSString stringWithFormat:@"%d", cpus],

@@ -12,6 +12,7 @@
 #import "asb_core_mac.h"
 #import "vz_display.h"
 #import "host_info.h"
+#import "vm_dir.h"
 #import "EventLogWindow.h"
 
 #include "asb_types.h"
@@ -57,6 +58,7 @@ static NSDictionary *vmToJsDict(const AsbVmMac *vm) {
     return @{
         @"name":            [NSString stringWithUTF8String:vm->name],
         @"osType":          [NSString stringWithUTF8String:vm->os_type],
+        @"diskDirectory":   [VmDir diskDirectoryForVm:@(vm->name)].URLByDeletingLastPathComponent.path,
         @"running":         @(vm->running || (!vm->disk_built && vm->install_progress >= 0)),
         @"shuttingDown":    @(vm->shutting_down ? YES : NO),
         @"agentOnline":     @(vm->agent_online ? YES : NO),
@@ -111,6 +113,7 @@ static NSDictionary *buildHostInfoDict(void) {
         @"vmCores":   @(vmCores),
         @"vmRamMb":   @(vmRamMb),
         @"freeGb":    @([HostInfo freeGb]),
+        @"defaultDiskDirectory": [VmDir vmsRootDirectory].path,
         @"vmHddGb":   @(vmHddGb),
     };
 }
@@ -268,8 +271,9 @@ static void handleCreateVm(NSDictionary *msg) {
     NSString *name      = msg[@"name"];
     NSString *osType    = msg[@"osType"] ?: @"macOS";
     NSString *image     = msg[@"imagePath"];
-    NSString *adminUser = msg[@"adminUser"] ?: @"user";
-    NSString *adminPass = msg[@"adminPass"] ?: @"test123";
+    NSString *diskDirectory = msg[@"diskDirectory"] ?: @"";
+    NSString *adminUser = msg[@"adminUser"];
+    NSString *adminPass = msg[@"adminPass"];
     BOOL sshEnabled     = [msg[@"sshEnabled"] boolValue];
     BOOL sshDeployKey   = [msg[@"sshDeployKey"] boolValue];
     BOOL testMode       = [msg[@"testMode"] boolValue];
@@ -279,10 +283,22 @@ static void handleCreateVm(NSDictionary *msg) {
     int gpuMode         = [msg[@"gpuMode"] intValue];
     int networkMode     = [msg[@"networkMode"] intValue];
 
+    NSString *usernameError = asb_mac_validate_username(osType, adminUser, name);
+    if (usernameError) {
+        sendAlert(usernameError);
+        return;
+    }
+    NSString *passwordError = asb_mac_validate_password(osType, adminPass);
+    if (passwordError) {
+        sendAlert(passwordError);
+        return;
+    }
+
     const char *imagePath = (image.length > 0) ? [image UTF8String] : NULL;
     int rc = asb_mac_vm_create([name UTF8String], [osType UTF8String],
                                 ramMb, hddGb, cpuCores,
                                 gpuMode, networkMode, imagePath,
+                                diskDirectory.UTF8String,
                                 [adminUser UTF8String], [adminPass UTF8String],
                                 sshEnabled, sshDeployKey, testMode);
     if (rc != 0) {
@@ -358,6 +374,37 @@ static void handleBrowseImage(NSDictionary *msg) {
     });
 }
 
+static void handleBrowseDiskDirectory(NSDictionary *msg) {
+    NSString *initial = [msg[@"path"] isKindOfClass:[NSString class]] ? msg[@"path"] : @"";
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSOpenPanel *panel = [NSOpenPanel openPanel];
+        panel.canChooseFiles = NO;
+        panel.canChooseDirectories = YES;
+        panel.canCreateDirectories = YES;
+        panel.allowsMultipleSelection = NO;
+        panel.message = @"Choose a folder for this VM's disks";
+        panel.directoryURL = initial.length ? [NSURL fileURLWithPath:initial isDirectory:YES]
+                                            : [VmDir vmsRootDirectory];
+        [panel beginWithCompletionHandler:^(NSModalResponse result) {
+            NSString *path = result == NSModalResponseOK && panel.URL ? panel.URL.path : @"";
+            postToJs(@{ @"type": @"diskDirectoryBrowseResult", @"path": path });
+        }];
+    });
+}
+
+static void handleGetDiskSpace(NSDictionary *msg) {
+    BOOL validPath = !msg[@"path"] || [msg[@"path"] isKindOfClass:[NSString class]];
+    NSString *path = validPath ? (msg[@"path"] ?: @"") : @"";
+    NSNumber *requestId = [msg[@"requestId"] isKindOfClass:[NSNumber class]] ? msg[@"requestId"] : @0;
+    /* Filesystem queries can block on external/network volumes. Echo the
+     * request so the UI can discard a reply after the user chooses another path. */
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        int freeGb = validPath ? [HostInfo freeGbForDirectory:path] : -1;
+        postToJs(@{ @"type": @"diskSpace", @"path": path,
+                    @"requestId": requestId, @"freeGb": @(freeGb) });
+    });
+}
+
 void ui_handle_message(NSString *json) {
     if (json.length == 0) return;
     NSData *data = [json dataUsingEncoding:NSUTF8StringEncoding];
@@ -391,6 +438,10 @@ void ui_handle_message(NSString *json) {
         handleEditVm(msg);
     } else if ([action isEqualToString:@"browseImage"]) {
         handleBrowseImage(msg);
+    } else if ([action isEqualToString:@"browseDiskDirectory"]) {
+        handleBrowseDiskDirectory(msg);
+    } else if ([action isEqualToString:@"getDiskSpace"]) {
+        handleGetDiskSpace(msg);
     } else if ([action isEqualToString:@"log"]) {
         NSString *message = msg[@"message"];
         if (message) sendLog(message);
@@ -412,6 +463,8 @@ void ui_handle_message(NSString *json) {
          * script. No AppleScript, no Apple-Events TCC prompt. */
         NSString *user = [NSString stringWithUTF8String:
             vm->admin_user[0] ? vm->admin_user : "user"];
+        NSString *quotedUser = [NSString stringWithFormat:@"'%@'",
+            [user stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
         /* If this VM had the AppSandbox key deployed, use it (-i) so the
          * terminal logs in with key auth instead of a password prompt.
          * IdentitiesOnly avoids offering the user's other keys, and -- since
@@ -432,8 +485,8 @@ void ui_handle_message(NSString *json) {
         NSString *body = [NSString stringWithFormat:
             @"#!/bin/sh\n"
             @"printf '\\033c'\n"
-            @"exec ssh %@%@@127.0.0.1 -p %d\n",
-            keyopt, user, vm->ssh_port];
+            @"exec ssh %@-l %@ -p %d 127.0.0.1\n",
+            keyopt, quotedUser, vm->ssh_port];
         NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
             [NSString stringWithFormat:@"appsandbox-ssh-%@-%u.command",
              n, arc4random()]];

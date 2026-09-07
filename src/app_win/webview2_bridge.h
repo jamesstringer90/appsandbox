@@ -51,6 +51,8 @@ void jb_append_escaped(JsonBuilder *jb, const wchar_t *s);
 
 /* ---- Simple JSON parser (for messages from JS) ---- */
 
+BOOL json_has_key(const wchar_t *json, const wchar_t *key);
+
 /* Extract a string value for a given key from a JSON string.
    Returns TRUE if found. out is null-terminated. */
 BOOL json_get_string(const wchar_t *json, const wchar_t *key,

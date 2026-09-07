@@ -479,6 +479,41 @@ td.editing select {
 .modal.wide .form-grid {
     margin-bottom: 16px;
 }
+#create-vm-overlay .modal {
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100vh - 32px);
+}
+#create-vm-overlay h3, #create-vm-overlay .modal-buttons {
+    flex-shrink: 0;
+}
+.create-form-body {
+    min-height: 0;
+    overflow-y: auto;
+    color-scheme: dark;
+    margin-bottom: 16px;
+}
+#create-vm-overlay .form-grid { grid-template-columns: 90px minmax(0, 1fr); margin-bottom: 0; }
+#create-vm-overlay .form-row, #create-vm-overlay .cred-row,
+#create-vm-overlay .image-row { min-width: 0; flex-wrap: wrap; }
+#create-vm-overlay .cred-row input { min-width: 0; }
+.disk-location-btn { flex-shrink: 0; }
+#disk-location-overlay .modal { max-width: 560px; max-height: calc(100vh - 32px); overflow-y: auto; color-scheme: dark; }
+#disk-location-overlay .disk-directory-field { margin-bottom: 16px; }
+.disk-directory-label { display: block; color: var(--text-dim); font-size: 12px; margin-bottom: 6px; }
+.disk-directory-field { min-width: 0; }
+.disk-directory-row { display: flex; align-items: center; gap: 6px; }
+.disk-directory-row input[type="text"] { flex: 1; min-width: 0; }
+.disk-directory-row button { flex-shrink: 0; }
+.disk-directory-field .field-warn { display: block; margin: 4px 0 0; }
+.disk-directory-field .field-warn:empty { display: none; }
+#disk-location-space { display: block; color: var(--text-dim); font-size: 11px; margin-top: 6px; }
+@media (max-width: 560px) {
+    #create-vm-overlay .form-grid { grid-template-columns: minmax(0, 1fr); }
+    #create-vm-overlay .form-grid > label { text-align: left; margin-top: 5px; }
+    #create-vm-overlay .modal-buttons { flex-wrap: wrap; }
+    #create-vm-overlay .modal { padding: 14px; }
+}
 .modal h3 {
     font-size: 14px;
     margin-bottom: 12px;

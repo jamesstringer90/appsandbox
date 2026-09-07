@@ -475,6 +475,62 @@ BOOL gpu_get_driver_shares(GpuList *gpu_list, GpuDriverShareList *out)
     return FALSE;
 }
 
+BOOL gpu_append_nvidia_drs_share(const GpuList *gpu_list, GpuDriverShareList *list)
+{
+    wchar_t base[MAX_PATH], path[MAX_PATH];
+    static const wchar_t suffix[] = L"\\NVIDIA Corporation\\Drs";
+    GpuDriverShare *s;
+    DWORD n, attrs;
+    int i;
+
+    if (!gpu_list || !list) return FALSE;
+    for (i = 0; i < gpu_list->count; i++) {
+        if (_wcsicmp(gpu_list->gpus[i].service, L"nvlddmkm") == 0)
+            break;
+    }
+    if (i == gpu_list->count) return FALSE;
+
+    for (i = 0; i < list->count; i++) {
+        if (_wcsicmp(list->shares[i].share_name, L"AppSandbox.NvidiaDrs") == 0)
+            return TRUE;
+    }
+    if (list->count >= MAX_GPU_SHARES) {
+        ui_log(L"NVIDIA DRS: GPU share list is full, skipping.");
+        return FALSE;
+    }
+
+    n = GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH);
+    if (!n)
+        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+    else if (n >= MAX_PATH) {
+        ui_log(L"NVIDIA DRS: ProgramData path is too long, skipping.");
+        return FALSE;
+    }
+    if (wcslen(base) + wcslen(suffix) >= MAX_PATH) {
+        ui_log(L"NVIDIA DRS: host directory path is too long, skipping.");
+        return FALSE;
+    }
+    swprintf_s(path, MAX_PATH, L"%s%s", base, suffix);
+    attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        ui_log(L"NVIDIA DRS: host directory unavailable: %s (error %lu), skipping.",
+               path, GetLastError());
+        return FALSE;
+    }
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        ui_log(L"NVIDIA DRS: host path is not a directory: %s, skipping.", path);
+        return FALSE;
+    }
+
+    s = &list->shares[list->count];
+    wcscpy_s(s->share_name, 128, L"AppSandbox.NvidiaDrs");
+    wcscpy_s(s->host_path, MAX_PATH, path);
+    wcscpy_s(s->guest_path, MAX_PATH, L"C:\\ProgramData\\NVIDIA Corporation\\Drs");
+    s->file_filter[0] = L'\0';
+    list->count++;
+    return TRUE;
+}
+
 BOOL gpu_append_lxsslib_share(GpuDriverShareList *list)
 {
     wchar_t sys_dir[MAX_PATH];

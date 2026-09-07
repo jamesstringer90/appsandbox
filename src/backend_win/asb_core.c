@@ -465,7 +465,7 @@ static void save_vm_list(void)
 
     get_config_path(path, MAX_PATH);
 
-    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    if (_wfopen_s(&f, path, L"w,ccs=UTF-8") != 0 || !f) return;
 
     if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn) {
         fwprintf(f, L"[Settings]\n");
@@ -474,6 +474,14 @@ static void save_vm_list(void)
         if (g_suppress_tray_warn)
             fwprintf(f, L"SuppressTrayWarn=1\n");
         fwprintf(f, L"\n");
+    }
+
+    for (i = 0; i < g_template_count; i++) {
+        fwprintf(f, L"[Template]\n");
+        fwprintf(f, L"Name=%s\n", g_templates[i].name);
+        fwprintf(f, L"OsType=%s\n", g_templates[i].os_type);
+        fwprintf(f, L"ImagePath=%s\n", g_templates[i].image_path);
+        fwprintf(f, L"VhdxPath=%s\n\n", g_templates[i].vhdx_path);
     }
 
     for (i = 0; i < g_vm_count; i++) {
@@ -519,16 +527,46 @@ static void save_vm_list(void)
 
 /* ---- Persistence: load VM list ---- */
 
+/* A VM named "snapshots" is a normal VM folder. Only generated branch/frozen
+   filenames identify a disk in the snapshots subfolder. */
+static BOOL get_vm_disk_root(const wchar_t *disk_path, wchar_t *out)
+{
+    wchar_t *slash;
+    BOOL branch;
+    size_t len;
+    if (!disk_path || wcslen(disk_path) >= MAX_PATH) return FALSE;
+    wcscpy_s(out, MAX_PATH, disk_path);
+    slash = wcsrchr(out, L'\\');
+    if (!slash) return FALSE;
+    branch = (_wcsnicmp(slash + 1, L"branch_", 7) == 0 ||
+              _wcsnicmp(slash + 1, L"snapshot_", 9) == 0);
+    *slash = 0;
+    len = wcslen(out);
+    if (branch && len >= 10 && _wcsicmp(out + len - 10, L"\\snapshots") == 0)
+        out[len - 10] = 0;
+    /* Never treat a drive root as an owned VM directory. */
+    return wcslen(out) > 3;
+}
+
 static void load_vm_list(void)
 {
     wchar_t path[MAX_PATH];
     wchar_t line[1024];
     FILE *f;
     VmInstance *vm = NULL;
+    TemplateInfo *tpl = NULL;
     BOOL in_settings = FALSE;
+    unsigned char bom[3] = { 0 };
+    BOOL unicode_config;
 
     get_config_path(path, MAX_PATH);
-    if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
+    /* A Unicode BOM selects Unicode decoding; files without a BOM use ANSI. */
+    if (_wfopen_s(&f, path, L"rb") != 0 || !f) return;
+    (void)fread(bom, 1, sizeof(bom), f);
+    fclose(f);
+    unicode_config = (bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF) ||
+                     (bom[0] == 0xFF && bom[1] == 0xFE);
+    if (_wfopen_s(&f, path, unicode_config ? L"r,ccs=UTF-8" : L"r") != 0 || !f) return;
 
     while (fgetws(line, 1024, f)) {
         size_t len = wcslen(line);
@@ -538,16 +576,41 @@ static void load_vm_list(void)
         if (wcscmp(line, L"[Settings]") == 0) {
             in_settings = TRUE;
             vm = NULL;
+            tpl = NULL;
             continue;
         }
 
         if (wcscmp(line, L"[VM]") == 0) {
             in_settings = FALSE;
+            tpl = NULL;
             if (g_vm_count >= ASB_MAX_VMS) break;
             vm = &g_vms[g_vm_count];
             ZeroMemory(vm, sizeof(VmInstance));
             vm->unique_id = g_next_vm_id++;
             g_vm_count++;
+            continue;
+        }
+
+        if (wcscmp(line, L"[Template]") == 0) {
+            in_settings = FALSE;
+            vm = NULL;
+            tpl = NULL;
+            if (g_template_count < ASB_MAX_TEMPLATES) {
+                tpl = &g_templates[g_template_count++];
+                ZeroMemory(tpl, sizeof(*tpl));
+            }
+            continue;
+        }
+
+        if (tpl) {
+            if (wcsncmp(line, L"Name=", 5) == 0)
+                wcsncpy_s(tpl->name, 256, line + 5, _TRUNCATE);
+            else if (wcsncmp(line, L"OsType=", 7) == 0)
+                wcsncpy_s(tpl->os_type, 32, line + 7, _TRUNCATE);
+            else if (wcsncmp(line, L"ImagePath=", 10) == 0)
+                wcsncpy_s(tpl->image_path, MAX_PATH, line + 10, _TRUNCATE);
+            else if (wcsncmp(line, L"VhdxPath=", 9) == 0)
+                wcsncpy_s(tpl->vhdx_path, MAX_PATH, line + 9, _TRUNCATE);
             continue;
         }
 
@@ -617,23 +680,15 @@ static void load_vm_list(void)
         int i;
         for (i = 0; i < g_vm_count; i++) {
             wchar_t snap_dir[MAX_PATH];
-            wchar_t *last_slash;
             g_vms[i].handle = NULL;
             g_vms[i].running = FALSE;
             if (vm_load_state_json(g_vms[i].vhdx_path))
                 g_vms[i].install_complete = TRUE;
-            wcscpy_s(snap_dir, MAX_PATH, g_vms[i].vhdx_path);
-            last_slash = wcsrchr(snap_dir, L'\\');
-            if (last_slash) *last_slash = L'\0';
-            {
-                size_t dlen = wcslen(snap_dir);
-                if (dlen >= 10 && _wcsicmp(snap_dir + dlen - 10, L"\\snapshots") == 0) {
-                    /* Already points to snapshots dir */
-                } else {
-                    wcscat_s(snap_dir, MAX_PATH, L"\\snapshots");
-                }
+            if (get_vm_disk_root(g_vms[i].vhdx_path, snap_dir) &&
+                wcslen(snap_dir) + 10 < MAX_PATH) {
+                wcscat_s(snap_dir, MAX_PATH, L"\\snapshots");
+                snapshot_init(&g_snap_trees[i], snap_dir);
             }
-            snapshot_init(&g_snap_trees[i], snap_dir);
         }
     }
 }
@@ -647,7 +702,8 @@ static void scan_templates(void)
     WIN32_FIND_DATAW fd;
     HANDLE hFind;
 
-    g_template_count = 0;
+    /* Retain registered templates while external storage is unavailable, and
+       discover unregistered folders in the template library. */
 
     {
         wchar_t base_dir[MAX_PATH];
@@ -665,9 +721,13 @@ static void scan_templates(void)
         wchar_t vhdx_path[MAX_PATH];
         FILE *jf;
         wchar_t line[1024];
+        int i;
 
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         if (fd.cFileName[0] == L'.') continue;
+        for (i = 0; i < g_template_count; i++)
+            if (_wcsicmp(g_templates[i].name, fd.cFileName) == 0) break;
+        if (i < g_template_count) continue;
         if (g_template_count >= ASB_MAX_TEMPLATES) break;
 
         swprintf_s(json_path, MAX_PATH, L"%s\\%s\\%s.json", tpl_base, fd.cFileName, fd.cFileName);
@@ -709,11 +769,19 @@ static void scan_templates(void)
 
 /* ---- Utility: recursive directory delete ---- */
 
-static void remove_dir_recursive(const wchar_t *dir)
+static BOOL remove_dir_recursive(const wchar_t *dir)
 {
     wchar_t pattern[MAX_PATH], full[MAX_PATH];
     WIN32_FIND_DATAW fd;
     HANDLE h;
+
+    /* A VM folder may be on user-selected storage. Never follow junctions or
+       directory symlinks while removing its files. */
+    DWORD attrs = GetFileAttributesW(dir);
+    if (attrs == INVALID_FILE_ATTRIBUTES) return FALSE;
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+        return RemoveDirectoryW(dir);
+    }
 
     swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
     h = FindFirstFileW(pattern, &fd);
@@ -730,7 +798,7 @@ static void remove_dir_recursive(const wchar_t *dir)
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    RemoveDirectoryW(dir);
+    return RemoveDirectoryW(dir);
 }
 
 /* ---- HCS state callback (called from HCS worker thread) ---- */
@@ -783,6 +851,14 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
                 asb_log(L"Template \"%s\" created successfully.", instance->name);
 
                 EnterCriticalSection(&g_cs);
+                if (g_template_count < ASB_MAX_TEMPLATES) {
+                    TemplateInfo *ti = &g_templates[g_template_count++];
+                    ZeroMemory(ti, sizeof(*ti));
+                    wcscpy_s(ti->name, 256, instance->name);
+                    wcscpy_s(ti->os_type, 32, instance->os_type);
+                    wcscpy_s(ti->image_path, MAX_PATH, instance->image_path);
+                    wcscpy_s(ti->vhdx_path, MAX_PATH, instance->vhdx_path);
+                }
                 for (j = i; j < g_vm_count - 1; j++) {
                     g_vms[j] = g_vms[j+1];
                     g_snap_trees[j] = g_snap_trees[j+1];
@@ -974,8 +1050,10 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
          * per-GPU driver shares. Windows guests have no use for it. */
         if (_wcsicmp(args->config.os_type, L"Linux") == 0)
             gpu_append_lxsslib_share(&args->config.gpu_shares);
-        else if (_wcsicmp(args->config.os_type, L"Windows") == 0)
+        else if (_wcsicmp(args->config.os_type, L"Windows") == 0) {
+            gpu_append_nvidia_drs_share(&g_gpu_list, &args->config.gpu_shares);
             prepare_gl_layers_share(&args->config.gpu_shares);
+        }
     }
 
     asb_log(L"Re-creating HCS compute system for \"%s\"...", vm->name);
@@ -1486,11 +1564,14 @@ static int stage_marker_file(FILE *manifest_f, const wchar_t *staging,
     }
     if (content_len > 0) {
         DWORD wr = 0;
-        WriteFile(h, content, (DWORD)content_len, &wr, NULL);
+        if (!WriteFile(h, content, (DWORD)content_len, &wr, NULL) || wr != content_len) {
+            CloseHandle(h);
+            asb_log(L"Error: could not write marker on host: %s", basename);
+            return 0;
+        }
     }
     CloseHandle(h);
-    fwprintf(manifest_f, L"%s\t%s\n", host, rootfs_path);
-    return 1;
+    return fwprintf(manifest_f, L"%s\t%s\n", host, rootfs_path) >= 0;
 }
 
 /* ====================================================================
@@ -1725,6 +1806,10 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
                                          const wchar_t *vm_name)
 {
     wchar_t extras[MAX_PATH];
+    if (!admin_user || !admin_user[0] || !admin_pw_hash || !admin_pw_hash[0]) {
+        asb_log(L"Error: Linux username and password hash are required.");
+        return -1;
+    }
     CreateDirectoryW(staging, NULL);
     /* Populate staging\extras\ with the full agent + module + units tree. */
     stage_linux_agent_and_extras(staging, res_dir, ssh_enabled);
@@ -1743,22 +1828,24 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
     /* Walk extras\ -> /opt/appsandbox/ */
     int n = write_manifest_walk_dir(f, extras, "/opt/appsandbox");
 
-    /* Admin user + password hash. firstboot STEP 5 reads these to create
-     * the login account. Without them, the firstboot falls back to a
-     * static test/test123 (which is a security smell anyway). */
-    if (admin_user && admin_user[0] && admin_pw_hash && admin_pw_hash[0]) {
+    /* Both account markers are required; do not build a guest that would use
+       firstboot's placeholder credentials because either marker is missing. */
+    {
         char user_utf8[128];
-        WideCharToMultiByte(CP_UTF8, 0, admin_user, -1,
-                            user_utf8, sizeof(user_utf8), NULL, NULL);
-        n += stage_marker_file(f, staging, L"admin-user.marker",
-                               user_utf8, strlen(user_utf8),
-                               L"/etc/appsandbox-admin-user");
-        n += stage_marker_file(f, staging, L"admin-hash.marker",
-                               admin_pw_hash, strlen(admin_pw_hash),
-                               L"/etc/appsandbox-admin-hash");
+        if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, admin_user, -1,
+                                 user_utf8, sizeof(user_utf8), NULL, NULL) ||
+            !stage_marker_file(f, staging, L"admin-user.marker",
+                                user_utf8, strlen(user_utf8),
+                                L"/etc/appsandbox-admin-user") ||
+            !stage_marker_file(f, staging, L"admin-hash.marker",
+                                admin_pw_hash, strlen(admin_pw_hash),
+                                L"/etc/appsandbox-admin-hash")) {
+            asb_log(L"Error: failed to stage Linux account credentials.");
+            fclose(f);
+            return -1;
+        }
+        n += 2;
         asb_log(L"Linux admin: staged user=%s + $6$ hash marker", admin_user);
-    } else {
-        asb_log(L"Linux admin: no admin_user/admin_pass — firstboot will use test/test123");
     }
 
     if (ssh_enabled) {
@@ -1802,7 +1889,11 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
         asb_log(L"Linux hostname: staged /etc/appsandbox-hostname = %s", vm_name);
     }
 
-    fclose(f);
+    {
+        BOOL written = !ferror(f);
+        if (fclose(f) != 0) written = FALSE;
+        if (!written) return -1;
+    }
     asb_log(L"Linux staging manifest written: %s (%d file(s))", manifest_path, n);
     return n;
 }
@@ -2263,16 +2354,16 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     /* Hash the modal-supplied admin password into glibc $6$ format so the
        firstboot can drop it straight into /etc/shadow via `usermod -p`.
        Plaintext is wiped immediately after — same pattern as the Windows
-       autounattend path. If the user left password blank, fall through
-       with empty strings; generate_vhdx_manifest_ubuntu logs a warning
-       and the guest falls back to the test/test123 placeholder. */
+       autounattend path. */
     char admin_pw_hash[256] = {0};
-    if (args->config.admin_pass[0] != L'\0') {
-        if (!unix_password_hash(args->config.admin_pass,
-                                admin_pw_hash, sizeof(admin_pw_hash))) {
-            asb_log(L"WARN: failed to hash admin_pass — falling back to test/test123");
-            admin_pw_hash[0] = '\0';
-        }
+    if (!args->config.admin_pass[0] ||
+        !unix_password_hash(args->config.admin_pass, admin_pw_hash, sizeof(admin_pw_hash))) {
+        SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
+        SecureZeroMemory(admin_pw_hash, sizeof(admin_pw_hash));
+        args->result = E_FAIL;
+        wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                  L"Failed to hash the Linux password.");
+        goto done;
     }
     SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
 
@@ -2601,6 +2692,246 @@ ASB_API void asb_detach(void)
 
 /* ---- VM Create ---- */
 
+ASB_API void asb_default_disk_directory(wchar_t *out, size_t out_len)
+{
+    wchar_t base[MAX_PATH];
+    DWORD n;
+    if (!out || !out_len) return;
+    n = GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH);
+    if (!n || n >= MAX_PATH)
+        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+    _snwprintf_s(out, out_len, _TRUNCATE, L"%s\\AppSandbox", base);
+}
+
+/* Each selected location receives an exclusive VM-named child, so cleanup
+   never owns the selected parent. */
+static const wchar_t *resolve_disk_directory(const wchar_t *name,
+    const wchar_t *selected, BOOL is_template, wchar_t *parent, wchar_t *vm_dir)
+{
+    wchar_t supplied[MAX_PATH], default_dir[MAX_PATH], default_full[MAX_PATH];
+    size_t i, len;
+    DWORD n, attrs, err;
+    BOOL use_default;
+
+    if (!name || !name[0] || wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0)
+        return L"VM name is required.";
+    len = wcslen(name);
+    if (len >= 256 || name[len - 1] == L'.' || name[len - 1] == L' ')
+        return L"VM name cannot be used as a disk folder name.";
+    for (i = 0; i < len; i++)
+        if (name[i] < 32 || wcschr(L"\\/:*?\"<>|", name[i]))
+            return L"VM name cannot be used as a disk folder name.";
+
+    asb_default_disk_directory(default_dir, MAX_PATH);
+    if (!selected || !selected[0]) selected = default_dir;
+    len = wcslen(selected);
+    if (len >= MAX_PATH)
+        return L"Disk storage path is too long.";
+    wcscpy_s(supplied, MAX_PATH, selected);
+    for (i = 0; i < len; i++) {
+        if (supplied[i] == L'/') supplied[i] = L'\\';
+        if (supplied[i] < 32 || wcschr(L"*?\"<>|", supplied[i]) ||
+            (supplied[i] == L':' && i != 1))
+            return L"Disk storage location contains invalid path characters.";
+    }
+    if (!((len >= 3 && ((supplied[0] >= L'A' && supplied[0] <= L'Z') ||
+                        (supplied[0] >= L'a' && supplied[0] <= L'z')) &&
+                        supplied[1] == L':' && supplied[2] == L'\\') ||
+          (len >= 5 && supplied[0] == L'\\' && supplied[1] == L'\\')))
+        return L"Disk storage location must be an absolute path.";
+
+    n = GetFullPathNameW(supplied, MAX_PATH, parent, NULL);
+    if (!n || n >= MAX_PATH)
+        return L"Disk storage path is too long or invalid.";
+    while (n > 3 && parent[n - 1] == L'\\') parent[--n] = 0;
+    n = GetFullPathNameW(default_dir, MAX_PATH, default_full, NULL);
+    if (!n || n >= MAX_PATH) return L"Default disk storage location is invalid.";
+    while (n > 3 && default_full[n - 1] == L'\\') default_full[--n] = 0;
+    use_default = (_wcsicmp(parent, default_full) == 0);
+    if (use_default && is_template) {
+        if (wcslen(parent) + 10 >= MAX_PATH) return L"Disk storage path is too long.";
+        wcscat_s(parent, MAX_PATH, L"\\templates");
+    }
+
+    /* Leave room for both GUID snapshot names and the installer staging tree. */
+    if (wcslen(parent) + 1 + wcslen(name) + 96 >= MAX_PATH)
+        return L"Disk storage path is too long for VM files and snapshots.";
+    attrs = GetFileAttributesW(parent);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        err = GetLastError();
+        if (!use_default || (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND))
+            return L"Disk storage location must be an existing accessible folder.";
+    } else if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        return L"Disk storage location must be a folder.";
+    }
+    swprintf_s(vm_dir, MAX_PATH, L"%s%s%s", parent,
+        parent[wcslen(parent) - 1] == L'\\' ? L"" : L"\\", name);
+    attrs = GetFileAttributesW(vm_dir);
+    if (attrs != INVALID_FILE_ATTRIBUTES)
+        return L"A file or folder with this VM name already exists in the disk storage location.";
+    err = GetLastError();
+    if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
+        return L"The VM disk folder cannot be accessed.";
+    return NULL;
+}
+
+ASB_API const wchar_t *asb_validate_disk_directory(const wchar_t *name,
+    const wchar_t *disk_directory, BOOL is_template)
+{
+    wchar_t parent[MAX_PATH], vm_dir[MAX_PATH];
+    return resolve_disk_directory(name, disk_directory, is_template, parent, vm_dir);
+}
+
+ASB_API const wchar_t *asb_validate_template_disk_size(const wchar_t *template_name,
+    DWORD hdd_gb)
+{
+    int i;
+    ULONGLONG parent_bytes;
+    HRESULT hr;
+
+    if (!template_name || !template_name[0]) return NULL;
+    for (i = 0; i < g_template_count; i++) {
+        if (_wcsicmp(g_templates[i].name, template_name) == 0) {
+            hr = vhdx_get_virtual_size(g_templates[i].vhdx_path, &parent_bytes);
+            if (FAILED(hr)) {
+                asb_log(L"Cannot read template VHDX capacity (0x%08X): %s",
+                        hr, g_templates[i].vhdx_path);
+                return L"Cannot read the selected template's virtual disk size.";
+            }
+            if ((ULONGLONG)(hdd_gb ? hdd_gb : 64) * 1024ULL * 1024ULL * 1024ULL < parent_bytes)
+                return L"HDD size cannot be smaller than the template's virtual disk size.";
+            return NULL;
+        }
+    }
+    return L"The selected template was not found.";
+}
+
+/* ECMAScript String.trim whitespace, matching the creation form. */
+static BOOL username_is_space(wchar_t ch)
+{
+    return (ch >= 0x0009 && ch <= 0x000D) || ch == 0x0020 ||
+           ch == 0x00A0 || ch == 0x1680 || (ch >= 0x2000 && ch <= 0x200A) ||
+           ch == 0x2028 || ch == 0x2029 || ch == 0x202F || ch == 0x205F ||
+           ch == 0x3000 || ch == 0xFEFF;
+}
+
+static const wchar_t *trimmed_username(const wchar_t *username, size_t *length)
+{
+    if (!username) username = L"";
+    while (username_is_space(*username)) username++;
+    *length = wcslen(username);
+    while (*length && username_is_space(username[*length - 1])) (*length)--;
+    return username;
+}
+
+ASB_API const wchar_t *asb_validate_username(const wchar_t *os_type,
+    const wchar_t *username, const wchar_t *vm_name, BOOL is_template)
+{
+    size_t length, i;
+    BOOL is_linux = os_type && _wcsicmp(os_type, L"Linux") == 0;
+    BOOL only_dots_spaces = TRUE;
+
+    username = trimmed_username(username, &length);
+    if (!length) return L"Username is required.";
+    for (i = 0; i < length; i++) {
+        unsigned ch = username[i];
+        if (ch >= 0xD800 && ch <= 0xDBFF) {
+            if (++i >= length || username[i] < 0xDC00 || username[i] > 0xDFFF)
+                return L"Username contains invalid Unicode.";
+        } else if (ch >= 0xDC00 && ch <= 0xDFFF) {
+            return L"Username contains invalid Unicode.";
+        }
+    }
+    if (is_linux) {
+        /* Canonical Subiquity 26.04 reserved-usernames. */
+        static const wchar_t *reserved[] = {
+            L"root", L"daemon", L"bin", L"sys", L"sync", L"games", L"man", L"lp",
+            L"mail", L"news", L"uucp", L"proxy", L"www-data", L"backup", L"list",
+            L"irc", L"gnats", L"nobody", L"adm", L"tty", L"disk", L"kmem", L"dialout",
+            L"fax", L"voice", L"cdrom", L"floppy", L"tape", L"sudo", L"audio", L"dip",
+            L"operator", L"src", L"shadow", L"utmp", L"video", L"sasl", L"plugdev",
+            L"staff", L"users", L"nogroup", L"netplan", L"ftn", L"mysql", L"tac-plus",
+            L"alias", L"qmail", L"qmaild", L"qmails", L"qmailr", L"qmailq", L"qmaill",
+            L"qmailp", L"asterisk", L"vpopmail", L"vchkpw", L"slurm", L"hacluster",
+            L"haclient", L"grsec-tpe", L"grsec-sock-all", L"grsec-sock-clt",
+            L"grsec-sock-srv", L"grsec-proc", L"ceph", L"opensrf", L"libvirt-qemu",
+            L"admin", L"Debian-exim", L"bind", L"crontab", L"cupsys", L"dcc", L"dhcp",
+            L"dictd", L"dnsmasq", L"dovecot", L"fetchmail", L"firebird", L"ftp", L"fuse",
+            L"gdm", L"haldaemon", L"hplilp", L"identd", L"input", L"jwhois", L"klog",
+            L"kvm", L"lpadmin", L"maas", L"messagebus", L"mythtv", L"netdev", L"powerdev",
+            L"radvd", L"render", L"saned", L"sbuild", L"scanner", L"sgx", L"slocate",
+            L"ssh", L"sshd", L"ssl-cert", L"sslwrap", L"statd", L"syslog", L"telnetd", L"tftpd"
+        };
+        if (length > 32) return L"Username cannot exceed 32 characters (Linux limit).";
+        for (i = 0; i < length; i++) {
+            wchar_t ch = username[i];
+            if (!((ch >= L'a' && ch <= L'z') || ch == L'_' ||
+                  (i && ((ch >= L'0' && ch <= L'9') || ch == L'-'))))
+                return L"Linux username: lowercase letters, digits, _ and - only; start with a letter or _.";
+        }
+        for (i = 0; i < ARRAYSIZE(reserved); i++)
+            if (wcslen(reserved[i]) == length && wcsncmp(username, reserved[i], length) == 0)
+                return L"Username is a reserved name.";
+        return NULL;
+    }
+    if (length > 20) return L"Username cannot exceed 20 characters.";
+    for (i = 0; i < length; i++) {
+        wchar_t ch = username[i];
+        if (ch < 32 || ch == 0xFFFE || ch == 0xFFFF || wcschr(L"\"\\/[]:;|=,+*?<>%@", ch))
+            return L"Username contains invalid characters.";
+        if (ch != L'.' && !username_is_space(ch)) only_dots_spaces = FALSE;
+    }
+    if (only_dots_spaces) return L"Username cannot be only dots or spaces.";
+    if (username[length - 1] == L'.') return L"Username cannot end with a period.";
+    {
+        static const wchar_t *reserved[] = {
+            L"NONE", L"CON", L"PRN", L"AUX", L"NUL",
+            L"COM1", L"COM2", L"COM3", L"COM4", L"COM5", L"COM6", L"COM7", L"COM8", L"COM9",
+            L"LPT1", L"LPT2", L"LPT3", L"LPT4", L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9"
+        };
+        for (i = 0; i < ARRAYSIZE(reserved); i++)
+            if (wcslen(reserved[i]) == length && _wcsnicmp(username, reserved[i], length) == 0)
+                return L"Username is a reserved name.";
+    }
+    if (!is_template && vm_name && wcslen(vm_name) == length &&
+        _wcsnicmp(username, vm_name, length) == 0)
+        return L"Username cannot match the VM name (Windows computer name).";
+    return NULL;
+}
+
+ASB_API const wchar_t *asb_validate_password(const wchar_t *os_type,
+    const wchar_t *password)
+{
+    size_t units = 0, code_points = 0, utf8_bytes = 0;
+    BOOL is_linux = os_type && _wcsicmp(os_type, L"Linux") == 0;
+
+    if (!password || !password[0]) return L"Password is required.";
+    while (password[units]) {
+        unsigned ch = password[units++];
+        if (ch >= 0xD800 && ch <= 0xDBFF) {
+            unsigned low = password[units];
+            if (low < 0xDC00 || low > 0xDFFF)
+                return L"Password contains invalid Unicode.";
+            units++;
+            utf8_bytes += 4;
+        } else if (ch >= 0xDC00 && ch <= 0xDFFF) {
+            return L"Password contains invalid Unicode.";
+        } else {
+            utf8_bytes += ch < 0x80 ? 1 : ch < 0x800 ? 2 : 3;
+        }
+        code_points++;
+    }
+    if (is_linux) {
+        if (code_points < 6)
+            return L"Password must be at least 6 characters (Ubuntu minimum).";
+        if (utf8_bytes > 255)
+            return L"Password is too long (max 255 bytes).";
+    } else if (units > 127) {
+        return L"Password is too long (max 127 characters for Windows).";
+    }
+    return NULL;
+}
+
 ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 {
     VmConfig cfg;
@@ -2613,20 +2944,48 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     BOOL is_template_create;
     int template_idx = -1;
     BOOL from_template = FALSE;
+    const wchar_t *effective_os;
 
     if (!config || !config->name || config->name[0] == L'\0') {
         asb_log(L"Error: VM name is required.");
         return E_INVALIDARG;
     }
 
+    effective_os = config->os_type;
+    if (config->template_name && config->template_name[0] != L'\0') {
+        int i;
+        for (i = 0; i < g_template_count; i++) {
+            if (_wcsicmp(g_templates[i].name, config->template_name) == 0) {
+                template_idx = i;
+                from_template = TRUE;
+                effective_os = g_templates[i].os_type;
+                break;
+            }
+        }
+    }
+    {
+        const wchar_t *error = asb_validate_username(effective_os, config->username,
+                                                    config->name, config->is_template);
+        if (!error) error = asb_validate_password(effective_os, config->password);
+        if (error) {
+            asb_log(L"Error: %s", error);
+            asb_alert(error);
+            return E_INVALIDARG;
+        }
+    }
+
     ZeroMemory(&cfg, sizeof(cfg));
 
     /* Copy config strings into local VmConfig */
     wcscpy_s(cfg.name, 256, config->name);
-    if (config->os_type) wcscpy_s(cfg.os_type, 32, config->os_type);
+    if (effective_os) wcscpy_s(cfg.os_type, 32, effective_os);
     if (config->image_path) wcscpy_s(cfg.image_path, MAX_PATH, config->image_path);
-    if (config->username) wcscpy_s(cfg.admin_user, 128, config->username);
-    if (config->password) wcscpy_s(cfg.admin_pass, 128, config->password);
+    {
+        size_t user_length;
+        const wchar_t *user = trimmed_username(config->username, &user_length);
+        wcsncpy_s(cfg.admin_user, ARRAYSIZE(cfg.admin_user), user, user_length);
+    }
+    wcscpy_s(cfg.admin_pass, ARRAYSIZE(cfg.admin_pass), config->password);
     cfg.ram_mb = config->ram_mb;
     cfg.hdd_gb = config->hdd_gb;
     cfg.cpu_cores = config->cpu_cores;
@@ -2657,22 +3016,18 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         cfg.test_mode = TRUE;
     }
 
-    /* Resolve template */
-    if (config->template_name && config->template_name[0] != L'\0') {
-        int i;
-        for (i = 0; i < g_template_count; i++) {
-            if (_wcsicmp(g_templates[i].name, config->template_name) == 0) {
-                template_idx = i;
-                from_template = TRUE;
-                wcscpy_s(cfg.os_type, 32, g_templates[i].os_type);
-                break;
-            }
-        }
-    }
-
     if (is_template_create && from_template) {
         asb_log(L"Error: Cannot create a template from another template.");
         return E_INVALIDARG;
+    }
+
+    {
+        const wchar_t *error = asb_validate_template_disk_size(config->template_name, cfg.hdd_gb);
+        if (error) {
+            asb_log(L"Error: %s", error);
+            asb_alert(error);
+            return E_INVALIDARG;
+        }
     }
 
     /* Linux v1: require an ISO. Templates aren't supported for Linux yet. */
@@ -2722,6 +3077,15 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         asb_log(L"Maximum VM count reached (%d)", ASB_MAX_VMS);
         return E_OUTOFMEMORY;
     }
+    if (is_template_create) {
+        int pending = 0, i;
+        for (i = 0; i < g_vm_count; i++)
+            if (g_vms[i].is_template) pending++;
+        if (g_template_count + pending >= ASB_MAX_TEMPLATES) {
+            asb_log(L"Maximum template count reached (%d)", ASB_MAX_TEMPLATES);
+            return E_OUTOFMEMORY;
+        }
+    }
 
     inst = &g_vms[g_vm_count];
     ZeroMemory(inst, sizeof(VmInstance));
@@ -2738,26 +3102,31 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         cfg.network_mode = NET_NONE;
     }
 
-    if (cfg.admin_user[0] == L'\0')
-        wcscpy_s(cfg.admin_user, 128, L"User");
-
-    /* Create VHDX directory */
     {
-        wchar_t base_dir[MAX_PATH];
-        if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
-            wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
-        swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox", base_dir);
-        CreateDirectoryW(vhdx_dir, NULL);
-
-        if (is_template_create) {
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates", base_dir);
-            CreateDirectoryW(vhdx_dir, NULL);
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates\\%s", base_dir, cfg.name);
-        } else {
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\%s", base_dir, cfg.name);
+        wchar_t parent[MAX_PATH], default_dir[MAX_PATH];
+        const wchar_t *error = resolve_disk_directory(cfg.name, config->disk_directory,
+            is_template_create, parent, vhdx_dir);
+        if (error) {
+            asb_log(L"Error: %s", error);
+            asb_alert(error);
+            return E_INVALIDARG;
+        }
+        asb_default_disk_directory(default_dir, MAX_PATH);
+        CreateDirectoryW(default_dir, NULL);
+        if (GetFileAttributesW(parent) == INVALID_FILE_ATTRIBUTES &&
+            !CreateDirectoryW(parent, NULL)) {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            asb_log(L"Error: Cannot create disk storage folder %s (0x%08X).", parent, hr);
+            asb_alert(L"Cannot create the disk storage folder.");
+            return hr;
+        }
+        if (!CreateDirectoryW(vhdx_dir, NULL)) {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            asb_log(L"Error: Cannot create VM disk folder %s (0x%08X).", vhdx_dir, hr);
+            asb_alert(L"Cannot create the VM disk folder. Check the location and permissions.");
+            return hr;
         }
     }
-    CreateDirectoryW(vhdx_dir, NULL);
     swprintf_s(cfg.vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
 
     /* GPU driver shares */
@@ -2768,8 +3137,10 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
          * /usr/lib/wsl/lib by the agent on first connect. */
         if (_wcsicmp(cfg.os_type, L"Linux") == 0)
             gpu_append_lxsslib_share(&cfg.gpu_shares);
-        else if (_wcsicmp(cfg.os_type, L"Windows") == 0)
+        else if (_wcsicmp(cfg.os_type, L"Windows") == 0) {
+            gpu_append_nvidia_drs_share(&g_gpu_list, &cfg.gpu_shares);
             prepare_gl_layers_share(&cfg.gpu_shares);
+        }
     }
 
     /* ---- VHDX-first path (Windows, from ISO) ---- */
@@ -2894,12 +3265,6 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             asb_log(L"Building Linux VM \"%s\" (direct ISO->VHDX, ~3 minutes)...", cfg.name);
             CloseHandle(CreateThread(NULL, 0, linux_create_thread, args, 0, NULL));
 
-            /* Wipe the plaintext password from the local cfg; the worker
-               thread has its own heap copy in args->config and wipes that
-               after use (run_iso_patch_ubuntu doesn't consume it today —
-               firstboot.sh uses a static test/test123 — but the field is
-               retained on the config for future password injection via
-               --stage manifest). */
             SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
 
             if (g_state_cb) g_state_cb(vm_handle(inst), FALSE, g_state_ud);
@@ -2917,14 +3282,31 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
        installs go through use_vhdx_first above). */
     if (from_template) {
         asb_log(L"Creating differencing VHDX from template \"%s\"...", g_templates[template_idx].name);
-        DeleteFileW(cfg.vhdx_path);
         hr = vhdx_create_differencing(cfg.vhdx_path, g_templates[template_idx].vhdx_path);
-        if (FAILED(hr)) { asb_log(L"Error: Failed to create differencing VHDX (0x%08X)", hr); return hr; }
-        asb_log(L"Differencing VHDX created.");
+        if (FAILED(hr)) {
+            asb_log(L"Error: Failed to create differencing VHDX (0x%08X)", hr);
+            remove_dir_recursive(vhdx_dir);
+            return hr;
+        }
+        /* The child initially inherits the parent's capacity. Grow only the
+           new child before attaching it; the template remains unchanged. */
+        hr = vhdx_grow(cfg.vhdx_path, (ULONGLONG)cfg.hdd_gb);
+        if (FAILED(hr)) {
+            asb_log(L"Error: Failed to size template instance VHDX to %lu GB (0x%08X).",
+                    cfg.hdd_gb, hr);
+            asb_alert(L"Failed to apply the requested HDD size to the template instance.");
+            remove_dir_recursive(vhdx_dir);
+            return hr;
+        }
+        asb_log(L"Differencing VHDX ready (%lu GB).", cfg.hdd_gb);
     } else {
         asb_log(L"Creating VHDX: %s (%lu GB)...", cfg.vhdx_path, cfg.hdd_gb);
         hr = vhdx_create(cfg.vhdx_path, (ULONGLONG)cfg.hdd_gb);
-        if (FAILED(hr)) { asb_log(L"Error: Failed to create VHDX (0x%08X)", hr); return hr; }
+        if (FAILED(hr)) {
+            asb_log(L"Error: Failed to create VHDX (0x%08X)", hr);
+            remove_dir_recursive(vhdx_dir);
+            return hr;
+        }
         asb_log(L"VHDX created successfully.");
     }
 
@@ -2947,7 +3329,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                 else asb_log(L"Warning: Failed to create template resources ISO (0x%08X).", hr);
             }
         } else if (from_template) {
-            if (_wcsicmp(cfg.os_type, L"Windows") == 0 && cfg.admin_pass[0] != L'\0') {
+            /* Every Windows instance needs mini-setup, including the OS
+               partition extension when its child VHDX was enlarged. */
+            if (_wcsicmp(cfg.os_type, L"Windows") == 0) {
                 wchar_t template_lang[32] = L"en-US";
                 vm_load_language_json(g_templates[template_idx].vhdx_path, template_lang, 32);
                 hr = iso_create_instance_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
@@ -2956,7 +3340,13 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                     wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                     vm_save_language_json(cfg.vhdx_path, template_lang);
                 }
-                else asb_log(L"Warning: Failed to create instance resources ISO (0x%08X).", hr);
+                else {
+                    asb_log(L"Error: Failed to create instance resources ISO (0x%08X).", hr);
+                    asb_alert(L"Failed to prepare the template instance's Windows setup.");
+                    SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
+                    remove_dir_recursive(vhdx_dir);
+                    return hr;
+                }
             }
         } else {
             if (_wcsicmp(cfg.os_type, L"Windows") == 0 && cfg.image_path[0] != L'\0' &&
@@ -3024,6 +3414,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             hcn_delete_endpoint(&inst->endpoint_id);
             endpoint_guid_str[0] = L'\0';
         }
+        remove_dir_recursive(vhdx_dir);
         return hr;
     }
 
@@ -3104,6 +3495,19 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         if (snap_idx == -2) asb_log(L"Switching to base branch...");
         else asb_log(L"Switching to \"%s\" branch...", g_snap_trees[idx].nodes[snap_idx].name);
         save_vm_list();
+    }
+
+    {
+        HRESULT hr = snapshot_ensure_writable(&g_snap_trees[idx], inst);
+        if (FAILED(hr)) {
+            asb_log(L"Error: Failed to create working branch (0x%08X)", hr);
+            if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
+            return hr;
+        }
+        if (hr == S_OK) {
+            if (inst->handle) hcs_close_vm(inst);
+            save_vm_list();
+        }
     }
 
     if (!inst->handle) {
@@ -3226,12 +3630,21 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
 {
     int idx, i;
     wchar_t dir[MAX_PATH];
-    wchar_t *last_slash;
     VmInstance *inst;
+    DWORD attrs;
+    HRESULT hr;
 
     idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     inst = &g_vms[idx];
+    if (!get_vm_disk_root(inst->vhdx_path, dir)) return E_INVALIDARG;
+    attrs = GetFileAttributesW(dir);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        asb_log(L"Error: VM disk folder is unavailable: %s (0x%08X).", dir, hr);
+        return hr;
+    }
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
 
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
@@ -3246,20 +3659,15 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     hcs_close_vm(inst);
     hcs_destroy_stale(inst->name);
 
-    /* Determine VM root directory */
-    wcscpy_s(dir, MAX_PATH, inst->vhdx_path);
-    last_slash = wcsrchr(dir, L'\\');
-    if (last_slash) *last_slash = L'\0';
-    {
-        size_t dlen = wcslen(dir);
-        if (dlen >= 10 && _wcsicmp(dir + dlen - 10, L"\\snapshots") == 0)
-            dir[dlen - 10] = L'\0';
-    }
-
     /* Recursively remove the whole VM folder, including subdirectories
        (snapshots\ and the build's _vhdx_staging\); a file-only delete would
        leave those and orphan the dir. */
-    remove_dir_recursive(dir);
+    if (!remove_dir_recursive(dir)) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        asb_log(L"Error: Cannot remove VM disk folder: %s (0x%08X).", dir, hr);
+        save_vm_list();
+        return hr;
+    }
 
     /* Compact arrays */
     EnterCriticalSection(&g_cs);
@@ -3278,6 +3686,20 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
 /* ---- VM Queries ---- */
 
 ASB_API int asb_vm_count(void) { return g_vm_count; }
+
+ASB_API void asb_vm_disk_directory(AsbVm vm, wchar_t *out, size_t out_len)
+{
+    VmInstance *inst = vm_inst(vm);
+    wchar_t dir[MAX_PATH], *slash;
+    if (!out || !out_len) return;
+    out[0] = 0;
+    if (!inst || !get_vm_disk_root(inst->vhdx_path, dir)) return;
+    slash = wcsrchr(dir, L'\\');
+    if (!slash) return;
+    if (slash == dir + 2 && dir[1] == L':') slash[1] = 0;
+    else *slash = 0;
+    wcsncpy_s(out, out_len, dir, _TRUNCATE);
+}
 
 ASB_API AsbVm asb_vm_get(int index)
 {
@@ -3622,31 +4044,35 @@ ASB_API const wchar_t *asb_template_os_type(int index)
 
 ASB_API HRESULT asb_template_delete(const wchar_t *name)
 {
-    wchar_t base_dir[MAX_PATH], tpl_dir[MAX_PATH];
-    wchar_t json_path[MAX_PATH], vhdx_path[MAX_PATH];
-    wchar_t vmgs[MAX_PATH], vmrs[MAX_PATH], res[MAX_PATH], snap_dir[MAX_PATH];
+    wchar_t tpl_dir[MAX_PATH];
+    DWORD attrs;
+    HRESULT hr;
+    int index, i;
 
     if (!name || name[0] == L'\0') return E_INVALIDARG;
-
-    if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
-        wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
-    swprintf_s(tpl_dir, MAX_PATH, L"%s\\AppSandbox\\templates\\%s", base_dir, name);
-
-    swprintf_s(json_path, MAX_PATH, L"%s\\%s.json", tpl_dir, name);
-    swprintf_s(vhdx_path, MAX_PATH, L"%s\\disk.vhdx", tpl_dir);
-    swprintf_s(vmgs, MAX_PATH, L"%s\\vm.vmgs", tpl_dir);
-    swprintf_s(vmrs, MAX_PATH, L"%s\\vm.vmrs", tpl_dir);
-    swprintf_s(res, MAX_PATH, L"%s\\resources.iso", tpl_dir);
-    DeleteFileW(json_path);
-    DeleteFileW(vhdx_path);
-    DeleteFileW(vmgs); DeleteFileW(vmrs); DeleteFileW(res);
-
-    swprintf_s(snap_dir, MAX_PATH, L"%s\\snapshots", tpl_dir);
-    RemoveDirectoryW(snap_dir);
-    RemoveDirectoryW(tpl_dir);
+    for (index = 0; index < g_template_count; index++)
+        if (_wcsicmp(g_templates[index].name, name) == 0) break;
+    if (index == g_template_count) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    if (!get_vm_disk_root(g_templates[index].vhdx_path, tpl_dir)) return E_INVALIDARG;
+    attrs = GetFileAttributesW(tpl_dir);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        asb_log(L"Error: Template disk folder is unavailable: %s (0x%08X).", tpl_dir, hr);
+        return hr;
+    }
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
+    if (!remove_dir_recursive(tpl_dir)) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        asb_log(L"Error: Cannot remove template disk folder: %s (0x%08X).", tpl_dir, hr);
+        return hr;
+    }
 
     asb_log(L"Template \"%s\" deleted.", name);
+    for (i = index; i < g_template_count - 1; i++)
+        g_templates[i] = g_templates[i + 1];
+    ZeroMemory(&g_templates[--g_template_count], sizeof(TemplateInfo));
     scan_templates();
+    save_vm_list();
     return S_OK;
 }
 

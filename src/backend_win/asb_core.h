@@ -62,6 +62,7 @@ typedef struct {
     BOOL   ssh_enabled;            /* TRUE = install OpenSSH Server in guest */
     BOOL   ssh_deploy_key;         /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
     BOOL   is_template;            /* TRUE = create as template VM */
+    const wchar_t *disk_directory; /* parent for a new VM folder; NULL/empty = default */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
@@ -128,6 +129,20 @@ ASB_API void asb_set_vm_removed_callback(AsbVmRemovedCallback cb, void *user_dat
    Depending on config, this may start a background VHDX creation thread. */
 ASB_API HRESULT asb_vm_create(const AsbVmConfig *config);
 
+ASB_API const wchar_t *asb_validate_username(const wchar_t *os_type,
+    const wchar_t *username, const wchar_t *vm_name, BOOL is_template);
+
+ASB_API const wchar_t *asb_validate_password(const wchar_t *os_type,
+    const wchar_t *password);
+
+ASB_API void asb_default_disk_directory(wchar_t *out, size_t out_len);
+
+ASB_API const wchar_t *asb_validate_disk_directory(const wchar_t *name,
+    const wchar_t *disk_directory, BOOL is_template);
+
+ASB_API const wchar_t *asb_validate_template_disk_size(const wchar_t *template_name,
+    DWORD hdd_gb);
+
 /* Start a VM.
    snap_idx: snapshot index (>= 0), -2 for base, -1 for current disk.
    branch_idx: branch index (>= 0) to resume, or -1 to create a new branch.
@@ -149,6 +164,7 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm);
 ASB_API int     asb_vm_count(void);
 ASB_API AsbVm   asb_vm_get(int index);
 ASB_API AsbVm   asb_vm_find(const wchar_t *name);
+ASB_API void    asb_vm_disk_directory(AsbVm vm, wchar_t *out, size_t out_len);
 
 ASB_API const wchar_t *asb_vm_name(AsbVm vm);
 ASB_API const wchar_t *asb_vm_os_type(AsbVm vm);

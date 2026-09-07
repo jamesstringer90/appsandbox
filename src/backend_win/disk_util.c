@@ -114,6 +114,102 @@ HRESULT vhdx_create_differencing(const wchar_t *child_path, const wchar_t *paren
     return S_OK;
 }
 
+static DWORD vhdx_query_virtual_size(HANDLE vhd_handle, ULONGLONG *size_bytes)
+{
+    GET_VIRTUAL_DISK_INFO info;
+    ULONG info_size = sizeof(info);
+    DWORD result;
+
+    ZeroMemory(&info, sizeof(info));
+    info.Version = GET_VIRTUAL_DISK_INFO_SIZE;
+    result = GetVirtualDiskInformation(vhd_handle, &info_size, &info, NULL);
+    if (result == ERROR_SUCCESS)
+        *size_bytes = info.Size.VirtualSize;
+    return result;
+}
+
+HRESULT vhdx_get_virtual_size(const wchar_t *path, ULONGLONG *size_bytes)
+{
+    VIRTUAL_STORAGE_TYPE storage_type;
+    OPEN_VIRTUAL_DISK_PARAMETERS open_params;
+    HANDLE vhd_handle = INVALID_HANDLE_VALUE;
+    DWORD result;
+
+    if (!size_bytes)
+        return E_INVALIDARG;
+    *size_bytes = 0;
+    if (!path || !path[0])
+        return E_INVALIDARG;
+
+    storage_type.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
+    storage_type.VendorId = VHDX_VENDOR_MS;
+    ZeroMemory(&open_params, sizeof(open_params));
+    open_params.Version = OPEN_VIRTUAL_DISK_VERSION_2;
+    open_params.Version2.GetInfoOnly = TRUE;
+    open_params.Version2.ReadOnly = TRUE;
+
+    result = OpenVirtualDisk(&storage_type, path, VIRTUAL_DISK_ACCESS_NONE,
+                             OPEN_VIRTUAL_DISK_FLAG_NONE, &open_params,
+                             &vhd_handle);
+    if (result != ERROR_SUCCESS)
+        return HRESULT_FROM_WIN32(result);
+
+    result = vhdx_query_virtual_size(vhd_handle, size_bytes);
+    CloseHandle(vhd_handle);
+    return HRESULT_FROM_WIN32(result);
+}
+
+HRESULT vhdx_grow(const wchar_t *path, ULONGLONG size_gb)
+{
+    const ULONGLONG bytes_per_gb = 1024ULL * 1024ULL * 1024ULL;
+    VIRTUAL_STORAGE_TYPE storage_type;
+    OPEN_VIRTUAL_DISK_PARAMETERS open_params;
+    RESIZE_VIRTUAL_DISK_PARAMETERS resize_params;
+    HANDLE vhd_handle = INVALID_HANDLE_VALUE;
+    ULONGLONG current_size = 0;
+    ULONGLONG requested_size;
+    DWORD result;
+
+    if (!path || !path[0] || size_gb == 0 ||
+        size_gb > (~(ULONGLONG)0) / bytes_per_gb)
+        return E_INVALIDARG;
+    requested_size = size_gb * bytes_per_gb;
+
+    storage_type.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
+    storage_type.VendorId = VHDX_VENDOR_MS;
+    ZeroMemory(&open_params, sizeof(open_params));
+    open_params.Version = OPEN_VIRTUAL_DISK_VERSION_2;
+    open_params.Version2.GetInfoOnly = FALSE;
+    open_params.Version2.ReadOnly = FALSE;
+
+    result = OpenVirtualDisk(&storage_type, path, VIRTUAL_DISK_ACCESS_NONE,
+                             OPEN_VIRTUAL_DISK_FLAG_NONE, &open_params,
+                             &vhd_handle);
+    if (result != ERROR_SUCCESS)
+        return HRESULT_FROM_WIN32(result);
+
+    result = vhdx_query_virtual_size(vhd_handle, &current_size);
+    if (result == ERROR_SUCCESS && requested_size < current_size) {
+        CloseHandle(vhd_handle);
+        return E_INVALIDARG;
+    }
+    if (result == ERROR_SUCCESS && requested_size > current_size) {
+        ZeroMemory(&resize_params, sizeof(resize_params));
+        resize_params.Version = RESIZE_VIRTUAL_DISK_VERSION_1;
+        resize_params.Version1.NewSize = requested_size;
+        result = ResizeVirtualDisk(vhd_handle, RESIZE_VIRTUAL_DISK_FLAG_NONE,
+                                   &resize_params, NULL);
+        if (result == ERROR_SUCCESS) {
+            result = vhdx_query_virtual_size(vhd_handle, &current_size);
+            if (result == ERROR_SUCCESS && current_size != requested_size)
+                result = ERROR_INVALID_DATA;
+        }
+    }
+
+    CloseHandle(vhd_handle);
+    return HRESULT_FROM_WIN32(result);
+}
+
 HRESULT vhdx_merge(const wchar_t *child_path)
 {
     VIRTUAL_STORAGE_TYPE storage_type;
@@ -194,6 +290,30 @@ static BOOL encode_unattend_password(const wchar_t *pass, wchar_t *b64_out, int 
     return TRUE;
 }
 
+static BOOL xml_escape_text(const wchar_t *text, wchar_t *out, size_t capacity)
+{
+    size_t used = 0;
+    if (!text || !out || !capacity) return FALSE;
+    while (*text) {
+        const wchar_t *replacement = NULL;
+        size_t count;
+        switch (*text) {
+            case L'&': replacement = L"&amp;"; break;
+            case L'<': replacement = L"&lt;"; break;
+            case L'>': replacement = L"&gt;"; break;
+            case L'"': replacement = L"&quot;"; break;
+            case L'\'': replacement = L"&apos;"; break;
+        }
+        count = replacement ? wcslen(replacement) : 1;
+        if (used + count >= capacity) { out[0] = 0; return FALSE; }
+        memcpy(out + used, replacement ? replacement : text, count * sizeof(wchar_t));
+        used += count;
+        text++;
+    }
+    out[used] = 0;
+    return TRUE;
+}
+
 /* Map language tag to LCID:KLID format for InputLocale */
 static const wchar_t *lang_to_input_locale(const wchar_t *lang)
 {
@@ -262,7 +382,10 @@ static BOOL generate_autounattend(const wchar_t *output_path,
                                    const wchar_t *lang)
 {
     FILE *f;
+    wchar_t user_xml[1024];
     wchar_t comp_name[16];
+    if (!xml_escape_text(admin_user, user_xml, ARRAYSIZE(user_xml)))
+        return FALSE;
     wcsncpy_s(comp_name, 16, vm_name, 15);
 
     if (_wfopen_s(&f, output_path, L"w,ccs=UTF-8") != 0 || !f)
@@ -472,8 +595,8 @@ static BOOL generate_autounattend(const wchar_t *output_path,
             L"    </settings>\n"
             L"</unattend>\n",
             lang_to_input_locale(lang), lang, lang, lang,
-            admin_user, b64_password,
-            admin_user, b64_password);
+            user_xml, b64_password,
+            user_xml, b64_password);
     }
 
     fclose(f);
@@ -825,7 +948,11 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
                                         const wchar_t *lang)
 {
     FILE *f;
+    BOOL written;
+    wchar_t user_xml[1024];
     wchar_t comp_name[16];
+    if (!xml_escape_text(admin_user, user_xml, ARRAYSIZE(user_xml)))
+        return FALSE;
     wcsncpy_s(comp_name, 16, vm_name, 15);
 
     if (_wfopen_s(&f, output_path, L"w,ccs=UTF-8") != 0 || !f)
@@ -847,6 +974,7 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
+        L"            <ExtendOSPartition><Extend>true</Extend></ExtendOSPartition>\n"
         L"            <RunSynchronous>\n"
         L"                <RunSynchronousCommand wcm:action=\"add\">\n"
         L"                    <Order>1</Order>\n"
@@ -941,11 +1069,13 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"</unattend>\n",
         comp_name,
         lang_to_input_locale(lang), lang, lang, lang,
-        admin_user, b64_password,
-        admin_user, b64_password);
+        user_xml, b64_password,
+        user_xml, b64_password);
 
-    fclose(f);
-    return TRUE;
+    written = !ferror(f);
+    if (fclose(f) != 0)
+        written = FALSE;
+    return written;
 }
 
 /* Helper: copy agent exe to staging and write setup.cmd */
@@ -1337,8 +1467,12 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
 
     /* unattend.xml (NOT autounattend.xml — post-sysprep mini-setup uses this name) */
     swprintf_s(file_path, MAX_PATH, L"%s\\unattend.xml", staging);
-    if (!generate_unattend_instance(file_path, vm_name, admin_user, b64_pass, lang))
-        ui_log(L"Warning: failed to write instance unattend.xml");
+    if (!generate_unattend_instance(file_path, vm_name, admin_user, b64_pass, lang)) {
+        ui_log(L"Error: failed to write instance unattend.xml");
+        SecureZeroMemory(b64_pass, sizeof(b64_pass));
+        remove_staging_dir(staging);
+        return E_FAIL;
+    }
 
     /* Agent exe + setup.cmd + SSH MSI */
     stage_agent_and_setup(staging, res_dir, ssh_enabled);
@@ -1862,10 +1996,11 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
             const wchar_t *rel_guest = ds->guest_path;
             if (GetFileAttributesW(ds->host_path) == INVALID_FILE_ATTRIBUTES)
                 continue;
-            /* The GL/CL/Vulkan mapping-layer share is delivered by the guest
-               agent over Plan9 at runtime (after the GPU driver copy), not baked
-               into the image — skip it here. */
-            if (_wcsicmp(ds->share_name, L"AppSandbox.GlLayers") == 0)
+            /* These shares need guest-side provisioning over Plan9. DRS is
+               mutable profile data: the agent seeds it with guest permissions
+               and excludes the host's runtime lock file. */
+            if (_wcsicmp(ds->share_name, L"AppSandbox.GlLayers") == 0 ||
+                _wcsicmp(ds->share_name, L"AppSandbox.NvidiaDrs") == 0)
                 continue;
             /* Strip "C:" or any drive prefix — keep the leading backslash */
             if (rel_guest[0] != L'\0' && rel_guest[1] == L':')

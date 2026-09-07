@@ -20,6 +20,11 @@ HRESULT vhdx_create(const wchar_t *path, ULONGLONG size_gb);
    New writes go to child_path; parent_path remains unchanged. */
 HRESULT vhdx_create_differencing(const wchar_t *child_path, const wchar_t *parent_path);
 
+HRESULT vhdx_get_virtual_size(const wchar_t *path, ULONGLONG *size_bytes);
+
+/* Shrinking is rejected. Pass the child path, never the shared template path. */
+HRESULT vhdx_grow(const wchar_t *path, ULONGLONG size_gb);
+
 /* Merge a differencing VHDX into its parent.
    After merge, child_path can be deleted. */
 HRESULT vhdx_merge(const wchar_t *child_path);

@@ -1220,6 +1220,8 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "    HOME_DIR=$(getent passwd \"$ASB_USER\" | cut -d: -f6)\n"
         "    install -d -o \"$ASB_USER\" -g \"$ASB_USER\" \"$HOME_DIR/.config\" 2>/dev/null || true\n"
         "    su \"$ASB_USER\" -c \"touch '$HOME_DIR/.config/gnome-initial-setup-done'\" 2>/dev/null || true\n"
+        "    su \"$ASB_USER\" -c \"dbus-run-session -- gsettings set org.gnome.desktop.input-sources sources \\\"[('xkb', '$KB')]\\\"\" \\\n"
+        "      && echo \"OK: GNOME keyboard=$KB\" || echo \"WARN: GNOME keyboard setup failed\"\n"
         "fi\n"
         "rm -f /etc/xdg/autostart/gnome-initial-setup-first-login.desktop || true\n"
         "\n"

@@ -18,6 +18,7 @@
 
 #import "idd_display.h"
 #import "asb_ivshmem_transport.h"
+#import "vm_dir.h"
 #import <AudioToolbox/AudioToolbox.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -33,6 +34,7 @@
 #include <errno.h>
 #include <time.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 #include <pwd.h>
 #include <sys/stat.h>
 #include "../../tools/transport/asb_transport.h"   /* ASB_CH_DISPLAY/INPUT/AUDIO/CLIPBOARD[_READER], AsbCursor, ASB_CURSOR_MAGIC */
@@ -160,6 +162,21 @@ static int is_extended(unsigned short kc)
     return 0;
 }
 
+/* Private WindowServer hotkey controls; resolve at runtime so an unavailable API
+   disables capture without preventing the viewer from opening. */
+static int32_t (*idd_cgs_connection)(void);
+static CGError (*idd_cgs_get_hotkeys)(int32_t, int *);
+static CGError (*idd_cgs_set_hotkeys)(int32_t, int);
+static void idd_load_hotkey_api(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        idd_cgs_connection = dlsym(RTLD_DEFAULT, "_CGSDefaultConnection");
+        idd_cgs_get_hotkeys = dlsym(RTLD_DEFAULT, "CGSGetGlobalHotKeyOperatingMode");
+        idd_cgs_set_hotkeys = dlsym(RTLD_DEFAULT, "CGSSetGlobalHotKeyOperatingMode");
+    });
+}
+
 /* Resolve the GUI console user (the one who will paste) so root-created clipboard files can be chowned
    to them. The daemon runs as root (for vmnet), where NSTemporaryDirectory() is root's PRIVATE temp,
    unreadable by the logged-in user — see -clipRecvFiles. Prefer /dev/console's owner (the logged-in GUI
@@ -240,6 +257,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
  * Input (coalesced moves + discrete events) is written to the ch3 fd by the controller.
  * ================================================================================ */
 @class IddDisplayWindow;
+static __weak IddDisplayWindow *g_hotkeyOwner;
 
 @interface IddDisplayView : NSView
 @property (nonatomic, weak) IddDisplayWindow *owner;
@@ -283,6 +301,10 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 - (void)sendInput:(uint32_t)type p1:(uint32_t)p1 p2:(uint32_t)p2 p3:(uint32_t)p3;
 - (void)recordMoveX:(uint32_t)x y:(uint32_t)y;
 - (void)flushMove;
+- (void)forwardKeyEvent:(NSEvent *)event;
+- (void)releaseHeldKeys;
+- (void)releaseKeyboardCapture;
+- (void)updateKeyboardCapture;
 @end
 
 @implementation IddDisplayWindow {
@@ -329,9 +351,16 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     int               _hasMove;
     uint32_t          _moveX, _moveY;
 
-    /* ch3 INPUT fd (the input WORKER thread connects + writes InputPacket). -1 until connected; the
-       worker reconnects it. The main thread NEVER touches this fd — it only enqueues into _inq. */
-    volatile int      _inputFd;
+    id                _eventMonitor;
+    BOOL              _transmitHotkeys;
+    BOOL              _hotkeysCaptured;
+    int32_t           _hotkeyConnection;
+    int               _savedHotkeyMode;
+    NSUInteger        _trackingMenus;
+    BOOL              _heldKeys[256];
+    uint8_t           _heldExtended[256];
+
+    /* Published reader fds shared with teardown. */
     pthread_mutex_t   _inputLock;
 
     /* Input send queue: the AppKit main thread (-sendInput:) enqueues InputPackets here and returns
@@ -357,6 +386,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     uint8_t          *_pcm;          /* PCM_RING_SZ jitter buffer */
     volatile uint32_t _pcmHead, _pcmTail;
     pthread_mutex_t   _pcmLock;
+    BOOL              _audioMuted;
 
     /* ch5/ch6 CLIPBOARD published fds (guarded by _inputLock, the shared fd-publication lock). The
        NSPasteboard changeCount we set ourselves, so the writer doesn't echo a Windows->Mac paste
@@ -396,7 +426,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 
     _name = [name copy];
     _transport = transport;
-    _inputFd = -1;
+    _stop = 1;
     _displayFd = -1;
     _audioFd = -1;
     _clipWriterFd = -1;
@@ -415,8 +445,192 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     _view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     window.contentView = _view;
     window.delegate = self;
+    [self loadDisplaySettings];
     [self setupMetal];
     return self;
+}
+
+#pragma mark - Display settings and keyboard capture
+
+- (NSURL *)displaySettingsURL {
+    return [[VmDir directoryForVm:self.name] URLByAppendingPathComponent:@"display_settings.json"];
+}
+
+- (void)saveDisplaySettings {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@{ @"transmitKeyboardHotkeys": @(_transmitHotkeys ? 1 : 0) }
+                                                 options:0 error:nil];
+    NSError *error = nil;
+    if (![data writeToURL:[self displaySettingsURL] options:NSDataWritingAtomic error:&error])
+        NSLog(@"IDD [%@]: Could not save display settings: %@", self.name, error);
+}
+
+- (void)loadDisplaySettings {
+    NSData *data = [NSData dataWithContentsOfURL:[self displaySettingsURL]];
+    if (!data) { [self saveDisplaySettings]; return; }
+    id settings = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if ([settings isKindOfClass:[NSDictionary class]]) {
+        id value = settings[@"transmitKeyboardHotkeys"];
+        if ([value isKindOfClass:[NSNumber class]]) _transmitHotkeys = [value boolValue];
+    }
+}
+
+- (void)toggleAudioMute:(id)sender {
+    (void)sender;
+    pthread_mutex_lock(&_pcmLock);
+    _audioMuted = !_audioMuted;
+    _pcmHead = _pcmTail = 0;
+    pthread_mutex_unlock(&_pcmLock);
+    self.window.title = [NSString stringWithFormat:@"%@%@ — Display", _audioMuted ? @"🔇 " : @"", self.name];
+}
+
+- (void)toggleTransmitHotkeys:(id)sender {
+    (void)sender;
+    _transmitHotkeys = !_transmitHotkeys;
+    [self updateKeyboardCapture];
+    [self saveDisplaySettings];
+}
+
+- (void)showTitlebarMenuAtPoint:(NSPoint)point {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+    NSMenuItem *mute = [menu addItemWithTitle:@"Mute audio" action:@selector(toggleAudioMute:) keyEquivalent:@""];
+    mute.target = self;
+    mute.state = _audioMuted ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *hotkeys = [menu addItemWithTitle:@"Transmit Keyboard Hotkeys"
+                                       action:@selector(toggleTransmitHotkeys:) keyEquivalent:@""];
+    hotkeys.target = self;
+    hotkeys.state = _transmitHotkeys ? NSControlStateValueOn : NSControlStateValueOff;
+    _trackingMenus++;
+    [self releaseKeyboardCapture];
+    [menu popUpMenuPositioningItem:nil atLocation:point inView:nil];
+    if (_trackingMenus) _trackingMenus--;
+    [self updateKeyboardCapture];
+}
+
+- (NSEvent *)handleViewerEvent:(NSEvent *)event {
+    if (_stop) return event;
+    BOOL contextClick = event.type == NSEventTypeRightMouseDown ||
+        (event.type == NSEventTypeLeftMouseDown && (event.modifierFlags & NSEventModifierFlagControl));
+    if (contextClick && !_trackingMenus) {
+        NSPoint screenPoint = event.window ? [event.window convertPointToScreen:event.locationInWindow] : [NSEvent mouseLocation];
+        BOOL targetsWindow = event.window == self.window;
+        if (!event.window)
+            targetsWindow = [NSWindow windowNumberAtPoint:screenPoint belowWindowWithWindowNumber:0] == self.window.windowNumber;
+        NSPoint point = [self.window convertPointFromScreen:screenPoint];
+        if (targetsWindow && !(self.window.styleMask & NSWindowStyleMaskFullScreen) &&
+            point.x >= 0 && point.x < self.window.frame.size.width &&
+            point.y >= NSMaxY(self.window.contentLayoutRect) && point.y < self.window.frame.size.height) {
+            [NSApp activateIgnoringOtherApps:YES];
+            [self.window makeKeyAndOrderFront:nil];
+            [self.window makeFirstResponder:self.view];
+            [self showTitlebarMenuAtPoint:screenPoint];
+            return nil;
+        }
+    }
+    if (_hotkeysCaptured && !_trackingMenus && NSApp.isActive && self.window.isKeyWindow &&
+        event.window == self.window && self.window.firstResponder == self.view && !self.window.attachedSheet &&
+        (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp || event.type == NSEventTypeFlagsChanged)) {
+        [self forwardKeyEvent:event];
+        return nil;
+    }
+    return event;
+}
+
+- (void)installEventMonitor {
+    if (_eventMonitor) return;
+    __weak IddDisplayWindow *weakSelf = self;
+    _eventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:
+        NSEventMaskKeyDown | NSEventMaskKeyUp | NSEventMaskFlagsChanged | NSEventMaskRightMouseDown | NSEventMaskLeftMouseDown
+        handler:^NSEvent *(NSEvent *event) {
+            IddDisplayWindow *owner = weakSelf;
+            return owner ? [owner handleViewerEvent:event] : event;
+        }];
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserver:self selector:@selector(applicationDidBecomeActive:) name:NSApplicationDidBecomeActiveNotification object:NSApp];
+    [nc addObserver:self selector:@selector(applicationDidResignActive:) name:NSApplicationDidResignActiveNotification object:NSApp];
+    [nc addObserver:self selector:@selector(menuDidBeginTracking:) name:NSMenuDidBeginTrackingNotification object:nil];
+    [nc addObserver:self selector:@selector(menuDidEndTracking:) name:NSMenuDidEndTrackingNotification object:nil];
+}
+
+- (void)releaseKeyboardCapture {
+    [self releaseHeldKeys];
+    if (!_hotkeysCaptured) return;
+    if (g_hotkeyOwner == self) {
+        CGError error = idd_cgs_set_hotkeys(_hotkeyConnection, _savedHotkeyMode);
+        if (error != kCGErrorSuccess)
+            NSLog(@"IDD [%@]: Could not restore host keyboard shortcuts (%d).", self.name, error);
+        g_hotkeyOwner = nil;
+    }
+    _hotkeysCaptured = NO;
+}
+
+- (void)updateKeyboardCapture {
+    BOOL capture = _transmitHotkeys && !_stop && !_trackingMenus && _eventMonitor && NSApp.isActive &&
+        self.window.isKeyWindow && self.window.firstResponder == self.view && !self.window.attachedSheet;
+    if (!capture) { [self releaseKeyboardCapture]; return; }
+    if (_hotkeysCaptured) return;
+    [g_hotkeyOwner releaseKeyboardCapture];
+    idd_load_hotkey_api();
+    CGError error = kCGErrorFailure;
+    if (idd_cgs_connection && idd_cgs_get_hotkeys && idd_cgs_set_hotkeys) {
+        _hotkeyConnection = idd_cgs_connection();
+        error = idd_cgs_get_hotkeys(_hotkeyConnection, &_savedHotkeyMode);
+        if (error == kCGErrorSuccess) {
+            const int disabled = 1;
+            error = idd_cgs_set_hotkeys(_hotkeyConnection, disabled);
+            int mode = -1;
+            if (error == kCGErrorSuccess) error = idd_cgs_get_hotkeys(_hotkeyConnection, &mode);
+            if (error == kCGErrorSuccess && mode != disabled) error = kCGErrorFailure;
+            if (error != kCGErrorSuccess) idd_cgs_set_hotkeys(_hotkeyConnection, _savedHotkeyMode);
+        }
+    }
+    if (error == kCGErrorSuccess) {
+        g_hotkeyOwner = self;
+        _hotkeysCaptured = YES;
+    } else {
+        _transmitHotkeys = NO;
+        [self saveDisplaySettings];
+        NSLog(@"IDD [%@]: Keyboard capture failed (%d).", self.name, error);
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"Keyboard capture could not be enabled";
+        alert.informativeText = @"macOS did not allow the viewer to capture system keyboard shortcuts. Transmit Keyboard Hotkeys has been turned off.";
+        [alert beginSheetModalForWindow:self.window completionHandler:nil];
+    }
+}
+
+- (void)forwardKeyEvent:(NSEvent *)event {
+    [self flushMove];
+    unsigned short kc = event.keyCode;
+    uint32_t vk = 0;
+    BOOL up = event.type == NSEventTypeKeyUp;
+    BOOL extended = is_extended(kc);
+    if (event.type == NSEventTypeFlagsChanged) {
+        NSEventModifierFlags mask = 0;
+        extended = NO;
+        switch (kc) {
+        case 0x38: case 0x3C: vk = 0x10; mask = NSEventModifierFlagShift; break;
+        case 0x3B: case 0x3E: vk = 0x11; mask = NSEventModifierFlagControl; break;
+        case 0x3A: case 0x3D: vk = 0x12; mask = NSEventModifierFlagOption; break;
+        case 0x37: vk = 0x5B; mask = NSEventModifierFlagCommand; break;
+        case 0x36: vk = 0x5C; mask = NSEventModifierFlagCommand; break;
+        case 0x39: vk = 0x14; mask = NSEventModifierFlagCapsLock; break;
+        default: return;
+        }
+        up = (event.modifierFlags & mask) == 0;
+    } else {
+        vk = kc < 128 ? g_vk[kc] : 0;
+    }
+    if (!vk) return;
+    [self sendInput:INPUT_KEY p1:vk p2:0 p3:((extended ? 1 : 0) | (up ? 2 : 0))];
+    _heldKeys[vk] = !up;
+    _heldExtended[vk] = extended;
+}
+
+- (void)releaseHeldKeys {
+    for (uint32_t vk = 0; vk < 256; vk++) {
+        if (!_heldKeys[vk]) continue;
+        [self sendInput:INPUT_KEY p1:vk p2:0 p3:(2 | _heldExtended[vk])];
+        _heldKeys[vk] = NO;
+    }
 }
 
 /* Build the Metal device/pipeline/sampler and point the view's CAMetalLayer at them. The shaders are the
@@ -505,6 +719,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
        with dead display+input. Reconnecting re-arms ch2/ch3 and the guest re-accepts. */
     _stop = 0;
     self.userClosed = NO;
+    [self installEventMonitor];
     if (!_threadsStarted) {
         _threadsStarted = YES;
         self.timer = [NSTimer timerWithTimeInterval:(1.0 / 60.0) repeats:YES block:^(NSTimer *t) {
@@ -523,6 +738,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
         pthread_create(&_clipWriterThread, NULL, idd_clip_writer_thread, (__bridge void *)self);
         pthread_create(&_clipReaderThread, NULL, idd_clip_reader_thread, (__bridge void *)self);
     }
+    [self updateKeyboardCapture];
 }
 
 /* Render-timer body (main thread): flush a coalesced move, mirror the guest HW cursor onto the
@@ -800,12 +1016,8 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     free(scratch);
 }
 
-/* Own the ch3 INPUT connection end-to-end on this worker thread: connect, publish the fd (so teardown
-   can shutdown() it), then loop draining the main thread's _inq and BLOCKING-sending each InputPacket,
-   plus detecting guest-side teardown. Blocking I/O is safe HERE (off the UI thread): ch3 backpressure
-   or a dead slot stalls only this thread, and we recover by reconnecting. The main thread only ever
-   touches _inq, so it can never wedge. Mirrors the proven Windows model (recv thread owns the input
-   socket + its reconnect) — just with the send moved off the UI thread via the queue. */
+/* Own ch3 on the worker: drain the main thread's input queue, reconnect on failure,
+   and flush queued key releases before closing. Socket writes are nonblocking. */
 - (void)inputLoop {
     while (!_stop) {
         int fd = [_transport connectChannel:ASB_CH_INPUT timeoutMs:2000];
@@ -818,10 +1030,6 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
            without O_NONBLOCK the worker can still briefly block in __sendto on a full ring. With it, send
            returns EAGAIN instantly (-> drop) and only a real error/EOF triggers reconnect. */
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-        pthread_mutex_lock(&_inputLock);
-        _inputFd = fd;
-        pthread_mutex_unlock(&_inputLock);
-
         BOOL dead = NO;
         while (!_stop && !dead) {
             /* 1) Wait briefly for queued input, then drain it into a local batch. The cond wait wakes
@@ -852,7 +1060,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
                acceptor stops draining (force-killed helper) — the ivshmem analog of an hvsocket RST — so
                this send then fails (EPIPE) exactly like Windows. A guest that is merely slow keeps
                draining, so EAGAIN-drop just sheds a few stale input events without dropping the link. */
-            for (int i = 0; i < nbatch && !_stop; i++) {
+            for (int i = 0; i < nbatch; i++) {
                 ssize_t wn = send(fd, &batch[i], sizeof(InputPacket), MSG_DONTWAIT);
                 if (wn == (ssize_t)sizeof(InputPacket)) continue;            /* delivered */
                 if (wn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;  /* full -> drop */
@@ -876,9 +1084,16 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
             }
         }
 
-        pthread_mutex_lock(&_inputLock);
-        if (_inputFd == fd) _inputFd = -1;
-        pthread_mutex_unlock(&_inputLock);
+        /* Teardown leaves ch3 open until the worker has sent the queued key releases. */
+        if (_stop && !dead) {
+            pthread_mutex_lock(&_inqLock);
+            while (_inqHead != _inqTail) {
+                InputPacket pkt = _inq[_inqHead];
+                _inqHead = (_inqHead + 1) % IDD_INQ_CAP;
+                if (send(fd, &pkt, sizeof(pkt), MSG_DONTWAIT) != (ssize_t)sizeof(pkt)) break;
+            }
+            pthread_mutex_unlock(&_inqLock);
+        }
         close(fd);
         if (!_stop) usleep(100000);
     }
@@ -890,6 +1105,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
    Full => drop oldest so latency stays bounded. */
 - (void)pcmPush:(const uint8_t *)p len:(uint32_t)n {
     pthread_mutex_lock(&_pcmLock);
+    if (_audioMuted) { pthread_mutex_unlock(&_pcmLock); return; }
     for (uint32_t i = 0; i < n; i++) {
         uint32_t next = (_pcmTail + 1) % PCM_RING_SZ;
         if (next == _pcmHead) _pcmHead = (_pcmHead + 1) % PCM_RING_SZ;   /* full -> drop oldest */
@@ -900,6 +1116,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 }
 - (uint32_t)pcmPull:(uint8_t *)out len:(uint32_t)n {
     pthread_mutex_lock(&_pcmLock);
+    if (_audioMuted) { pthread_mutex_unlock(&_pcmLock); return 0; }
     uint32_t got = 0;
     while (got < n && _pcmHead != _pcmTail) { out[got++] = _pcm[_pcmHead]; _pcmHead = (_pcmHead + 1) % PCM_RING_SZ; }
     pthread_mutex_unlock(&_pcmLock);
@@ -1275,6 +1492,38 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 
 #pragma mark - NSWindowDelegate
 
+- (void)windowDidBecomeKey:(NSNotification *)notification {
+    (void)notification;
+    [self updateKeyboardCapture];
+}
+
+- (void)windowDidResignKey:(NSNotification *)notification {
+    (void)notification;
+    [self releaseKeyboardCapture];
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification {
+    (void)notification;
+    [self updateKeyboardCapture];
+}
+
+- (void)applicationDidResignActive:(NSNotification *)notification {
+    (void)notification;
+    [self releaseKeyboardCapture];
+}
+
+- (void)menuDidBeginTracking:(NSNotification *)notification {
+    (void)notification;
+    _trackingMenus++;
+    [self releaseKeyboardCapture];
+}
+
+- (void)menuDidEndTracking:(NSNotification *)notification {
+    (void)notification;
+    if (_trackingMenus) _trackingMenus--;
+    [self updateKeyboardCapture];
+}
+
 - (void)windowWillClose:(NSNotification *)notification {
     self.userClosed = YES;   /* mark closed (X button or programmatic) before teardown */
     [self teardown];
@@ -1284,25 +1533,27 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 
 - (void)teardown {
     if (_stop) return;
+    [self releaseKeyboardCapture];
+    if (_eventMonitor) {
+        [NSEvent removeMonitor:_eventMonitor];
+        _eventMonitor = nil;
+    }
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    _trackingMenus = 0;
     _stop = 1;
     [self.timer invalidate];
     self.timer = nil;
-    /* Wake the input worker if it's parked in pthread_cond_timedwait so it sees _stop at once
-       (the shutdown() below also unblocks it if it's mid-send). */
+    /* Wake the input worker so it can flush pending key releases before closing ch3. */
     pthread_mutex_lock(&_inqLock);
     pthread_cond_broadcast(&_inqCond);
     pthread_mutex_unlock(&_inqLock);
-    /* Drop both fds so the threads' blocking calls return: the input thread's published fd, and the
-       display thread's published ch2 fd (it's blocked in idd_rd_full -> recv; shutdown() forces EOF).
-       Without the display shutdown the join below hangs until the VDD next sends a frame. */
+    /* Unblock the readers. The nonblocking input worker drains key releases and closes ch3 itself. */
     pthread_mutex_lock(&_inputLock);
-    int ifd = _inputFd; _inputFd = -1;
     int dfd = _displayFd; _displayFd = -1;
     int afd = _audioFd; _audioFd = -1;
     int cwfd = _clipWriterFd; _clipWriterFd = -1;
     int crfd = _clipReaderFd; _clipReaderFd = -1;
     pthread_mutex_unlock(&_inputLock);
-    if (ifd >= 0) shutdown(ifd, SHUT_RDWR);
     if (dfd >= 0) shutdown(dfd, SHUT_RDWR);
     /* Audio + clipboard threads block in recv on their published fd; shutdown() forces EOF so the
        join below can't hang (same close-hang fix as display). */
@@ -1317,6 +1568,9 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
         pthread_join(_clipReaderThread, NULL);
         _threadsStarted = NO;
     }
+    pthread_mutex_lock(&_inqLock);
+    _inqHead = _inqTail = 0;
+    pthread_mutex_unlock(&_inqLock);
     /* The audio thread stops its own AudioQueue on exit, but make sure nothing lingers. */
     if (_aq) { AudioQueueStop(_aq, true); AudioQueueDispose(_aq, true); _aq = NULL; }
 }
@@ -1598,34 +1852,15 @@ static CGRect idd_letterbox(double viewW, double viewH, double frameW, double fr
 /* ---- keyboard ---- */
 - (void)keyDown:(NSEvent *)e
 {
-    [self.owner flushMove];
-    unsigned short kc = e.keyCode;
-    uint8_t vk = (kc < 128) ? g_vk[kc] : 0;
-    if (vk) [self.owner sendInput:INPUT_KEY p1:vk p2:0 p3:(is_extended(kc) ? 1 : 0)];
+    [self.owner forwardKeyEvent:e];
     /* swallow (no super) to avoid the system beep */
 }
 - (void)keyUp:(NSEvent *)e
 {
-    [self.owner flushMove];
-    unsigned short kc = e.keyCode;
-    uint8_t vk = (kc < 128) ? g_vk[kc] : 0;
-    if (vk) [self.owner sendInput:INPUT_KEY p1:vk p2:0 p3:((is_extended(kc) ? 1 : 0) | 2)];
+    [self.owner forwardKeyEvent:e];
 }
 - (void)flagsChanged:(NSEvent *)e
 {
-    [self.owner flushMove];
-    unsigned short kc = e.keyCode;
-    uint32_t vk = 0, mask = 0;
-    switch (kc) {
-    case 0x38: case 0x3C: vk = 0x10; mask = NSEventModifierFlagShift;    break; /* Shift */
-    case 0x3B: case 0x3E: vk = 0x11; mask = NSEventModifierFlagControl;  break; /* Control */
-    case 0x3A: case 0x3D: vk = 0x12; mask = NSEventModifierFlagOption;   break; /* Option->Alt */
-    case 0x37:            vk = 0x5B; mask = NSEventModifierFlagCommand;  break; /* LCmd->LWin */
-    case 0x36:            vk = 0x5C; mask = NSEventModifierFlagCommand;  break; /* RCmd->RWin */
-    case 0x39:            vk = 0x14; mask = NSEventModifierFlagCapsLock; break; /* CapsLock */
-    default: return;
-    }
-    BOOL down = (e.modifierFlags & mask) != 0;
-    [self.owner sendInput:INPUT_KEY p1:vk p2:0 p3:(down ? 0 : 2)];
+    [self.owner forwardKeyEvent:e];
 }
 @end

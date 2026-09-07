@@ -19,6 +19,9 @@
 /* Free bytes on the volume that backs the VMs root directory, as GB. */
 + (int)freeGb;
 
+/* Empty selects the default VM root; invalid or unavailable paths return -1. */
++ (int)freeGbForDirectory:(NSString *)directory;
+
 /* Host GPU name (e.g. "Apple M3 Pro"). VM guests implicitly share this GPU. */
 + (NSString *)hostGpuName;
 

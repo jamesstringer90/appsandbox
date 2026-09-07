@@ -10,6 +10,11 @@ let editingCell = null; /* {row, col, element} */
 let pendingConfirm = null; /* {resolve} */
 let minSizeReported = false;
 let lastHostInfo = null;
+let diskSpaceInfo = null;
+let diskSpaceRequestId = 0;
+let diskSpaceTimer = null;
+let diskSpacePending = false;
+let diskDirectoryBeforeEdit = null;
 let rowCache = {};          /* vm.name -> <tr> — persistent rows so the status spinner doesn't reset on every update */
 let rowSigCache = {};       /* vm.name -> last render signature; skip rebuild when unchanged */
 
@@ -87,22 +92,16 @@ if (hostBridge.isMac) {
     });
 }
 
-/* Apply Create-modal visibility rules for the currently selected OS type.
- *   Windows: .win-only shown, .needs-iso shown,             .needs-linux-version hidden
- *   Linux:   .win-only hidden, .needs-iso hidden,           .needs-linux-version shown
- *   macOS:   handled by the isMac branch above; this function is a no-op there.
- *
- * Linux is back to user-picks-an-ISO (Ubuntu Desktop ISO etc.), same as
- * Windows. The version-dropdown / cloud-image flow is preserved in
- * asb_core.c under #if 0 in case we need to bring it back. */
+/* Apply Create-modal visibility rules for the currently selected OS type. */
 function applyOsTypeUI() {
+    var modal = document.getElementById('create-vm-overlay');
     var osType = document.getElementById('os-type').value;
     var isWindows = osType === 'Windows';
     var isLinux = osType === 'Linux';
-    var winOnly = document.querySelectorAll('.win-only');
-    var needsIso = document.querySelectorAll('.needs-iso');
-    var needsWindows = document.querySelectorAll('.needs-windows');
-    var needsLinuxVersion = document.querySelectorAll('.needs-linux-version');
+    var winOnly = modal.querySelectorAll('.win-only');
+    var needsIso = modal.querySelectorAll('.needs-iso');
+    var needsWindows = modal.querySelectorAll('.needs-windows');
+    var needsLinuxVersion = modal.querySelectorAll('.needs-linux-version');
     /* .win-only = template/snapshot features that exist only on a Windows *host*;
        never shown on a Mac host, even for a Windows guest. */
     for (var i = 0; i < winOnly.length; i++)
@@ -142,6 +141,8 @@ window.onHostMessage = function(msg) {
         case 'log':           appendLog(msg.message); break;
         case 'hostInfo':      updateHostInfo(msg); break;
         case 'browseResult':  onBrowseResult(msg.path); break;
+        case 'diskDirectoryBrowseResult': onDiskDirectoryBrowseResult(msg.path); break;
+        case 'diskSpace':     onDiskSpace(msg); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
@@ -201,14 +202,66 @@ function onVmStateChanged(msg) {
 
 function updateHostInfo(info) {
     if (!info) return;
+    var previousDefault = lastHostInfo && lastHostInfo.defaultDiskDirectory;
     lastHostInfo = info;
+    var diskDirectory = document.getElementById('disk-directory');
+    if (diskDirectoryBeforeEdit === null && info.defaultDiskDirectory &&
+        (!diskDirectory.value || diskDirectory.value === previousDefault))
+        diskDirectory.value = info.defaultDiskDirectory;
     var el;
     el = document.getElementById('host-cpu');
     if (el) el.textContent = 'Host: ' + info.hostCores + ' cores | VMs using: ' + info.vmCores;
     el = document.getElementById('host-ram');
     if (el) el.textContent = 'Host: ' + info.hostRamMb + ' MB | VMs using: ' + info.vmRamMb + ' MB';
-    el = document.getElementById('host-hdd');
-    if (el) el.textContent = 'Free: ' + info.freeGb + ' GB | VMs allocated: ' + info.vmHddGb + ' GB';
+    if (previousDefault !== info.defaultDiskDirectory) refreshDiskSpaceInfo();
+    else {
+        updateDiskSpaceInfo();
+        if (document.getElementById('create-vm-overlay').classList.contains('active') && !diskSpacePending)
+            refreshDiskSpaceInfo(true);
+    }
+}
+
+function selectedDiskDirectory() {
+    return document.getElementById('disk-directory').value.trim() ||
+        (lastHostInfo && lastHostInfo.defaultDiskDirectory) || '';
+}
+
+function updateDiskSpaceInfo() {
+    if (!lastHostInfo) return;
+    var path = selectedDiskDirectory();
+    var free = 'Checking...';
+    if (!path || validateDiskDirectory(path)) free = 'Unavailable';
+    else if (diskSpaceInfo && diskSpaceInfo.path === path)
+        free = diskSpaceInfo.freeGb >= 0 ? diskSpaceInfo.freeGb + ' GB' : 'Unavailable';
+    document.getElementById('host-hdd').textContent =
+        'Free: ' + free + ' | VMs allocated: ' + lastHostInfo.vmHddGb + ' GB';
+    document.getElementById('disk-location-space').textContent = 'Free: ' + free;
+    document.getElementById('btn-disk-location').title = 'HDD Location: ' + path;
+}
+
+function refreshDiskSpaceInfo(keepPrevious) {
+    clearTimeout(diskSpaceTimer);
+    diskSpaceTimer = null;
+    var path = selectedDiskDirectory();
+    var requestId = ++diskSpaceRequestId;
+    if (!keepPrevious) diskSpaceInfo = null;
+    diskSpacePending = !!path && !validateDiskDirectory(path);
+    updateDiskSpaceInfo();
+    if (!diskSpacePending) return;
+    diskSpaceTimer = setTimeout(function() {
+        diskSpaceTimer = null;
+        sendCmd('getDiskSpace', { path: path, requestId: requestId });
+    }, 200);
+}
+
+function onDiskSpace(msg) {
+    if (msg.requestId !== diskSpaceRequestId || msg.path !== selectedDiskDirectory()) return;
+    diskSpacePending = false;
+    diskSpaceInfo = {
+        path: msg.path,
+        freeGb: typeof msg.freeGb === 'number' && Number.isFinite(msg.freeGb) ? msg.freeGb : -1
+    };
+    updateDiskSpaceInfo();
 }
 
 /* ---- Adapters ---- */
@@ -342,6 +395,72 @@ function onBrowseResult(path) {
     }
 }
 
+function onDiskDirectoryBrowseResult(path) {
+    if (!path || diskDirectoryBeforeEdit === null) return;
+    document.getElementById('disk-directory').value = path;
+    revalidateDiskDirectory();
+}
+
+function validateDiskDirectory(path) {
+    if (!path) return null;  /* Empty uses the host's default. */
+    if (/[\x00-\x1f\x7f]/.test(path)) return 'Disk folder cannot contain control characters.';
+    if (hostBridge.isMac) {
+        if (path[0] !== '/') return 'Disk folder must be an absolute path.';
+    } else {
+        if (!/^(?:[a-zA-Z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/.test(path))
+            return 'Disk folder must be an absolute path.';
+        if (/["<>|?*]/.test(path) || /:/.test(path.slice(2)))
+            return 'Disk folder contains invalid characters.';
+    }
+    return null;
+}
+
+function revalidateDiskDirectory() {
+    var path = document.getElementById('disk-directory').value.trim();
+    var error = validateDiskDirectory(path);
+    document.getElementById('disk-directory-warn').textContent = error || '';
+    document.getElementById('btn-save-disk-location').disabled = !!error;
+    refreshDiskSpaceInfo();
+}
+document.getElementById('disk-directory').addEventListener('input', revalidateDiskDirectory);
+
+function openDiskLocationModal() {
+    var createOverlay = document.getElementById('create-vm-overlay');
+    if (!createOverlay.classList.contains('active') || diskDirectoryBeforeEdit !== null) return;
+    diskDirectoryBeforeEdit = document.getElementById('disk-directory').value;
+    document.getElementById('disk-location-overlay').classList.add('active');
+    createOverlay.inert = true;
+    revalidateDiskDirectory();
+    document.getElementById('disk-directory').focus();
+    document.getElementById('disk-directory').select();
+}
+
+function closeDiskLocationModal(save) {
+    if (diskDirectoryBeforeEdit === null) return;
+    var input = document.getElementById('disk-directory');
+    if (save && validateDiskDirectory(input.value.trim())) {
+        revalidateDiskDirectory();
+        input.focus();
+        return;
+    }
+    var previousPath = selectedDiskDirectory();
+    input.value = save ? input.value.trim() : diskDirectoryBeforeEdit;
+    diskDirectoryBeforeEdit = null;
+    document.getElementById('disk-location-overlay').classList.remove('active');
+    document.getElementById('create-vm-overlay').inert = false;
+    if (selectedDiskDirectory() !== previousPath) revalidateDiskDirectory();
+    document.getElementById('btn-disk-location').focus();
+}
+
+let diskLocationBackdropPress = false;
+document.getElementById('disk-location-overlay').addEventListener('mousedown', function(e) {
+    diskLocationBackdropPress = (e.target === this);
+});
+document.getElementById('disk-location-overlay').addEventListener('click', function(e) {
+    if (e.target === this && diskLocationBackdropPress) closeDiskLocationModal(false);
+    diskLocationBackdropPress = false;
+});
+
 /* ---- Create buttons state ---- */
 
 function updateCreateButtons() {
@@ -377,7 +496,10 @@ function revalidateVmName() {
     var name = document.getElementById('vm-name').value.trim();
     document.getElementById('vm-name-warn').textContent = validateVmName(name) || '';
 }
-document.getElementById('vm-name').addEventListener('input', revalidateVmName);
+document.getElementById('vm-name').addEventListener('input', function() {
+    revalidateVmName();
+    revalidateUsername();
+});
 
 function revalidateUsername() {
     var u = document.getElementById('admin-user').value.trim();
@@ -440,6 +562,9 @@ function gatherConfig() {
         name:        document.getElementById('vm-name').value.trim(),
         osType:      osType,
         imagePath:   imagePath,
+        diskDirectory: document.getElementById('disk-directory').value.trim() ===
+            (lastHostInfo && lastHostInfo.defaultDiskDirectory) ? '' :
+            document.getElementById('disk-directory').value.trim(),
         templateName: document.getElementById('template-select').value,
         hddGb:       parseInt(document.getElementById('hdd-size').value) || 64,
         ramMb:       alignRamMb(parseInt(document.getElementById('ram-size').value) || 16384),
@@ -501,48 +626,84 @@ function validateVmName(name) {
 
 /* Username validation. Per-guest-OS rules keyed off osType. Each branch
    is explicit so it's clear which OS's account rules apply. */
-function validateUsername(name) {
+function validateUsername(name, isTemplate) {
+    if (name === undefined) return 'Username is required.';
+    if (typeof name !== 'string') return 'Username must be a string.';
+    name = name.trim();
     if (!name) return 'Username is required.';
+    if (name.indexOf('\u0000') >= 0) return 'Username cannot contain NUL characters.';
+    var bytes;
+    try {
+        bytes = unescape(encodeURIComponent(name)).length;
+    } catch (e) {
+        return 'Username contains invalid Unicode.';
+    }
     var osSelect = document.getElementById('os-type');
     var osType = osSelect ? osSelect.value : 'Windows';
     if (osType === 'Linux') {
-        /* Ubuntu useradd/adduser: lowercase, start with a letter or
-           underscore, then [a-z0-9_-], max 32 chars. */
+        /* Ubuntu 26.04's installer grammar and reserved-usernames list.
+           https://github.com/canonical/subiquity/tree/26.04 */
         if (name.length > 32) return 'Username cannot exceed 32 characters (Linux limit).';
         if (!/^[a-z_][a-z0-9_-]*$/.test(name))
-            return 'Lowercase alphanumeric only.';
+            return 'Linux username: lowercase letters, digits, _ and - only; start with a letter or _.';
+        var linuxReserved = (
+            'root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats nobody ' +
+            'adm tty disk kmem dialout fax voice cdrom floppy tape sudo audio dip operator src shadow utmp video ' +
+            'sasl plugdev staff users nogroup netplan ftn mysql tac-plus alias qmail qmaild qmails qmailr qmailq ' +
+            'qmaill qmailp asterisk vpopmail vchkpw slurm hacluster haclient grsec-tpe grsec-sock-all grsec-sock-clt ' +
+            'grsec-sock-srv grsec-proc ceph opensrf libvirt-qemu admin Debian-exim bind crontab cupsys dcc dhcp ' +
+            'dictd dnsmasq dovecot fetchmail firebird ftp fuse gdm haldaemon hplilp identd input jwhois klog kvm ' +
+            'lpadmin maas messagebus mythtv netdev powerdev radvd render saned sbuild scanner sgx slocate ssh ' +
+            'sshd ssl-cert sslwrap statd syslog telnetd tftpd'
+        ).split(' ');
+        if (linuxReserved.indexOf(name) >= 0) return 'Username is a reserved name.';
         return null;
     }
-    /* macOS and Windows: keep the existing Windows-account ruleset.
-       (macOS-specific shortname rules are not yet verified; treated the
-       same as Windows for now — see validatePassword note.) */
+    if (osType === 'macOS') {
+        if (bytes > 63) return 'Username is too long (max 63 UTF-8 bytes in AppSandbox).';
+        if (/\s/.test(name)) return 'Username cannot contain spaces (macOS short account name).';
+        if (/[\x00-\x1f\x7f\ufffe\uffff/\\:]/.test(name)) return 'Username contains invalid characters.';
+        if (name === '.' || name === '..') return 'Username cannot be . or .. (macOS short account name).';
+        if (['root', 'daemon', 'nobody', 'guest', 'shared'].indexOf(name.toLowerCase()) >= 0)
+            return 'Username is a reserved name.';
+        return null;
+    }
     if (name.length > 20) return 'Username cannot exceed 20 characters.';
-    if (/["\\/\[\]:;|=,+*?<>]/.test(name)) return 'Username contains invalid characters.';
+    if (/[\x00-\x1f\ufffe\uffff"\\/\[\]:;|=,+*?<>%@]/.test(name)) return 'Username contains invalid characters.';
     if (/^[.\s]+$/.test(name)) return 'Username cannot be only dots or spaces.';
     if (name.endsWith('.')) return 'Username cannot end with a period.';
-    var reserved = ['CON','PRN','AUX','NUL',
+    var reserved = ['NONE','CON','PRN','AUX','NUL',
         'COM1','COM2','COM3','COM4','COM5','COM6','COM7','COM8','COM9',
         'LPT1','LPT2','LPT3','LPT4','LPT5','LPT6','LPT7','LPT8','LPT9'];
     if (reserved.indexOf(name.toUpperCase()) >= 0) return 'Username is a reserved name.';
+    if (!isTemplate &&
+        name.toLowerCase() === document.getElementById('vm-name').value.trim().toLowerCase())
+        return 'Username cannot match the VM name (Windows computer name).';
     return null;
 }
 
-/* Password validation. Per-guest-OS rules keyed off osType.
-   - Linux: Ubuntu accepts ALL characters via the host's $6$ hash path
-     (usermod -p bypasses pwquality), so the only limits are non-empty
-     and a sane byte ceiling.
-   - macOS / Windows: no extra content rule enforced here today. */
 function validatePassword(pass) {
+    if (!pass) return 'Password is required.';
+    if (pass.indexOf('\u0000') >= 0) return 'Password cannot contain NUL characters.';
+    var bytes;
+    try {
+        bytes = unescape(encodeURIComponent(pass)).length;
+    } catch (e) {
+        return 'Password contains invalid Unicode.';
+    }
     var osSelect = document.getElementById('os-type');
     var osType = osSelect ? osSelect.value : 'Windows';
     if (osType === 'Linux') {
-        if (!pass) return 'Password is required.';
-        /* UTF-8 byte length (encodeURIComponent escapes multibyte). */
-        var bytes = unescape(encodeURIComponent(pass)).length;
+        if (Array.from(pass).length < 6)
+            return 'Password must be at least 6 characters (Ubuntu minimum).';
         if (bytes > 255) return 'Password is too long (max 255 bytes).';
-        return null;
+    } else if (osType === 'macOS') {
+        if (Array.from(pass).length < 4)
+            return 'Password must be at least 4 characters (macOS minimum).';
+        if (bytes > 127) return 'Password is too long (max 127 UTF-8 bytes in AppSandbox).';
+    } else if (pass.length > 127) {
+        return 'Password is too long (max 127 characters for Windows).';
     }
-    /* macOS / Windows: no additional constraints today. */
     return null;
 }
 
@@ -550,6 +711,8 @@ function onCreateVm() {
     var cfg = gatherConfig();
     var nameErr = validateVmName(cfg.name);
     if (nameErr) { sendCmd('log', { message: nameErr }); return; }
+    var diskErr = validateDiskDirectory(cfg.diskDirectory);
+    if (diskErr) { sendCmd('log', { message: diskErr }); return; }
     var userErr = validateUsername(cfg.adminUser);
     if (userErr) { sendCmd('log', { message: userErr }); return; }
     var passErr = validatePassword(cfg.adminPass);
@@ -567,6 +730,12 @@ function onCreateTemplate() {
     var cfg = gatherConfig();
     var nameErr = validateVmName(cfg.name);
     if (nameErr) { sendCmd('log', { message: nameErr }); return; }
+    var diskErr = validateDiskDirectory(cfg.diskDirectory);
+    if (diskErr) { sendCmd('log', { message: diskErr }); return; }
+    var userErr = validateUsername(cfg.adminUser, true);
+    if (userErr) { sendCmd('log', { message: userErr }); return; }
+    var passErr = validatePassword(cfg.adminPass);
+    if (passErr) { sendCmd('log', { message: passErr }); return; }
     if (cfg.adminPass !== cfg.adminConfirm) {
         sendCmd('log', { message: 'Passwords do not match.' });
         return;
@@ -580,9 +749,12 @@ function onCreateTemplate() {
 /* ---- Create Sandbox modal ---- */
 
 function openCreateModal() {
+    closeDiskLocationModal(false);
     /* Reset to defaults every time the modal opens */
     document.getElementById('vm-name').value = 'MyAppSandbox';
     document.getElementById('image-path').value = '';
+    document.getElementById('disk-directory').value = (lastHostInfo && lastHostInfo.defaultDiskDirectory) || '';
+    revalidateDiskDirectory();
     selectTemplate('', templateDefaultLabel());
     document.getElementById('hdd-size').value = 64;
     document.getElementById('gpu-mode').value = '1';
@@ -610,11 +782,18 @@ function openCreateModal() {
     applyOsTypeUI();   /* fires updateCreateButtons + revalidateVmName */
 
     document.getElementById('create-vm-overlay').classList.add('active');
-    setTimeout(function() { document.getElementById('vm-name').focus(); }, 0);
+    setTimeout(function() {
+        if (diskDirectoryBeforeEdit === null) document.getElementById('vm-name').focus();
+    }, 0);
 }
 
 function closeCreateModal() {
+    closeDiskLocationModal(false);
     document.getElementById('create-vm-overlay').classList.remove('active');
+    clearTimeout(diskSpaceTimer);
+    diskSpaceTimer = null;
+    diskSpacePending = false;
+    ++diskSpaceRequestId;
 }
 
 /* Close on backdrop click — but only when the press also STARTED on the backdrop.
@@ -630,8 +809,37 @@ document.getElementById('create-vm-overlay').addEventListener('click', function(
     createBackdropPress = false;
 });
 
-/* Close on Escape */
+function trapModalFocus(event, overlay) {
+    if (event.key !== 'Tab') return;
+    var controls = Array.from(overlay.querySelectorAll('button, input, select, [tabindex]')).filter(function(el) {
+        return !el.disabled && el.tabIndex >= 0 && el.getClientRects().length;
+    });
+    if (!controls.length) return;
+    var first = controls[0], last = controls[controls.length - 1];
+    if (!overlay.contains(document.activeElement) ||
+        (event.shiftKey && document.activeElement === first) ||
+        (!event.shiftKey && document.activeElement === last)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+    }
+}
+
 document.addEventListener('keydown', function(e) {
+    var confirmOverlay = document.getElementById('modal-overlay');
+    if (confirmOverlay.classList.contains('active')) {
+        if (e.key === 'Escape') { e.preventDefault(); modalResolve(false); }
+        else trapModalFocus(e, confirmOverlay);
+        return;
+    }
+    var diskOverlay = document.getElementById('disk-location-overlay');
+    if (diskOverlay.classList.contains('active')) {
+        if (e.key === 'Escape') { e.preventDefault(); closeDiskLocationModal(false); }
+        else if (e.key === 'Enter' && e.target.id === 'disk-directory') {
+            e.preventDefault();
+            closeDiskLocationModal(true);
+        } else trapModalFocus(e, diskOverlay);
+        return;
+    }
     if (e.key !== 'Escape') return;
     if (document.getElementById('create-vm-overlay').classList.contains('active')) {
         closeCreateModal();
@@ -1400,6 +1608,7 @@ function onPrereqResult(msg) {
 /* ---- Modal ---- */
 
 function showModal(title, message, confirmText, opts) {
+    var previousFocus = document.activeElement;
     document.getElementById('modal-title').textContent = title;
     document.getElementById('modal-message').textContent = message;
     var confirmBtn = document.getElementById('modal-confirm-btn');
@@ -1425,15 +1634,17 @@ function showModal(title, message, confirmText, opts) {
         inputRow.style.display = 'none';
     }
     document.getElementById('modal-overlay').classList.add('active');
+    if (!(opts && opts.input)) confirmBtn.focus();
 
     return new Promise(function(resolve) {
-        pendingConfirm = { resolve: resolve, hasInput: !!(opts && opts.input) };
+        pendingConfirm = { resolve: resolve, hasInput: !!(opts && opts.input), previousFocus: previousFocus };
     });
 }
 
 function modalResolve(result) {
     document.getElementById('modal-overlay').classList.remove('active');
     if (pendingConfirm) {
+        if (pendingConfirm.previousFocus) pendingConfirm.previousFocus.focus();
         if (result && pendingConfirm.hasInput) {
             pendingConfirm.resolve(document.getElementById('modal-input').value);
         } else {

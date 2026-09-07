@@ -40,7 +40,7 @@ typedef struct {
     int     gpu_mode;             /* GPU_NONE, GPU_DEFAULT, or GPU_MIRROR */
     int     network_mode;         /* NET_NONE, NET_NAT, NET_EXTERNAL, or NET_INTERNAL */
     wchar_t admin_user[128];      /* Guest local admin username */
-    wchar_t admin_pass[128];      /* Guest local admin password */
+    wchar_t admin_pass[256];      /* Guest local admin password */
     wchar_t resources_iso_path[MAX_PATH]; /* ISO with autounattend + agent + helpers */
     GpuDriverShareList gpu_shares;         /* Plan9 shares for GPU driver files */
     BOOL    is_template;              /* TRUE = template creation (no GPU/network) */

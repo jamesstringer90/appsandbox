@@ -3,6 +3,7 @@
 
 #import <Metal/Metal.h>
 #include <sys/sysctl.h>
+#include <limits.h>
 
 @implementation HostInfo
 
@@ -21,17 +22,28 @@
 }
 
 + (int)freeGb {
-    NSURL *root = [VmDir vmsRootDirectory];
-    if (!root) return 0;
+    return MAX(0, [self freeGbForDirectory:@""]);
+}
+
++ (int)freeGbForDirectory:(NSString *)directory {
+    NSString *path = directory.length ? directory : [VmDir vmsRootDirectory].path;
+    if (![path hasPrefix:@"/"] ||
+        [path rangeOfCharacterFromSet:[NSCharacterSet controlCharacterSet]].location != NSNotFound)
+        return -1;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDirectory = NO;
+    if (![fm fileExistsAtPath:path isDirectory:&isDirectory] || !isDirectory)
+        return -1;
 
     NSError *err = nil;
-    NSDictionary *attrs = [[NSFileManager defaultManager]
-        attributesOfFileSystemForPath:[root path] error:&err];
-    if (!attrs) return 0;
+    NSDictionary *attrs = [fm attributesOfFileSystemForPath:path error:&err];
+    if (!attrs || err) return -1;
 
     NSNumber *freeBytes = attrs[NSFileSystemFreeSize];
-    if (!freeBytes) return 0;
-    return (int)([freeBytes unsignedLongLongValue] / (1024ULL * 1024ULL * 1024ULL));
+    if (!freeBytes) return -1;
+    unsigned long long freeGb = [freeBytes unsignedLongLongValue] / (1024ULL * 1024ULL * 1024ULL);
+    return freeGb > INT_MAX ? INT_MAX : (int)freeGb;
 }
 
 + (NSString *)hostGpuName {
