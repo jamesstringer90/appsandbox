@@ -31,6 +31,7 @@
 #include <stdarg.h>
 
 #include "vm_display_idd.h"
+#include "../core/protocol.h"
 #include "vm_clipboard.h"
 #include "vm_agent.h"
 #include "hcs_vm.h"
@@ -105,36 +106,12 @@ typedef struct AudioFrameHeader {
 #define MAX_DIRTY_RECTS     64
 #define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
 
-/* ---- Input protocol (host → guest) ---- */
-
-#define INPUT_MAGIC         0x4E495341  /* "ASIN" little-endian */
-#define INPUT_MOUSE_MOVE    0
-#define INPUT_MOUSE_BUTTON  1
-#define INPUT_MOUSE_WHEEL   2
-#define INPUT_KEY           3
-
-/* Button IDs for INPUT_MOUSE_BUTTON */
-#define INPUT_BTN_LEFT      0
-#define INPUT_BTN_RIGHT     1
-#define INPUT_BTN_MIDDLE    2
-
-#define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
-
-#pragma pack(push, 1)
-typedef struct InputPacket {
-    UINT32 magic;   /* INPUT_MAGIC */
-    UINT32 type;    /* INPUT_MOUSE_MOVE / BUTTON / WHEEL / KEY */
-    UINT32 param1;
-    UINT32 param2;
-    UINT32 param3;
-} InputPacket;
-#pragma pack(pop)
-
 /* ---- Window messages ---- */
 
 #define WM_VM_DISPLAY_CLOSED    (WM_APP + 5)
 #define WM_IDD_FRAME_READY      (WM_USER + 100)
 #define WM_IDD_FOCUS            (WM_USER + 101)
+#define WM_IDD_INPUT_READY      (WM_USER + 102)
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -235,6 +212,8 @@ struct VmDisplayIdd {
 
     /* Input forwarding */
     volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
+    SRWLOCK        input_lock;
+    volatile LONG  keyboard_version;
     BOOL           mouse_in;        /* TRUE while cursor is inside the render area */
     BOOL           tracking;        /* TrackMouseEvent active */
 
@@ -243,12 +222,11 @@ struct VmDisplayIdd {
     volatile BOOL  transmit_hotkeys; /* TRUE = capture host hotkeys + send to guest */
     volatile BOOL  input_focused;    /* TRUE while our top-level window is active */
     HHOOK          kbd_hook;          /* WH_KEYBOARD_LL handle, NULL when not installed */
-    /* Held-key tracking (window-thread only, no lock). Indexed by virtual key.
-       held_down[vk]=1 means we forwarded a down with no matching up yet; the
-       saved scan/ext let us synthesize an accurate up when flushing. */
-    BYTE           held_down[256];
-    BYTE           held_scan[256];
-    BYTE           held_ext[256];
+    /* Legacy keys use VK indices; physical keys use scan/E0 or 512 + function VK. */
+    BYTE           held_down[768];
+    InputPacket    held_keys[768];
+    BYTE           hook_routes[768];
+    BOOL           input_menu_active;
 
     /* Guest cursor */
     HCURSOR        guest_cursor;    /* current cursor created from guest bitmap */
@@ -483,16 +461,14 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
 
 /* ---- Send input packet to guest ---- */
 
-static UINT g_input_send_count = 0;
-
-static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
+static BOOL send_input_locked(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
 {
     InputPacket pkt;
     SOCKET s;
     int ret;
 
     s = d->input_socket;
-    if (s == INVALID_SOCKET) return;
+    if (s == INVALID_SOCKET) return FALSE;
 
     pkt.magic  = INPUT_MAGIC;
     pkt.type   = type;
@@ -505,14 +481,13 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
     if (ret == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK) {
-            /* Send buffer full: drop this packet (as the comment intends)
-               without tearing down the socket. */
-            return;
+            /* A full send buffer does not require reconnecting. */
+            return FALSE;
         }
         idd_log(d, L"INPUT SEND ERR %d - flagging for reconnect.", err);
         /* Mark dead — recv thread owns the socket and will close + reconnect */
         d->input_socket = INVALID_SOCKET;
-        return;
+        return FALSE;
     }
     if (ret != (int)sizeof(pkt)) {
         /* Partial send on a stream socket: the guest reads fixed-size 20-byte
@@ -521,19 +496,17 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
         idd_log(d, L"INPUT SEND short (%d/%d) - flagging for reconnect.",
                 ret, (int)sizeof(pkt));
         d->input_socket = INVALID_SOCKET;
-        return;
+        return FALSE;
     }
 
-    g_input_send_count++;
+    return TRUE;
+}
 
-    /* Log non-move events only (moves are too noisy) */
-    if (type != INPUT_MOUSE_MOVE) {
-        static const wchar_t *type_names[] = {
-            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY"
-        };
-        const wchar_t *name = type < 4 ? type_names[type] : L"?";
-        idd_log(d, L"INPUT %s p1=%u p2=%u p3=%u (#%u)", name, p1, p2, p3, g_input_send_count);
-    }
+static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
+{
+    AcquireSRWLockExclusive(&d->input_lock);
+    send_input_locked(d, type, p1, p2, p3);
+    ReleaseSRWLockExclusive(&d->input_lock);
 }
 
 /* ==================================================================
@@ -620,35 +593,58 @@ static BOOL idd_is_reserved_hotkey(DWORD vk, BOOL alt_down)
    change can release anything still down. Runs on the window thread only. */
 static void idd_forward_key(VmDisplayIdd *d, DWORD vk, DWORD scan, BOOL ext, BOOL up)
 {
-    UINT32 flags = 0;
-    if (ext) flags |= 1;
-    if (up)  flags |= 2;
-    send_input(d, INPUT_KEY, vk, scan, flags);
-
-    if (vk < 256) {
-        if (up) {
-            d->held_down[vk] = 0;
-        } else {
-            d->held_down[vk] = 1;
-            d->held_scan[vk] = (BYTE)scan;
-            d->held_ext[vk]  = (BYTE)(ext ? 1 : 0);
-        }
+    UINT32 type = INPUT_KEY, index = vk;
+    InputPacket pkt;
+    AcquireSRWLockExclusive(&d->input_lock);
+    if (d->keyboard_version == INPUT_KEYBOARD_VERSION) {
+        type = INPUT_KEY_PHYSICAL;
+        if (vk == VK_PAUSE || vk == VK_CANCEL) { scan = 0; ext = FALSE; }
+        if (vk == VK_PACKET || scan > 255) goto done;
+        if (scan == 0 && vk != VK_CANCEL && vk != VK_PAUSE &&
+            vk != VK_SNAPSHOT && vk != VK_SLEEP &&
+            !(vk >= VK_BROWSER_BACK && vk <= VK_LAUNCH_APP2)) goto done;
+        index = scan ? scan + (ext ? 256 : 0) : 512 + vk;
     }
+    pkt.magic = INPUT_MAGIC;
+    pkt.type = type;
+    pkt.param1 = vk;
+    pkt.param2 = scan;
+    pkt.param3 = ext ? INPUT_KEY_EXTENDED : 0;
+    if (type == INPUT_KEY_PHYSICAL &&
+        index < ARRAYSIZE(d->held_down) && d->held_down[index])
+        pkt = d->held_keys[index];
+    if (type == INPUT_KEY_PHYSICAL && up && (scan == 0xF1 || scan == 0xF2) &&
+        !d->held_down[index]) {
+        /* Some Korean keyboard drivers report only the key release. */
+        if (!send_input_locked(d, pkt.type, pkt.param1, pkt.param2, pkt.param3)) goto done;
+        d->held_down[index] = 1;
+        d->held_keys[index] = pkt;
+    }
+    if (up) pkt.param3 |= INPUT_KEY_UP;
+    if (send_input_locked(d, pkt.type, pkt.param1, pkt.param2, pkt.param3) &&
+        index < ARRAYSIZE(d->held_down)) {
+        d->held_down[index] = !up;
+        if (!up) d->held_keys[index] = pkt;
+    }
+done:
+    ReleaseSRWLockExclusive(&d->input_lock);
 }
 
 /* Send key-up for every key we believe is still held in the guest, then
    clear tracking. Called when our window loses activation, when Transmit
-   mode is turned off, and on teardown — this is the core stuck-key fix. */
+   mode is turned off, and on teardown. */
 static void idd_flush_held_keys(VmDisplayIdd *d)
 {
-    int vk;
-    for (vk = 0; vk < 256; vk++) {
-        if (d->held_down[vk]) {
-            UINT32 flags = 2 | (d->held_ext[vk] ? 1 : 0);
-            send_input(d, INPUT_KEY, (UINT32)vk, d->held_scan[vk], flags);
-            d->held_down[vk] = 0;
+    AcquireSRWLockExclusive(&d->input_lock);
+    for (int i = 0; i < ARRAYSIZE(d->held_down); i++) {
+        if (d->held_down[i]) {
+            const InputPacket *pkt = &d->held_keys[i];
+            send_input_locked(d, pkt->type, pkt->param1, pkt->param2,
+                              pkt->param3 | INPUT_KEY_UP);
+            d->held_down[i] = 0;
         }
     }
+    ReleaseSRWLockExclusive(&d->input_lock);
 }
 
 /* Thread-local owner: a WH_KEYBOARD_LL callback runs on the thread that
@@ -656,18 +652,57 @@ static void idd_flush_held_keys(VmDisplayIdd *d)
    without a global registry, keeping multiple displays independent. */
 static __declspec(thread) VmDisplayIdd *t_hook_display;
 
+enum { KEY_ROUTE_HOST = 1, KEY_ROUTE_GUEST, KEY_ROUTE_BOTH };
+
+static BOOL idd_is_modifier(DWORD vk)
+{
+    return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU ||
+           (vk >= VK_LSHIFT && vk <= VK_RMENU);
+}
+
 static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
 {
     VmDisplayIdd *d = t_hook_display;
-
-    if (code == HC_ACTION && d && !d->stop &&
-        d->input_focused && d->transmit_hotkeys &&
-        GetForegroundWindow() == d->hwnd) {
+    if (code == HC_ACTION && d && !d->stop) {
         const KBDLLHOOKSTRUCT *k = (const KBDLLHOOKSTRUCT *)lp;
-        BOOL up  = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
-        idd_forward_key(d, k->vkCode, k->scanCode,
-                        (k->flags & LLKHF_EXTENDED) != 0, up);
-        return 1;
+        BOOL up = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
+        BOOL ext = (k->flags & LLKHF_EXTENDED) != 0;
+        BOOL focused = d->input_focused && GetForegroundWindow() == d->hwnd;
+        if (d->keyboard_version != INPUT_KEYBOARD_VERSION) {
+            if (focused && d->transmit_hotkeys) {
+                idd_forward_key(d, k->vkCode, k->scanCode, ext, up);
+                return 1;
+            }
+        } else {
+            DWORD scan = (k->vkCode == VK_PAUSE || k->vkCode == VK_CANCEL)
+                         ? 0 : k->scanCode;
+            if (scan > 255 || k->vkCode > 255) return CallNextHookEx(NULL, code, wp, lp);
+            UINT index = scan ? scan + (ext ? 256 : 0) : 512 + k->vkCode;
+            BYTE route = d->hook_routes[index];
+            BOOL pulse = k->vkCode == VK_PAUSE || k->vkCode == VK_CANCEL;
+            if (!focused || d->input_menu_active) {
+                d->hook_routes[index] = up || pulse ? 0 : KEY_ROUTE_HOST;
+                return CallNextHookEx(NULL, code, wp, lp);
+            }
+            if (!route) {
+                if (up && scan != 0xF1 && scan != 0xF2)
+                    return CallNextHookEx(NULL, code, wp, lp);
+                if (d->transmit_hotkeys) {
+                    route = KEY_ROUTE_GUEST;
+                } else if (idd_is_reserved_hotkey(k->vkCode, (k->flags & LLKHF_ALTDOWN) != 0) ||
+                           (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
+                           (GetAsyncKeyState(VK_RWIN) & 0x8000)) {
+                    route = KEY_ROUTE_HOST;
+                } else {
+                    route = idd_is_modifier(k->vkCode) ? KEY_ROUTE_BOTH : KEY_ROUTE_GUEST;
+                }
+            }
+            /* Releases and repeats follow the key-down destination even if modifiers changed. */
+            d->hook_routes[index] = up || pulse ? 0 : route;
+            if (route != KEY_ROUTE_HOST)
+                idd_forward_key(d, k->vkCode, k->scanCode, ext, up);
+            if (route == KEY_ROUTE_GUEST) return 1;
+        }
     }
     return CallNextHookEx(NULL, code, wp, lp);
 }
@@ -675,6 +710,13 @@ static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
 static void idd_install_kbd_hook(VmDisplayIdd *d)
 {
     if (d->kbd_hook) return;
+    ZeroMemory(d->hook_routes, sizeof(d->hook_routes));
+    AcquireSRWLockShared(&d->input_lock);
+    if (d->keyboard_version == INPUT_KEYBOARD_VERSION) {
+        for (UINT i = 0; i < ARRAYSIZE(d->held_down); i++)
+            if (d->held_down[i]) d->hook_routes[i] = KEY_ROUTE_BOTH;
+    }
+    ReleaseSRWLockShared(&d->input_lock);
     t_hook_display = d;
     d->kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL, idd_ll_keyboard_proc,
                                      d->hInstance, 0);
@@ -692,6 +734,14 @@ static void idd_remove_kbd_hook(VmDisplayIdd *d)
         idd_log(d, L"Hotkey capture disabled.");
     }
     t_hook_display = NULL;
+}
+
+static void idd_update_kbd_hook(VmDisplayIdd *d)
+{
+    if (d->transmit_hotkeys || d->keyboard_version == INPUT_KEYBOARD_VERSION)
+        idd_install_kbd_hook(d);
+    else
+        idd_remove_kbd_hook(d);
 }
 
 /* Compute letterboxed/pillarboxed viewport within client rect */
@@ -812,6 +862,65 @@ static SOCKET connect_to_hv_service(const GUID *vm_runtime_id, const GUID *servi
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&sock_timeout, sizeof(sock_timeout));
 
     return s;
+}
+
+static SOCKET connect_input(VmDisplayIdd *d)
+{
+    static volatile LONG request_id;
+    GUID svc;
+    UINT32 ready = 0;
+    InputPacket query = { INPUT_MAGIC, INPUT_KEYBOARD_QUERY, INPUT_KEYBOARD_VERSION, 0, 0 };
+    InputPacket reply = {0};
+    int got = 0, version = 1;
+    ULONGLONG deadline;
+    u_long nonblock = 1;
+    DWORD zero_timeout = 0;
+    hcs_service_guid(d->os_type, 3, &svc);
+    SOCKET s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
+    if (s == INVALID_SOCKET) return s;
+    if (!recv_exact(s, &ready, sizeof(ready)) || ready != INPUT_READY_MAGIC)
+        goto failed;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
+    if (ioctlsocket(s, FIONBIO, &nonblock) != 0) goto failed;
+    query.param2 = (UINT32)InterlockedIncrement(&request_id);
+    if (send(s, (const char *)&query, sizeof(query), 0) != sizeof(query))
+        goto failed;
+    /* Old helpers ignore the query. A late or incomplete reply cannot change
+       the mode after the socket has been made available to the window thread. */
+    deadline = GetTickCount64() + 500;
+    while (got < sizeof(reply) && !d->stop) {
+        fd_set read_set;
+        struct timeval timeout;
+        LONGLONG remaining = (LONGLONG)(deadline - GetTickCount64());
+        if (remaining <= 0) break;
+        timeout.tv_sec = 0;
+        timeout.tv_usec = (long)remaining * 1000;
+        FD_ZERO(&read_set);
+        FD_SET(s, &read_set);
+        int result = select(0, &read_set, NULL, NULL, &timeout);
+        if (result == SOCKET_ERROR) goto failed;
+        if (result == 0) break;
+        int n = recv(s, (char *)&reply + got, (int)sizeof(reply) - got, 0);
+        if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
+        if (n <= 0) goto failed;
+        got += n;
+    }
+    if (d->stop) goto failed;
+    if (got == sizeof(reply) && reply.magic == INPUT_MAGIC &&
+        reply.type == INPUT_KEYBOARD_REPLY && reply.param1 == INPUT_KEYBOARD_VERSION &&
+        reply.param2 == query.param2 && reply.param3 == 0)
+        version = INPUT_KEYBOARD_VERSION;
+    AcquireSRWLockExclusive(&d->input_lock);
+    ZeroMemory(d->held_down, sizeof(d->held_down));
+    d->keyboard_version = version;
+    d->input_socket = s;
+    ReleaseSRWLockExclusive(&d->input_lock);
+    PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
+    idd_log(d, L"Input connected + ready (keyboard v%d).", version);
+    return s;
+failed:
+    closesocket(s);
+    return INVALID_SOCKET;
 }
 
 /* ==================================================================
@@ -1542,27 +1651,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         FrameHeader hdr;
 
         /* Ensure input channel is connected (independent of frame channel) */
-        if (input_s == INVALID_SOCKET) {
-            GUID svc; hcs_service_guid(d->os_type, 3, &svc);
-            input_s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
-            if (input_s != INVALID_SOCKET) {
-                UINT32 ready_magic = 0;
-                if (recv_exact(input_s, &ready_magic, sizeof(ready_magic)) &&
-                    ready_magic == INPUT_READY_MAGIC) {
-                    DWORD zero_timeout = 0;
-                    u_long nb = 1;
-                    setsockopt(input_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
-                    ioctlsocket(input_s, FIONBIO, &nb);
-                    d->input_socket = input_s;
-                    g_input_send_count = 0;
-                    idd_log(d, L"Input connected + ready (GUID :0003).");
-                } else {
-                    idd_log(d, L"Input handshake failed - closing.");
-                    closesocket(input_s);
-                    input_s = INVALID_SOCKET;
-                }
-            }
-        }
+        if (input_s == INVALID_SOCKET)
+            input_s = connect_input(d);
 
         /* Clipboard module (handles :0005 + :0006 internally) */
         if (!d->clipboard) {
@@ -1798,27 +1888,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 input_s = INVALID_SOCKET;
                 idd_log(d, L"Input socket closed, will reconnect...");
             }
-            if (input_s == INVALID_SOCKET) {
-                GUID svc; hcs_service_guid(d->os_type, 3, &svc);
-                SOCKET new_s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
-                if (new_s != INVALID_SOCKET) {
-                    UINT32 ready_magic = 0;
-                    if (recv_exact(new_s, &ready_magic, sizeof(ready_magic)) &&
-                        ready_magic == INPUT_READY_MAGIC) {
-                        DWORD zero_timeout = 0;
-                        u_long nb = 1;
-                        setsockopt(new_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
-                        ioctlsocket(new_s, FIONBIO, &nb);
-                        input_s = new_s;
-                        d->input_socket = new_s;
-                        g_input_send_count = 0;
-                        idd_log(d, L"Input reconnected + ready (GUID :0003).");
-                    } else {
-                        closesocket(new_s);
-                    }
-                }
-                /* If connect/handshake fails, will retry next frame */
-            }
+            if (input_s == INVALID_SOCKET)
+                input_s = connect_input(d);
         }
 
         /* Frame channel lost — close it but keep input alive */
@@ -1841,7 +1912,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     }
 
     /* Final cleanup — close input socket on thread exit */
+    AcquireSRWLockExclusive(&d->input_lock);
     d->input_socket = INVALID_SOCKET;
+    d->keyboard_version = 1;
+    ZeroMemory(d->held_down, sizeof(d->held_down));
+    ReleaseSRWLockExclusive(&d->input_lock);
     if (input_s != INVALID_SOCKET) {
         closesocket(input_s);
     }
@@ -1991,10 +2066,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     /* Start a present timer for steady rendering */
     SetTimer(d->hwnd, IDT_PRESENT, PRESENT_MS, NULL);
 
-    /* Install the hotkey hook on this (message-pumping) thread if the
-       persisted setting has Transmit mode enabled. */
-    if (d->transmit_hotkeys)
-        idd_install_kbd_hook(d);
+    idd_update_kbd_hook(d);
 
     /* Message pump */
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
@@ -2047,13 +2119,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                               MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
             }
-            if (d->transmit_hotkeys) {
-                idd_install_kbd_hook(d);
-            } else {
-                idd_remove_kbd_hook(d);
+            if (!d->transmit_hotkeys) {
                 /* Release anything the guest may be holding from this mode. */
                 idd_flush_held_keys(d);
             }
+            idd_update_kbd_hook(d);
             idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys);
             idd_log(d, d->transmit_hotkeys
                         ? L"Transmit Keyboard Hotkeys: ON."
@@ -2222,6 +2292,21 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SetForegroundWindow(hwnd);
         return 0;
 
+    case WM_IDD_INPUT_READY:
+        if (d && !d->stop) idd_update_kbd_hook(d);
+        return 0;
+
+    case WM_ENTERMENULOOP:
+        if (d) {
+            d->input_menu_active = TRUE;
+            if (d->keyboard_version == INPUT_KEYBOARD_VERSION) idd_flush_held_keys(d);
+        }
+        break;
+
+    case WM_EXITMENULOOP:
+        if (d) d->input_menu_active = FALSE;
+        break;
+
     case WM_SETFOCUS:
         if (d && d->clipboard)
             vm_clipboard_set_sync_enabled(d->clipboard, TRUE);
@@ -2339,6 +2424,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (!d->transmit_hotkeys &&
             idd_is_reserved_hotkey((DWORD)wp, (GetKeyState(VK_MENU) & 0x8000) != 0))
             break;  /* Default mode: let the host handle this hotkey. */
+        if (d->kbd_hook && d->keyboard_version == INPUT_KEYBOARD_VERSION)
+            return 0;  /* The hook already forwarded modifiers passed through to the host. */
         if (d->input_focused)
             idd_forward_key(d, (DWORD)wp, scan, ext, up);
         return 0;
@@ -2373,6 +2460,8 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->main_hwnd   = main_hwnd;
     d->open         = TRUE;
     d->stop         = FALSE;
+    InitializeSRWLock(&d->input_lock);
+    d->keyboard_version   = 1;
     d->input_socket       = INVALID_SOCKET;
     d->audio_socket       = INVALID_SOCKET;
     d->clipboard          = NULL;

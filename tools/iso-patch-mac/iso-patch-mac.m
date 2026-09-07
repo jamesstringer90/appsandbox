@@ -1648,7 +1648,7 @@ static int cmd_build_windows(int argc, char **argv) {
             FILE *fc = fopen(setupComplete.fileSystemRepresentation, "wb");
             if (fu && fs && fc) {
                 asb_provision_unattend(fu, vmName.UTF8String, user.UTF8String, pass.UTF8String,
-                                       "arm64", testMode, /*is_arm64=*/1, lang.UTF8String);
+                                       "arm64", testMode, /*is_arm64=*/1, lang.UTF8String, NULL);
                 asb_provision_setup_cmd(fs);
                 asb_provision_setupcomplete(fc, sshMsiName.length ? sshMsiName.UTF8String : NULL);
                 scriptsOK = YES;

@@ -264,7 +264,7 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
      */
     u_mkdir_p(out_dir);
 
-    /* agent-src/: 5 .c files + Makefile */
+    /* agent-src/: sources, Makefile, and shared protocol header */
     {
         wchar_t agent_src[MAX_PATH], dst[MAX_PATH];
         swprintf_s(agent_src, MAX_PATH,
@@ -282,6 +282,12 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
             swprintf_s(s, MAX_PATH, L"%s\\%s", agent_src, files[i]);
             swprintf_s(dst, MAX_PATH, L"%s\\%s", out_agent, files[i]);
             u_cp_file(s, dst);
+        }
+        wchar_t protocol_src[MAX_PATH];
+        swprintf_s(protocol_src, MAX_PATH, L"%s\\src\\core\\protocol.h", extracted_root);
+        if (GetFileAttributesW(protocol_src) != INVALID_FILE_ATTRIBUTES) {
+            swprintf_s(dst, MAX_PATH, L"%s\\protocol.h", out_agent);
+            if (u_cp_file(protocol_src, dst) != 0) return -1;
         }
         log_msg(L"prefetch-repo: staged agent-src/");
     }

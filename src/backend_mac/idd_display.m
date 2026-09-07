@@ -23,6 +23,8 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <IOSurface/IOSurface.h>
+#import <Carbon/Carbon.h>
+#import <IOKit/hidsystem/IOLLEvent.h>
 
 #include <unistd.h>
 #include <pthread.h>
@@ -38,6 +40,7 @@
 #include <pwd.h>
 #include <sys/stat.h>
 #include "../../tools/transport/asb_transport.h"   /* ASB_CH_DISPLAY/INPUT/AUDIO/CLIPBOARD[_READER], AsbCursor, ASB_CURSOR_MAGIC */
+#include "../core/protocol.h"
 
 /* ---- VDD wire protocol (mirror of tools/vdd/vdd.h + src/backend_win/vm_display_idd.c).
  * The VDD pushes the same stream it sends over HvSocket on a
@@ -52,19 +55,6 @@ typedef struct {
     uint32_t magic; int32_t x, y; uint32_t visible, shape_updated, shape_id,
              width, height, pitch, xhot, yhot, cursor_type, shape_data_size;
 } WireCursorHeader;
-#pragma pack(pop)
-
-/* ---- ch3 input record (mirror of tools/agent/appsandbox-input.c's InputPacket). ---- */
-#define INPUT_MAGIC        0x4E495341u        /* 'ASIN' */
-#define INPUT_MOUSE_MOVE   0
-#define INPUT_MOUSE_BUTTON 1
-#define INPUT_MOUSE_WHEEL  2
-#define INPUT_KEY          3
-#define INPUT_BTN_LEFT     0
-#define INPUT_BTN_RIGHT    1
-#define INPUT_BTN_MIDDLE   2
-#pragma pack(push, 1)
-typedef struct { uint32_t magic, type, param1, param2, param3; } InputPacket;
 #pragma pack(pop)
 
 /* ---- ch4 AUDIO wire format (mirror of tools/agent/appsandbox-audio.c). The guest sends one
@@ -149,6 +139,116 @@ static void build_keymap(void)
     g_vk[0x29]=0xBA; g_vk[0x18]=0xBB; g_vk[0x2B]=0xBC; g_vk[0x1B]=0xBD;
     g_vk[0x2F]=0xBE; g_vk[0x2C]=0xBF; g_vk[0x32]=0xC0; g_vk[0x21]=0xDB;
     g_vk[0x2A]=0xDC; g_vk[0x1E]=0xDD; g_vk[0x27]=0xDE;
+}
+
+/* Set-1 make codes; 0xe000 marks the Windows E0 prefix. */
+static const uint16_t g_scan[128] = {
+    [kVK_ANSI_A]=0x1e, [kVK_ANSI_S]=0x1f, [kVK_ANSI_D]=0x20, [kVK_ANSI_F]=0x21,
+    [kVK_ANSI_H]=0x23, [kVK_ANSI_G]=0x22, [kVK_ANSI_Z]=0x2c, [kVK_ANSI_X]=0x2d,
+    [kVK_ANSI_C]=0x2e, [kVK_ANSI_V]=0x2f, [kVK_ANSI_B]=0x30, [kVK_ANSI_Q]=0x10,
+    [kVK_ANSI_W]=0x11, [kVK_ANSI_E]=0x12, [kVK_ANSI_R]=0x13, [kVK_ANSI_Y]=0x15,
+    [kVK_ANSI_T]=0x14, [kVK_ANSI_U]=0x16, [kVK_ANSI_I]=0x17, [kVK_ANSI_O]=0x18,
+    [kVK_ANSI_P]=0x19, [kVK_ANSI_L]=0x26, [kVK_ANSI_J]=0x24, [kVK_ANSI_K]=0x25,
+    [kVK_ANSI_N]=0x31, [kVK_ANSI_M]=0x32,
+    [kVK_ANSI_1]=0x02, [kVK_ANSI_2]=0x03, [kVK_ANSI_3]=0x04, [kVK_ANSI_4]=0x05,
+    [kVK_ANSI_5]=0x06, [kVK_ANSI_6]=0x07, [kVK_ANSI_7]=0x08, [kVK_ANSI_8]=0x09,
+    [kVK_ANSI_9]=0x0a, [kVK_ANSI_0]=0x0b,
+    [kVK_ANSI_Equal]=0x0d, [kVK_ANSI_Minus]=0x0c,
+    [kVK_ANSI_LeftBracket]=0x1a, [kVK_ANSI_RightBracket]=0x1b,
+    [kVK_ANSI_Quote]=0x28, [kVK_ANSI_Semicolon]=0x27, [kVK_ANSI_Backslash]=0x2b,
+    [kVK_ANSI_Comma]=0x33, [kVK_ANSI_Slash]=0x35, [kVK_ANSI_Period]=0x34,
+    [kVK_ANSI_Grave]=0x29, [kVK_ISO_Section]=0x56,
+    [kVK_Return]=0x1c, [kVK_Tab]=0x0f, [kVK_Space]=0x39,
+    [kVK_Delete]=0x0e, [kVK_Escape]=0x01,
+    [kVK_Command]=0xe05b, [kVK_RightCommand]=0xe05c,
+    [kVK_Shift]=0x2a, [kVK_RightShift]=0x36, [kVK_CapsLock]=0x3a,
+    [kVK_Option]=0x38, [kVK_RightOption]=0xe038,
+    [kVK_Control]=0x1d, [kVK_RightControl]=0xe01d,
+    [kVK_ANSI_Keypad0]=0x52, [kVK_ANSI_Keypad1]=0x4f, [kVK_ANSI_Keypad2]=0x50,
+    [kVK_ANSI_Keypad3]=0x51, [kVK_ANSI_Keypad4]=0x4b, [kVK_ANSI_Keypad5]=0x4c,
+    [kVK_ANSI_Keypad6]=0x4d, [kVK_ANSI_Keypad7]=0x47, [kVK_ANSI_Keypad8]=0x48,
+    [kVK_ANSI_Keypad9]=0x49, [kVK_ANSI_KeypadDecimal]=0x53,
+    [kVK_ANSI_KeypadMultiply]=0x37, [kVK_ANSI_KeypadPlus]=0x4e,
+    [kVK_ANSI_KeypadMinus]=0x4a, [kVK_ANSI_KeypadDivide]=0xe035,
+    [kVK_ANSI_KeypadEnter]=0xe01c, [kVK_ANSI_KeypadClear]=0x45,
+    [0x34]=0xe01c, [0x6e]=0xe05d,
+    [kVK_F1]=0x3b, [kVK_F2]=0x3c, [kVK_F3]=0x3d, [kVK_F4]=0x3e,
+    [kVK_F5]=0x3f, [kVK_F6]=0x40, [kVK_F7]=0x41, [kVK_F8]=0x42,
+    [kVK_F9]=0x43, [kVK_F10]=0x44, [kVK_F11]=0x57, [kVK_F12]=0x58,
+    [kVK_F13]=0x64, [kVK_F14]=0x65, [kVK_F15]=0x66, [kVK_F16]=0x67,
+    [kVK_F17]=0x68, [kVK_F18]=0x69, [kVK_F19]=0x6a, [kVK_F20]=0x6b,
+    [kVK_Help]=0xe052, [kVK_Home]=0xe047, [kVK_End]=0xe04f,
+    [kVK_PageUp]=0xe049, [kVK_PageDown]=0xe051, [kVK_ForwardDelete]=0xe053,
+    [kVK_LeftArrow]=0xe04b, [kVK_RightArrow]=0xe04d,
+    [kVK_UpArrow]=0xe048, [kVK_DownArrow]=0xe050,
+    [kVK_JIS_Yen]=0x7d, [kVK_JIS_Underscore]=0x73,
+    [kVK_JIS_Kana]=0xe0f2, [kVK_JIS_Eisu]=0xe0f1
+};
+
+static BOOL idd_modifier_down(NSEventModifierFlags flags, unsigned short kc) {
+    NSEventModifierFlags side = 0, pair = 0, common = 0;
+    switch (kc) {
+    case kVK_Shift:        side = NX_DEVICELSHIFTKEYMASK; pair = NX_DEVICERSHIFTKEYMASK; common = NSEventModifierFlagShift; break;
+    case kVK_RightShift:   side = NX_DEVICERSHIFTKEYMASK; pair = NX_DEVICELSHIFTKEYMASK; common = NSEventModifierFlagShift; break;
+    case kVK_Control:      side = NX_DEVICELCTLKEYMASK; pair = NX_DEVICERCTLKEYMASK; common = NSEventModifierFlagControl; break;
+    case kVK_RightControl: side = NX_DEVICERCTLKEYMASK; pair = NX_DEVICELCTLKEYMASK; common = NSEventModifierFlagControl; break;
+    case kVK_Option:       side = NX_DEVICELALTKEYMASK; pair = NX_DEVICERALTKEYMASK; common = NSEventModifierFlagOption; break;
+    case kVK_RightOption:  side = NX_DEVICERALTKEYMASK; pair = NX_DEVICELALTKEYMASK; common = NSEventModifierFlagOption; break;
+    case kVK_Command:      side = NX_DEVICELCMDKEYMASK; pair = NX_DEVICERCMDKEYMASK; common = NSEventModifierFlagCommand; break;
+    case kVK_RightCommand: side = NX_DEVICERCMDKEYMASK; pair = NX_DEVICELCMDKEYMASK; common = NSEventModifierFlagCommand; break;
+    default: return NO;
+    }
+    if (!(flags & common)) return NO;
+    return (flags & (side | pair)) ? (flags & side) != 0 : YES;
+}
+
+static int idd_keyboard_version(int fd, volatile int *stop) {
+    InputPacket query = { INPUT_MAGIC, INPUT_KEYBOARD_QUERY, INPUT_KEYBOARD_VERSION, arc4random() | 1u, 0 };
+    uint8_t received[sizeof(uint32_t) + sizeof(InputPacket)];
+    size_t sent = 0, count = 0;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (!*stop) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t left = 500000 - ((now.tv_sec - start.tv_sec) * 1000000
+                            + (now.tv_nsec - start.tv_nsec) / 1000);
+        if (left <= 0) break;
+        fd_set reads, writes;
+        FD_ZERO(&reads); FD_SET(fd, &reads);
+        FD_ZERO(&writes); if (sent < sizeof(query)) FD_SET(fd, &writes);
+        struct timeval timeout = { 0, (suseconds_t)(left < 50000 ? left : 50000) };
+        int ready = select(fd + 1, &reads, &writes, NULL, &timeout);
+        if (ready < 0) { if (errno == EINTR) continue; return 0; }
+        if (FD_ISSET(fd, &writes)) {
+            ssize_t n = send(fd, (uint8_t *)&query + sent, sizeof(query) - sent, MSG_DONTWAIT);
+            if (n > 0) sent += (size_t)n;
+            else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) return 0;
+        }
+        if (FD_ISSET(fd, &reads)) {
+            ssize_t n = recv(fd, received + count, sizeof(received) - count, 0);
+            if (n == 0) return 0;
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+                return 0;
+            }
+            count += (size_t)n;
+            if (count >= sizeof(uint32_t)) {
+                uint32_t magic;
+                memcpy(&magic, received, sizeof(magic));
+                if (magic != INPUT_READY_MAGIC) return sent == sizeof(query) ? 1 : 0;
+            }
+            if (count == sizeof(received)) {
+                InputPacket reply;
+                memcpy(&reply, received + sizeof(uint32_t), sizeof(reply));
+                if (sent == sizeof(query) && reply.magic == INPUT_MAGIC &&
+                    reply.type == INPUT_KEYBOARD_REPLY && reply.param1 == INPUT_KEYBOARD_VERSION &&
+                    reply.param2 == query.param2 && reply.param3 == 0)
+                    return INPUT_KEYBOARD_VERSION;
+                return sent == sizeof(query) ? 1 : 0;
+            }
+        }
+    }
+    return sent && sent < sizeof(query) ? 0 : 1;
 }
 /* extended-key keycodes (arrows + nav + fwd-delete) */
 static int is_extended(unsigned short kc)
@@ -299,6 +399,7 @@ static __weak IddDisplayWindow *g_hotkeyOwner;
 - (NSCursor *)currentCursorForScale:(double)scale;
 - (NSCursor *)appliedCursor;
 - (void)sendInput:(uint32_t)type p1:(uint32_t)p1 p2:(uint32_t)p2 p3:(uint32_t)p3;
+- (void)enqueueInputLocked:(InputPacket)packet;
 - (void)recordMoveX:(uint32_t)x y:(uint32_t)y;
 - (void)flushMove;
 - (void)forwardKeyEvent:(NSEvent *)event;
@@ -357,8 +458,8 @@ static __weak IddDisplayWindow *g_hotkeyOwner;
     int32_t           _hotkeyConnection;
     int               _savedHotkeyMode;
     NSUInteger        _trackingMenus;
-    BOOL              _heldKeys[256];
-    uint8_t           _heldExtended[256];
+    BOOL              _heldKeys[128];
+    InputPacket       _heldPackets[128];
 
     /* Published reader fds shared with teardown. */
     pthread_mutex_t   _inputLock;
@@ -372,6 +473,8 @@ static __weak IddDisplayWindow *g_hotkeyOwner;
     #define IDD_INQ_CAP 256
     InputPacket       _inq[IDD_INQ_CAP];
     uint32_t          _inqHead, _inqTail;
+    BOOL              _inputReady;
+    int               _keyboardVersion;
     pthread_mutex_t   _inqLock;
     pthread_cond_t    _inqCond;
     /* Display thread's current ch2 fd, published so teardown can shutdown() it to unblock the
@@ -600,10 +703,46 @@ static __weak IddDisplayWindow *g_hotkeyOwner;
 - (void)forwardKeyEvent:(NSEvent *)event {
     [self flushMove];
     unsigned short kc = event.keyCode;
+    if (kc >= 128) return;
+    pthread_mutex_lock(&_inqLock);
+    if (!_inputReady || _stop) { pthread_mutex_unlock(&_inqLock); return; }
     uint32_t vk = 0;
+    uint32_t scan = 0;
     BOOL up = event.type == NSEventTypeKeyUp;
     BOOL extended = is_extended(kc);
-    if (event.type == NSEventTypeFlagsChanged) {
+    BOOL physical = _keyboardVersion == INPUT_KEYBOARD_VERSION;
+    if (physical) {
+        unsigned short position = kc;
+        if (kc == kVK_ISO_Section || kc == kVK_ANSI_Grave) {
+            /* macOS swaps these two physical positions on ISO hardware. */
+            CGEventRef cg = event.CGEvent;
+            SInt16 keyboardType = cg ? (SInt16)CGEventGetIntegerValue(cg, kCGKeyboardEventKeyboardType) : LMGetKbdType();
+            if (KBGetLayoutType(keyboardType) == kKeyboardISO)
+                position = kVK_ISO_Section + kVK_ANSI_Grave - kc;
+        }
+        scan = g_scan[position] & 0xff;
+        extended = (g_scan[position] & 0xff00) == 0xe000;
+        vk = g_vk[kc];
+        if (event.type == NSEventTypeFlagsChanged) {
+            if (kc == kVK_CapsLock) {
+                InputPacket caps = { INPUT_MAGIC, INPUT_KEY_PHYSICAL, 0, 0x3a, 0 };
+                [self enqueueInputLocked:caps];
+                caps.param3 = INPUT_KEY_UP;
+                [self enqueueInputLocked:caps];
+                pthread_mutex_unlock(&_inqLock);
+                return;
+            }
+            up = !idd_modifier_down(event.modifierFlags, kc);
+        }
+        if (!scan) {
+            switch (kc) {
+            case kVK_VolumeUp: vk = 0xaf; break;
+            case kVK_VolumeDown: vk = 0xae; break;
+            case kVK_Mute: vk = 0xad; break;
+            default: vk = 0; break;
+            }
+        }
+    } else if (event.type == NSEventTypeFlagsChanged) {
         NSEventModifierFlags mask = 0;
         extended = NO;
         switch (kc) {
@@ -613,24 +752,39 @@ static __weak IddDisplayWindow *g_hotkeyOwner;
         case 0x37: vk = 0x5B; mask = NSEventModifierFlagCommand; break;
         case 0x36: vk = 0x5C; mask = NSEventModifierFlagCommand; break;
         case 0x39: vk = 0x14; mask = NSEventModifierFlagCapsLock; break;
-        default: return;
+        default: pthread_mutex_unlock(&_inqLock); return;
         }
         up = (event.modifierFlags & mask) == 0;
     } else {
-        vk = kc < 128 ? g_vk[kc] : 0;
+        vk = g_vk[kc];
     }
-    if (!vk) return;
-    [self sendInput:INPUT_KEY p1:vk p2:0 p3:((extended ? 1 : 0) | (up ? 2 : 0))];
-    _heldKeys[vk] = !up;
-    _heldExtended[vk] = extended;
+    if ((!vk && !scan) || (up && !_heldKeys[kc]) ||
+        (event.type == NSEventTypeKeyDown && event.isARepeat && !_heldKeys[kc])) {
+        pthread_mutex_unlock(&_inqLock);
+        return;
+    }
+    InputPacket packet = { INPUT_MAGIC, physical ? INPUT_KEY_PHYSICAL : INPUT_KEY,
+                           vk, scan, (extended ? INPUT_KEY_EXTENDED : 0) | (up ? INPUT_KEY_UP : 0) };
+    if (up) {
+        packet = _heldPackets[kc];
+        packet.param3 |= INPUT_KEY_UP;
+    }
+    [self enqueueInputLocked:packet];
+    _heldKeys[kc] = !up;
+    _heldPackets[kc] = packet;
+    pthread_mutex_unlock(&_inqLock);
 }
 
 - (void)releaseHeldKeys {
-    for (uint32_t vk = 0; vk < 256; vk++) {
-        if (!_heldKeys[vk]) continue;
-        [self sendInput:INPUT_KEY p1:vk p2:0 p3:(2 | _heldExtended[vk])];
-        _heldKeys[vk] = NO;
+    pthread_mutex_lock(&_inqLock);
+    for (unsigned int kc = 0; kc < 128; kc++) {
+        if (!_heldKeys[kc]) continue;
+        InputPacket packet = _heldPackets[kc];
+        packet.param3 |= INPUT_KEY_UP;
+        if (_inputReady) [self enqueueInputLocked:packet];
+        _heldKeys[kc] = NO;
     }
+    pthread_mutex_unlock(&_inqLock);
 }
 
 /* Build the Metal device/pipeline/sampler and point the view's CAMetalLayer at them. The shaders are the
@@ -873,12 +1027,16 @@ static __weak IddDisplayWindow *g_hotkeyOwner;
        (A non-blocking main-thread send would not suffice: the main thread stays coupled to ch3's live
        state and can pin in __sendto.) Bounded ring, drop-OLDEST when full (latest position wins). */
     pthread_mutex_lock(&_inqLock);
+    if (_inputReady && !_stop) [self enqueueInputLocked:pkt];
+    pthread_mutex_unlock(&_inqLock);
+}
+
+- (void)enqueueInputLocked:(InputPacket)pkt {
     uint32_t next = (_inqTail + 1) % IDD_INQ_CAP;
     if (next == _inqHead) _inqHead = (_inqHead + 1) % IDD_INQ_CAP;   /* full -> drop oldest */
     _inq[_inqTail] = pkt;
     _inqTail = next;
     pthread_cond_signal(&_inqCond);
-    pthread_mutex_unlock(&_inqLock);
 }
 
 - (void)recordMoveX:(uint32_t)x y:(uint32_t)y { _moveX = x; _moveY = y; _hasMove = 1; }
@@ -1030,6 +1188,18 @@ static __weak IddDisplayWindow *g_hotkeyOwner;
            without O_NONBLOCK the worker can still briefly block in __sendto on a full ring. With it, send
            returns EAGAIN instantly (-> drop) and only a real error/EOF triggers reconnect. */
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        int keyboardVersion = idd_keyboard_version(fd, &_stop);
+        if (!keyboardVersion || _stop) {
+            close(fd);
+            if (!_stop) usleep(100000);
+            continue;
+        }
+        pthread_mutex_lock(&_inqLock);
+        _inqHead = _inqTail = 0;
+        memset(_heldKeys, 0, sizeof(_heldKeys));
+        _keyboardVersion = keyboardVersion;
+        _inputReady = YES;
+        pthread_mutex_unlock(&_inqLock);
         BOOL dead = NO;
         while (!_stop && !dead) {
             /* 1) Wait briefly for queued input, then drain it into a local batch. The cond wait wakes
@@ -1068,19 +1238,17 @@ static __weak IddDisplayWindow *g_hotkeyOwner;
             }
             if (dead || _stop) break;
 
-            /* 3) Detect a guest-side teardown even while idle: ch3 is host->guest, but the guest's
-               socketpair end is closed by the pump on disconnect/respawn (asb_ivshmem_pump_main done:),
-               and the input helper sends a one-time READY magic. Poll readable (0 timeout, non-blocking);
-               recv==0 is EOF -> reconnect; recv>0 is the incidental READY byte(s) -> discard and keep
-               serving. So input survives a guest restart even with nothing being typed. */
+            /* Drain late negotiation bytes without changing this connection's selected version. */
             fd_set rfds; FD_ZERO(&rfds); FD_SET(fd, &rfds);
             struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
             int s = select(fd + 1, &rfds, NULL, NULL, &tv);
-            if (s < 0) break;                          /* select error -> reconnect */
+            if (s < 0) { if (errno == EINTR) continue; dead = YES; break; }
             if (s > 0 && FD_ISSET(fd, &rfds)) {
                 char drain[64];
                 ssize_t rd = recv(fd, drain, sizeof(drain), 0);
-                if (rd <= 0) break;   /* 0 = guest closed ch3 (respawn/disconnect) -> reconnect */
+                if (rd == 0 || (rd < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                    dead = YES; break;
+                }
             }
         }
 
@@ -1094,6 +1262,12 @@ static __weak IddDisplayWindow *g_hotkeyOwner;
             }
             pthread_mutex_unlock(&_inqLock);
         }
+        pthread_mutex_lock(&_inqLock);
+        _inputReady = NO;
+        _keyboardVersion = 1;
+        _inqHead = _inqTail = 0;
+        memset(_heldKeys, 0, sizeof(_heldKeys));
+        pthread_mutex_unlock(&_inqLock);
         close(fd);
         if (!_stop) usleep(100000);
     }

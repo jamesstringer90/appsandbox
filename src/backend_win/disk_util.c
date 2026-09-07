@@ -3,6 +3,7 @@
 #include "../../tools/provision/win_provision.h"
 #include <virtdisk.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <wincrypt.h>
 #include <bcrypt.h>
 #include <imapi2fs.h>
@@ -346,6 +347,109 @@ static const wchar_t *lang_to_input_locale(const wchar_t *lang)
     return L"0409:00000409";  /* fallback */
 }
 
+static BOOL system_keyboard_layout(DWORD klid)
+{
+    wchar_t key[96], file[MAX_PATH], path[MAX_PATH];
+    DWORD size = sizeof(file), attributes;
+    UINT len;
+
+    if (!klid || (klid & 0xF0000000)) return FALSE;
+    swprintf_s(key, ARRAYSIZE(key),
+               L"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layouts\\%08X", klid);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, key, L"Layout File", RRF_RT_REG_SZ,
+                     NULL, file, &size) != ERROR_SUCCESS ||
+        _wcsnicmp(file, L"kbd", 3) != 0 || wcspbrk(file, L"\\/:") != NULL)
+        return FALSE;
+    len = GetSystemDirectoryW(path, ARRAYSIZE(path));
+    if (!len || len + wcslen(file) + 2 > ARRAYSIZE(path)) return FALSE;
+    wcscat_s(path, ARRAYSIZE(path), L"\\");
+    wcscat_s(path, ARRAYSIZE(path), file);
+    attributes = GetFileAttributesW(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static DWORD keyboard_layout_id(HKL layout)
+{
+    wchar_t name[KL_NAMELENGTH];
+    DWORD klid = 0;
+    WORD device = HIWORD((ULONG_PTR)layout);
+    HKEY layouts;
+
+    if (layout == GetKeyboardLayout(0) && GetKeyboardLayoutNameW(name)) {
+        klid = wcstoul(name, NULL, 16);
+        if (system_keyboard_layout(klid)) return klid;
+        klid = 0;
+    }
+    if ((device & 0xF000) != 0xF000)
+        return system_keyboard_layout(device) ? device : 0;
+
+    /* Variant HKLs contain a registry Layout Id, not the full KLID. */
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layouts",
+                      0, KEY_READ, &layouts) == ERROR_SUCCESS) {
+        DWORD index;
+        for (index = 0;; index++) {
+            wchar_t id[16];
+            DWORD length = ARRAYSIZE(name), size = sizeof(id);
+            LONG result = RegEnumKeyExW(layouts, index, name, &length,
+                                        NULL, NULL, NULL, NULL);
+            if (result == ERROR_MORE_DATA) continue;
+            if (result != ERROR_SUCCESS) break;
+            if (RegGetValueW(layouts, name, L"Layout Id", RRF_RT_REG_SZ,
+                             NULL, id, &size) == ERROR_SUCCESS &&
+                wcstoul(id, NULL, 16) == (DWORD)(device & 0x0FFF)) {
+                DWORD candidate = wcstoul(name, NULL, 16);
+                if (system_keyboard_layout(candidate)) {
+                    klid = candidate;
+                    break;
+                }
+            }
+        }
+        RegCloseKey(layouts);
+    }
+    return klid;
+}
+
+void get_host_keyboard_settings(wchar_t *input_locale, size_t size,
+                                DWORD *klid, WORD *langid)
+{
+    HWND foreground = GetForegroundWindow();
+    DWORD thread = foreground ? GetWindowThreadProcessId(foreground, NULL) : 0;
+    HKL layout = thread ? GetKeyboardLayout(thread) : NULL;
+    WORD language;
+    DWORD keyboard;
+    wchar_t locale[LOCALE_NAME_MAX_LENGTH], result[128];
+    const wchar_t *ime = NULL;
+
+    if (!layout) layout = GetKeyboardLayout(0);
+    language = layout ? LOWORD((ULONG_PTR)layout) : GetUserDefaultLangID();
+    keyboard = layout ? keyboard_layout_id(layout) : 0;
+    switch (language) {
+    case 0x0411: ime = L"ja-JP"; break;
+    case 0x0412: ime = L"ko-KR"; break;
+    case 0x0804: case 0x1004: ime = L"zh-CN"; break;
+    case 0x0404: case 0x0C04: case 0x1404: ime = L"zh-TW"; break;
+    }
+    if (ime) {
+        wcscpy_s(result, ARRAYSIZE(result), ime);
+        if (!keyboard)
+            keyboard = PRIMARYLANGID(language) == LANG_CHINESE ? 0x0409 : language;
+    } else {
+        if (!keyboard) {
+            const wchar_t *fallback;
+            if (!LCIDToLocaleName(MAKELCID(language, SORT_DEFAULT), locale,
+                                  ARRAYSIZE(locale), 0))
+                wcscpy_s(locale, ARRAYSIZE(locale), L"en-US");
+            fallback = wcschr(lang_to_input_locale(locale), L':');
+            keyboard = wcstoul(fallback + 1, NULL, 16);
+        }
+        swprintf_s(result, ARRAYSIZE(result), L"%04X:%08X", language, keyboard);
+    }
+    if (input_locale && size) wcsncpy_s(input_locale, size, result, _TRUNCATE);
+    if (klid) *klid = keyboard;
+    if (langid) *langid = language;
+}
+
 #if ASB_IS_ARM64
 /* ARM Windows HCS exposes no vTPM, so the Windows 11 Setup hardware checks are
    bypassed via the HKLM\SYSTEM\Setup\LabConfig keys (x64 gets a real vTPM and
@@ -384,6 +488,8 @@ static BOOL generate_autounattend(const wchar_t *output_path,
     FILE *f;
     wchar_t user_xml[1024];
     wchar_t comp_name[16];
+    wchar_t input_locale[128];
+    get_host_keyboard_settings(input_locale, ARRAYSIZE(input_locale), NULL, NULL);
     if (!xml_escape_text(admin_user, user_xml, ARRAYSIZE(user_xml)))
         return FALSE;
     wcsncpy_s(comp_name, 16, vm_name, 15);
@@ -436,7 +542,7 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         L"                    <ModifyPartition wcm:action=\"add\"><Order>3</Order><PartitionID>3</PartitionID><Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter></ModifyPartition>\n"
         L"                </ModifyPartitions>\n"
         L"            </Disk></DiskConfiguration>\n",
-        lang, lang_to_input_locale(lang), lang, lang, lang);
+        lang, input_locale, lang, lang, lang);
 
 #if ASB_IS_ARM64
     /* windowsPE Setup pass — bypass keys must run before the Win11 appraiser. */
@@ -594,7 +700,7 @@ static BOOL generate_autounattend(const wchar_t *output_path,
             L"        </component>\n"
             L"    </settings>\n"
             L"</unattend>\n",
-            lang_to_input_locale(lang), lang, lang, lang,
+            input_locale, lang, lang, lang,
             user_xml, b64_password,
             user_xml, b64_password);
     }
@@ -951,6 +1057,8 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
     BOOL written;
     wchar_t user_xml[1024];
     wchar_t comp_name[16];
+    wchar_t input_locale[128];
+    get_host_keyboard_settings(input_locale, ARRAYSIZE(input_locale), NULL, NULL);
     if (!xml_escape_text(admin_user, user_xml, ARRAYSIZE(user_xml)))
         return FALSE;
     wcsncpy_s(comp_name, 16, vm_name, 15);
@@ -1068,7 +1176,7 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"    </settings>\n"
         L"</unattend>\n",
         comp_name,
-        lang_to_input_locale(lang), lang, lang, lang,
+        input_locale, lang, lang, lang,
         user_xml, b64_password,
         user_xml, b64_password);
 
@@ -1509,10 +1617,11 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
                              const wchar_t *admin_user,
                              const wchar_t *admin_pass,
                              BOOL test_mode,
-                             const wchar_t *lang)
+                             const wchar_t *lang,
+                             const wchar_t *input_locale)
 {
     FILE *f;
-    char vm_u[64], user_u[256], pass_u[512], lang_u[32];
+    char vm_u[64], user_u[256], pass_u[512], lang_u[32], input_u[128];
     int rc;
 
     if (!output_path || !vm_name || !admin_user || !admin_pass)
@@ -1524,7 +1633,9 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
     if (!WideCharToMultiByte(CP_UTF8, 0, vm_name, -1, vm_u, sizeof vm_u, NULL, NULL) ||
         !WideCharToMultiByte(CP_UTF8, 0, admin_user, -1, user_u, sizeof user_u, NULL, NULL) ||
         !WideCharToMultiByte(CP_UTF8, 0, admin_pass, -1, pass_u, sizeof pass_u, NULL, NULL) ||
-        !WideCharToMultiByte(CP_UTF8, 0, lang ? lang : L"en-US", -1, lang_u, sizeof lang_u, NULL, NULL)) {
+        !WideCharToMultiByte(CP_UTF8, 0, lang ? lang : L"en-US", -1, lang_u, sizeof lang_u, NULL, NULL) ||
+        !WideCharToMultiByte(CP_UTF8, 0, input_locale ? input_locale : L"", -1,
+                             input_u, sizeof input_u, NULL, NULL)) {
         SecureZeroMemory(pass_u, sizeof pass_u);
         return FALSE;
     }
@@ -1536,7 +1647,7 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
 
     rc = asb_provision_unattend(f, vm_u, user_u, pass_u,
                                 ASB_IS_ARM64 ? "arm64" : "amd64",
-                                test_mode ? 1 : 0, ASB_IS_ARM64, lang_u);
+                                test_mode ? 1 : 0, ASB_IS_ARM64, lang_u, input_u);
 
     fclose(f);
     SecureZeroMemory(pass_u, sizeof pass_u);

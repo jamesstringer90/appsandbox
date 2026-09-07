@@ -1111,6 +1111,7 @@ typedef struct {
     wchar_t  error_msg[512];
     VmInstance *vm_inst;
     wchar_t  language[32];
+    wchar_t  input_locale[128];
     BOOL     vhdx_created;
 } VhdxCreateArgs;
 
@@ -1146,7 +1147,8 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         }
     } else {
         if (!generate_unattend_vhdx(file_path, args->config.name, args->config.admin_user,
-                                     args->config.admin_pass, args->config.test_mode, L"en-US")) {
+                                     args->config.admin_pass, args->config.test_mode, L"en-US",
+                                     args->input_locale)) {
             args->result = E_FAIL;
             wcscpy_s(args->error_msg, 512, L"Failed to generate unattend.xml");
             goto done;
@@ -1262,7 +1264,8 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                                 swprintf_s(unattend_path, MAX_PATH, L"%s\\unattend.xml", stg);
                                 generate_unattend_vhdx(unattend_path, args->config.name,
                                                         args->config.admin_user, args->config.admin_pass,
-                                                        args->config.test_mode, args->language);
+                                                        args->config.test_mode, args->language,
+                                                        args->input_locale);
                             }
                         } else if (strncmp(line, "DONE:", 5) == 0) {
                             args->result = S_OK;
@@ -1692,6 +1695,51 @@ static void langid_to_xkb(WORD langid, char *out, size_t out_sz)
         if ((WORD)(map[i].id & 0x3ff) == prim) { strcpy_s(out, out_sz, map[i].xkb); return; }
 }
 
+static void host_keyboard_to_linux(DWORD klid, WORD language,
+                                   char *layout, size_t layout_sz,
+                                   char *variant, size_t variant_sz,
+                                   char *input_method, size_t input_method_sz)
+{
+    static const struct { DWORD klid; const char *layout, *variant; } variants[] = {
+        { 0x00010409, "us", "dvorak" }, { 0x00020409, "us", "intl" },
+        { 0x00000452, "gb", "extd" }, { 0x0000100c, "ch", "fr" },
+        { 0x00001009, "ca", "" }, { 0x00000c0c, "ca", "fr-legacy" },
+        { 0x00011009, "ca", "multix" }, { 0x0001041f, "tr", "f" },
+        { 0x00010419, "ru", "typewriter" }, { 0x00010405, "cz", "qwerty" },
+        { 0x00010415, "pl", "qwertz" }, { 0x00010410, "it", "ibm" },
+    };
+    langid_to_xkb((WORD)klid, layout, layout_sz);
+    variant[0] = input_method[0] = '\0';
+    for (int i = 0; i < ARRAYSIZE(variants); i++) {
+        if (variants[i].klid == klid) {
+            strcpy_s(layout, layout_sz, variants[i].layout);
+            strcpy_s(variant, variant_sz, variants[i].variant);
+            break;
+        }
+    }
+    switch (PRIMARYLANGID(language)) {
+    case LANG_CHINESE:
+        strcpy_s(layout, layout_sz, "us");
+        strcpy_s(input_method, input_method_sz,
+                 language == 0x0804 || language == 0x1004 ? "libpinyin" : "chewing");
+        break;
+    case LANG_JAPANESE: {
+        DWORD thread = GetWindowThreadProcessId(GetForegroundWindow(), NULL);
+        HKL keyboard = GetKeyboardLayout(thread);
+        /* Japanese IME supports both JIS and US physical keyboards. */
+        strcpy_s(layout, layout_sz,
+                 MapVirtualKeyExW(0x1a, MAPVK_VSC_TO_VK_EX, keyboard) == VK_OEM_3 ? "jp" : "us");
+        strcpy_s(input_method, input_method_sz, "mozc-jp");
+        break;
+    }
+    case LANG_KOREAN:
+        strcpy_s(layout, layout_sz, "kr");
+        strcpy_s(variant, variant_sz, "kr104");
+        strcpy_s(input_method, input_method_sz, "hangul");
+        break;
+    }
+}
+
 /* Map a Windows time-zone key name to an IANA zone. Never gated — all
  * zones ship in tzdata. Fallback "Etc/UTC". Subset of CLDR windowsZones
  * covering the common zones; unknown keys fall back to UTC. */
@@ -1761,6 +1809,8 @@ static void win_tz_to_iana(const wchar_t *keyname, char *out, size_t out_sz)
  * failure leaves the corresponding output at its safe default. */
 static void detect_host_locale_settings(char *locale, size_t locale_sz,
                                         char *xkb, size_t xkb_sz,
+                                        char *variant, size_t variant_sz,
+                                        char *input_method, size_t input_method_sz,
                                         char *tz, size_t tz_sz)
 {
     /* Locale (gated). */
@@ -1774,12 +1824,13 @@ static void detect_host_locale_settings(char *locale, size_t locale_sz,
     }
     /* Keyboard (not gated). */
     {
-        HKL list[16];
-        int n = GetKeyboardLayoutList(16, list);
-        WORD langid = 0x0409;
-        if (n > 0) langid = (WORD)((UINT_PTR)list[0] & 0xFFFF);
-        langid_to_xkb(langid, xkb, xkb_sz);
-        asb_log(L"Host keyboard: langid=0x%04x -> %hs", langid, xkb);
+        DWORD klid;
+        WORD langid;
+        wchar_t input_locale[128];
+        get_host_keyboard_settings(input_locale, ARRAYSIZE(input_locale), &klid, &langid);
+        host_keyboard_to_linux(klid, langid, xkb, xkb_sz,
+                                variant, variant_sz, input_method, input_method_sz);
+        asb_log(L"Host keyboard: %s -> %hs %hs %hs", input_locale, xkb, variant, input_method);
     }
     /* Timezone (not gated). */
     {
@@ -1802,6 +1853,8 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
                                          const char *admin_pw_hash,
                                          const char *host_locale,
                                          const char *host_xkb,
+                                         const char *host_variant,
+                                         const char *host_input_method,
                                          const char *host_tz,
                                          const wchar_t *vm_name)
 {
@@ -1866,6 +1919,14 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
         n += stage_marker_file(f, staging, L"keyboard.marker",
                                host_xkb, strlen(host_xkb),
                                L"/etc/appsandbox-keyboard");
+    if (host_variant && host_variant[0])
+        n += stage_marker_file(f, staging, L"keyboard-variant.marker",
+                               host_variant, strlen(host_variant),
+                               L"/etc/appsandbox-keyboard-variant");
+    if (host_input_method && host_input_method[0])
+        n += stage_marker_file(f, staging, L"input-method.marker",
+                               host_input_method, strlen(host_input_method),
+                               L"/etc/appsandbox-input-method");
     if (host_tz && host_tz[0])
         n += stage_marker_file(f, staging, L"timezone.marker",
                                host_tz, strlen(host_tz),
@@ -2265,6 +2326,11 @@ typedef struct {
     wchar_t     error_msg[512];
     VmInstance *vm_inst;
     BOOL        vhdx_created;
+    char        host_locale[64];
+    char        host_xkb[32];
+    char        host_variant[32];
+    char        host_input_method[64];
+    char        host_tz[64];
 } LinuxCreateArgs;
 
 static DWORD WINAPI linux_create_thread(LPVOID param)
@@ -2303,15 +2369,13 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         swprintf_s(extras, MAX_PATH, L"%s\\extras", staging);
         CreateDirectoryW(extras, NULL);
 
-        /* Prefetch 1: repo source from GitHub. Writes agent-src/,
+        /* Prefetch 1: Linux sources from GitHub. Writes agent-src/,
            asb_drm-src/, dxgkrnl-src/, systemd/, modprobe.d-asb_drm.conf,
            50-appsandbox-gpu, org.gnome.Shell-no-gpu.conf, appsandbox-gpu,
            wsl-mesa.tar.zst directly into <staging>/extras/. */
-        asb_log(L"Prefetch 1/3: cloning repo source from GitHub...");
-        /* Branch must match the branch this binary was built from, so the Linux
-           guest builds its agent/driver source from the SAME revision. */
+        asb_log(L"Prefetch 1/3: downloading Linux sources from GitHub...");
         swprintf_s(args_buf, 2048,
-            L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
+            L"--prefetch-repo --branch \"bug-fixes-user-requests\" --out-dir \"%s\"",
             extras);
         if (spawn_iso_patch_prefetch(args_buf) != 0)
             asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
@@ -2367,19 +2431,13 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     }
     SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
 
-    /* Read the current user's Windows regional settings and translate to
-     * Linux. Language is gated to the 8 ISO-preinstalled languages
-     * (else en_US.UTF-8); keyboard + timezone always match the host. */
-    char host_locale[64], host_xkb[32], host_tz[64];
-    detect_host_locale_settings(host_locale, sizeof(host_locale),
-                                host_xkb, sizeof(host_xkb),
-                                host_tz, sizeof(host_tz));
-
     int n_staged = generate_vhdx_manifest_ubuntu(manifest, staging, res_dir,
                                                   args->config.ssh_enabled,
                                                   args->config.admin_user,
                                                   admin_pw_hash,
-                                                  host_locale, host_xkb, host_tz,
+                                                  args->host_locale, args->host_xkb,
+                                                  args->host_variant, args->host_input_method,
+                                                  args->host_tz,
                                                   args->config.name);
     SecureZeroMemory(admin_pw_hash, sizeof(admin_pw_hash));
     if (n_staged < 0) {
@@ -3195,6 +3253,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             wcscpy_s(args->vhdx_dir, MAX_PATH, vhdx_dir);
             wcscpy_s(args->net_adapter, 256, inst->net_adapter);
 
+            get_host_keyboard_settings(args->input_locale, ARRAYSIZE(args->input_locale), NULL, NULL);
+
             asb_log(L"Building VHDX for \"%s\" (this may take several minutes)...", cfg.name);
             CloseHandle(CreateThread(NULL, 0, vhdx_create_thread, args, 0, NULL));
 
@@ -3261,6 +3321,12 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             args->vm_unique_id = inst->unique_id;
             wcscpy_s(args->vhdx_dir, MAX_PATH, vhdx_dir);
             wcscpy_s(args->net_adapter, 256, inst->net_adapter);
+
+            detect_host_locale_settings(args->host_locale, sizeof(args->host_locale),
+                                        args->host_xkb, sizeof(args->host_xkb),
+                                        args->host_variant, sizeof(args->host_variant),
+                                        args->host_input_method, sizeof(args->host_input_method),
+                                        args->host_tz, sizeof(args->host_tz));
 
             asb_log(L"Building Linux VM \"%s\" (direct ISO->VHDX, ~3 minutes)...", cfg.name);
             CloseHandle(CreateThread(NULL, 0, linux_create_thread, args, 0, NULL));

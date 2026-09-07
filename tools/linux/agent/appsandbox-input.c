@@ -9,18 +9,7 @@
  * full keyboard. GNOME / Mutter (Wayland) and Xorg both pick it up via
  * libinput automatically because uinput presents a real evdev node.
  *
- * Wire protocol (host → guest):
- *   #pragma pack(1)
- *   { uint32 magic=0x4E495341 ('ASIN'), uint32 type,
- *     uint32 p1, uint32 p2, uint32 p3 }
- *
- *   type=0 MOUSE_MOVE   : p1=x, p2=y in pixels (frame coords)
- *   type=1 MOUSE_BUTTON : p1=btn (0=L,1=R,2=M), p2=down(1)/up(0)
- *   type=2 MOUSE_WHEEL  : p1=delta (signed int32, ~120/notch)
- *   type=3 KEY          : p1=Windows VK, p2=scancode,
- *                          p3 bit0=extended, bit1=keyup (clear=keydown)
- *
- * Build:  gcc -O2 -Wall -o appsandbox-input appsandbox-input.c
+ * Wire protocol: src/core/protocol.h.
  */
 
 #include <stdio.h>
@@ -38,33 +27,15 @@
 #include <sys/types.h>
 #include <linux/uinput.h>
 #include <linux/vm_sockets.h>
+#include "protocol.h"
 
 #define VSOCK_PORT          3
-#define INPUT_MAGIC         0x4E495341u  /* 'ASIN' */
-#define INPUT_READY_MAGIC   0x59445249u  /* 'IRDY' */
-
-#define INPUT_MOUSE_MOVE    0
-#define INPUT_MOUSE_BUTTON  1
-#define INPUT_MOUSE_WHEEL   2
-#define INPUT_KEY           3
-
-#define BTN_ID_LEFT         0
-#define BTN_ID_RIGHT        1
-#define BTN_ID_MIDDLE       2
 
 /* Absolute pointer range. We don't know the guest screen size before
  * accept, and it can change mid-session. We pick a coordinate space
  * large enough for any plausible resolution and trust libinput to map
  * it to the active screen. 32767 is the de-facto absolute-tablet range. */
 #define ABS_RANGE   32767
-
-#pragma pack(push, 1)
-struct input_packet {
-    uint32_t magic;
-    uint32_t type;
-    uint32_t p1, p2, p3;
-};
-#pragma pack(pop)
 
 static volatile sig_atomic_t g_stop = 0;
 static int g_frame_w = 1920;  /* updated by hint command if we add one later */
@@ -153,6 +124,86 @@ static const uint16_t g_vk_to_key[256] = {
     [0xDE] = KEY_APOSTROPHE,
 };
 
+static const uint16_t g_set1_extended[128] = {
+    [0x10] = KEY_PREVIOUSSONG, [0x19] = KEY_NEXTSONG,
+    [0x1C] = KEY_KPENTER, [0x1D] = KEY_RIGHTCTRL,
+    [0x20] = KEY_MUTE, [0x21] = KEY_CALC, [0x22] = KEY_PLAYPAUSE,
+    [0x24] = KEY_STOPCD, [0x2E] = KEY_VOLUMEDOWN,
+    [0x30] = KEY_VOLUMEUP, [0x32] = KEY_HOMEPAGE,
+    [0x35] = KEY_KPSLASH, [0x36] = KEY_RIGHTSHIFT,
+    [0x37] = KEY_SYSRQ, [0x38] = KEY_RIGHTALT,
+    [0x45] = KEY_NUMLOCK, [0x46] = KEY_PAUSE,
+    [0x47] = KEY_HOME, [0x48] = KEY_UP, [0x49] = KEY_PAGEUP,
+    [0x4B] = KEY_LEFT, [0x4D] = KEY_RIGHT,
+    [0x4F] = KEY_END, [0x50] = KEY_DOWN, [0x51] = KEY_PAGEDOWN,
+    [0x52] = KEY_INSERT, [0x53] = KEY_DELETE,
+    [0x5B] = KEY_LEFTMETA, [0x5C] = KEY_RIGHTMETA,
+    [0x5D] = KEY_COMPOSE, [0x5E] = KEY_POWER, [0x5F] = KEY_SLEEP,
+    [0x63] = KEY_WAKEUP, [0x65] = KEY_SEARCH,
+    [0x66] = KEY_BOOKMARKS, [0x67] = KEY_REFRESH,
+    [0x68] = KEY_STOP, [0x69] = KEY_FORWARD, [0x6A] = KEY_BACK,
+    [0x6B] = KEY_COMPUTER, [0x6C] = KEY_MAIL,
+    [0x6D] = KEY_MEDIA, [0x6E] = KEY_PROG1, [0x6F] = KEY_PROG2,
+};
+
+static uint16_t physical_keycode(uint32_t scan, uint32_t flags)
+{
+    if (scan == 0xF1) return KEY_HANJA;
+    if (scan == 0xF2) return KEY_HANGEUL;
+    if (flags & INPUT_KEY_EXTENDED)
+        return scan < 128 ? g_set1_extended[scan] : 0;
+    /* Linux retains the set-1 values for the original PC keyboard keys. */
+    if ((scan >= 0x01 && scan <= 0x53) || (scan >= 0x56 && scan <= 0x58))
+        return (uint16_t)scan;
+    if (scan >= 0x64 && scan <= 0x6F)
+        return (uint16_t)(KEY_F13 + scan - 0x64);
+    switch (scan) {
+    case 0x54: return KEY_SYSRQ;
+    case 0x59: return KEY_KPEQUAL;
+    case 0x5C: return KEY_KPJPCOMMA;
+    case 0x70: return KEY_KATAKANAHIRAGANA;
+    case 0x71: case 0xF1: return KEY_HANJA;
+    case 0x72: case 0xF2: return KEY_HANGEUL;
+    case 0x73: return KEY_RO;
+    case 0x76: return KEY_F24;
+    case 0x77: return KEY_HIRAGANA;
+    case 0x78: return KEY_KATAKANA;
+    case 0x79: return KEY_HENKAN;
+    case 0x7B: return KEY_MUHENKAN;
+    case 0x7D: return KEY_YEN;
+    case 0x7E: return KEY_KPCOMMA;
+    default: return 0;
+    }
+}
+
+static uint16_t function_keycode(uint32_t vk)
+{
+    switch (vk) {
+    case 0x03: case 0x13: return KEY_PAUSE;
+    case 0x2C: return KEY_SYSRQ;
+    case 0x5F: return KEY_SLEEP;
+    case 0xA6: return KEY_BACK;
+    case 0xA7: return KEY_FORWARD;
+    case 0xA8: return KEY_REFRESH;
+    case 0xA9: return KEY_STOP;
+    case 0xAA: return KEY_SEARCH;
+    case 0xAB: return KEY_BOOKMARKS;
+    case 0xAC: return KEY_HOMEPAGE;
+    case 0xAD: return KEY_MUTE;
+    case 0xAE: return KEY_VOLUMEDOWN;
+    case 0xAF: return KEY_VOLUMEUP;
+    case 0xB0: return KEY_NEXTSONG;
+    case 0xB1: return KEY_PREVIOUSSONG;
+    case 0xB2: return KEY_STOPCD;
+    case 0xB3: return KEY_PLAYPAUSE;
+    case 0xB4: return KEY_MAIL;
+    case 0xB5: return KEY_MEDIA;
+    case 0xB6: return KEY_PROG1;
+    case 0xB7: return KEY_PROG2;
+    default: return 0;
+    }
+}
+
 /* ---- uinput device setup ---- */
 
 static int uinput_open(void)
@@ -182,6 +233,12 @@ static int uinput_open(void)
     for (int i = 0; i < 256; i++) {
         if (g_vk_to_key[i])
             ioctl(fd, UI_SET_KEYBIT, g_vk_to_key[i]);
+        uint16_t code = physical_keycode((uint32_t)i, 0);
+        if (code) ioctl(fd, UI_SET_KEYBIT, code);
+        code = physical_keycode((uint32_t)i, INPUT_KEY_EXTENDED);
+        if (code) ioctl(fd, UI_SET_KEYBIT, code);
+        code = function_keycode((uint32_t)i);
+        if (code) ioctl(fd, UI_SET_KEYBIT, code);
     }
 
     /* Modern uinput setup (UI_DEV_SETUP) gives us absinfo per-axis */
@@ -250,9 +307,9 @@ static void do_mouse_button(int ui_fd, uint32_t btn_id, uint32_t down)
 {
     uint16_t code = 0;
     switch (btn_id) {
-    case BTN_ID_LEFT:   code = BTN_LEFT;   break;
-    case BTN_ID_RIGHT:  code = BTN_RIGHT;  break;
-    case BTN_ID_MIDDLE: code = BTN_MIDDLE; break;
+    case INPUT_BTN_LEFT:   code = BTN_LEFT;   break;
+    case INPUT_BTN_RIGHT:  code = BTN_RIGHT;  break;
+    case INPUT_BTN_MIDDLE: code = BTN_MIDDLE; break;
     default: return;
     }
     emit(ui_fd, EV_KEY, code, down ? 1 : 0);
@@ -277,6 +334,37 @@ static void do_key(int ui_fd, uint32_t vk, uint32_t scan, uint32_t flags)
     int is_up = (flags & 2) != 0;
     emit(ui_fd, EV_KEY, code, is_up ? 0 : 1);
     emit_syn(ui_fd);
+}
+
+static void release_physical_keys(int ui_fd, uint8_t held[KEY_CNT])
+{
+    int released = 0;
+    for (unsigned code = 1; code < KEY_CNT; code++) {
+        if (!held[code]) continue;
+        emit(ui_fd, EV_KEY, (uint16_t)code, 0);
+        held[code] = 0;
+        released = 1;
+    }
+    if (released) emit_syn(ui_fd);
+}
+
+static void do_physical_key(int ui_fd, uint32_t vk, uint32_t scan,
+                            uint32_t flags, uint8_t held[KEY_CNT])
+{
+    if (flags & ~(INPUT_KEY_EXTENDED | INPUT_KEY_UP)) return;
+    uint16_t code = scan ? physical_keycode(scan, flags) : function_keycode(vk);
+    if (!code) return;
+    int up = (flags & INPUT_KEY_UP) != 0;
+    if (up && !held[code]) return;
+    emit(ui_fd, EV_KEY, code, up ? 0 : held[code] ? 2 : 1);
+    held[code] = !up;
+    emit_syn(ui_fd);
+    /* Pause and Korean mode keys have no hardware break event. */
+    if (!up && (code == KEY_PAUSE || code == KEY_HANGEUL || code == KEY_HANJA)) {
+        emit(ui_fd, EV_KEY, code, 0);
+        held[code] = 0;
+        emit_syn(ui_fd);
+    }
 }
 
 /* ---- vsock listener ---- */
@@ -316,30 +404,61 @@ static int recv_exact(int fd, void *buf, size_t len)
     return 0;
 }
 
+static int send_exact(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    while (len) {
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
 static void serve(int client_fd, int ui_fd)
 {
     /* Tell the host the guest is ready. */
     uint32_t ready = INPUT_READY_MAGIC;
-    if (send(client_fd, &ready, sizeof(ready), MSG_NOSIGNAL) != sizeof(ready)) {
+    if (send_exact(client_fd, &ready, sizeof(ready)) < 0) {
         in_log("send IRDY: %s", strerror(errno));
         return;
     }
 
+    uint32_t keyboard_version = 1;
+    uint8_t held[KEY_CNT] = {0};
     while (!g_stop) {
-        struct input_packet pkt;
+        InputPacket pkt;
         if (recv_exact(client_fd, &pkt, sizeof(pkt)) < 0) break;
         if (pkt.magic != INPUT_MAGIC) {
             in_log("bad magic 0x%08x — desync, closing", pkt.magic);
             break;
         }
         switch (pkt.type) {
-        case INPUT_MOUSE_MOVE:   do_mouse_move(ui_fd, pkt.p1, pkt.p2); break;
-        case INPUT_MOUSE_BUTTON: do_mouse_button(ui_fd, pkt.p1, pkt.p2); break;
-        case INPUT_MOUSE_WHEEL:  do_mouse_wheel(ui_fd, (int32_t)pkt.p1); break;
-        case INPUT_KEY:          do_key(ui_fd, pkt.p1, pkt.p2, pkt.p3); break;
+        case INPUT_MOUSE_MOVE:   do_mouse_move(ui_fd, pkt.param1, pkt.param2); break;
+        case INPUT_MOUSE_BUTTON: do_mouse_button(ui_fd, pkt.param1, pkt.param2); break;
+        case INPUT_MOUSE_WHEEL:  do_mouse_wheel(ui_fd, (int32_t)pkt.param1); break;
+        case INPUT_KEY:          do_key(ui_fd, pkt.param1, pkt.param2, pkt.param3); break;
+        case INPUT_KEYBOARD_QUERY: {
+            if (pkt.param3) break;
+            InputPacket reply = { INPUT_MAGIC, INPUT_KEYBOARD_REPLY,
+                pkt.param1 >= INPUT_KEYBOARD_VERSION ? INPUT_KEYBOARD_VERSION : 1,
+                pkt.param2, 0 };
+            if (send_exact(client_fd, &reply, sizeof(reply)) < 0) goto disconnected;
+            release_physical_keys(ui_fd, held);
+            keyboard_version = reply.param1;
+            break;
+        }
+        case INPUT_KEY_PHYSICAL:
+            if (keyboard_version >= INPUT_KEYBOARD_VERSION)
+                do_physical_key(ui_fd, pkt.param1, pkt.param2, pkt.param3, held);
+            break;
         default: break;
         }
     }
+disconnected:
+    release_physical_keys(ui_fd, held);
 }
 
 int main(void)

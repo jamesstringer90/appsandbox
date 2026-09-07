@@ -85,7 +85,7 @@ static void password_b64(const char *pass, char *out, size_t out_sz) {
 }
 
 /* Map a BCP-47 tag to the InputLocale "LCID:KLID" form (same table as lang_to_input_locale). */
-static const char *input_locale(const char *lang) {
+static const char *default_input_locale(const char *lang) {
     static const struct { const char *tag, *klid; } map[] = {
         {"en-US","0409:00000409"},{"en-GB","0809:00000809"},{"de-DE","0407:00000407"},
         {"fr-FR","040c:0000040c"},{"fr-CA","0c0c:00001009"},{"es-ES","0c0a:0000040a"},
@@ -130,7 +130,8 @@ static int xml_escape_text(const char *text, char *out, size_t capacity) {
 }
 
 int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const char *pass,
-                           const char *arch, int test_mode, int is_arm64, const char *lang) {
+                           const char *arch, int test_mode, int is_arm64, const char *lang,
+                           const char *input_locale) {
     if (!f) return -1;
     char user_xml[1024];
     if (!xml_escape_text(user, user_xml, sizeof user_xml)) return -1;
@@ -147,7 +148,11 @@ int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const
         comp[bi] = 0;
     }
     char b64[2048]; password_b64(pass ? pass : "", b64, sizeof b64);
-    const char *loc = input_locale(lang ? lang : "en-US");
+    const char *loc = input_locale && input_locale[0] ? input_locale :
+                      default_input_locale(lang ? lang : "en-US");
+    char input_xml[512];
+    if (!xml_escape_text(loc, input_xml, sizeof input_xml)) return -1;
+    loc = input_xml;
     if (!lang) lang = "en-US";
 
     /* UTF-8 BOM, matching the Windows _wfopen_s("w,ccs=UTF-8"). */

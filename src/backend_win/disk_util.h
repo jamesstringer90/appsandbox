@@ -29,6 +29,9 @@ HRESULT vhdx_grow(const wchar_t *path, ULONGLONG size_gb);
    After merge, child_path can be deleted. */
 HRESULT vhdx_merge(const wchar_t *child_path);
 
+void get_host_keyboard_settings(wchar_t *input_locale, size_t size,
+                                DWORD *klid, WORD *langid);
+
 /* Create a resources ISO containing autounattend.xml, agent, and helper
    executables for unattended Windows install with GPU-PV. GPU driver
    file copy is handled by the agent service's embedded 9P client (p9copy).
@@ -67,7 +70,8 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
                              const wchar_t *admin_user,
                              const wchar_t *admin_pass,
                              BOOL test_mode,
-                             const wchar_t *lang);
+                             const wchar_t *lang,
+                             const wchar_t *input_locale);
 
 /* Generate unattend.xml for VHDX-first *template* boot.
    Boots into audit mode, runs sysprep /generalize /oobe /shutdown /mode:vm.

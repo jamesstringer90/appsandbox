@@ -35,8 +35,8 @@ appsandbox-display: appsandbox-display.c
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags libdrm) -o $@ $< \
 	       $(LDFLAGS) $(shell pkg-config --libs libdrm)
 
-appsandbox-input: appsandbox-input.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+appsandbox-input: appsandbox-input.c $(wildcard protocol.h ../../../src/core/protocol.h)
+	$(CC) $(CFLAGS) -I../../../src/core -o $@ $< $(LDFLAGS)
 
 # Audio daemon uses libasound to talk to the kernel snd-aloop driver.
 appsandbox-audio: appsandbox-audio.c
