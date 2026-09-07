@@ -1,4 +1,5 @@
 #include "hcs_vm.h"
+#include "hcn_network.h"
 #include "vm_agent.h"
 #include "ui.h"
 #include "disk_util.h"   /* ASB_IS_ARM64 */
@@ -935,9 +936,12 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     /* Network adapter — skip for template VMs (no network during template creation) */
     net_section[0] = L'\0';
     if (endpoint_guid && endpoint_guid[0] != L'\0' && !config->is_template) {
+        wchar_t mac_address[18];
+        if (FAILED(hcn_get_endpoint_mac(endpoint_guid, mac_address, 18)))
+            return FALSE;
         swprintf_s(net_section, 512,
-            L",\"NetworkAdapters\":{\"Default\":{\"EndpointId\":\"%s\"}}",
-            endpoint_guid);
+            L",\"NetworkAdapters\":{\"Default\":{\"EndpointId\":\"%s\",\"MacAddress\":\"%s\"}}",
+            endpoint_guid, mac_address);
     }
 
     /* Secure Boot — uses ApplySecureBootTemplate + SecureBootTemplateId
