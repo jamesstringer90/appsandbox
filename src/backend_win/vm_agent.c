@@ -398,7 +398,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             ui_log(L"Install complete for \"%s\".", vm->name);
         }
 
-        if (vm->network_mode == NET_NAT) {
+        if (vm->network_mode == NET_NAT && _wcsicmp(vm->os_type, L"Linux") == 0) {
             DWORD timeout = 65000;
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
             n = send_tagged_cmd(s, vm, &conn->cmd_seq, "set_dhcp", buf, sizeof(buf));

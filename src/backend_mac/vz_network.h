@@ -9,8 +9,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface VzNetwork : NSObject
 
-/* NAT-attached virtio network device. Works out of the box, no entitlements. */
-+ (VZVirtioNetworkDeviceConfiguration *)natConfiguration;
++ (nullable VZVirtioNetworkDeviceConfiguration *)natConfigurationWithError:(NSError **)error;
 
 /* Bridged network device for the given interface identifier (e.g. "en0")
  * or the first interface if interfaceName is nil. Returns nil if no interfaces

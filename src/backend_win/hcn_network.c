@@ -242,7 +242,17 @@ HRESULT hcn_create_nat_network(GUID *network_id)
         L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
         L"\"Name\":\"AppSandboxNAT\","
         L"\"Type\":\"ICS\","
-        L"\"Flags\":11"
+        L"\"Flags\":11,"
+        L"\"Ipams\":[{"
+            L"\"Type\":\"Static\","
+            L"\"Subnets\":[{"
+                L"\"IpAddressPrefix\":\"192.168.42.0/24\","
+                L"\"Routes\":[{"
+                    L"\"NextHop\":\"192.168.42.1\","
+                    L"\"DestinationPrefix\":\"0.0.0.0/0\""
+                L"}]"
+            L"}]"
+        L"}]"
         L"}");
 
     hr = pfnCreateNet(network_id, settings, &network, &error_record);

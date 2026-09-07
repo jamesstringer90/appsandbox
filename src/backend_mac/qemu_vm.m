@@ -237,7 +237,7 @@
         @"-device", @"nvme,drive=hdd,serial=asb-nvme,bootindex=0",
         @"-drive", [NSString stringWithFormat:@"if=none,id=hdd,format=raw,file=%@",
                     [diskPath stringByReplacingOccurrencesOfString:@"," withString:@",,"]],
-        @"-netdev", @"vmnet-shared,id=net0",
+        @"-netdev", @"vmnet-shared,id=net0,start-address=192.168.42.1,end-address=192.168.42.254,subnet-mask=255.255.255.0",
         /* NAT networking: vmnet-shared NATs the guest to the internet AND puts the host on the same
          * private subnet (bridge100 is the gateway), so host<->guest is reachable over IP. The NIC is
          * the standard QEMU virtio-net-pci (clean PCI, no USB stack); the guest binds the NetKVM driver

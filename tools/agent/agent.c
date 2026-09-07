@@ -9,7 +9,7 @@
  * when the host sends gpu_query_response with share metadata.
  *
  * Supports: ping, shutdown, restart, gpu_copy, gpu_query_response,
- *           gpu_none, idd_connect, set_dhcp.
+ *           gpu_none, idd_connect.
  *
  * Usage:
  *   appsandbox-agent.exe --install   Install and start the service
@@ -19,7 +19,6 @@
 
 #include <winsock2.h>
 #include <windows.h>
-#include <iphlpapi.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <wtsapi32.h>
@@ -30,7 +29,6 @@
 #include "../transport/asb_transport.h"
 
 #pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
@@ -1876,39 +1874,6 @@ static void disable_hyperv_video(AsbConn *notify_sock)
 /* Forward declaration — defined after SSH proxy section */
 static void handle_ssh_enable(AsbConn *client, const char *tag);
 
-static ULONG primary_nic_index(BOOL *dhcp_enabled)
-{
-    ULONG buf_len = 15000;
-    ULONG index = 0;
-    *dhcp_enabled = FALSE;
-
-    for (int attempt = 0; attempt < 3; attempt++) {
-        IP_ADAPTER_ADDRESSES *addrs, *cur;
-        ULONG ret;
-
-        addrs = (IP_ADAPTER_ADDRESSES *)HeapAlloc(GetProcessHeap(), 0, buf_len);
-        if (!addrs) return 0;
-        ret = GetAdaptersAddresses(AF_INET,
-            GAA_FLAG_INCLUDE_ALL_INTERFACES | GAA_FLAG_SKIP_ANYCAST |
-            GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
-            NULL, addrs, &buf_len);
-        if (ret == NO_ERROR) {
-            for (cur = addrs; cur; cur = cur->Next) {
-                if (cur->IfType != IF_TYPE_ETHERNET_CSMACD || !cur->IfIndex)
-                    continue;
-                if (!index || cur->OperStatus == IfOperStatusUp) {
-                    index = cur->IfIndex;
-                    *dhcp_enabled = (cur->Flags & IP_ADAPTER_DHCP_ENABLED) != 0;
-                    if (cur->OperStatus == IfOperStatusUp) break;
-                }
-            }
-        }
-        HeapFree(GetProcessHeap(), 0, addrs);
-        if (ret != ERROR_BUFFER_OVERFLOW) break;
-    }
-    return index;
-}
-
 static void handle_client(AsbConn *client)
 {
     char buf[256];
@@ -2041,27 +2006,6 @@ static void handle_client(AsbConn *client)
         }
         else if (strcmp(cmd, "ssh_enable") == 0) {
             handle_ssh_enable(client, tag);
-        }
-        else if (strcmp(cmd, "set_dhcp") == 0) {
-            wchar_t wcmd[256];
-            wchar_t nic[32] = L"Ethernet";
-            BOOL dhcp_enabled;
-            ULONG nic_index = primary_nic_index(&dhcp_enabled);
-            DWORD result = ERROR_SUCCESS;
-
-            if (nic_index)
-                swprintf_s(nic, 32, L"%lu", nic_index);
-            if (!dhcp_enabled) {
-                swprintf_s(wcmd, 256,
-                    L"netsh interface ipv4 set address name=\"%s\" source=dhcp", nic);
-                result = run_quiet(wcmd);
-            }
-            if (result == ERROR_SUCCESS) {
-                swprintf_s(wcmd, 256,
-                    L"netsh interface ipv4 set dnsservers name=\"%s\" source=dhcp", nic);
-                result = run_quiet(wcmd);
-            }
-            REPLY(result == ERROR_SUCCESS ? "ok" : "error:dhcp_failed");
         }
         else if (strcmp(cmd, "gpu_copy") == 0) {
             /* Host re-triggered GPU copy — ask for share list */
