@@ -483,44 +483,121 @@ static void *heartbeat_thread(void *arg)
 
 /* ---- Command handlers ---- */
 
-static void handle_set_dhcp(int fd, const char *tag)
+/* set_ip:<ip>/<prefix>:<gw>
+ *   e.g. set_ip:192.168.42.2/24:192.168.42.1
+ *
+ * Mirrors the Windows agent's `netsh ip set static` clobber semantics:
+ *   1. Disable cloud-init's network module so it stops re-writing
+ *      /etc/netplan/50-cloud-init.yaml at next boot.
+ *   2. Remove every other *.yaml in /etc/netplan so the merge has only
+ *      our file to consider — no coexistence games.
+ *   3. Write /etc/netplan/99-appsandbox.yaml with the host-assigned
+ *      address + gateway + DNS (gateway primary, 8.8.8.8 fallback —
+ *      same DNS layout the Windows agent uses).
+ *   4. `netplan apply` then `systemctl restart systemd-networkd` so the
+ *      kernel actually drops any stale addresses from a prior config.
+ *
+ * Reply: "ok" on success, "error:..." on failure. */
+static void handle_set_ip(int fd, const char *tag, const char *args)
 {
-    const char *cmd =
+    char ip[64], prefix[8], gw[64];
+    const char *slash  = strchr(args, '/');
+    const char *colon2 = slash ? strchr(slash, ':') : NULL;
+    size_t ip_len, pfx_len;
+    char cmd[2400];
+    int n, rc;
+
+    if (!slash || !colon2) {
+        send_reply(fd, tag, "error:bad_format");
+        return;
+    }
+    ip_len  = (size_t)(slash - args);
+    pfx_len = (size_t)(colon2 - slash - 1);
+    if (ip_len >= sizeof(ip) || pfx_len >= sizeof(prefix)) {
+        send_reply(fd, tag, "error:bad_format");
+        return;
+    }
+    memcpy(ip,     args,        ip_len);  ip[ip_len]   = '\0';
+    memcpy(prefix, slash + 1,   pfx_len); prefix[pfx_len] = '\0';
+    snprintf(gw, sizeof(gw), "%s", colon2 + 1);
+
+    n = snprintf(cmd, sizeof(cmd),
+        /* Pick the renderer by probing whether the NetworkManager service
+         * is active (Ubuntu Desktop); otherwise default to systemd-networkd
+         * (Server). Writing a netplan with the wrong renderer makes the
+         * active one stop managing the NIC entirely (which is why "no
+         * network in Ubuntu Settings" happened). */
         "RENDERER=networkd; "
         "if systemctl is-active --quiet NetworkManager; then "
         "  RENDERER=NetworkManager; "
         "fi; "
-        "mkdir -p /etc/cloud/cloud.cfg.d /etc/netplan || exit 1; "
+        /* Disable cloud-init's network module so it stops re-writing
+         * /etc/netplan/50-cloud-init.yaml on every boot. Idempotent. */
+        "mkdir -p /etc/cloud/cloud.cfg.d && "
         "printf 'network: {config: disabled}\\n' "
-        "  > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg || exit 1; "
+        "  > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg && "
+        /* Remove every other netplan dropfile so merge can't reintroduce
+         * a conflicting interface key (e.g. cloud-init's `enp0s5: dhcp4`
+         * + our `appsbnic` both binding the same NIC). */
         "find /etc/netplan -maxdepth 1 -type f -name '*.yaml' "
-        "  ! -name '99-appsandbox.yaml' -delete || exit 1; "
-        "umask 077; cat > /etc/netplan/99-appsandbox.yaml <<EOF || exit 1\n"
+        "  ! -name '99-appsandbox.yaml' -delete; "
+        /* Our authoritative config. Heredoc is unquoted so $RENDERER
+         * expands; nothing else in the YAML uses '$'. */
+        "umask 077 && cat > /etc/netplan/99-appsandbox.yaml <<EOF\n"
         "network:\n"
         "  version: 2\n"
         "  renderer: $RENDERER\n"
         "  ethernets:\n"
         "    appsbnic:\n"
         "      match: { name: \"e*\" }\n"
-        "      dhcp4: true\n"
+        "      dhcp4: false\n"
         "      dhcp6: false\n"
+        "      addresses: [\"%s/%s\"]\n"
+        "      routes:\n"
+        "        - to: default\n"
+        "          via: %s\n"
+        "      nameservers:\n"
+        "        addresses: [%s, 8.8.8.8]\n"
         "EOF\n"
-        "chmod 600 /etc/netplan/99-appsandbox.yaml || exit 1; "
-        "umask 022; "
+        /* Apply, then restart the renderer to drop stale leases / state
+         * left behind by cloud-init or a previous run. netplan apply
+         * alone is sometimes a no-op against a NIC that already has an
+         * address the renderer hasn't released.
+         *
+         * IMPORTANT: reset umask BEFORE `netplan apply`. netplan's
+         * systemd-networkd backend writes the generated
+         * /run/systemd/network/10-netplan-*.network file via Python
+         * open() with no explicit mode, so the file ends up at
+         * (0666 & ~umask). With our 077 umask the generated file is 600
+         * (root:systemd-network), and systemd-networkd — running as
+         * `systemd-network` user, only in the systemd-network group —
+         * gets "Permission denied" trying to read it, falls back to the
+         * dracut catch-all `.network`, and eth0 ends up with no IP.
+         * 022 → generated .network is 644 → systemd-network can read it. */
+        "chmod 600 /etc/netplan/99-appsandbox.yaml && "
+        "umask 022 && "
+        "netplan apply 2>&1; "
         "if [ \"$RENDERER\" = NetworkManager ]; then "
-        "  netplan generate 2>&1 && nmcli connection reload 2>&1 || exit 1; "
-        "  if nmcli -t -f NAME connection show --active | grep -Fxq netplan-appsbnic && "
-        "     nmcli -g DHCP4.OPTION connection show id netplan-appsbnic | grep -q . && "
-        "     nmcli -g IP4.ADDRESS connection show id netplan-appsbnic | grep -q . && "
-        "     nmcli -g IP4.GATEWAY connection show id netplan-appsbnic | grep -q .; then "
-        "    exit 0; "
-        "  fi; "
-        "  nmcli --wait 10 connection up id netplan-appsbnic 2>&1; "
+        "  systemctl restart NetworkManager 2>&1; "
         "else "
-        "  netplan apply 2>&1 && systemctl restart systemd-networkd 2>&1; "
-        "fi";
-    int rc = run_sync(cmd);
-    send_reply(fd, tag, rc == 0 ? "ok" : "error:dhcp_failed");
+        "  systemctl restart systemd-networkd 2>&1; "
+        "fi; "
+        /* Verify the address actually materialised. netplan apply / NM
+         * reload are async — the host might try to SSH before the new
+         * IP claims the wire. Poll for up to 5 seconds. */
+        "for i in 1 2 3 4 5 6 7 8 9 10; do "
+        "  ip -4 addr show | grep -q '%s/' && exit 0; "
+        "  sleep 0.5; "
+        "done; "
+        "echo 'set_ip: address never appeared'; ip -4 addr show; exit 1",
+        ip, prefix, gw, gw, ip);
+    if (n < 0 || n >= (int)sizeof(cmd)) {
+        send_reply(fd, tag, "error:cmd_too_long");
+        return;
+    }
+    rc = run_sync(cmd);
+    agent_log("set_ip: %s/%s via %s → rc=%d", ip, prefix, gw, rc);
+    send_reply(fd, tag, rc == 0 ? "ok" : "error:netplan_failed");
 }
 
 /* ---- SSH proxy: AF_VSOCK :7 ↔ localhost:22 ----
@@ -1032,8 +1109,8 @@ static void handle_client(int fd)
             agent_log("restart requested");
             spawn_detached("sleep 1 && systemctl reboot");
         }
-        else if (strcmp(cmd, "set_dhcp") == 0) {
-            handle_set_dhcp(fd, tag);
+        else if (strncmp(cmd, "set_ip:", 7) == 0) {
+            handle_set_ip(fd, tag, cmd + 7);
         }
         else if (strcmp(cmd, "ssh_enable") == 0) {
             handle_ssh_enable(fd, tag);

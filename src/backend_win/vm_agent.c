@@ -2,6 +2,7 @@
 #include "vm_agent.h"
 #include "vm_ssh_proxy.h"
 #include "asb_core.h"
+#include "hcn_network.h"
 #include "ui.h"
 #include <stdio.h>
 
@@ -398,14 +399,15 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             ui_log(L"Install complete for \"%s\".", vm->name);
         }
 
-        if (vm->network_mode == NET_NAT && _wcsicmp(vm->os_type, L"Linux") == 0) {
-            DWORD timeout = 65000;
-            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
-            n = send_tagged_cmd(s, vm, &conn->cmd_seq, "set_dhcp", buf, sizeof(buf));
+        /* Send NAT IP to agent (only for NAT mode). Gateway is the chosen
+           subnet's .1; prefix length is always /24 for our NAT. */
+        if (vm->network_mode == NET_NAT && vm->nat_ip[0] != '\0') {
+            char ip_cmd[64];
+            sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s.1",
+                       vm->nat_ip, hcn_nat_subnet_base());
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd, buf, sizeof(buf));
             if (n <= 0) goto disconnected;
-            timeout = 5000;
-            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
-            ui_log(L"NAT DHCP config for \"%s\": %S", vm->name, buf);
+            ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);
         }
 
         /* Send GPU share info to agent (if GPU-PV is assigned).

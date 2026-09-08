@@ -119,9 +119,7 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
     config.storageDevices = @[[[VZVirtioBlockDeviceConfiguration alloc] initWithAttachment:att]];
 
     config.graphicsDevices = @[BuildGraphics()];
-    VZVirtioNetworkDeviceConfiguration *network = [VzNetwork natConfigurationWithError:error];
-    if (!network) return nil;
-    config.networkDevices = @[network];
+    config.networkDevices = @[[VzNetwork natConfiguration]];
     config.pointingDevices = @[[[VZMacTrackpadConfiguration alloc] init],
                                 [[VZUSBScreenCoordinatePointingDeviceConfiguration alloc] init]];
     config.keyboards = @[[[VZUSBKeyboardConfiguration alloc] init]];
@@ -178,9 +176,7 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
     config.bootLoader = [[VZMacOSBootLoader alloc] init];
     config.storageDevices = @[[[VZVirtioBlockDeviceConfiguration alloc] initWithAttachment:att]];
     config.graphicsDevices = @[BuildGraphics()];
-    VZVirtioNetworkDeviceConfiguration *network = [VzNetwork natConfigurationWithError:error];
-    if (!network) return nil;
-    config.networkDevices = @[network];
+    config.networkDevices = @[[VzNetwork natConfiguration]];
     config.pointingDevices = @[[[VZMacTrackpadConfiguration alloc] init],
                                 [[VZUSBScreenCoordinatePointingDeviceConfiguration alloc] init]];
     config.keyboards = @[[[VZUSBKeyboardConfiguration alloc] init]];

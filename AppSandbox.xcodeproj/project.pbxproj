@@ -77,7 +77,6 @@
 		4011000000000000000000BB /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3001000000000000000000AA /* Cocoa.framework */; };
 		4016000000000000000000BB /* Carbon.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3016000000000000000000BB /* Carbon.framework */; };
 		4012000000000000000000BB /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3003000000000000000000AA /* Virtualization.framework */; };
-		4017000000000000000000BB /* vmnet.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3008000000000000000000AA /* vmnet.framework */; };
 		4013000000000000000000BB /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3004000000000000000000AA /* Metal.framework */; };
 		4014000000000000000000BB /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3005000000000000000000AA /* Security.framework */; };
 		4015000000000000000000BB /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3007000000000000000000AA /* AudioToolbox.framework */; };
@@ -205,7 +204,6 @@
 		3016000000000000000000BB /* Carbon.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Carbon.framework; path = System/Library/Frameworks/Carbon.framework; sourceTree = SDKROOT; };
 		3002000000000000000000AA /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		3003000000000000000000AA /* Virtualization.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Virtualization.framework; path = System/Library/Frameworks/Virtualization.framework; sourceTree = SDKROOT; };
-		3008000000000000000000AA /* vmnet.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = vmnet.framework; path = System/Library/Frameworks/vmnet.framework; sourceTree = SDKROOT; };
 		3004000000000000000000AA /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		3005000000000000000000AA /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		3006000000000000000000AA /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
@@ -261,7 +259,6 @@
 				4011000000000000000000BB /* Cocoa.framework in Frameworks */,
 				4016000000000000000000BB /* Carbon.framework in Frameworks */,
 				4012000000000000000000BB /* Virtualization.framework in Frameworks */,
-				4017000000000000000000BB /* vmnet.framework in Frameworks */,
 				4013000000000000000000BB /* Metal.framework in Frameworks */,
 				4014000000000000000000BB /* Security.framework in Frameworks */,
 				4015000000000000000000BB /* AudioToolbox.framework in Frameworks */,
@@ -447,7 +444,6 @@
 				3016000000000000000000BB /* Carbon.framework */,
 				3002000000000000000000AA /* WebKit.framework */,
 				3003000000000000000000AA /* Virtualization.framework */,
-				3008000000000000000000AA /* vmnet.framework */,
 				3004000000000000000000AA /* Metal.framework */,
 				3005000000000000000000AA /* Security.framework */,
 				3006000000000000000000AA /* Foundation.framework */,
