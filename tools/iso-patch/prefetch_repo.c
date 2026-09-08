@@ -264,7 +264,7 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
      */
     u_mkdir_p(out_dir);
 
-    /* agent-src/: sources, Makefile, and shared protocol header */
+    /* agent-src/ */
     {
         wchar_t agent_src[MAX_PATH], dst[MAX_PATH];
         swprintf_s(agent_src, MAX_PATH,

@@ -1252,7 +1252,6 @@ static __weak IddDisplayWindow *g_hotkeyOwner;
             }
         }
 
-        /* Teardown leaves ch3 open until the worker has sent the queued key releases. */
         if (_stop && !dead) {
             pthread_mutex_lock(&_inqLock);
             while (_inqHead != _inqTail) {
@@ -1717,11 +1716,9 @@ static __weak IddDisplayWindow *g_hotkeyOwner;
     _stop = 1;
     [self.timer invalidate];
     self.timer = nil;
-    /* Wake the input worker so it can flush pending key releases before closing ch3. */
     pthread_mutex_lock(&_inqLock);
     pthread_cond_broadcast(&_inqCond);
     pthread_mutex_unlock(&_inqLock);
-    /* Unblock the readers. The nonblocking input worker drains key releases and closes ch3 itself. */
     pthread_mutex_lock(&_inputLock);
     int dfd = _displayFd; _displayFd = -1;
     int afd = _audioFd; _audioFd = -1;

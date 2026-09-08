@@ -92,7 +92,6 @@ if (hostBridge.isMac) {
     });
 }
 
-/* Apply Create-modal visibility rules for the currently selected OS type. */
 function applyOsTypeUI() {
     var modal = document.getElementById('create-vm-overlay');
     var osType = document.getElementById('os-type').value;

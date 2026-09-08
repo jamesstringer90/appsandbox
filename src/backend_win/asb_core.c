@@ -560,7 +560,6 @@ static void load_vm_list(void)
     BOOL unicode_config;
 
     get_config_path(path, MAX_PATH);
-    /* A Unicode BOM selects Unicode decoding; files without a BOM use ANSI. */
     if (_wfopen_s(&f, path, L"rb") != 0 || !f) return;
     (void)fread(bom, 1, sizeof(bom), f);
     fclose(f);

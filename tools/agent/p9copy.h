@@ -33,8 +33,7 @@ int p9_copy_share(UINT32 port, const char *share_name,
                   const wchar_t *local_dir, const char *filter,
                   int *files_copied);
 
-/* NULL options uses size-based skipping. Options and exclude_file must remain
-   valid until this synchronous call returns. */
+/* NULL options uses size-based skipping. */
 int p9_copy_share_ex(UINT32 port, const char *share_name,
                      const wchar_t *local_dir, const char *filter,
                      const P9CopyOptions *options, int *files_copied);

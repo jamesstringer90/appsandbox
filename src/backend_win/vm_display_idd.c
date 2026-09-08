@@ -481,7 +481,6 @@ static BOOL send_input_locked(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2
     if (ret == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK) {
-            /* A full send buffer does not require reconnecting. */
             return FALSE;
         }
         idd_log(d, L"INPUT SEND ERR %d - flagging for reconnect.", err);
@@ -1451,7 +1450,7 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
            We extract A into a 1bpp monochrome hbmMask and BGR into hbmColor. */
         UINT mask_row_bytes = (width + 7) / 8;
         /* CreateBitmap consumes WORD-aligned rows, unlike a DWORD-aligned
-           DIB. A 48-pixel cursor needs 6 bytes per mask row, not 8. */
+           DIB. */
         UINT mask_pitch = (mask_row_bytes + 1) & ~1u;
         void *color_bits = NULL;
         BYTE *mask_buf;
