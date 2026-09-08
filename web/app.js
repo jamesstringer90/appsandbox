@@ -97,6 +97,7 @@ function applyOsTypeUI() {
     var osType = document.getElementById('os-type').value;
     var isWindows = osType === 'Windows';
     var isLinux = osType === 'Linux';
+    if (!isWindows || hostBridge.isMac) selectTemplate('', templateDefaultLabel());
     var winOnly = modal.querySelectorAll('.win-only');
     var needsIso = modal.querySelectorAll('.needs-iso');
     var needsWindows = modal.querySelectorAll('.needs-windows');
@@ -246,6 +247,7 @@ function refreshDiskSpaceInfo(keepPrevious) {
     if (!keepPrevious) diskSpaceInfo = null;
     diskSpacePending = !!path && !validateDiskDirectory(path);
     updateDiskSpaceInfo();
+    updateCreateButtons();
     if (!diskSpacePending) return;
     diskSpaceTimer = setTimeout(function() {
         diskSpaceTimer = null;
@@ -261,6 +263,7 @@ function onDiskSpace(msg) {
         freeGb: typeof msg.freeGb === 'number' && Number.isFinite(msg.freeGb) ? msg.freeGb : -1
     };
     updateDiskSpaceInfo();
+    updateCreateButtons();
 }
 
 /* ---- Adapters ---- */
@@ -345,6 +348,7 @@ function populateTemplates(templates) {
         /* No template selected — update default label in case count changed */
         document.getElementById('template-dropdown-selected').textContent = templateDefaultLabel();
     }
+    revalidateVmName();
 }
 
 function selectTemplate(value, label) {
@@ -462,22 +466,49 @@ document.getElementById('disk-location-overlay').addEventListener('click', funct
 
 /* ---- Create buttons state ---- */
 
-function updateCreateButtons() {
+function createValidationError(isTemplate) {
     var osType = document.getElementById('os-type').value;
-    var hasImage = (document.getElementById('image-path').value.trim() !== '');
-    var hasTpl = document.getElementById('template-select').value !== '';
-    /* macOS guests auto-download their restore image (no path needed). Windows
-       and Linux guests build from a user-picked ISO — or, on a Windows host, a
-       saved template. Holds on both hosts: on a Mac the template UI is hidden so
-       hasTpl stays false and a Windows guest genuinely requires the ISO. */
-    var createOk = (osType === 'macOS') ? true : (hasImage || hasTpl);
-    document.getElementById('btn-create').disabled = !createOk;
-    /* Templates are Windows-only; disabling create-as-template for Linux
-       (and macOS) is fine since hasImage is the only signal we check. */
-    document.getElementById('btn-create-template').disabled = (osType !== 'Windows') || !hasImage;
+    if (isTemplate && (hostBridge.isMac || osType !== 'Windows'))
+        return 'Templates require a Windows guest on a Windows host.';
+    var error = validateVmName(document.getElementById('vm-name').value.trim()) ||
+        validateDiskDirectory(document.getElementById('disk-directory').value.trim()) ||
+        validateUsername(document.getElementById('admin-user').value.trim(), isTemplate) ||
+        validatePassword(document.getElementById('admin-pass').value);
+    if (error) return error;
+    if (document.getElementById('admin-pass').value !== document.getElementById('admin-confirm').value)
+        return 'Passwords do not match.';
+
+    var numericFields = [
+        ['hdd-size', 'Disk size must be a whole number of at least 1 GB.'],
+        ['ram-size', 'RAM must be an even number of at least 512 MB.'],
+        ['cpu-cores', 'CPU cores must be a whole number of at least 1.']
+    ];
+    for (var i = 0; i < numericFields.length; i++) {
+        var input = document.getElementById(numericFields[i][0]);
+        if (input.value === '' || !input.validity.valid) return numericFields[i][1];
+    }
+
+    var path = selectedDiskDirectory();
+    var diskKnown = diskSpaceInfo && diskSpaceInfo.path === path;
+    if (diskKnown && diskSpaceInfo.freeGb < 0) return 'Disk folder is unavailable.';
+    if (diskSpacePending && !diskKnown) return 'Checking disk folder...';
+
+    var hasImage = document.getElementById('image-path').value.trim() !== '';
+    var hasTemplate = !hostBridge.isMac && osType === 'Windows' &&
+        document.getElementById('template-select').value !== '';
+    if ((isTemplate || osType !== 'macOS') && !hasImage && (isTemplate || !hasTemplate))
+        return 'Select an OS image or an available template.';
+    return null;
+}
+
+function updateCreateButtons() {
+    document.getElementById('btn-create').disabled = !!createValidationError(false);
+    document.getElementById('btn-create-template').disabled = !!createValidationError(true);
 }
 
 /* Wire up change events */
+document.getElementById('create-vm-overlay').addEventListener('input', updateCreateButtons);
+document.getElementById('create-vm-overlay').addEventListener('change', updateCreateButtons);
 document.getElementById('image-path').addEventListener('input', function() {
     if (this.value.trim() !== '') {
         selectTemplate('', templateDefaultLabel());
@@ -487,13 +518,14 @@ document.getElementById('image-path').addEventListener('input', function() {
 
 /* RAM must be 2 MB-aligned: snap an odd entry down by 1 when the field is committed. */
 document.getElementById('ram-size').addEventListener('change', function() {
-    var mb = parseInt(this.value, 10);
+    var mb = this.valueAsNumber;
     if (!isNaN(mb)) this.value = alignRamMb(mb);
 });
 
 function revalidateVmName() {
     var name = document.getElementById('vm-name').value.trim();
     document.getElementById('vm-name-warn').textContent = validateVmName(name) || '';
+    updateCreateButtons();
 }
 document.getElementById('vm-name').addEventListener('input', function() {
     revalidateVmName();
@@ -564,10 +596,11 @@ function gatherConfig() {
         diskDirectory: document.getElementById('disk-directory').value.trim() ===
             (lastHostInfo && lastHostInfo.defaultDiskDirectory) ? '' :
             document.getElementById('disk-directory').value.trim(),
-        templateName: document.getElementById('template-select').value,
-        hddGb:       parseInt(document.getElementById('hdd-size').value) || 64,
-        ramMb:       alignRamMb(parseInt(document.getElementById('ram-size').value) || 16384),
-        cpuCores:    parseInt(document.getElementById('cpu-cores').value) || 8,
+        templateName: (!hostBridge.isMac && osType === 'Windows') ?
+            document.getElementById('template-select').value : '',
+        hddGb:       document.getElementById('hdd-size').valueAsNumber,
+        ramMb:       alignRamMb(document.getElementById('ram-size').valueAsNumber),
+        cpuCores:    document.getElementById('cpu-cores').valueAsNumber,
         gpuMode:     parseInt(document.getElementById('gpu-mode').value),
         networkMode: parseInt(document.getElementById('net-mode').value),
         netAdapter:  document.getElementById('net-adapter').value,
@@ -707,38 +740,18 @@ function validatePassword(pass) {
 }
 
 function onCreateVm() {
+    var error = createValidationError(false);
+    if (error) { sendCmd('log', { message: error }); updateCreateButtons(); return; }
     var cfg = gatherConfig();
-    var nameErr = validateVmName(cfg.name);
-    if (nameErr) { sendCmd('log', { message: nameErr }); return; }
-    var diskErr = validateDiskDirectory(cfg.diskDirectory);
-    if (diskErr) { sendCmd('log', { message: diskErr }); return; }
-    var userErr = validateUsername(cfg.adminUser);
-    if (userErr) { sendCmd('log', { message: userErr }); return; }
-    var passErr = validatePassword(cfg.adminPass);
-    if (passErr) { sendCmd('log', { message: passErr }); return; }
-    if (cfg.adminPass !== cfg.adminConfirm) {
-        sendCmd('log', { message: 'Passwords do not match.' });
-        return;
-    }
     sendCmd('createVm', cfg);
     clearCreateForm();
     closeCreateModal();
 }
 
 function onCreateTemplate() {
+    var error = createValidationError(true);
+    if (error) { sendCmd('log', { message: error }); updateCreateButtons(); return; }
     var cfg = gatherConfig();
-    var nameErr = validateVmName(cfg.name);
-    if (nameErr) { sendCmd('log', { message: nameErr }); return; }
-    var diskErr = validateDiskDirectory(cfg.diskDirectory);
-    if (diskErr) { sendCmd('log', { message: diskErr }); return; }
-    var userErr = validateUsername(cfg.adminUser, true);
-    if (userErr) { sendCmd('log', { message: userErr }); return; }
-    var passErr = validatePassword(cfg.adminPass);
-    if (passErr) { sendCmd('log', { message: passErr }); return; }
-    if (cfg.adminPass !== cfg.adminConfirm) {
-        sendCmd('log', { message: 'Passwords do not match.' });
-        return;
-    }
     cfg.isTemplate = true;
     sendCmd('createVm', cfg);
     clearCreateForm();

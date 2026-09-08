@@ -716,7 +716,7 @@ static __weak IddDisplayWindow *g_hotkeyOwner;
         if (kc == kVK_ISO_Section || kc == kVK_ANSI_Grave) {
             /* macOS swaps these two physical positions on ISO hardware. */
             CGEventRef cg = event.CGEvent;
-            SInt16 keyboardType = cg ? (SInt16)CGEventGetIntegerValue(cg, kCGKeyboardEventKeyboardType) : LMGetKbdType();
+            SInt16 keyboardType = cg ? (SInt16)CGEventGetIntegerValueField(cg, kCGKeyboardEventKeyboardType) : LMGetKbdType();
             if (KBGetLayoutType(keyboardType) == kKeyboardISO)
                 position = kVK_ISO_Section + kVK_ANSI_Grave - kc;
         }

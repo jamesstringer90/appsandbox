@@ -198,7 +198,7 @@
 		1040000000000000000000EE /* appsandbox-clipboard.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "appsandbox-clipboard.m"; sourceTree = "<group>"; };
 		C040000000000000000000EE /* appsandbox-clipboard */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "appsandbox-clipboard"; sourceTree = BUILT_PRODUCTS_DIR; };
 		1018000000000000000000AA /* asb_types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_types.h; sourceTree = "<group>"; };
-		1019000000000000000000AA /* protocol.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = protocol.h; sourceTree = "<group>"; };
+		1070000000000000000000AA /* protocol.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = protocol.h; sourceTree = "<group>"; };
 		1020000000000000000000BB /* AppSandboxCore-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "AppSandboxCore-Info.plist"; sourceTree = "<group>"; };
 		3001000000000000000000AA /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = System/Library/Frameworks/Cocoa.framework; sourceTree = SDKROOT; };
 		3016000000000000000000BB /* Carbon.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Carbon.framework; path = System/Library/Frameworks/Carbon.framework; sourceTree = SDKROOT; };
@@ -397,7 +397,7 @@
 			isa = PBXGroup;
 			children = (
 				1018000000000000000000AA /* asb_types.h */,
-				1019000000000000000000AA /* protocol.h */,
+				1070000000000000000000AA /* protocol.h */,
 			);
 			name = core;
 			path = src/core;
