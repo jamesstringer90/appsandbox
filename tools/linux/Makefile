@@ -57,6 +57,8 @@ install-agents: agents
 	        echo "  installed $(DISTDIR)/$$bin"; \
 	    fi; \
 	done
+	install -d $(DISTDIR)/gnome/appsandbox-pointer@appsandbox
+	install -m 0644 agent/gnome/appsandbox-pointer@appsandbox/*.json agent/gnome/appsandbox-pointer@appsandbox/*.js $(DISTDIR)/gnome/appsandbox-pointer@appsandbox/
 
 # ---- kernel modules ---------------------------------------------------------
 #

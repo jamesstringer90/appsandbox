@@ -289,6 +289,19 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
             swprintf_s(dst, MAX_PATH, L"%s\\protocol.h", out_agent);
             if (u_cp_file(protocol_src, dst) != 0) return -1;
         }
+        wchar_t gnome_src[MAX_PATH];
+        swprintf_s(gnome_src, MAX_PATH,
+                   L"%s\\gnome\\appsandbox-pointer@appsandbox", agent_src);
+        if (GetFileAttributesW(gnome_src) != INVALID_FILE_ATTRIBUTES) {
+            const wchar_t *gnome_files[] = { L"metadata.json", L"extension.js" };
+            for (int i = 0; i < 2; i++) {
+                wchar_t s[MAX_PATH];
+                swprintf_s(s, MAX_PATH, L"%s\\%s", gnome_src, gnome_files[i]);
+                swprintf_s(dst, MAX_PATH,
+                           L"%s\\gnome\\appsandbox-pointer@appsandbox\\%s", out_agent, gnome_files[i]);
+                if (u_cp_file(s, dst) != 0) return -1;
+            }
+        }
         log_msg(L"prefetch-repo: staged agent-src/");
     }
 

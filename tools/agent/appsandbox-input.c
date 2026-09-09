@@ -146,6 +146,17 @@ static BOOL is_function_key(UINT32 vk)
            vk == VK_SLEEP || (vk >= VK_BROWSER_BACK && vk <= VK_LAUNCH_APP2);
 }
 
+static void inject_relative_mouse(const InputPacket *pkt)
+{
+    INPUT inp = {0};
+    inp.type = INPUT_MOUSE;
+    inp.mi.dx = (LONG)(INT32)pkt->param1;
+    inp.mi.dy = (LONG)(INT32)pkt->param2;
+    inp.mi.dwFlags = MOUSEEVENTF_MOVE;
+    switch_to_input_desktop();
+    SendInput(1, &inp, sizeof(inp));
+}
+
 static void inject_physical_key(const InputPacket *pkt, PhysicalKeyState *keys)
 {
     INPUT inp;
@@ -242,6 +253,7 @@ static void handle_conn(AsbConn *c)
     InputPacket pkt;
     PhysicalKeyState keys = {0};
     UINT keyboard_version = 1;
+    UINT mouse_version = 0;
     UINT pkt_count = 0;
     UINT32 ready = INPUT_READY_MAGIC;
 
@@ -267,7 +279,30 @@ static void handle_conn(AsbConn *c)
         if (pkt_count == 1)
             input_log("First packet: type=%u p1=%u p2=%u p3=%u",
                        pkt.type, pkt.param1, pkt.param2, pkt.param3);
-        if (pkt.type == INPUT_KEYBOARD_QUERY) {
+        if (pkt.type == INPUT_MOUSE_QUERY) {
+            InputPacket reply = {INPUT_MAGIC, INPUT_MOUSE_REPLY, 0, pkt.param2, 0};
+            if (pkt.param3 != 0) continue;
+            if (pkt.param1 >= INPUT_MOUSE_VERSION)
+                reply.param1 = INPUT_MOUSE_VERSION;
+            if (send_full(c, &reply, (int)sizeof(reply)) != (int)sizeof(reply))
+                break;
+            mouse_version = reply.param1;
+        } else if (pkt.type == INPUT_MOUSE_RELATIVE) {
+            if (mouse_version == INPUT_MOUSE_VERSION && pkt.param3 == 0)
+                inject_relative_mouse(&pkt);
+        } else if (pkt.type == INPUT_MOUSE_POSITION_QUERY) {
+            POINT point;
+            InputPacket reply = {INPUT_MAGIC, INPUT_MOUSE_POSITION_REPLY,
+                                 (UINT32)INT32_MIN, (UINT32)INT32_MIN, pkt.param1};
+            if (mouse_version != INPUT_MOUSE_VERSION || pkt.param2 || pkt.param3) continue;
+            switch_to_input_desktop();
+            if (GetPhysicalCursorPos(&point)) {
+                reply.param1 = (UINT32)point.x;
+                reply.param2 = (UINT32)point.y;
+            }
+            if (send_full(c, &reply, (int)sizeof(reply)) != (int)sizeof(reply))
+                break;
+        } else if (pkt.type == INPUT_KEYBOARD_QUERY) {
             InputPacket reply = {INPUT_MAGIC, INPUT_KEYBOARD_REPLY, 1, pkt.param2, 0};
             if (pkt.param3 != 0) continue;
             if (pkt.param1 >= INPUT_KEYBOARD_VERSION)

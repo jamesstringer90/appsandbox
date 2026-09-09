@@ -2374,7 +2374,7 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
            wsl-mesa.tar.zst directly into <staging>/extras/. */
         asb_log(L"Prefetch 1/3: downloading Linux sources from GitHub...");
         swprintf_s(args_buf, 2048,
-            L"--prefetch-repo --branch \"bug-fixes-user-requests\" --out-dir \"%s\"",
+            L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
             extras);
         if (spawn_iso_patch_prefetch(args_buf) != 0)
             asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");

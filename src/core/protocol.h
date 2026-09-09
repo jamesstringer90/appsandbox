@@ -13,6 +13,12 @@
 #define INPUT_KEYBOARD_REPLY  5
 #define INPUT_KEY_PHYSICAL    6
 #define INPUT_KEYBOARD_VERSION 2
+#define INPUT_MOUSE_QUERY     7
+#define INPUT_MOUSE_REPLY     8
+#define INPUT_MOUSE_RELATIVE  9
+#define INPUT_MOUSE_POSITION_QUERY 10
+#define INPUT_MOUSE_POSITION_REPLY 11
+#define INPUT_MOUSE_VERSION   1
 
 #define INPUT_BTN_LEFT        0
 #define INPUT_BTN_RIGHT       1
@@ -26,6 +32,12 @@
  * KEY_PHYSICAL: param2 = set-1 make byte, EXTENDED = E0, UP = release.
  * With scan zero only, param1 identifies a Windows VK non-text function key
  * (Pause/Break, Print Screen, Sleep, or browser/media/launch keys).
+ * MOUSE_QUERY/REPLY: param1 = mouse version, param2 = echoed request ID, param3 = 0.
+ * Without a matching mouse reply, senders retain absolute mouse movement.
+ * MOUSE_RELATIVE: param1/param2 = signed int32 X/Y deltas, param3 = 0.
+ * POSITION_QUERY: param1 = request ID, param2/param3 = 0.
+ * POSITION_REPLY: param1/param2 = physical guest-screen X/Y, param3 = request ID.
+ * Both coordinates are INT32_MIN if the cursor position cannot be read.
  */
 #pragma pack(push, 1)
 typedef struct {

@@ -5,7 +5,7 @@
  * incoming ASIN InputPackets into /dev/uinput events. The host stack
  * already speaks this protocol (see src/backend_win/vm_display_idd.c).
  *
- * Single virtual device exposing absolute pointer, wheel, buttons, and
+ * Primary virtual device exposing absolute pointer, wheel, buttons, and
  * full keyboard. GNOME / Mutter (Wayland) and Xorg both pick it up via
  * libinput automatically because uinput presents a real evdev node.
  *
@@ -22,11 +22,16 @@
 #include <fcntl.h>
 #include <time.h>
 #include <signal.h>
+#include <poll.h>
+#include <endian.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <linux/uinput.h>
 #include <linux/vm_sockets.h>
+#include <systemd/sd-login.h>
 #include "protocol.h"
 
 #define VSOCK_PORT          3
@@ -38,7 +43,7 @@
 #define ABS_RANGE   32767
 
 static volatile sig_atomic_t g_stop = 0;
-static int g_frame_w = 1920;  /* updated by hint command if we add one later */
+static int g_frame_w = 1920;
 static int g_frame_h = 1080;
 
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
@@ -277,6 +282,33 @@ static void uinput_close(int fd)
     }
 }
 
+static int uinput_open_relative(void)
+{
+    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return -1;
+    struct uinput_setup setup = {0};
+    strncpy(setup.name, "AppSandbox Relative Mouse", UINPUT_MAX_NAME_SIZE - 1);
+    setup.id.bustype = BUS_VIRTUAL;
+    setup.id.vendor = 0xA53B;
+    setup.id.product = 0x0002;
+    setup.id.version = 1;
+    if (ioctl(fd, UI_SET_EVBIT, EV_REL) < 0 ||
+        ioctl(fd, UI_SET_RELBIT, REL_X) < 0 ||
+        ioctl(fd, UI_SET_RELBIT, REL_Y) < 0 ||
+        ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 ||
+        ioctl(fd, UI_SET_KEYBIT, BTN_LEFT) < 0 ||
+        ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT) < 0 ||
+        ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE) < 0 ||
+        ioctl(fd, UI_DEV_SETUP, &setup) < 0 ||
+        ioctl(fd, UI_DEV_CREATE) < 0) {
+        close(fd);
+        return -1;
+    }
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000000L };
+    nanosleep(&ts, NULL);
+    return fd;
+}
+
 static void emit(int fd, uint16_t type, uint16_t code, int32_t value)
 {
     struct input_event ev = {0};
@@ -289,7 +321,7 @@ static void emit_syn(int fd) { emit(fd, EV_SYN, SYN_REPORT, 0); }
 
 /* ---- Event translation ---- */
 
-static void do_mouse_move(int ui_fd, uint32_t x, uint32_t y)
+static void do_mouse_move(int ui_fd, uint32_t x, uint32_t y, int after_relative)
 {
     /* Host gives us pixel coordinates in the current frame. Map to
      * 0..ABS_RANGE so the compositor scales correctly regardless of
@@ -298,6 +330,11 @@ static void do_mouse_move(int ui_fd, uint32_t x, uint32_t y)
     int32_t ay = (int32_t)((uint64_t)y * ABS_RANGE / (g_frame_h ? g_frame_h : 1));
     if (ax < 0) ax = 0; if (ax > ABS_RANGE) ax = ABS_RANGE;
     if (ay < 0) ay = 0; if (ay > ABS_RANGE) ay = ABS_RANGE;
+    if (after_relative) {
+        /* EV_ABS filters unchanged values. Keep the reset in the same SYN frame. */
+        emit(ui_fd, EV_ABS, ABS_X, ax ? ax - 1 : 1);
+        emit(ui_fd, EV_ABS, ABS_Y, ay ? ay - 1 : 1);
+    }
     emit(ui_fd, EV_ABS, ABS_X, ax);
     emit(ui_fd, EV_ABS, ABS_Y, ay);
     emit_syn(ui_fd);
@@ -417,6 +454,55 @@ static int send_exact(int fd, const void *buf, size_t len)
     return 0;
 }
 
+static int get_pointer_position(uint32_t *x, uint32_t *y)
+{
+    uid_t uid;
+    if (sd_seat_get_active("seat0", NULL, &uid) < 0) return 0;
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    snprintf(addr.sun_path, sizeof(addr.sun_path),
+             "/run/user/%u/appsandbox-pointer.sock", (unsigned)uid);
+    struct stat st;
+    if (lstat(addr.sun_path, &st) || !S_ISSOCK(st.st_mode) || st.st_uid != uid) return 0;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) return 0;
+    struct ucred peer;
+    socklen_t peer_len = sizeof(peer);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_len) != 0 || peer.uid != uid) {
+        close(fd);
+        return 0;
+    }
+
+    uint32_t position[4];
+    size_t received = 0;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (received < sizeof(position)) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long remaining = 100 - (now.tv_sec - start.tv_sec) * 1000 -
+                         (now.tv_nsec - start.tv_nsec) / 1000000;
+        if (remaining <= 0) break;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int ready = poll(&pfd, 1, (int)remaining);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) break;
+        ssize_t n = recv(fd, (char *)position + received, sizeof(position) - received, 0);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (n <= 0) break;
+        received += (size_t)n;
+    }
+    close(fd);
+    if (received != sizeof(position)) return 0;
+    for (unsigned i = 0; i < 4; i++) position[i] = le32toh(position[i]);
+    if (!position[2] || !position[3] || position[2] > 16384 || position[3] > 16384 ||
+        position[0] >= position[2] || position[1] >= position[3]) return 0;
+    *x = position[0];
+    *y = position[1];
+    g_frame_w = (int)position[2];
+    g_frame_h = (int)position[3];
+    return 1;
+}
+
 static void serve(int client_fd, int ui_fd)
 {
     /* Tell the host the guest is ready. */
@@ -427,6 +513,9 @@ static void serve(int client_fd, int ui_fd)
     }
 
     uint32_t keyboard_version = 1;
+    uint32_t mouse_version = 0;
+    int relative_fd = -1;
+    int after_relative = 0;
     uint8_t held[KEY_CNT] = {0};
     while (!g_stop) {
         InputPacket pkt;
@@ -436,10 +525,42 @@ static void serve(int client_fd, int ui_fd)
             break;
         }
         switch (pkt.type) {
-        case INPUT_MOUSE_MOVE:   do_mouse_move(ui_fd, pkt.param1, pkt.param2); break;
+        case INPUT_MOUSE_MOVE:
+            do_mouse_move(ui_fd, pkt.param1, pkt.param2, after_relative);
+            after_relative = 0;
+            break;
         case INPUT_MOUSE_BUTTON: do_mouse_button(ui_fd, pkt.param1, pkt.param2); break;
         case INPUT_MOUSE_WHEEL:  do_mouse_wheel(ui_fd, (int32_t)pkt.param1); break;
         case INPUT_KEY:          do_key(ui_fd, pkt.param1, pkt.param2, pkt.param3); break;
+        case INPUT_MOUSE_QUERY: {
+            if (pkt.param3) break;
+            uint32_t x, y;
+            get_pointer_position(&x, &y);
+            if (pkt.param1 >= INPUT_MOUSE_VERSION && relative_fd < 0)
+                relative_fd = uinput_open_relative();
+            InputPacket reply = { INPUT_MAGIC, INPUT_MOUSE_REPLY,
+                pkt.param1 >= INPUT_MOUSE_VERSION && relative_fd >= 0 ? INPUT_MOUSE_VERSION : 0,
+                pkt.param2, 0 };
+            if (send_exact(client_fd, &reply, sizeof(reply)) < 0) goto disconnected;
+            mouse_version = reply.param1;
+            break;
+        }
+        case INPUT_MOUSE_RELATIVE:
+            if (mouse_version == INPUT_MOUSE_VERSION && pkt.param3 == 0) {
+                emit(relative_fd, EV_REL, REL_X, (int32_t)pkt.param1);
+                emit(relative_fd, EV_REL, REL_Y, (int32_t)pkt.param2);
+                emit_syn(relative_fd);
+                after_relative = 1;
+            }
+            break;
+        case INPUT_MOUSE_POSITION_QUERY: {
+            if (mouse_version != INPUT_MOUSE_VERSION || pkt.param2 || pkt.param3) break;
+            InputPacket reply = { INPUT_MAGIC, INPUT_MOUSE_POSITION_REPLY,
+                (uint32_t)INT32_MIN, (uint32_t)INT32_MIN, pkt.param1 };
+            get_pointer_position(&reply.param1, &reply.param2);
+            if (send_exact(client_fd, &reply, sizeof(reply)) < 0) goto disconnected;
+            break;
+        }
         case INPUT_KEYBOARD_QUERY: {
             if (pkt.param3) break;
             InputPacket reply = { INPUT_MAGIC, INPUT_KEYBOARD_REPLY,
@@ -459,6 +580,7 @@ static void serve(int client_fd, int ui_fd)
     }
 disconnected:
     release_physical_keys(ui_fd, held);
+    uinput_close(relative_fd);
 }
 
 int main(void)

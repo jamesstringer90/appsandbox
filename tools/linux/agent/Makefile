@@ -11,6 +11,8 @@ DESTDIR       ?=
 BINDIR        := $(PREFIX)/bin
 SYSTEMDDIR    := /etc/systemd/system
 USERUNITDIR   := /etc/systemd/user
+POINTER_EXT   := appsandbox-pointer@appsandbox
+EXTENSIONDIR  := /usr/share/gnome-shell/extensions/$(POINTER_EXT)
 
 # Daemons get added here as each phase lands.
 BINS := appsandbox-agent appsandbox-display appsandbox-input appsandbox-audio appsandbox-clipboard
@@ -36,7 +38,7 @@ appsandbox-display: appsandbox-display.c
 	       $(LDFLAGS) $(shell pkg-config --libs libdrm)
 
 appsandbox-input: appsandbox-input.c $(wildcard protocol.h ../../../src/core/protocol.h)
-	$(CC) $(CFLAGS) -I../../../src/core -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) -I../../../src/core -o $@ $< $(LDFLAGS) -lsystemd
 
 # Audio daemon uses libasound to talk to the kernel snd-aloop driver.
 appsandbox-audio: appsandbox-audio.c
@@ -48,7 +50,11 @@ appsandbox-audio: appsandbox-audio.c
 appsandbox-clipboard: appsandbox-clipboard.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) -lxcb -lxcb-xfixes
 
-install: $(BINS)
+install-pointer:
+	install -d $(DESTDIR)$(EXTENSIONDIR)
+	install -m 0644 gnome/$(POINTER_EXT)/metadata.json gnome/$(POINTER_EXT)/extension.js $(DESTDIR)$(EXTENSIONDIR)/
+
+install: $(BINS) install-pointer
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 $(BINS) $(DESTDIR)$(BINDIR)/
 	install -d $(DESTDIR)$(SYSTEMDDIR)
@@ -77,4 +83,4 @@ disable:
 clean:
 	rm -f $(BINS)
 
-.PHONY: all install enable disable clean
+.PHONY: all install install-pointer enable disable clean
