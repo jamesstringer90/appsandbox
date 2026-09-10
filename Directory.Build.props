@@ -14,7 +14,7 @@
   <PropertyGroup>
     <AsbVersionMajor>0</AsbVersionMajor>
     <AsbVersionMinor>1</AsbVersionMinor>
-    <AsbVersionPatch>4</AsbVersionPatch>
+    <AsbVersionPatch>5</AsbVersionPatch>
     <AsbVersionRevision>0</AsbVersionRevision>
 
     <!-- Derived forms - do not edit. -->
