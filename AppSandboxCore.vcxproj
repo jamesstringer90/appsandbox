@@ -184,6 +184,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\core\asb_types.h" />
+    <ClInclude Include="src\core\protocol.h" />
     <ClInclude Include="src\backend_win\asb_core.h" />
     <ClInclude Include="src\backend_win\asb_display.h" />
     <ClInclude Include="src\ui.h" />

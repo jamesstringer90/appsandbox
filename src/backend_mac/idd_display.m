@@ -18,10 +18,13 @@
 
 #import "idd_display.h"
 #import "asb_ivshmem_transport.h"
+#import "vm_dir.h"
 #import <AudioToolbox/AudioToolbox.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <IOSurface/IOSurface.h>
+#import <Carbon/Carbon.h>
+#import <IOKit/hidsystem/IOLLEvent.h>
 
 #include <unistd.h>
 #include <pthread.h>
@@ -32,10 +35,13 @@
 #include <sys/select.h>
 #include <errno.h>
 #include <time.h>
+#include <math.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 #include <pwd.h>
 #include <sys/stat.h>
 #include "../../tools/transport/asb_transport.h"   /* ASB_CH_DISPLAY/INPUT/AUDIO/CLIPBOARD[_READER], AsbCursor, ASB_CURSOR_MAGIC */
+#include "../core/protocol.h"
 
 /* ---- VDD wire protocol (mirror of tools/vdd/vdd.h + src/backend_win/vm_display_idd.c).
  * The VDD pushes the same stream it sends over HvSocket on a
@@ -50,19 +56,6 @@ typedef struct {
     uint32_t magic; int32_t x, y; uint32_t visible, shape_updated, shape_id,
              width, height, pitch, xhot, yhot, cursor_type, shape_data_size;
 } WireCursorHeader;
-#pragma pack(pop)
-
-/* ---- ch3 input record (mirror of tools/agent/appsandbox-input.c's InputPacket). ---- */
-#define INPUT_MAGIC        0x4E495341u        /* 'ASIN' */
-#define INPUT_MOUSE_MOVE   0
-#define INPUT_MOUSE_BUTTON 1
-#define INPUT_MOUSE_WHEEL  2
-#define INPUT_KEY          3
-#define INPUT_BTN_LEFT     0
-#define INPUT_BTN_RIGHT    1
-#define INPUT_BTN_MIDDLE   2
-#pragma pack(push, 1)
-typedef struct { uint32_t magic, type, param1, param2, param3; } InputPacket;
 #pragma pack(pop)
 
 /* ---- ch4 AUDIO wire format (mirror of tools/agent/appsandbox-audio.c). The guest sends one
@@ -148,6 +141,134 @@ static void build_keymap(void)
     g_vk[0x2F]=0xBE; g_vk[0x2C]=0xBF; g_vk[0x32]=0xC0; g_vk[0x21]=0xDB;
     g_vk[0x2A]=0xDC; g_vk[0x1E]=0xDD; g_vk[0x27]=0xDE;
 }
+
+/* Set-1 make codes; 0xe000 marks the Windows E0 prefix. */
+static const uint16_t g_scan[128] = {
+    [kVK_ANSI_A]=0x1e, [kVK_ANSI_S]=0x1f, [kVK_ANSI_D]=0x20, [kVK_ANSI_F]=0x21,
+    [kVK_ANSI_H]=0x23, [kVK_ANSI_G]=0x22, [kVK_ANSI_Z]=0x2c, [kVK_ANSI_X]=0x2d,
+    [kVK_ANSI_C]=0x2e, [kVK_ANSI_V]=0x2f, [kVK_ANSI_B]=0x30, [kVK_ANSI_Q]=0x10,
+    [kVK_ANSI_W]=0x11, [kVK_ANSI_E]=0x12, [kVK_ANSI_R]=0x13, [kVK_ANSI_Y]=0x15,
+    [kVK_ANSI_T]=0x14, [kVK_ANSI_U]=0x16, [kVK_ANSI_I]=0x17, [kVK_ANSI_O]=0x18,
+    [kVK_ANSI_P]=0x19, [kVK_ANSI_L]=0x26, [kVK_ANSI_J]=0x24, [kVK_ANSI_K]=0x25,
+    [kVK_ANSI_N]=0x31, [kVK_ANSI_M]=0x32,
+    [kVK_ANSI_1]=0x02, [kVK_ANSI_2]=0x03, [kVK_ANSI_3]=0x04, [kVK_ANSI_4]=0x05,
+    [kVK_ANSI_5]=0x06, [kVK_ANSI_6]=0x07, [kVK_ANSI_7]=0x08, [kVK_ANSI_8]=0x09,
+    [kVK_ANSI_9]=0x0a, [kVK_ANSI_0]=0x0b,
+    [kVK_ANSI_Equal]=0x0d, [kVK_ANSI_Minus]=0x0c,
+    [kVK_ANSI_LeftBracket]=0x1a, [kVK_ANSI_RightBracket]=0x1b,
+    [kVK_ANSI_Quote]=0x28, [kVK_ANSI_Semicolon]=0x27, [kVK_ANSI_Backslash]=0x2b,
+    [kVK_ANSI_Comma]=0x33, [kVK_ANSI_Slash]=0x35, [kVK_ANSI_Period]=0x34,
+    [kVK_ANSI_Grave]=0x29, [kVK_ISO_Section]=0x56,
+    [kVK_Return]=0x1c, [kVK_Tab]=0x0f, [kVK_Space]=0x39,
+    [kVK_Delete]=0x0e, [kVK_Escape]=0x01,
+    [kVK_Command]=0xe05b, [kVK_RightCommand]=0xe05c,
+    [kVK_Shift]=0x2a, [kVK_RightShift]=0x36, [kVK_CapsLock]=0x3a,
+    [kVK_Option]=0x38, [kVK_RightOption]=0xe038,
+    [kVK_Control]=0x1d, [kVK_RightControl]=0xe01d,
+    [kVK_ANSI_Keypad0]=0x52, [kVK_ANSI_Keypad1]=0x4f, [kVK_ANSI_Keypad2]=0x50,
+    [kVK_ANSI_Keypad3]=0x51, [kVK_ANSI_Keypad4]=0x4b, [kVK_ANSI_Keypad5]=0x4c,
+    [kVK_ANSI_Keypad6]=0x4d, [kVK_ANSI_Keypad7]=0x47, [kVK_ANSI_Keypad8]=0x48,
+    [kVK_ANSI_Keypad9]=0x49, [kVK_ANSI_KeypadDecimal]=0x53,
+    [kVK_ANSI_KeypadMultiply]=0x37, [kVK_ANSI_KeypadPlus]=0x4e,
+    [kVK_ANSI_KeypadMinus]=0x4a, [kVK_ANSI_KeypadDivide]=0xe035,
+    [kVK_ANSI_KeypadEnter]=0xe01c, [kVK_ANSI_KeypadClear]=0x45,
+    [0x34]=0xe01c, [0x6e]=0xe05d,
+    [kVK_F1]=0x3b, [kVK_F2]=0x3c, [kVK_F3]=0x3d, [kVK_F4]=0x3e,
+    [kVK_F5]=0x3f, [kVK_F6]=0x40, [kVK_F7]=0x41, [kVK_F8]=0x42,
+    [kVK_F9]=0x43, [kVK_F10]=0x44, [kVK_F11]=0x57, [kVK_F12]=0x58,
+    [kVK_F13]=0x64, [kVK_F14]=0x65, [kVK_F15]=0x66, [kVK_F16]=0x67,
+    [kVK_F17]=0x68, [kVK_F18]=0x69, [kVK_F19]=0x6a, [kVK_F20]=0x6b,
+    [kVK_Help]=0xe052, [kVK_Home]=0xe047, [kVK_End]=0xe04f,
+    [kVK_PageUp]=0xe049, [kVK_PageDown]=0xe051, [kVK_ForwardDelete]=0xe053,
+    [kVK_LeftArrow]=0xe04b, [kVK_RightArrow]=0xe04d,
+    [kVK_UpArrow]=0xe048, [kVK_DownArrow]=0xe050,
+    [kVK_JIS_Yen]=0x7d, [kVK_JIS_Underscore]=0x73,
+    [kVK_JIS_Kana]=0xe0f2, [kVK_JIS_Eisu]=0xe0f1
+};
+
+static BOOL idd_modifier_down(NSEventModifierFlags flags, unsigned short kc) {
+    NSEventModifierFlags side = 0, pair = 0, common = 0;
+    switch (kc) {
+    case kVK_Shift:        side = NX_DEVICELSHIFTKEYMASK; pair = NX_DEVICERSHIFTKEYMASK; common = NSEventModifierFlagShift; break;
+    case kVK_RightShift:   side = NX_DEVICERSHIFTKEYMASK; pair = NX_DEVICELSHIFTKEYMASK; common = NSEventModifierFlagShift; break;
+    case kVK_Control:      side = NX_DEVICELCTLKEYMASK; pair = NX_DEVICERCTLKEYMASK; common = NSEventModifierFlagControl; break;
+    case kVK_RightControl: side = NX_DEVICERCTLKEYMASK; pair = NX_DEVICELCTLKEYMASK; common = NSEventModifierFlagControl; break;
+    case kVK_Option:       side = NX_DEVICELALTKEYMASK; pair = NX_DEVICERALTKEYMASK; common = NSEventModifierFlagOption; break;
+    case kVK_RightOption:  side = NX_DEVICERALTKEYMASK; pair = NX_DEVICELALTKEYMASK; common = NSEventModifierFlagOption; break;
+    case kVK_Command:      side = NX_DEVICELCMDKEYMASK; pair = NX_DEVICERCMDKEYMASK; common = NSEventModifierFlagCommand; break;
+    case kVK_RightCommand: side = NX_DEVICERCMDKEYMASK; pair = NX_DEVICELCMDKEYMASK; common = NSEventModifierFlagCommand; break;
+    default: return NO;
+    }
+    if (!(flags & common)) return NO;
+    return (flags & (side | pair)) ? (flags & side) != 0 : YES;
+}
+
+static int idd_input_versions(int fd, volatile int *stop, int *keyboardVersion, int *mouseVersion) {
+    InputPacket queries[] = {
+        { INPUT_MAGIC, INPUT_KEYBOARD_QUERY, INPUT_KEYBOARD_VERSION, arc4random() | 1u, 0 },
+        { INPUT_MAGIC, INPUT_MOUSE_QUERY, INPUT_MOUSE_VERSION, arc4random() | 1u, 0 }
+    };
+    uint8_t received[sizeof(uint32_t) + sizeof(InputPacket)];
+    size_t sent = 0, count = 0;
+    BOOL greeted = NO, keyboardReplied = NO, mouseReplied = NO;
+    *keyboardVersion = 1;
+    *mouseVersion = 0;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (!*stop) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t left = 500000 - ((now.tv_sec - start.tv_sec) * 1000000
+                            + (now.tv_nsec - start.tv_nsec) / 1000);
+        if (left <= 0) break;
+        fd_set reads, writes;
+        FD_ZERO(&reads); FD_SET(fd, &reads);
+        FD_ZERO(&writes); if (sent < sizeof(queries)) FD_SET(fd, &writes);
+        struct timeval timeout = { 0, (suseconds_t)(left < 50000 ? left : 50000) };
+        int ready = select(fd + 1, &reads, &writes, NULL, &timeout);
+        if (ready < 0) { if (errno == EINTR) continue; return 0; }
+        if (FD_ISSET(fd, &writes)) {
+            ssize_t n = send(fd, (uint8_t *)queries + sent, sizeof(queries) - sent, MSG_DONTWAIT);
+            if (n > 0) sent += (size_t)n;
+            else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) return 0;
+        }
+        if (FD_ISSET(fd, &reads)) {
+            ssize_t n = recv(fd, received + count, sizeof(received) - count, 0);
+            if (n == 0) return 0;
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+                return 0;
+            }
+            count += (size_t)n;
+            if (!greeted && count >= sizeof(uint32_t)) {
+                uint32_t magic;
+                memcpy(&magic, received, sizeof(magic));
+                if (magic != INPUT_READY_MAGIC) return sent == sizeof(queries);
+                greeted = YES;
+                count -= sizeof(magic);
+                memmove(received, received + sizeof(magic), count);
+            }
+            if (greeted && count >= sizeof(InputPacket)) {
+                InputPacket reply;
+                memcpy(&reply, received, sizeof(reply));
+                count -= sizeof(reply);
+                memmove(received, received + sizeof(reply), count);
+                if (reply.magic == INPUT_MAGIC && reply.param3 == 0) {
+                    if (reply.type == INPUT_KEYBOARD_REPLY && reply.param2 == queries[0].param2) {
+                        *keyboardVersion = reply.param1 == INPUT_KEYBOARD_VERSION ? INPUT_KEYBOARD_VERSION : 1;
+                        keyboardReplied = YES;
+                    } else if (reply.type == INPUT_MOUSE_REPLY && reply.param2 == queries[1].param2) {
+                        *mouseVersion = reply.param1 == INPUT_MOUSE_VERSION ? INPUT_MOUSE_VERSION : 0;
+                        mouseReplied = YES;
+                    }
+                }
+            }
+        }
+        if (sent == sizeof(queries) && keyboardReplied && mouseReplied)
+            return *mouseVersion == INPUT_MOUSE_VERSION && count ? 0 : 1;
+    }
+    if (*mouseVersion == INPUT_MOUSE_VERSION && count) return 0;
+    return sent && sent < sizeof(queries) ? 0 : 1;
+}
 /* extended-key keycodes (arrows + nav + fwd-delete) */
 static int is_extended(unsigned short kc)
 {
@@ -158,6 +279,21 @@ static int is_extended(unsigned short kc)
         return 1;
     }
     return 0;
+}
+
+/* Private WindowServer hotkey controls; resolve at runtime so an unavailable API
+   disables capture without preventing the viewer from opening. */
+static int32_t (*idd_cgs_connection)(void);
+static CGError (*idd_cgs_get_hotkeys)(int32_t, int *);
+static CGError (*idd_cgs_set_hotkeys)(int32_t, int);
+static void idd_load_hotkey_api(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        idd_cgs_connection = dlsym(RTLD_DEFAULT, "_CGSDefaultConnection");
+        idd_cgs_get_hotkeys = dlsym(RTLD_DEFAULT, "CGSGetGlobalHotKeyOperatingMode");
+        idd_cgs_set_hotkeys = dlsym(RTLD_DEFAULT, "CGSSetGlobalHotKeyOperatingMode");
+    });
 }
 
 /* Resolve the GUI console user (the one who will paste) so root-created clipboard files can be chowned
@@ -240,11 +376,14 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
  * Input (coalesced moves + discrete events) is written to the ch3 fd by the controller.
  * ================================================================================ */
 @class IddDisplayWindow;
+static __weak IddDisplayWindow *g_hotkeyOwner;
+static __weak IddDisplayWindow *g_mouseOwner;
 
 @interface IddDisplayView : NSView
 @property (nonatomic, weak) IddDisplayWindow *owner;
 @property (nonatomic, strong) NSTrackingArea *track;
 - (void)updateGuestCursor;   /* mirror the guest HW cursor onto this view's NSCursor (render timer) */
+- (void)recordAbsoluteMove:(NSPoint)point;
 @end
 
 @interface IddDisplayWindow () <NSWindowDelegate>
@@ -281,8 +420,20 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 - (NSCursor *)currentCursorForScale:(double)scale;
 - (NSCursor *)appliedCursor;
 - (void)sendInput:(uint32_t)type p1:(uint32_t)p1 p2:(uint32_t)p2 p3:(uint32_t)p3;
+- (void)enqueueInputLocked:(InputPacket)packet;
 - (void)recordMoveX:(uint32_t)x y:(uint32_t)y;
 - (void)flushMove;
+- (BOOL)recordRelativeMove:(NSEvent *)event;
+- (void)releaseMouseCapture;
+- (void)updateMouseCapture;
+- (void)discardMouseMovesLocked;
+- (void)beginMousePosition;
+- (void)fallbackMousePosition;
+- (void)finishMousePosition:(InputPacket)reply connection:(uint64_t)connection;
+- (void)forwardKeyEvent:(NSEvent *)event;
+- (void)releaseHeldKeys;
+- (void)releaseKeyboardCapture;
+- (void)updateKeyboardCapture;
 @end
 
 @implementation IddDisplayWindow {
@@ -322,16 +473,28 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     uint32_t          _curBlobApplied;
     double            _curScale;
     NSCursor         *_nsCursor;
+    BOOL              _displayReady;
+    BOOL              _cursorKnown;
+    BOOL              _guestCursorVisible;
 
     /* Coalesced mouse-move state (main thread only). A retina trackpad fires far more move
        events than the guest can inject, so we keep only the latest position and emit at most
        one move per render tick; discrete events flush the pending move first to keep ordering. */
     int               _hasMove;
     uint32_t          _moveX, _moveY;
+    double            _relativeX, _relativeY;
+    NSTimeInterval    _mousePositionDeadline, _mousePositionResumeTime;
 
-    /* ch3 INPUT fd (the input WORKER thread connects + writes InputPacket). -1 until connected; the
-       worker reconnects it. The main thread NEVER touches this fd — it only enqueues into _inq. */
-    volatile int      _inputFd;
+    id                _eventMonitor;
+    BOOL              _transmitHotkeys;
+    BOOL              _hotkeysCaptured;
+    int32_t           _hotkeyConnection;
+    int               _savedHotkeyMode;
+    NSUInteger        _trackingMenus;
+    BOOL              _heldKeys[128];
+    InputPacket       _heldPackets[128];
+
+    /* Published reader fds shared with teardown. */
     pthread_mutex_t   _inputLock;
 
     /* Input send queue: the AppKit main thread (-sendInput:) enqueues InputPackets here and returns
@@ -343,6 +506,12 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     #define IDD_INQ_CAP 256
     InputPacket       _inq[IDD_INQ_CAP];
     uint32_t          _inqHead, _inqTail;
+    BOOL              _inputReady;
+    int               _keyboardVersion;
+    int               _mouseVersion;
+    BOOL              _relativeMouse;
+    uint32_t          _mousePositionRequest, _mousePositionSerial;
+    uint64_t          _inputConnection, _mouseCaptureConnection, _mouseMoveGeneration;
     pthread_mutex_t   _inqLock;
     pthread_cond_t    _inqCond;
     /* Display thread's current ch2 fd, published so teardown can shutdown() it to unblock the
@@ -357,6 +526,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     uint8_t          *_pcm;          /* PCM_RING_SZ jitter buffer */
     volatile uint32_t _pcmHead, _pcmTail;
     pthread_mutex_t   _pcmLock;
+    BOOL              _audioMuted;
 
     /* ch5/ch6 CLIPBOARD published fds (guarded by _inputLock, the shared fd-publication lock). The
        NSPasteboard changeCount we set ourselves, so the writer doesn't echo a Windows->Mac paste
@@ -396,7 +566,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 
     _name = [name copy];
     _transport = transport;
-    _inputFd = -1;
+    _stop = 1;
     _displayFd = -1;
     _audioFd = -1;
     _clipWriterFd = -1;
@@ -415,8 +585,413 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     _view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     window.contentView = _view;
     window.delegate = self;
+    [self loadDisplaySettings];
     [self setupMetal];
     return self;
+}
+
+#pragma mark - Display settings and keyboard capture
+
+- (NSURL *)displaySettingsURL {
+    return [[VmDir directoryForVm:self.name] URLByAppendingPathComponent:@"display_settings.json"];
+}
+
+- (void)saveDisplaySettings {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@{ @"transmitKeyboardHotkeys": @(_transmitHotkeys ? 1 : 0) }
+                                                 options:0 error:nil];
+    NSError *error = nil;
+    if (![data writeToURL:[self displaySettingsURL] options:NSDataWritingAtomic error:&error])
+        NSLog(@"IDD [%@]: Could not save display settings: %@", self.name, error);
+}
+
+- (void)loadDisplaySettings {
+    NSData *data = [NSData dataWithContentsOfURL:[self displaySettingsURL]];
+    if (!data) { [self saveDisplaySettings]; return; }
+    id settings = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if ([settings isKindOfClass:[NSDictionary class]]) {
+        id value = settings[@"transmitKeyboardHotkeys"];
+        if ([value isKindOfClass:[NSNumber class]]) _transmitHotkeys = [value boolValue];
+    }
+}
+
+- (void)toggleAudioMute:(id)sender {
+    (void)sender;
+    pthread_mutex_lock(&_pcmLock);
+    _audioMuted = !_audioMuted;
+    _pcmHead = _pcmTail = 0;
+    pthread_mutex_unlock(&_pcmLock);
+    self.window.title = [NSString stringWithFormat:@"%@%@ — Display", _audioMuted ? @"🔇 " : @"", self.name];
+}
+
+- (void)toggleTransmitHotkeys:(id)sender {
+    (void)sender;
+    _transmitHotkeys = !_transmitHotkeys;
+    [self updateKeyboardCapture];
+    [self saveDisplaySettings];
+}
+
+- (void)showTitlebarMenuAtPoint:(NSPoint)point {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+    NSMenuItem *mute = [menu addItemWithTitle:@"Mute audio" action:@selector(toggleAudioMute:) keyEquivalent:@""];
+    mute.target = self;
+    mute.state = _audioMuted ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *hotkeys = [menu addItemWithTitle:@"Transmit Keyboard Hotkeys"
+                                       action:@selector(toggleTransmitHotkeys:) keyEquivalent:@""];
+    hotkeys.target = self;
+    hotkeys.state = _transmitHotkeys ? NSControlStateValueOn : NSControlStateValueOff;
+    _trackingMenus++;
+    [self releaseKeyboardCapture];
+    [self releaseMouseCapture];
+    [menu popUpMenuPositioningItem:nil atLocation:point inView:nil];
+    if (_trackingMenus) _trackingMenus--;
+    [self updateKeyboardCapture];
+    [self updateMouseCapture];
+}
+
+- (NSEvent *)handleViewerEvent:(NSEvent *)event {
+    if (_stop) return event;
+    BOOL contextClick = event.type == NSEventTypeRightMouseDown ||
+        (event.type == NSEventTypeLeftMouseDown && (event.modifierFlags & NSEventModifierFlagControl));
+    if (contextClick && !_trackingMenus) {
+        NSPoint screenPoint = event.window ? [event.window convertPointToScreen:event.locationInWindow] : [NSEvent mouseLocation];
+        BOOL targetsWindow = event.window == self.window;
+        if (!event.window)
+            targetsWindow = [NSWindow windowNumberAtPoint:screenPoint belowWindowWithWindowNumber:0] == self.window.windowNumber;
+        NSPoint point = [self.window convertPointFromScreen:screenPoint];
+        if (targetsWindow && !(self.window.styleMask & NSWindowStyleMaskFullScreen) &&
+            point.x >= 0 && point.x < self.window.frame.size.width &&
+            point.y >= NSMaxY(self.window.contentLayoutRect) && point.y < self.window.frame.size.height) {
+            [NSApp activateIgnoringOtherApps:YES];
+            [self.window makeKeyAndOrderFront:nil];
+            [self.window makeFirstResponder:self.view];
+            [self showTitlebarMenuAtPoint:screenPoint];
+            return nil;
+        }
+    }
+    if (_hotkeysCaptured && !_trackingMenus && NSApp.isActive && self.window.isKeyWindow &&
+        event.window == self.window && self.window.firstResponder == self.view && !self.window.attachedSheet &&
+        (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp || event.type == NSEventTypeFlagsChanged)) {
+        [self forwardKeyEvent:event];
+        return nil;
+    }
+    return event;
+}
+
+- (void)installEventMonitor {
+    if (_eventMonitor) return;
+    __weak IddDisplayWindow *weakSelf = self;
+    _eventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:
+        NSEventMaskKeyDown | NSEventMaskKeyUp | NSEventMaskFlagsChanged | NSEventMaskRightMouseDown | NSEventMaskLeftMouseDown
+        handler:^NSEvent *(NSEvent *event) {
+            IddDisplayWindow *owner = weakSelf;
+            return owner ? [owner handleViewerEvent:event] : event;
+        }];
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserver:self selector:@selector(applicationDidBecomeActive:) name:NSApplicationDidBecomeActiveNotification object:NSApp];
+    [nc addObserver:self selector:@selector(applicationDidResignActive:) name:NSApplicationDidResignActiveNotification object:NSApp];
+    [nc addObserver:self selector:@selector(menuDidBeginTracking:) name:NSMenuDidBeginTrackingNotification object:nil];
+    [nc addObserver:self selector:@selector(menuDidEndTracking:) name:NSMenuDidEndTrackingNotification object:nil];
+}
+
+- (void)releaseKeyboardCapture {
+    [self releaseHeldKeys];
+    if (!_hotkeysCaptured) return;
+    if (g_hotkeyOwner == self) {
+        CGError error = idd_cgs_set_hotkeys(_hotkeyConnection, _savedHotkeyMode);
+        if (error != kCGErrorSuccess)
+            NSLog(@"IDD [%@]: Could not restore host keyboard shortcuts (%d).", self.name, error);
+        g_hotkeyOwner = nil;
+    }
+    _hotkeysCaptured = NO;
+}
+
+- (void)updateKeyboardCapture {
+    BOOL capture = _transmitHotkeys && !_stop && !_trackingMenus && _eventMonitor && NSApp.isActive &&
+        self.window.isKeyWindow && self.window.firstResponder == self.view && !self.window.attachedSheet;
+    if (!capture) { [self releaseKeyboardCapture]; return; }
+    if (_hotkeysCaptured) return;
+    [g_hotkeyOwner releaseKeyboardCapture];
+    idd_load_hotkey_api();
+    CGError error = kCGErrorFailure;
+    if (idd_cgs_connection && idd_cgs_get_hotkeys && idd_cgs_set_hotkeys) {
+        _hotkeyConnection = idd_cgs_connection();
+        error = idd_cgs_get_hotkeys(_hotkeyConnection, &_savedHotkeyMode);
+        if (error == kCGErrorSuccess) {
+            const int disabled = 1;
+            error = idd_cgs_set_hotkeys(_hotkeyConnection, disabled);
+            int mode = -1;
+            if (error == kCGErrorSuccess) error = idd_cgs_get_hotkeys(_hotkeyConnection, &mode);
+            if (error == kCGErrorSuccess && mode != disabled) error = kCGErrorFailure;
+            if (error != kCGErrorSuccess) idd_cgs_set_hotkeys(_hotkeyConnection, _savedHotkeyMode);
+        }
+    }
+    if (error == kCGErrorSuccess) {
+        g_hotkeyOwner = self;
+        _hotkeysCaptured = YES;
+    } else {
+        _transmitHotkeys = NO;
+        [self saveDisplaySettings];
+        NSLog(@"IDD [%@]: Keyboard capture failed (%d).", self.name, error);
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"Keyboard capture could not be enabled";
+        alert.informativeText = @"macOS did not allow the viewer to capture system keyboard shortcuts. Transmit Keyboard Hotkeys has been turned off.";
+        [alert beginSheetModalForWindow:self.window completionHandler:nil];
+    }
+}
+
+- (void)forwardKeyEvent:(NSEvent *)event {
+    [self flushMove];
+    unsigned short kc = event.keyCode;
+    if (kc >= 128) return;
+    pthread_mutex_lock(&_inqLock);
+    if (!_inputReady || _stop) { pthread_mutex_unlock(&_inqLock); return; }
+    uint32_t vk = 0;
+    uint32_t scan = 0;
+    BOOL up = event.type == NSEventTypeKeyUp;
+    BOOL extended = is_extended(kc);
+    BOOL physical = _keyboardVersion == INPUT_KEYBOARD_VERSION;
+    if (physical) {
+        unsigned short position = kc;
+        if (kc == kVK_ISO_Section || kc == kVK_ANSI_Grave) {
+            /* macOS swaps these two physical positions on ISO hardware. */
+            CGEventRef cg = event.CGEvent;
+            SInt16 keyboardType = cg ? (SInt16)CGEventGetIntegerValueField(cg, kCGKeyboardEventKeyboardType) : LMGetKbdType();
+            if (KBGetLayoutType(keyboardType) == kKeyboardISO)
+                position = kVK_ISO_Section + kVK_ANSI_Grave - kc;
+        }
+        scan = g_scan[position] & 0xff;
+        extended = (g_scan[position] & 0xff00) == 0xe000;
+        vk = g_vk[kc];
+        if (event.type == NSEventTypeFlagsChanged) {
+            if (kc == kVK_CapsLock) {
+                InputPacket caps = { INPUT_MAGIC, INPUT_KEY_PHYSICAL, 0, 0x3a, 0 };
+                [self enqueueInputLocked:caps];
+                caps.param3 = INPUT_KEY_UP;
+                [self enqueueInputLocked:caps];
+                pthread_mutex_unlock(&_inqLock);
+                return;
+            }
+            up = !idd_modifier_down(event.modifierFlags, kc);
+        }
+        if (!scan) {
+            switch (kc) {
+            case kVK_VolumeUp: vk = 0xaf; break;
+            case kVK_VolumeDown: vk = 0xae; break;
+            case kVK_Mute: vk = 0xad; break;
+            default: vk = 0; break;
+            }
+        }
+    } else if (event.type == NSEventTypeFlagsChanged) {
+        NSEventModifierFlags mask = 0;
+        extended = NO;
+        switch (kc) {
+        case 0x38: case 0x3C: vk = 0x10; mask = NSEventModifierFlagShift; break;
+        case 0x3B: case 0x3E: vk = 0x11; mask = NSEventModifierFlagControl; break;
+        case 0x3A: case 0x3D: vk = 0x12; mask = NSEventModifierFlagOption; break;
+        case 0x37: vk = 0x5B; mask = NSEventModifierFlagCommand; break;
+        case 0x36: vk = 0x5C; mask = NSEventModifierFlagCommand; break;
+        case 0x39: vk = 0x14; mask = NSEventModifierFlagCapsLock; break;
+        default: pthread_mutex_unlock(&_inqLock); return;
+        }
+        up = (event.modifierFlags & mask) == 0;
+    } else {
+        vk = g_vk[kc];
+    }
+    if ((!vk && !scan) || (up && !_heldKeys[kc]) ||
+        (event.type == NSEventTypeKeyDown && event.isARepeat && !_heldKeys[kc])) {
+        pthread_mutex_unlock(&_inqLock);
+        return;
+    }
+    InputPacket packet = { INPUT_MAGIC, physical ? INPUT_KEY_PHYSICAL : INPUT_KEY,
+                           vk, scan, (extended ? INPUT_KEY_EXTENDED : 0) | (up ? INPUT_KEY_UP : 0) };
+    if (up) {
+        packet = _heldPackets[kc];
+        packet.param3 |= INPUT_KEY_UP;
+    }
+    [self enqueueInputLocked:packet];
+    _heldKeys[kc] = !up;
+    _heldPackets[kc] = packet;
+    pthread_mutex_unlock(&_inqLock);
+}
+
+- (void)discardMouseMovesLocked {
+    _mouseMoveGeneration++;
+    uint32_t tail = _inqHead;
+    for (uint32_t i = _inqHead; i != _inqTail; i = (i + 1) % IDD_INQ_CAP) {
+        if (_inq[i].type == INPUT_MOUSE_MOVE || _inq[i].type == INPUT_MOUSE_RELATIVE ||
+            _inq[i].type == INPUT_MOUSE_POSITION_QUERY) continue;
+        _inq[tail] = _inq[i];
+        tail = (tail + 1) % IDD_INQ_CAP;
+    }
+    _inqTail = tail;
+}
+
+- (void)releaseMouseCapture {
+    pthread_mutex_lock(&_inqLock);
+    if (!_relativeMouse && !_mousePositionRequest) { pthread_mutex_unlock(&_inqLock); return; }
+    _relativeMouse = NO;
+    _mousePositionRequest = 0;
+    [self discardMouseMovesLocked];
+    pthread_mutex_unlock(&_inqLock);
+    _hasMove = 0;
+    _relativeX = _relativeY = 0;
+    if (g_mouseOwner == self) {
+        CGAssociateMouseAndMouseCursorPosition(true);
+        g_mouseOwner = nil;
+    }
+    [NSCursor unhide];
+    [self.window invalidateCursorRectsForView:self.view];
+}
+
+- (void)beginMousePosition {
+    pthread_mutex_lock(&_inqLock);
+    if (!_inputReady || _mouseVersion != INPUT_MOUSE_VERSION || !_relativeMouse ||
+        _mouseCaptureConnection != _inputConnection) {
+        pthread_mutex_unlock(&_inqLock);
+        [self releaseMouseCapture];
+        return;
+    }
+    _relativeMouse = NO;
+    [self discardMouseMovesLocked];
+    if (++_mousePositionSerial == 0) ++_mousePositionSerial;
+    _mousePositionRequest = _mousePositionSerial;
+    InputPacket packet = { INPUT_MAGIC, INPUT_MOUSE_POSITION_QUERY, _mousePositionRequest, 0, 0 };
+    [self enqueueInputLocked:packet];
+    pthread_mutex_unlock(&_inqLock);
+    _hasMove = 0;
+    _relativeX = _relativeY = 0;
+    _mousePositionDeadline = NSProcessInfo.processInfo.systemUptime + 0.25;
+}
+
+- (void)fallbackMousePosition {
+    if (!_mousePositionRequest) return;
+    [self releaseMouseCapture];
+    NSPoint point = [self.view convertPoint:
+        [self.window convertPointFromScreen:[NSEvent mouseLocation]] fromView:nil];
+    [self.view recordAbsoluteMove:point];
+    [self flushMove];
+}
+
+- (void)finishMousePosition:(InputPacket)reply connection:(uint64_t)connection {
+    pthread_mutex_lock(&_inqLock);
+    BOOL matches = _inputReady && _inputConnection == connection &&
+        _mousePositionRequest && _mousePositionRequest == reply.param3;
+    pthread_mutex_unlock(&_inqLock);
+    if (!matches) return;
+    [self updateMouseCapture];
+    if (!_mousePositionRequest || _mousePositionRequest != reply.param3) return;
+
+    uint32_t gw = [self frameWidth], gh = [self frameHeight];
+    int32_t x = (int32_t)reply.param1, y = (int32_t)reply.param2;
+    NSScreen *primary = NSScreen.screens.firstObject;
+    NSRect bounds = self.view.bounds;
+    CGRect frame = idd_letterbox(bounds.size.width, bounds.size.height, gw, gh, NULL);
+    if (!primary || gw <= 1 || gh <= 1 || x < 0 || y < 0 ||
+        (uint32_t)x >= gw || (uint32_t)y >= gh || frame.size.width < 1 || frame.size.height < 1) {
+        [self fallbackMousePosition];
+        return;
+    }
+    NSPoint point = NSMakePoint(frame.origin.x + (double)x / (gw - 1) * frame.size.width,
+        CGRectGetMaxY(frame) - (double)y / (gh - 1) * frame.size.height);
+    point.x = fmin(point.x, NSMaxX(bounds) - fmin(1.0, bounds.size.width * 0.5));
+    point.y = fmin(point.y, NSMaxY(bounds) - fmin(1.0, bounds.size.height * 0.5));
+    NSPoint screen = [self.window convertPointToScreen:[self.view convertPoint:point toView:nil]];
+    pthread_mutex_lock(&_inqLock);
+    matches = _inputReady && _inputConnection == connection &&
+        _mousePositionRequest && _mousePositionRequest == reply.param3;
+    CGError error = matches ?
+        CGWarpMouseCursorPosition(CGPointMake(screen.x, NSMaxY(primary.frame) - screen.y)) : kCGErrorFailure;
+    pthread_mutex_unlock(&_inqLock);
+    if (!matches) { [self releaseMouseCapture]; return; }
+    if (error != kCGErrorSuccess) {
+        [self fallbackMousePosition];
+        return;
+    }
+    _mousePositionResumeTime = NSProcessInfo.processInfo.systemUptime;
+    [self releaseMouseCapture];
+}
+
+- (void)updateMouseCapture {
+    pthread_mutex_lock(&_inqLock);
+    BOOL ready = _inputReady && _mouseVersion == INPUT_MOUSE_VERSION &&
+        ((!_relativeMouse && !_mousePositionRequest) || _mouseCaptureConnection == _inputConnection);
+    pthread_mutex_unlock(&_inqLock);
+    pthread_mutex_lock(&_curLock);
+    BOOL hidden = _displayReady && _cursorKnown && !_guestCursorVisible;
+    BOOL visible = _displayReady && _cursorKnown && _guestCursorVisible;
+    pthread_mutex_unlock(&_curLock);
+    BOOL active = ready && (hidden || ((_relativeMouse || _mousePositionRequest) && visible)) &&
+        !_stop && !_trackingMenus && NSApp.isActive &&
+        self.window.isKeyWindow && !self.window.isMiniaturized && self.window.isVisible &&
+        self.window.firstResponder == self.view && !self.window.attachedSheet;
+    NSPoint point = NSZeroPoint;
+    if (active) {
+        NSPoint screenPoint = [NSEvent mouseLocation];
+        point = [self.view convertPoint:[self.window convertPointFromScreen:screenPoint] fromView:nil];
+        CGRect frame = idd_letterbox(self.view.bounds.size.width, self.view.bounds.size.height,
+                                    [self frameWidth], [self frameHeight], NULL);
+        active = NSPointInRect(point, self.view.visibleRect) && CGRectContainsPoint(frame, point) &&
+            [NSWindow windowNumberAtPoint:screenPoint belowWindowWithWindowNumber:0] == self.window.windowNumber;
+    }
+    if (_mousePositionRequest) {
+        if (!active || !visible) {
+            [self releaseMouseCapture];
+        } else {
+            if (NSProcessInfo.processInfo.systemUptime >= _mousePositionDeadline)
+                [self fallbackMousePosition];
+            return;
+        }
+    }
+    BOOL capture = active && hidden;
+    if (!capture) {
+        if (_relativeMouse) {
+            if (active && visible && g_mouseOwner == self) {
+                [self beginMousePosition];
+                return;
+            }
+            [self releaseMouseCapture];
+        }
+        return;
+    }
+    if (_relativeMouse) return;
+    [g_mouseOwner releaseMouseCapture];
+    if (CGAssociateMouseAndMouseCursorPosition(false) != kCGErrorSuccess) return;
+    _hasMove = 0;
+    _relativeX = _relativeY = 0;
+    pthread_mutex_lock(&_inqLock);
+    [self discardMouseMovesLocked];
+    _relativeMouse = YES;
+    _mouseCaptureConnection = _inputConnection;
+    pthread_mutex_unlock(&_inqLock);
+    g_mouseOwner = self;
+    [NSCursor hide];
+}
+
+- (BOOL)recordRelativeMove:(NSEvent *)event {
+    BOOL movement = event.type == NSEventTypeMouseMoved || event.type == NSEventTypeLeftMouseDragged ||
+        event.type == NSEventTypeRightMouseDragged || event.type == NSEventTypeOtherMouseDragged;
+    if (event.timestamp <= _mousePositionResumeTime) return YES;
+    BOOL captured = _relativeMouse || _mousePositionRequest;
+    [self updateMouseCapture];
+    if (_mousePositionRequest) return YES;
+    if (!_relativeMouse) return captured;
+    if (captured && movement) {
+        _relativeX += event.deltaX;
+        _relativeY += event.deltaY;
+    }
+    return YES;
+}
+
+- (void)releaseHeldKeys {
+    pthread_mutex_lock(&_inqLock);
+    for (unsigned int kc = 0; kc < 128; kc++) {
+        if (!_heldKeys[kc]) continue;
+        InputPacket packet = _heldPackets[kc];
+        packet.param3 |= INPUT_KEY_UP;
+        if (_inputReady) [self enqueueInputLocked:packet];
+        _heldKeys[kc] = NO;
+    }
+    pthread_mutex_unlock(&_inqLock);
 }
 
 /* Build the Metal device/pipeline/sampler and point the view's CAMetalLayer at them. The shaders are the
@@ -505,6 +1080,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
        with dead display+input. Reconnecting re-arms ch2/ch3 and the guest re-accepts. */
     _stop = 0;
     self.userClosed = NO;
+    [self installEventMonitor];
     if (!_threadsStarted) {
         _threadsStarted = YES;
         self.timer = [NSTimer timerWithTimeInterval:(1.0 / 60.0) repeats:YES block:^(NSTimer *t) {
@@ -523,11 +1099,13 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
         pthread_create(&_clipWriterThread, NULL, idd_clip_writer_thread, (__bridge void *)self);
         pthread_create(&_clipReaderThread, NULL, idd_clip_reader_thread, (__bridge void *)self);
     }
+    [self updateKeyboardCapture];
 }
 
 /* Render-timer body (main thread): flush a coalesced move, mirror the guest HW cursor onto the
    macOS cursor, and copy a freshly reconstructed frame into the render buffer + redraw. */
 - (void)renderTick {
+    [self updateMouseCapture];
     [self flushMove];
     [self.view updateGuestCursor];
     [self renderMetal];
@@ -634,6 +1212,14 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
    NSCursor to install, or nil if nothing changed. */
 - (NSCursor *)currentCursorForScale:(double)scale {
     pthread_mutex_lock(&_curLock);
+    if (!_displayReady || !_cursorKnown) {
+        pthread_mutex_unlock(&_curLock);
+        NSCursor *arrow = [NSCursor arrowCursor];
+        if (_nsCursor == arrow) return nil;
+        _nsCursor = arrow;
+        _curBlobApplied = 0;
+        return arrow;
+    }
     uint32_t seq = _curBlobSeq;
     if ((seq == _curBlobApplied && fabs(scale - _curScale) < 0.01) || !_curBlob) {
         pthread_mutex_unlock(&_curLock);
@@ -649,6 +1235,8 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 #pragma mark - Input (main thread -> ch3 fd)
 
 - (void)sendInput:(uint32_t)type p1:(uint32_t)p1 p2:(uint32_t)p2 p3:(uint32_t)p3 {
+    if (_mousePositionRequest && ((type == INPUT_MOUSE_BUTTON && p2) || type == INPUT_MOUSE_WHEEL))
+        [self fallbackMousePosition];
     InputPacket pkt = { INPUT_MAGIC, type, p1, p2, p3 };
     /* ENQUEUE ONLY — the AppKit main thread does ZERO ch3 socket I/O. The input worker thread
        (inputLoop) drains this ring and does the actual blocking send + owns reconnect. Any guest
@@ -657,16 +1245,32 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
        (A non-blocking main-thread send would not suffice: the main thread stays coupled to ch3's live
        state and can pin in __sendto.) Bounded ring, drop-OLDEST when full (latest position wins). */
     pthread_mutex_lock(&_inqLock);
+    if (_inputReady && !_stop) [self enqueueInputLocked:pkt];
+    pthread_mutex_unlock(&_inqLock);
+}
+
+- (void)enqueueInputLocked:(InputPacket)pkt {
     uint32_t next = (_inqTail + 1) % IDD_INQ_CAP;
     if (next == _inqHead) _inqHead = (_inqHead + 1) % IDD_INQ_CAP;   /* full -> drop oldest */
     _inq[_inqTail] = pkt;
     _inqTail = next;
     pthread_cond_signal(&_inqCond);
-    pthread_mutex_unlock(&_inqLock);
 }
 
-- (void)recordMoveX:(uint32_t)x y:(uint32_t)y { _moveX = x; _moveY = y; _hasMove = 1; }
+- (void)recordMoveX:(uint32_t)x y:(uint32_t)y {
+    if (_mousePositionRequest) return;
+    _moveX = x; _moveY = y; _hasMove = 1;
+}
 - (void)flushMove {
+    if (_mousePositionRequest) return;
+    if (_relativeMouse) {
+        int32_t dx = (int32_t)fmax(INT32_MIN, fmin(INT32_MAX, _relativeX));
+        int32_t dy = (int32_t)fmax(INT32_MIN, fmin(INT32_MAX, _relativeY));
+        _relativeX -= dx;
+        _relativeY -= dy;
+        if (dx || dy) [self sendInput:INPUT_MOUSE_RELATIVE p1:(uint32_t)dx p2:(uint32_t)dy p3:0];
+        return;
+    }
     if (_hasMove) { _hasMove = 0; [self sendInput:INPUT_MOUSE_MOVE p1:_moveX p2:_moveY p3:0]; }
 }
 
@@ -677,6 +1281,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
    first then dirty-rect frames + cursor updates). On EOF/error we close the fd and reconnect — a new
    accept => a fresh full frame, exactly like reopening the IDD window. Mirrors display_recv_thread. */
 - (void)displayLoop {
+    __weak IddDisplayWindow *weakSelf = self;
     uint8_t *scratch = NULL;
     size_t   scratchSz = 0;
     while (!_stop) {
@@ -706,6 +1311,8 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
                 /* Build an AsbCursor blob (header + image) so the render timer reuses buildGuestCursor
                    unchanged. shape_updated=0 => keep last image, update visibility only. */
                 pthread_mutex_lock(&_curLock);
+                _cursorKnown = YES;
+                _guestCursorVisible = ch.visible != 0;
                 if (shape) {
                     uint8_t *blob = malloc(sizeof(AsbCursor) + ch.shape_data_size);
                     if (blob) {
@@ -718,9 +1325,13 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
                         memcpy(blob + sizeof(AsbCursor), shape, ch.shape_data_size);
                         free(_curBlob); _curBlob = blob; _curBlobSeq++;
                     }
-                } else if (_curBlob) {
+                } else {
+                    if (!_curBlob) {
+                        _curBlob = calloc(1, sizeof(AsbCursor));
+                        _curBlobSeq++;
+                    }
                     AsbCursor *c = (AsbCursor *)_curBlob;
-                    if (c->visible != ch.visible) { c->visible = ch.visible; _curBlobSeq++; }
+                    if (c && c->visible != ch.visible) { c->visible = ch.visible; _curBlobSeq++; }
                 }
                 pthread_mutex_unlock(&_curLock);
                 free(shape);
@@ -789,8 +1400,16 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
                 _fbSeq++;
                 pthread_mutex_unlock(&_fbLock);
             }
+            pthread_mutex_lock(&_curLock);
+            _displayReady = YES;
+            pthread_mutex_unlock(&_curLock);
         }
 
+        pthread_mutex_lock(&_curLock);
+        _displayReady = NO;
+        _cursorKnown = NO;
+        pthread_mutex_unlock(&_curLock);
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf releaseMouseCapture]; });
         pthread_mutex_lock(&_inputLock);
         if (_displayFd == fd) _displayFd = -1;   /* unpublish before close so teardown won't shutdown a reused fd */
         pthread_mutex_unlock(&_inputLock);
@@ -800,13 +1419,10 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     free(scratch);
 }
 
-/* Own the ch3 INPUT connection end-to-end on this worker thread: connect, publish the fd (so teardown
-   can shutdown() it), then loop draining the main thread's _inq and BLOCKING-sending each InputPacket,
-   plus detecting guest-side teardown. Blocking I/O is safe HERE (off the UI thread): ch3 backpressure
-   or a dead slot stalls only this thread, and we recover by reconnecting. The main thread only ever
-   touches _inq, so it can never wedge. Mirrors the proven Windows model (recv thread owns the input
-   socket + its reconnect) — just with the send moved off the UI thread via the queue. */
+/* Own ch3 on the worker: drain the main thread's input queue, reconnect on failure,
+   and flush queued key releases before closing. Socket writes are nonblocking. */
 - (void)inputLoop {
+    __weak IddDisplayWindow *weakSelf = self;
     while (!_stop) {
         int fd = [_transport connectChannel:ASB_CH_INPUT timeoutMs:2000];
         if (fd < 0) { if (_stop) break; usleep(200000); continue; }
@@ -818,11 +1434,23 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
            without O_NONBLOCK the worker can still briefly block in __sendto on a full ring. With it, send
            returns EAGAIN instantly (-> drop) and only a real error/EOF triggers reconnect. */
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-        pthread_mutex_lock(&_inputLock);
-        _inputFd = fd;
-        pthread_mutex_unlock(&_inputLock);
-
+        int keyboardVersion = 1, mouseVersion = 0;
+        if (!idd_input_versions(fd, &_stop, &keyboardVersion, &mouseVersion) || _stop) {
+            close(fd);
+            if (!_stop) usleep(100000);
+            continue;
+        }
+        pthread_mutex_lock(&_inqLock);
+        _inqHead = _inqTail = 0;
+        memset(_heldKeys, 0, sizeof(_heldKeys));
+        _keyboardVersion = keyboardVersion;
+        _mouseVersion = mouseVersion;
+        uint64_t connection = ++_inputConnection;
+        _inputReady = YES;
+        pthread_mutex_unlock(&_inqLock);
         BOOL dead = NO;
+        uint8_t received[sizeof(InputPacket)];
+        size_t receivedCount = 0;
         while (!_stop && !dead) {
             /* 1) Wait briefly for queued input, then drain it into a local batch. The cond wait wakes
                immediately when -sendInput: enqueues, or after 50 ms so we still periodically poll the
@@ -841,6 +1469,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
                 batch[nbatch++] = _inq[_inqHead];
                 _inqHead = (_inqHead + 1) % IDD_INQ_CAP;
             }
+            uint64_t moveGeneration = _mouseMoveGeneration;
             pthread_mutex_unlock(&_inqLock);
 
             /* 2) Send the batch NON-BLOCKING — mirrors the proven Windows send_input
@@ -852,33 +1481,79 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
                acceptor stops draining (force-killed helper) — the ivshmem analog of an hvsocket RST — so
                this send then fails (EPIPE) exactly like Windows. A guest that is merely slow keeps
                draining, so EAGAIN-drop just sheds a few stale input events without dropping the link. */
-            for (int i = 0; i < nbatch && !_stop; i++) {
+            for (int i = 0; i < nbatch; i++) {
+                pthread_mutex_lock(&_inqLock);
+                BOOL move = batch[i].type == INPUT_MOUSE_MOVE || batch[i].type == INPUT_MOUSE_RELATIVE;
+                if ((move && (moveGeneration != _mouseMoveGeneration || _mousePositionRequest)) ||
+                    (batch[i].type == INPUT_MOUSE_MOVE && _relativeMouse) ||
+                    (batch[i].type == INPUT_MOUSE_RELATIVE &&
+                        (!_relativeMouse || _mouseVersion != INPUT_MOUSE_VERSION)) ||
+                    (batch[i].type == INPUT_MOUSE_POSITION_QUERY &&
+                        (!_mousePositionRequest || batch[i].param1 != _mousePositionRequest))) {
+                    pthread_mutex_unlock(&_inqLock);
+                    continue;
+                }
                 ssize_t wn = send(fd, &batch[i], sizeof(InputPacket), MSG_DONTWAIT);
+                pthread_mutex_unlock(&_inqLock);
                 if (wn == (ssize_t)sizeof(InputPacket)) continue;            /* delivered */
                 if (wn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;  /* full -> drop */
                 dead = YES; break;                                          /* error/partial -> reconnect */
             }
             if (dead || _stop) break;
 
-            /* 3) Detect a guest-side teardown even while idle: ch3 is host->guest, but the guest's
-               socketpair end is closed by the pump on disconnect/respawn (asb_ivshmem_pump_main done:),
-               and the input helper sends a one-time READY magic. Poll readable (0 timeout, non-blocking);
-               recv==0 is EOF -> reconnect; recv>0 is the incidental READY byte(s) -> discard and keep
-               serving. So input survives a guest restart even with nothing being typed. */
             fd_set rfds; FD_ZERO(&rfds); FD_SET(fd, &rfds);
             struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
             int s = select(fd + 1, &rfds, NULL, NULL, &tv);
-            if (s < 0) break;                          /* select error -> reconnect */
+            if (s < 0) { if (errno == EINTR) continue; dead = YES; break; }
             if (s > 0 && FD_ISSET(fd, &rfds)) {
-                char drain[64];
-                ssize_t rd = recv(fd, drain, sizeof(drain), 0);
-                if (rd <= 0) break;   /* 0 = guest closed ch3 (respawn/disconnect) -> reconnect */
+                if (mouseVersion == 0) {
+                    char drain[64];
+                    ssize_t rd = recv(fd, drain, sizeof(drain), 0);
+                    if (rd == 0 || (rd < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+                        dead = YES;
+                } else for (;;) {
+                    ssize_t rd = recv(fd, received + receivedCount, sizeof(received) - receivedCount, 0);
+                    if (rd <= 0) {
+                        if (rd == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+                            dead = YES;
+                        break;
+                    }
+                    receivedCount += (size_t)rd;
+                    if (receivedCount == sizeof(InputPacket)) {
+                        InputPacket reply;
+                        memcpy(&reply, received, sizeof(reply));
+                        receivedCount = 0;
+                        if (reply.magic != INPUT_MAGIC) { dead = YES; break; }
+                        if (reply.type == INPUT_MOUSE_POSITION_REPLY) {
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                [weakSelf finishMousePosition:reply connection:connection];
+                            });
+                        }
+                    }
+                }
             }
         }
 
-        pthread_mutex_lock(&_inputLock);
-        if (_inputFd == fd) _inputFd = -1;
-        pthread_mutex_unlock(&_inputLock);
+        if (_stop && !dead) {
+            pthread_mutex_lock(&_inqLock);
+            while (_inqHead != _inqTail) {
+                InputPacket pkt = _inq[_inqHead];
+                _inqHead = (_inqHead + 1) % IDD_INQ_CAP;
+                if (send(fd, &pkt, sizeof(pkt), MSG_DONTWAIT) != (ssize_t)sizeof(pkt)) break;
+            }
+            pthread_mutex_unlock(&_inqLock);
+        }
+        pthread_mutex_lock(&_inqLock);
+        _inputReady = NO;
+        _keyboardVersion = 1;
+        _mouseVersion = 0;
+        _inqHead = _inqTail = 0;
+        memset(_heldKeys, 0, sizeof(_heldKeys));
+        pthread_mutex_unlock(&_inqLock);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            IddDisplayWindow *owner = weakSelf;
+            if (owner && owner->_mouseCaptureConnection == connection) [owner releaseMouseCapture];
+        });
         close(fd);
         if (!_stop) usleep(100000);
     }
@@ -890,6 +1565,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
    Full => drop oldest so latency stays bounded. */
 - (void)pcmPush:(const uint8_t *)p len:(uint32_t)n {
     pthread_mutex_lock(&_pcmLock);
+    if (_audioMuted) { pthread_mutex_unlock(&_pcmLock); return; }
     for (uint32_t i = 0; i < n; i++) {
         uint32_t next = (_pcmTail + 1) % PCM_RING_SZ;
         if (next == _pcmHead) _pcmHead = (_pcmHead + 1) % PCM_RING_SZ;   /* full -> drop oldest */
@@ -900,6 +1576,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 }
 - (uint32_t)pcmPull:(uint8_t *)out len:(uint32_t)n {
     pthread_mutex_lock(&_pcmLock);
+    if (_audioMuted) { pthread_mutex_unlock(&_pcmLock); return 0; }
     uint32_t got = 0;
     while (got < n && _pcmHead != _pcmTail) { out[got++] = _pcm[_pcmHead]; _pcmHead = (_pcmHead + 1) % PCM_RING_SZ; }
     pthread_mutex_unlock(&_pcmLock);
@@ -1275,6 +1952,49 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 
 #pragma mark - NSWindowDelegate
 
+- (void)windowDidBecomeKey:(NSNotification *)notification {
+    (void)notification;
+    [self updateKeyboardCapture];
+    [self updateMouseCapture];
+}
+
+- (void)windowDidResignKey:(NSNotification *)notification {
+    (void)notification;
+    [self releaseKeyboardCapture];
+    [self releaseMouseCapture];
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification {
+    (void)notification;
+    [self updateKeyboardCapture];
+    [self updateMouseCapture];
+}
+
+- (void)applicationDidResignActive:(NSNotification *)notification {
+    (void)notification;
+    [self releaseKeyboardCapture];
+    [self releaseMouseCapture];
+}
+
+- (void)menuDidBeginTracking:(NSNotification *)notification {
+    (void)notification;
+    _trackingMenus++;
+    [self releaseKeyboardCapture];
+    [self releaseMouseCapture];
+}
+
+- (void)menuDidEndTracking:(NSNotification *)notification {
+    (void)notification;
+    if (_trackingMenus) _trackingMenus--;
+    [self updateKeyboardCapture];
+    [self updateMouseCapture];
+}
+
+- (void)windowWillMiniaturize:(NSNotification *)notification {
+    (void)notification;
+    [self releaseMouseCapture];
+}
+
 - (void)windowWillClose:(NSNotification *)notification {
     self.userClosed = YES;   /* mark closed (X button or programmatic) before teardown */
     [self teardown];
@@ -1284,25 +2004,26 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 
 - (void)teardown {
     if (_stop) return;
+    [self releaseMouseCapture];
+    [self releaseKeyboardCapture];
+    if (_eventMonitor) {
+        [NSEvent removeMonitor:_eventMonitor];
+        _eventMonitor = nil;
+    }
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    _trackingMenus = 0;
     _stop = 1;
     [self.timer invalidate];
     self.timer = nil;
-    /* Wake the input worker if it's parked in pthread_cond_timedwait so it sees _stop at once
-       (the shutdown() below also unblocks it if it's mid-send). */
     pthread_mutex_lock(&_inqLock);
     pthread_cond_broadcast(&_inqCond);
     pthread_mutex_unlock(&_inqLock);
-    /* Drop both fds so the threads' blocking calls return: the input thread's published fd, and the
-       display thread's published ch2 fd (it's blocked in idd_rd_full -> recv; shutdown() forces EOF).
-       Without the display shutdown the join below hangs until the VDD next sends a frame. */
     pthread_mutex_lock(&_inputLock);
-    int ifd = _inputFd; _inputFd = -1;
     int dfd = _displayFd; _displayFd = -1;
     int afd = _audioFd; _audioFd = -1;
     int cwfd = _clipWriterFd; _clipWriterFd = -1;
     int crfd = _clipReaderFd; _clipReaderFd = -1;
     pthread_mutex_unlock(&_inputLock);
-    if (ifd >= 0) shutdown(ifd, SHUT_RDWR);
     if (dfd >= 0) shutdown(dfd, SHUT_RDWR);
     /* Audio + clipboard threads block in recv on their published fd; shutdown() forces EOF so the
        join below can't hang (same close-hang fix as display). */
@@ -1317,6 +2038,9 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
         pthread_join(_clipReaderThread, NULL);
         _threadsStarted = NO;
     }
+    pthread_mutex_lock(&_inqLock);
+    _inqHead = _inqTail = 0;
+    pthread_mutex_unlock(&_inqLock);
     /* The audio thread stops its own AudioQueue on exit, but make sure nothing lingers. */
     if (_aq) { AudioQueueStop(_aq, true); AudioQueueDispose(_aq, true); _aq = NULL; }
 }
@@ -1561,7 +2285,12 @@ static CGRect idd_letterbox(double viewW, double viewH, double frameW, double fr
 {
     IddDisplayWindow *o = self.owner;
     if (!o) return;
-    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    if ([o recordRelativeMove:e]) return;
+    [self recordAbsoluteMove:[self convertPoint:e.locationInWindow fromView:nil]];
+}
+- (void)recordAbsoluteMove:(NSPoint)p {
+    IddDisplayWindow *o = self.owner;
+    if (!o) return;
     NSRect b = self.bounds;
     if (b.size.width < 1 || b.size.height < 1) return;
     uint32_t gw = [o frameWidth]  ? [o frameWidth]  : 1920;
@@ -1598,34 +2327,15 @@ static CGRect idd_letterbox(double viewW, double viewH, double frameW, double fr
 /* ---- keyboard ---- */
 - (void)keyDown:(NSEvent *)e
 {
-    [self.owner flushMove];
-    unsigned short kc = e.keyCode;
-    uint8_t vk = (kc < 128) ? g_vk[kc] : 0;
-    if (vk) [self.owner sendInput:INPUT_KEY p1:vk p2:0 p3:(is_extended(kc) ? 1 : 0)];
+    [self.owner forwardKeyEvent:e];
     /* swallow (no super) to avoid the system beep */
 }
 - (void)keyUp:(NSEvent *)e
 {
-    [self.owner flushMove];
-    unsigned short kc = e.keyCode;
-    uint8_t vk = (kc < 128) ? g_vk[kc] : 0;
-    if (vk) [self.owner sendInput:INPUT_KEY p1:vk p2:0 p3:((is_extended(kc) ? 1 : 0) | 2)];
+    [self.owner forwardKeyEvent:e];
 }
 - (void)flagsChanged:(NSEvent *)e
 {
-    [self.owner flushMove];
-    unsigned short kc = e.keyCode;
-    uint32_t vk = 0, mask = 0;
-    switch (kc) {
-    case 0x38: case 0x3C: vk = 0x10; mask = NSEventModifierFlagShift;    break; /* Shift */
-    case 0x3B: case 0x3E: vk = 0x11; mask = NSEventModifierFlagControl;  break; /* Control */
-    case 0x3A: case 0x3D: vk = 0x12; mask = NSEventModifierFlagOption;   break; /* Option->Alt */
-    case 0x37:            vk = 0x5B; mask = NSEventModifierFlagCommand;  break; /* LCmd->LWin */
-    case 0x36:            vk = 0x5C; mask = NSEventModifierFlagCommand;  break; /* RCmd->RWin */
-    case 0x39:            vk = 0x14; mask = NSEventModifierFlagCapsLock; break; /* CapsLock */
-    default: return;
-    }
-    BOOL down = (e.modifierFlags & mask) != 0;
-    [self.owner sendInput:INPUT_KEY p1:vk p2:0 p3:(down ? 0 : 2)];
+    [self.owner forwardKeyEvent:e];
 }
 @end

@@ -16,6 +16,11 @@ typedef void (*P9LogFn)(const char *fmt, ...);
 /* Set the log function used by p9copy. If not set, no logging occurs. */
 void p9_set_log(P9LogFn fn);
 
+typedef struct {
+    BOOL keep_existing;
+    const char *exclude_file; /* Optional case-insensitive leaf filename to skip. */
+} P9CopyOptions;
+
 /* Copy a single Plan9 share to a local directory via HvSocket.
    Connects to the host via AF_HYPERV on the given port, attaches to share_name,
    and recursively copies all files to local_dir.
@@ -27,5 +32,10 @@ void p9_set_log(P9LogFn fn);
 int p9_copy_share(UINT32 port, const char *share_name,
                   const wchar_t *local_dir, const char *filter,
                   int *files_copied);
+
+/* NULL options uses size-based skipping. */
+int p9_copy_share_ex(UINT32 port, const char *share_name,
+                     const wchar_t *local_dir, const char *filter,
+                     const P9CopyOptions *options, int *files_copied);
 
 #endif /* P9COPY_H */

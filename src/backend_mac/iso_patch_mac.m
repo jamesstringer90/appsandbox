@@ -2,6 +2,7 @@
 #import "vm_dir.h"               /* AppSandbox support root (sibling of VMs/) for the driver cache */
 #import <Security/Security.h>
 #import <Security/AuthorizationTags.h>
+#import <Carbon/Carbon.h>
 #import "../../tools/provision/win_provision.h"  /* shared answer-file generator (same source the Windows backend uses) */
 #import "../../tools/provision/mac_account_hash.h"  /* shared macOS ShadowHash + kcpassword encoders */
 
@@ -13,6 +14,50 @@
 
 static AuthorizationRef  g_auth = NULL;
 static dispatch_source_t g_authKeepAlive = NULL;
+
+static NSString *windows_input_locale(void) {
+    TISInputSourceRef source = TISCopyCurrentKeyboardInputSource();
+    if (!source) return nil;
+    NSString *sourceID = [(__bridge NSString *)TISGetInputSourceProperty(source,
+                                                    kTISPropertyInputSourceID) copy];
+    CFRelease(source);
+    NSDictionary<NSString *, NSString *> *layouts = @{
+        @"com.apple.keylayout.ABC": @"0409:00000409",
+        @"com.apple.keylayout.US": @"0409:00000409",
+        @"com.apple.keylayout.USInternational-PC": @"0409:00020409",
+        @"com.apple.keylayout.Dvorak": @"0409:00010409",
+        @"com.apple.keylayout.Dvorak-Left": @"0409:00030409",
+        @"com.apple.keylayout.Dvorak-Right": @"0409:00040409",
+        @"com.apple.keylayout.British": @"0809:00000809",
+        @"com.apple.keylayout.British-PC": @"0809:00000809",
+        @"com.apple.keylayout.German": @"0407:00000407",
+        @"com.apple.keylayout.German-DIN-2137": @"0407:00000407",
+        @"com.apple.keylayout.Austrian": @"0c07:00000407",
+        @"com.apple.keylayout.SwissGerman": @"0807:00000807",
+        @"com.apple.keylayout.French": @"040c:0000040c",
+        @"com.apple.keylayout.French-PC": @"040c:0000040c",
+        @"com.apple.keylayout.CanadianFrench-PC": @"0c0c:00001009",
+        @"com.apple.keylayout.SwissFrench": @"100c:0000100c",
+        @"com.apple.keylayout.Spanish-ISO": @"0c0a:0000040a",
+        @"com.apple.keylayout.Italian-Pro": @"0410:00000410",
+        @"com.apple.keylayout.Portuguese": @"0816:00000816",
+        @"com.apple.keylayout.Brazilian-ABNT2": @"0416:00010416",
+        @"com.apple.keylayout.Russian": @"0419:00000419",
+        @"com.apple.keylayout.RussianWin": @"0419:00000419",
+        @"com.apple.keylayout.PolishPro": @"0415:00000415",
+        @"com.apple.inputmethod.SCIM.ITABC": @"zh-CN",
+        @"com.apple.inputmethod.TCIM.Zhuyin": @"zh-TW",
+        @"com.apple.inputmethod.TCIM.Cangjie": @"0404:{531FDEBF-9B4C-4A43-A2AA-960E8FCDC732}{4BDF9F03-C7D3-11D4-B2AB-0080C882687E}",
+        @"com.apple.inputmethod.TCIM.Sucheng": @"0404:{531FDEBF-9B4C-4A43-A2AA-960E8FCDC732}{6024B45F-5C54-11D4-B921-0080C882687E}",
+        @"com.apple.inputmethod.Korean.2SetKorean": @"ko-KR"
+    };
+    NSString *locale = sourceID ? layouts[sourceID] : nil;
+    if (!locale && [sourceID hasPrefix:@"com.apple.inputmethod.Kotoeri."])
+        locale = @"ja-JP";
+    if (sourceID && !locale)
+        NSLog(@"Windows keyboard: no input profile mapping for %@", sourceID);
+    return locale;
+}
 
 /* Keep-alive interval: shorter than the default 300s TTL of
  * kAuthorizationRightExecute so the right never expires while the app
@@ -392,6 +437,7 @@ static void ensure_fetch_registry(void) {
         @"install",
         @"--name",     name,
         @"--vm-dir",   vmDir.path,
+        @"--disk-path", [VmDir diskImageURLFor:name].path,
         @"--ipsw",     ipswURL.path,
         @"--ram-mb",   [NSString stringWithFormat:@"%d", ramMb],
         @"--cpus",     [NSString stringWithFormat:@"%d", cpus],
@@ -409,13 +455,14 @@ static void ensure_fetch_registry(void) {
  * This is the exact mirror of generate_unattend_vhdx -> asb_provision_unattend in the Windows
  * backend (src/backend_win/disk_util.c / asb_core.c vhdx_create_thread). */
 static BOOL write_unattend_xml(NSString *path, NSString *vmName, NSString *user,
-                               NSString *pass, NSString *lang, BOOL testMode) {
+                               NSString *pass, NSString *lang, NSString *inputLocale, BOOL testMode) {
     FILE *fu = fopen(path.fileSystemRepresentation, "wb");
     if (!fu) return NO;
     int rc = asb_provision_unattend(fu, vmName.UTF8String, user.UTF8String,
                                     pass.length ? pass.UTF8String : "",
                                     "arm64", testMode ? 1 : 0, /*is_arm64=*/1,
-                                    lang.length ? lang.UTF8String : "en-US");
+                                    lang.length ? lang.UTF8String : "en-US",
+                                    inputLocale.UTF8String);
     fclose(fu);
     return rc == 0;
 }
@@ -461,8 +508,9 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
                               ? sshMsiPath.lastPathComponent : nil;
     BOOL hasOverride = (lang.length > 0);
     NSString *initialLang = hasOverride ? lang : @"en-US";
+    NSString *inputLocale = windows_input_locale();
     if (!write_unattend_xml([provDir stringByAppendingPathComponent:@"unattend.xml"],
-                            vmName, adminUser, adminPass, initialLang, testMode) ||
+                            vmName, adminUser, adminPass, initialLang, inputLocale, testMode) ||
         !write_prov_scripts(provDir, sshMsiName)) {
         [fm removeItemAtPath:provDir error:nil];
         completion([NSError errorWithDomain:@"IsoPatchMac" code:7
@@ -493,7 +541,7 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
         if (frac == ISO_PATCH_PROGRESS_LANG) {
             if (!hasOverride) {
                 (void)write_unattend_xml([provDir stringByAppendingPathComponent:@"unattend.xml"],
-                                         vmName, adminUser, adminPass, step, testMode);
+                                         vmName, adminUser, adminPass, step, inputLocale, testMode);
             }
             if (progressBlock)
                 progressBlock(ISO_PATCH_PROGRESS_LOG,
@@ -550,8 +598,8 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
     /* Signed ARM64 release: EV-signed agent EXEs + MS-attestation-signed drivers (VDD/VAD/AppSandboxSHM/
      * devcon). The release version is pinned in the cached filename, so a newer release auto-invalidates
      * the cache. The URL must stay publicly fetchable by an unauthenticated client. */
-    NSString *name   = @"AppSandbox-0.1.4-win-arm64.zip";
-    NSString *urlStr = @"https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.4/AppSandbox-0.1.4-win-arm64.zip";
+    NSString *name   = @"AppSandbox-0.1.5-win-arm64.zip";
+    NSString *urlStr = @"https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.5/AppSandbox-0.1.5-win-arm64.zip";
     NSString *cacheDir = [[VmDir vmsRootDirectory] URLByDeletingLastPathComponent].path;
     [[NSFileManager defaultManager] createDirectoryAtPath:cacheDir
                               withIntermediateDirectories:YES attributes:nil error:nil];

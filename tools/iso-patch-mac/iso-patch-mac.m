@@ -446,6 +446,58 @@ static BOOL add_user_to_admin_group(NSString *mountPt, NSString *shortname,
     return write_plist(admin, adminPath, 0, 80, 0600, errOut);
 }
 
+/* Offline account creation bypasses Open Directory's collision checks. */
+static BOOL new_user_paths_available(NSString *mountPt, NSString *shortname,
+                                     NSString **errOut) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *roots = @[@"private/var/db/dslocal/nodes/Default/users",
+                       @"var/db/dslocal/nodes/Default/users", @"Users"];
+    for (NSString *relativeRoot in roots) {
+        NSString *root = [mountPt stringByAppendingPathComponent:relativeRoot];
+        struct stat st;
+        if (lstat(root.fileSystemRepresentation, &st) != 0) {
+            if (errno == ENOENT) continue;
+            if (errOut) *errOut = [NSString stringWithFormat:
+                @"Cannot check guest account directory %@: %s", relativeRoot, strerror(errno)];
+            return NO;
+        }
+        NSError *error = nil;
+        NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:root error:&error];
+        if (!entries) {
+            if (errOut) *errOut = [NSString stringWithFormat:
+                @"Cannot check guest account directory %@: %@", relativeRoot, error.localizedDescription];
+            return NO;
+        }
+        BOOL homes = [relativeRoot isEqualToString:@"Users"];
+        for (NSString *entry in entries) {
+            if (!homes && [entry.pathExtension caseInsensitiveCompare:@"plist"] != NSOrderedSame)
+                continue;
+            NSString *entryName = homes ? entry : entry.stringByDeletingPathExtension;
+            BOOL collision = [entryName caseInsensitiveCompare:shortname] == NSOrderedSame;
+            if (!homes && !collision) {
+                NSDictionary *record = [NSDictionary dictionaryWithContentsOfFile:
+                    [root stringByAppendingPathComponent:entry]];
+                id names = record[@"name"];
+                if ([names isKindOfClass:[NSArray class]]) {
+                    for (id alias in names) {
+                        if ([alias isKindOfClass:[NSString class]] &&
+                            [alias caseInsensitiveCompare:shortname] == NSOrderedSame) {
+                            collision = YES;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (collision) {
+                if (errOut) *errOut = [NSString stringWithFormat:
+                    @"Username '%@' already exists in the guest account or home directories.", shortname];
+                return NO;
+            }
+        }
+    }
+    return YES;
+}
+
 static BOOL inject_user(NSString *mountPt,
                         NSString *shortname, NSString *realname, int uid,
                         NSData *shd,
@@ -456,6 +508,7 @@ static BOOL inject_user(NSString *mountPt,
         if (errOut) *errOut = @"missing ShadowHashData";
         return NO;
     }
+    if (!new_user_paths_available(mountPt, shortname, errOut)) return NO;
 
     NSString *uuidStr = [[NSUUID UUID] UUIDString];
     NSDictionary *userPlist = @{
@@ -1142,11 +1195,12 @@ static InstallProgressObserver *g_progressObs = nil;
 static VZVirtualMachine        *g_installVM = nil;
 
 static int cmd_install(int argc, char **argv) {
-    NSString *name = nil, *vmDir = nil, *ipsw = nil;
+    NSString *name = nil, *vmDir = nil, *ipsw = nil, *diskPath = nil;
     int ramMb = 0, cpus = 0, diskGb = 0;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) name = @(argv[++i]);
         else if (strcmp(argv[i], "--vm-dir") == 0 && i + 1 < argc) vmDir = @(argv[++i]);
+        else if (strcmp(argv[i], "--disk-path") == 0 && i + 1 < argc) diskPath = @(argv[++i]);
         else if (strcmp(argv[i], "--ipsw") == 0 && i + 1 < argc) ipsw = @(argv[++i]);
         else if (strcmp(argv[i], "--ram-mb") == 0 && i + 1 < argc) ramMb = atoi(argv[++i]);
         else if (strcmp(argv[i], "--cpus") == 0 && i + 1 < argc) cpus = atoi(argv[++i]);
@@ -1165,7 +1219,7 @@ static int cmd_install(int argc, char **argv) {
         return 3;
     }
 
-    NSString *diskPath = [vmDir stringByAppendingPathComponent:@"disk.img"];
+    if (!diskPath) diskPath = [vmDir stringByAppendingPathComponent:@"disk.img"];
     NSString *auxPath  = [vmDir stringByAppendingPathComponent:@"aux.img"];
     NSString *hwPath   = [vmDir stringByAppendingPathComponent:@"hardware.bin"];
     NSString *midPath  = [vmDir stringByAppendingPathComponent:@"machine-id.bin"];
@@ -1594,7 +1648,7 @@ static int cmd_build_windows(int argc, char **argv) {
             FILE *fc = fopen(setupComplete.fileSystemRepresentation, "wb");
             if (fu && fs && fc) {
                 asb_provision_unattend(fu, vmName.UTF8String, user.UTF8String, pass.UTF8String,
-                                       "arm64", testMode, /*is_arm64=*/1, lang.UTF8String);
+                                       "arm64", testMode, /*is_arm64=*/1, lang.UTF8String, NULL);
                 asb_provision_setup_cmd(fs);
                 asb_provision_setupcomplete(fc, sshMsiName.length ? sshMsiName.UTF8String : NULL);
                 scriptsOK = YES;

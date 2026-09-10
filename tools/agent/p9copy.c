@@ -95,6 +95,7 @@ typedef struct {
     UINT32   next_fid;
     UINT32   msize;
     int      files_copied;
+    P9CopyOptions options;
 } P9Session;
 
 /* ---- Logging ---- */
@@ -522,6 +523,27 @@ static void utf8_to_wide(const char *utf8, wchar_t *wide, int wide_max)
     MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, wide_max);
 }
 
+static BOOL skip_excluded_file(P9Session *s, const char *name)
+{
+    if (s->options.exclude_file && s->options.exclude_file[0] &&
+        _stricmp(name, s->options.exclude_file) == 0) {
+        P9LOG("9P skip (excluded): %s", name);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL skip_preserved_file(P9Session *s, const char *name,
+                                const wchar_t *local_path)
+{
+    if (s->options.keep_existing &&
+        GetFileAttributesW(local_path) != INVALID_FILE_ATTRIBUTES) {
+        P9LOG("9P skip (preserve existing): %s", name);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 /* Copy a single file from the 9P share to local disk. */
 static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
                       const wchar_t *local_path, UINT64 file_size)
@@ -531,7 +553,11 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
     UINT64 offset = 0;
     HANDLE hfile;
     BOOL ok = TRUE;
+    BOOL created;
     const char *names[1];
+
+    if (skip_excluded_file(s, name) || skip_preserved_file(s, name, local_path))
+        return TRUE;
 
     /* Check if file exists and same size — skip if so */
     {
@@ -558,23 +584,38 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
         iounit = s->msize - 24;
 
     hfile = CreateFileW(local_path, GENERIC_WRITE, 0, NULL,
-                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                        s->options.keep_existing ? CREATE_NEW : CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
     if (hfile == INVALID_HANDLE_VALUE) {
-        P9LOG("9P cannot create file: %ls (error %lu)", local_path, GetLastError());
+        DWORD err = GetLastError();
         p9_clunk(s, fid);
+        if (s->options.keep_existing &&
+            (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS)) {
+            P9LOG("9P skip (destination created during copy): %s", name);
+            return TRUE;
+        }
+        P9LOG("9P cannot create file: %ls (error %lu)", local_path, err);
         return FALSE;
     }
+    created = s->options.keep_existing || GetLastError() != ERROR_ALREADY_EXISTS;
 
     while (offset < file_size) {
         BYTE *data;
         UINT32 nread;
+        UINT64 remaining = file_size - offset;
+        UINT32 count = remaining < iounit ? (UINT32)remaining : iounit;
         DWORD written;
 
-        if (!p9_read(s, fid, offset, iounit, &data, &nread)) {
+        if (!p9_read(s, fid, offset, count, &data, &nread)) {
             ok = FALSE;
             break;
         }
-        if (nread == 0) break;
+        if (nread == 0) {
+            P9LOG("9P unexpected end of file: %s (%llu/%llu bytes)", name,
+                  (unsigned long long)offset, (unsigned long long)file_size);
+            ok = FALSE;
+            break;
+        }
 
         if (!WriteFile(hfile, data, nread, &written, NULL) || written != nread) {
             P9LOG("9P write failed for %s (error %lu)", name, GetLastError());
@@ -586,6 +627,10 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
 
     CloseHandle(hfile);
     p9_clunk(s, fid);
+
+    if (!ok && created && !DeleteFileW(local_path))
+        P9LOG("9P cannot remove incomplete file: %ls (error %lu)",
+              local_path, GetLastError());
 
     if (ok) {
         s->files_copied++;
@@ -670,21 +715,33 @@ static BOOL copy_dir_contents(P9Session *s, UINT32 dir_fid, const wchar_t *local
                 P9LOG("9P dir: %s", entry_name);
 
                 if (p9_walk(s, dir_fid, child_fid, names, 1, NULL)) {
-                    copy_dir_contents(s, child_fid, child_path);
+                    if (!copy_dir_contents(s, child_fid, child_path))
+                        ok = FALSE;
                     p9_clunk(s, child_fid);
+                } else {
+                    ok = FALSE;
                 }
             } else {
                 UINT32 child_fid = alloc_fid(s);
                 const char *names[1];
                 names[0] = entry_name;
 
+                /* Skip excluded/preserved files before contacting the source,
+                   including files that may be locked on the host. */
+                if (skip_excluded_file(s, entry_name) ||
+                    skip_preserved_file(s, entry_name, child_path))
+                    continue;
+
                 if (p9_walk(s, dir_fid, child_fid, names, 1, NULL)) {
                     UINT64 fsize = 0;
                     UINT32 fmode = 0;
-                    p9_getattr(s, child_fid, &fmode, &fsize);
+                    BOOL got_attr = p9_getattr(s, child_fid, &fmode, &fsize);
                     p9_clunk(s, child_fid);
 
-                    copy_file(s, dir_fid, entry_name, child_path, fsize);
+                    if (!got_attr || !copy_file(s, dir_fid, entry_name, child_path, fsize))
+                        ok = FALSE;
+                } else {
+                    ok = FALSE;
                 }
             }
         }
@@ -717,6 +774,13 @@ static BOOL copy_filtered_files(P9Session *s, UINT32 root_fid,
 
         names[0] = tok;
 
+        utf8_to_wide(tok, wide_name, 512);
+        swprintf_s(local_path, MAX_PATH, L"%s\\%s", local_dir, wide_name);
+        if (skip_excluded_file(s, tok) || skip_preserved_file(s, tok, local_path)) {
+            tok = strtok_s(NULL, ";", &ctx);
+            continue;
+        }
+
         if (!p9_walk(s, root_fid, fid, names, 1, NULL)) {
             P9LOG("9P walk failed for '%s'", tok);
             failed++;
@@ -724,11 +788,13 @@ static BOOL copy_filtered_files(P9Session *s, UINT32 root_fid,
             continue;
         }
 
-        p9_getattr(s, fid, &fmode, &fsize);
+        if (!p9_getattr(s, fid, &fmode, &fsize)) {
+            p9_clunk(s, fid);
+            failed++;
+            tok = strtok_s(NULL, ";", &ctx);
+            continue;
+        }
         p9_clunk(s, fid);
-
-        utf8_to_wide(tok, wide_name, 512);
-        swprintf_s(local_path, MAX_PATH, L"%s\\%s", local_dir, wide_name);
 
         if (!copy_file(s, root_fid, tok, local_path, fsize))
             failed++;
@@ -774,6 +840,13 @@ int p9_copy_share(UINT32 port, const char *share_name,
                   const wchar_t *local_dir, const char *filter,
                   int *files_copied)
 {
+    return p9_copy_share_ex(port, share_name, local_dir, filter, NULL, files_copied);
+}
+
+int p9_copy_share_ex(UINT32 port, const char *share_name,
+                     const wchar_t *local_dir, const char *filter,
+                     const P9CopyOptions *options, int *files_copied)
+{
     P9Session s;
     UINT32 root_fid;
     int result = P9_OK;
@@ -784,6 +857,8 @@ int p9_copy_share(UINT32 port, const char *share_name,
     s.next_fid = 10;
     s.msize = P9_MSIZE;
     s.files_copied = 0;
+    if (options)
+        s.options = *options;
 
     P9LOG("9P connecting to share '%s' on port %u...", share_name, port);
 

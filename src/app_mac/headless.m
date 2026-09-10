@@ -127,6 +127,7 @@ static uid_t g_user_uid = 0;
 static gid_t g_user_gid = 0;
 static dispatch_queue_t g_chown_q;
 static int   g_chown_pending = 0;   /* touched only on g_chown_q */
+static NSArray<NSString *> *g_chown_disk_paths;  /* snapshot, owned by g_chown_q */
 
 /* Resolve the invoking user's uid/gid from the SAME source vm_dir.m uses to
  * resolve the tree location -- getpwnam(SUDO_USER) -- so the chown target and
@@ -148,7 +149,20 @@ static void chown_to_user(NSString *path) {
         chown(path.fileSystemRepresentation, g_user_uid, g_user_gid);
 }
 
-static void fix_tree_ownership_now(void) {
+/* Read the registry on the main queue; only VM disk paths may change owner. */
+static NSArray<NSString *> *vm_disk_ownership_paths(void) {
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (int i = 0; i < asb_mac_vm_count(); i++) {
+        AsbVmMac *vm = asb_mac_vm_get(i);
+        if (!vm || !vm->disk_directory[0]) continue;
+        NSString *name = @(vm->name);
+        [paths addObject:[VmDir diskDirectoryForVm:name].path];
+        [paths addObject:[VmDir diskImageURLFor:name].path];
+    }
+    return paths;
+}
+
+static void fix_tree_ownership_now(NSArray<NSString *> *disk_paths) {
     if (!g_user_uid) return;
     NSTask *t = [[NSTask alloc] init];
     t.launchPath = @"/usr/sbin/chown";
@@ -157,6 +171,9 @@ static void fix_tree_ownership_now(void) {
                           (unsigned)g_user_uid, (unsigned)g_user_gid],
                      support_dir()];
     if ([t launchAndReturnError:nil]) [t waitUntilExit];
+    for (NSString *path in disk_paths) {
+        lchown(path.fileSystemRepresentation, g_user_uid, g_user_gid);
+    }
 }
 
 /* Debounced (5s) so chatty events coalesce; chown -R is metadata-only and the
@@ -164,13 +181,15 @@ static void fix_tree_ownership_now(void) {
  * and written only on g_chown_q (serial), so no cross-thread race. */
 static void fix_tree_ownership_soon(void) {
     if (!g_user_uid) return;
+    NSArray<NSString *> *diskPaths = vm_disk_ownership_paths();
     dispatch_async(g_chown_q, ^{
+        g_chown_disk_paths = diskPaths;
         if (g_chown_pending) return;   /* a pass is already scheduled */
         g_chown_pending = 1;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
                        g_chown_q, ^{
             g_chown_pending = 0;
-            fix_tree_ownership_now();
+            fix_tree_ownership_now(g_chown_disk_paths);
         });
     });
 }
@@ -300,6 +319,7 @@ static NSDictionary *vm_status_dict(const AsbVmMac *v) {
     return @{
         @"name":            @(v->name),
         @"osType":          @(v->os_type),
+        @"diskDirectory":   [VmDir diskDirectoryForVm:@(v->name)].URLByDeletingLastPathComponent.path,
         @"state":           @(derive_state(v)),
         @"running":         v->running ? @YES : @NO,
         @"agentOnline":     v->agent_online ? @YES : @NO,
@@ -327,9 +347,10 @@ static NSDictionary *vm_status_dict(const AsbVmMac *v) {
  * templates), plus the numeric rules the Windows daemon enforces, so the API
  * rejects exactly what the UI would. Returns an English error (nil = valid). */
 static NSString *validate_create_mac(NSString *name, NSString *os,
-                                     NSString *user, BOOL is_template,
+                                     id user, id password, BOOL is_template,
                                      int ram_mb, int hdd_gb, int cpu_cores,
-                                     int gpu_mode, int net_mode) {
+                                     int gpu_mode, int net_mode,
+                                     NSString *disk_directory) {
     BOOL is_mac = [os.lowercaseString isEqualToString:@"macos"];
     BOOL is_win = [os.lowercaseString isEqualToString:@"windows"];
     if (!is_mac && !is_win)
@@ -337,9 +358,12 @@ static NSString *validate_create_mac(NSString *name, NSString *os,
     if (is_template)
         return @"Templates are not yet supported for Windows-on-Mac (use a direct ISO install).";
 
-    /* name / hostname (macOS LocalHostName rules, app.js validateVmName) */
     if (!name.length) return @"VM name is required.";
-    if (name.length > 63) return @"VM name cannot exceed 63 characters (macOS LocalHostName limit).";
+    if (is_win) {
+        if (name.length > 15) return @"VM name cannot exceed 15 characters (NetBIOS limit).";
+    } else if (name.length > 63) {
+        return @"VM name cannot exceed 63 characters (macOS LocalHostName limit).";
+    }
     BOOL all_digits = YES;
     for (NSUInteger i = 0; i < name.length; i++) {
         unichar ch = [name characterAtIndex:i];
@@ -354,24 +378,11 @@ static NSString *validate_create_mac(NSString *name, NSString *os,
     if (asb_mac_vm_find(name.UTF8String))
         return @"A VM with this name already exists.";
 
-    /* username -- app.js applies the Windows-account ruleset on macOS */
-    if (!user.length) return @"Username is required.";
-    if (user.length > 20) return @"Username cannot exceed 20 characters.";
-    BOOL only_dots_ws = YES;
-    for (NSUInteger i = 0; i < user.length; i++) {
-        unichar ch = [user characterAtIndex:i];
-        if ([@"\"\\/[]:;|=,+*?<>" rangeOfString:
-                [NSString stringWithCharacters:&ch length:1]].location != NSNotFound)
-            return @"Username contains invalid characters.";
-        if (!(ch == '.' || ch == ' ' || ch == '\t')) only_dots_ws = NO;
-    }
-    if (only_dots_ws) return @"Username cannot be only dots or spaces.";
-    if ([user hasSuffix:@"."]) return @"Username cannot end with a period.";
-    NSArray *reserved = @[@"CON",@"PRN",@"AUX",@"NUL",
-        @"COM1",@"COM2",@"COM3",@"COM4",@"COM5",@"COM6",@"COM7",@"COM8",@"COM9",
-        @"LPT1",@"LPT2",@"LPT3",@"LPT4",@"LPT5",@"LPT6",@"LPT7",@"LPT8",@"LPT9"];
-    if ([reserved containsObject:user.uppercaseString])
-        return @"Username is a reserved name.";
+    NSString *usernameError = asb_mac_validate_username(os, user, name);
+    if (usernameError) return usernameError;
+
+    NSString *passwordError = asb_mac_validate_password(os, password);
+    if (passwordError) return passwordError;
 
     /* numeric ranges (0 = unset -> the core fills a default). The even-RAM
        rule is kept for interface parity with the GUI/Windows daemon. */
@@ -384,7 +395,7 @@ static NSString *validate_create_mac(NSString *name, NSString *os,
     if (gpu_mode < 0 || gpu_mode > 2)    return @"gpuMode must be 0 (None), 1 (Default), or 2 (Try all).";
     if (net_mode < 0 || net_mode > 3)    return @"networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal).";
 
-    return nil;
+    return [VmDir validationErrorForDiskDirectory:disk_directory vmName:name];
 }
 
 /* ---- Minimal HTTP plumbing (loopback only, Connection: close) ---- */
@@ -608,10 +619,11 @@ static void cleanup_and_exit(int code) {
     if (g_listen_fd >= 0) close(g_listen_fd);
     /* Orderly teardown of agent/proxy/clipboard threads; the VZ VMs themselves
        are in-process and terminate with us -- the daemon owns its VMs. */
+    NSArray<NSString *> *diskPaths = vm_disk_ownership_paths();
     asb_mac_cleanup();
     /* Final synchronous hand-back: everything root touched in the user's
        AppSandbox tree is the user's again before we exit. */
-    fix_tree_ownership_now();
+    fix_tree_ownership_now(diskPaths);
     hlog(@"cleaned up. exit %d.", code);
     if (g_log) { fclose(g_log); g_log = NULL; }
     if (g_lock_fd >= 0) close(g_lock_fd);
@@ -665,6 +677,7 @@ static int handle_request(int fd, HttpReq *r) {
             info = @{ @"hostCores": @([HostInfo hostCores]),
                       @"hostRamMb": @([HostInfo hostRamMb]),
                       @"freeGb":    @([HostInfo freeGb]),
+                      @"defaultDiskDirectory": [VmDir vmsRootDirectory].path,
                       @"vmCores":   @(vmCores), @"vmRamMb": @(vmRamMb),
                       @"vmHddGb":   @(vmHddGb) };
         });
@@ -699,10 +712,13 @@ static int handle_request(int fd, HttpReq *r) {
             if (!b[@"name"]) name = @"";
             NSString *os   = b[@"osType"] ? [b[@"osType"] description] : @"macOS";
             NSString *img  = b[@"imagePath"] ? [b[@"imagePath"] description] : @"";
-            NSString *user = b[@"adminUser"] ? [[b[@"adminUser"] description]
-                                stringByTrimmingCharactersInSet:
-                                [NSCharacterSet whitespaceAndNewlineCharacterSet]] : @"";
-            NSString *pass = b[@"adminPass"] ? [b[@"adminPass"] description] : @"";
+            if (b[@"diskDirectory"] && ![b[@"diskDirectory"] isKindOfClass:[NSString class]]) {
+                send_err(fd, 400, "Bad Request", @"invalid_arg", @"diskDirectory must be a string.");
+                return 0;
+            }
+            NSString *diskDirectory = b[@"diskDirectory"] ?: @"";
+            NSString *user = b[@"adminUser"];
+            NSString *pass = b[@"adminPass"];
             int ram = [b[@"ramMb"] intValue], hdd = [b[@"hddGb"] intValue];
             int cpu = [b[@"cpuCores"] intValue], gpu = [b[@"gpuMode"] intValue];
             int net = [b[@"networkMode"] intValue];
@@ -718,8 +734,8 @@ static int handle_request(int fd, HttpReq *r) {
             }
             __block NSString *verr;
             on_main(^{
-                verr = validate_create_mac(name, os, user, isTemplate,
-                                           ram, hdd, cpu, gpu, net);
+                verr = validate_create_mac(name, os, user, pass, isTemplate,
+                                           ram, hdd, cpu, gpu, net, diskDirectory);
             });
             if (verr) {
                 send_err(fd, 400, "Bad Request", @"invalid_arg", verr);
@@ -742,6 +758,7 @@ static int handle_request(int fd, HttpReq *r) {
                 int rc = asb_mac_vm_create(name.UTF8String, os.UTF8String,
                                            ram, hdd, cpu, gpu, net,
                                            img.length ? img.UTF8String : NULL,
+                                           diskDirectory.UTF8String,
                                            user.UTF8String, pass.UTF8String,
                                            sshEnabled, sshDeploy, testMode);
                 if (rc != BACKEND_OK)

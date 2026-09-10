@@ -1,4 +1,5 @@
 #import "qemu_vm.h"
+#import "vm_dir.h"
 #import "asb_ivshmem_transport.h"
 #import <Security/Security.h>
 
@@ -176,7 +177,7 @@
         }
     }
 
-    NSString *diskPath = [self.vmDir URLByAppendingPathComponent:@"disk.img"].path;
+    NSString *diskPath = [VmDir diskImageURLFor:self.name].path;
     NSString *ivsPath  = [self.vmDir URLByAppendingPathComponent:@"ivshmem.bin"].path;
     NSString *varsPath = [self.vmDir URLByAppendingPathComponent:@"vars.fd"].path;
 
@@ -234,7 +235,8 @@
          * the Hyper-V case where the desktop lands on the VDD with no topology setup. */
         @"-device", @"qemu-xhci,id=usb", @"-device", @"usb-kbd", @"-device", @"usb-tablet",
         @"-device", @"nvme,drive=hdd,serial=asb-nvme,bootindex=0",
-        @"-drive", [NSString stringWithFormat:@"if=none,id=hdd,format=raw,file=%@", diskPath],
+        @"-drive", [NSString stringWithFormat:@"if=none,id=hdd,format=raw,file=%@",
+                    [diskPath stringByReplacingOccurrencesOfString:@"," withString:@",,"]],
         @"-netdev", @"vmnet-shared,id=net0",
         /* NAT networking: vmnet-shared NATs the guest to the internet AND puts the host on the same
          * private subnet (bridge100 is the gateway), so host<->guest is reachable over IP. The NIC is

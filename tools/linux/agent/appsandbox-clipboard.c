@@ -612,6 +612,11 @@ static uint32_t g_cf_html_id = 0;        /* host sends this in the format id */
 /* X atom resolution cache, populated at startup. */
 static xcb_atom_t g_x_atom[N_FORMATS];
 static xcb_atom_t g_x_atom_html = XCB_ATOM_NONE;
+static struct {
+    uint32_t cf;
+    xcb_atom_t target;
+} g_guest_formats[CLIP_MAX_FORMATS];
+static uint32_t g_guest_format_count;
 
 static enum conv_kind cf_to_conv(uint32_t cf)
 {
@@ -682,6 +687,7 @@ static xcb_atom_t a_INCR;
 static xcb_atom_t a_MULTIPLE;
 static xcb_atom_t a_TIMESTAMP;
 static xcb_atom_t a_ATOM;
+static xcb_atom_t a_CLIP_DATA;
 
 static xcb_atom_t intern_atom(const char *name)
 {
@@ -734,6 +740,7 @@ static int xcb_setup(void)
     a_MULTIPLE  = intern_atom("MULTIPLE");
     a_TIMESTAMP = intern_atom("TIMESTAMP");
     a_ATOM      = XCB_ATOM_ATOM;
+    a_CLIP_DATA = intern_atom("_APPSANDBOX_CLIP_DATA");
 
     /* Per-format atoms. */
     for (size_t i = 0; i < N_FORMATS; i++)
@@ -771,13 +778,22 @@ static uint32_t target_to_cf(xcb_atom_t target)
     return 0;
 }
 
-/* Inverse: given a CF_*, return the preferred X target atom. The
- * format table is ordered so the first match is the preferred one. */
-static xcb_atom_t cf_to_preferred_target(uint32_t cf)
+static xcb_atom_t cf_to_offered_target(uint32_t cf, const xcb_atom_t *atoms,
+                                      uint32_t count)
 {
     if (cf == g_cf_html_id && g_x_atom_html) return g_x_atom_html;
-    for (size_t i = 0; i < N_FORMATS; i++)
-        if (kFormats[i].cf == cf) return g_x_atom[i];
+    for (size_t i = 0; i < N_FORMATS; i++) {
+        if (kFormats[i].cf != cf) continue;
+        for (uint32_t j = 0; j < count; j++)
+            if (atoms[j] == g_x_atom[i]) return g_x_atom[i];
+    }
+    return XCB_ATOM_NONE;
+}
+
+static xcb_atom_t guest_target_for_cf(uint32_t cf)
+{
+    for (uint32_t i = 0; i < g_guest_format_count; i++)
+        if (g_guest_formats[i].cf == cf) return g_guest_formats[i].target;
     return XCB_ATOM_NONE;
 }
 
@@ -1249,6 +1265,9 @@ struct pending_host_req {
     bool         active;
     uint32_t     cf;
     xcb_atom_t   target;
+    xcb_atom_t   property;
+    xcb_window_t owner;
+    xcb_timestamp_t time;
     bool         incr;        /* receiving via INCR protocol */
     uint8_t     *accum;       /* growing buffer */
     size_t       accum_len;
@@ -1259,6 +1278,9 @@ static struct pending_host_req g_pending_host;
 /* Accepted clients (one per channel at a time). */
 static int g_writer_fd = -1;
 static int g_reader_fd = -1;
+static xcb_window_t g_selection_owner;
+static xcb_timestamp_t g_selection_time;
+static bool g_targets_dirty;
 
 /* When we're owner of CLIPBOARD via a FORMAT_LIST from the host, hold
  * onto the last set of formats we advertised so SelectionRequest TARGETS
@@ -1581,33 +1603,52 @@ static void handle_selection_request(xcb_selection_request_event_t *ev)
 
 /* ---- Guest→host path: handle CLIPBOARD owner change ---- */
 
+static void query_guest_targets(void)
+{
+    if (!g_targets_dirty || g_pending_host.active ||
+        !g_sync_enabled || g_reader_fd < 0 ||
+        g_selection_owner == XCB_NONE || g_selection_owner == g_window) return;
+
+    g_targets_dirty = false;
+    g_pending_host.active = true;
+    g_pending_host.target = a_TARGETS;
+    g_pending_host.property = a_TARGETS;
+    g_pending_host.owner = g_selection_owner;
+    g_pending_host.time = g_selection_time;
+    xcb_delete_property(g_xcb, g_window, a_TARGETS);
+    xcb_convert_selection(g_xcb, g_window, a_CLIPBOARD, a_TARGETS,
+                          a_TARGETS, g_pending_host.time);
+    xcb_flush(g_xcb);
+    clip_log("CLIPBOARD owner changed, fetching TARGETS");
+}
+
+static bool pending_host_is_current(void)
+{
+    return g_pending_host.owner == g_selection_owner &&
+           g_pending_host.time == g_selection_time && g_sync_enabled;
+}
+
+static void finish_pending_host(bool failed)
+{
+    if (failed && g_pending_host.active && g_pending_host.cf && g_reader_fd >= 0)
+        send_clip_msg(g_reader_fd, CLIP_MSG_FORMAT_DATA_RESP,
+                      g_pending_host.cf, NULL, 0);
+    free(g_pending_host.accum);
+    memset(&g_pending_host, 0, sizeof(g_pending_host));
+    query_guest_targets();
+}
+
 static void handle_xfixes_selection_notify(xcb_xfixes_selection_notify_event_t *ev)
 {
     if (ev->selection != a_CLIPBOARD) return;
 
-    /* Owner change to ourselves means our own xcb_set_selection_owner —
-     * ignore to avoid loop. */
-    if (ev->owner == g_window) return;
-
-    /* If sync is gated off, swallow. */
-    if (!g_sync_enabled || g_reader_fd < 0) return;
-
-    /* If owner went to None, host clipboard becomes empty — clearing
-     * the host doesn't have a clean wire representation (the host's
-     * vm_clipboard.c expects FORMAT_LIST to be non-empty), so just no-op. */
-    if (ev->owner == XCB_NONE) return;
-
-    /* Query TARGETS to discover available formats on the new owner. */
-    if (g_pending_host.active) {
-        /* Already mid-fetch; drop. The next change will re-trigger. */
-        return;
-    }
-    xcb_convert_selection(g_xcb, g_window, a_CLIPBOARD, a_TARGETS,
-                          a_TARGETS, ev->timestamp);
-    xcb_flush(g_xcb);
-    g_pending_host.active = true;
-    g_pending_host.target = a_TARGETS;
-    clip_log("CLIPBOARD owner changed, fetching TARGETS");
+    g_selection_owner = ev->owner;
+    g_selection_time = ev->selection_timestamp;
+    g_guest_format_count = 0;
+    g_targets_dirty = g_sync_enabled && g_reader_fd >= 0 &&
+                      ev->owner != XCB_NONE && ev->owner != g_window;
+    /* Finish the old transfer before reusing its reply property. */
+    query_guest_targets();
 }
 
 /* SelectionNotify arrives in response to xcb_convert_selection — could
@@ -1615,9 +1656,15 @@ static void handle_xfixes_selection_notify(xcb_xfixes_selection_notify_event_t *
  * data reply for a specific format. */
 static void handle_selection_notify(xcb_selection_notify_event_t *ev)
 {
+    if (!g_pending_host.active || ev->requestor != g_window ||
+        ev->selection != a_CLIPBOARD || ev->target != g_pending_host.target ||
+        ev->time != g_pending_host.time ||
+        (ev->property != XCB_ATOM_NONE && ev->property != g_pending_host.property))
+        return;
+
     if (ev->property == XCB_ATOM_NONE) {
         clip_log("SelectionNotify with no property — owner declined");
-        g_pending_host.active = false;
+        finish_pending_host(true);
         return;
     }
 
@@ -1627,7 +1674,7 @@ static void handle_selection_notify(xcb_selection_notify_event_t *ev)
                                                     0, UINT32_MAX);
     xcb_get_property_reply_t *pr = xcb_get_property_reply(g_xcb, pc, NULL);
     if (!pr) {
-        g_pending_host.active = false;
+        finish_pending_host(true);
         return;
     }
 
@@ -1647,17 +1694,32 @@ static void handle_selection_notify(xcb_selection_notify_event_t *ev)
     uint32_t n = xcb_get_property_value_length(pr);
     void *val = xcb_get_property_value(pr);
 
+    if (!pending_host_is_current() || pr->type == XCB_ATOM_NONE) {
+        free(pr);
+        finish_pending_host(true);
+        return;
+    }
+
     if (ev->target == a_TARGETS) {
+        if (pr->type != a_ATOM || pr->format != 32) {
+            free(pr);
+            finish_pending_host(true);
+            return;
+        }
         /* TARGETS arrived — build a FORMAT_LIST and ship. */
         const xcb_atom_t *atoms = (const xcb_atom_t *)val;
         uint32_t n_atoms = n / 4;
         uint8_t buf[16384];
         uint32_t count = 0;
         size_t off = 4;
+        g_guest_format_count = 0;
         for (uint32_t i = 0; i < n_atoms; i++) {
             uint32_t cf = target_to_cf(atoms[i]);
-            if (cf == 0) continue;
+            if (cf == 0 || guest_target_for_cf(cf) != XCB_ATOM_NONE) continue;
             if (off + 8 > sizeof(buf)) break;
+            g_guest_formats[count].cf = cf;
+            g_guest_formats[count].target = cf_to_offered_target(cf, atoms, n_atoms);
+            g_guest_format_count = count + 1;
             *(uint32_t *)(buf + off) = cf;       off += 4;
             *(uint32_t *)(buf + off) = 0;        off += 4;   /* name_len, only used for registered names */
             count++;
@@ -1670,7 +1732,7 @@ static void handle_selection_notify(xcb_selection_notify_event_t *ev)
             clip_log("→ host FORMAT_LIST (%u formats)", count);
         }
         free(pr);
-        g_pending_host.active = false;
+        finish_pending_host(false);
         return;
     }
 
@@ -1681,7 +1743,7 @@ static void handle_selection_notify(xcb_selection_notify_event_t *ev)
     uint32_t cf = g_pending_host.cf;
     if (cf == 0 || g_reader_fd < 0) {
         free(pr);
-        g_pending_host.active = false;
+        finish_pending_host(true);
         return;
     }
 
@@ -1692,7 +1754,7 @@ static void handle_selection_notify(xcb_selection_notify_event_t *ev)
          * CF_HDROP branch). */
         deliver_hdrop_to_host((const uint8_t *)val, n);
         free(pr);
-        g_pending_host.active = false;
+        finish_pending_host(false);
         return;
     }
 
@@ -1709,7 +1771,7 @@ static void handle_selection_notify(xcb_selection_notify_event_t *ev)
         clip_log("→ host FORMAT_DATA_RESP cf=%u (empty, convert failed)", cf);
     }
     free(pr);
-    g_pending_host.active = false;
+    finish_pending_host(false);
 }
 
 /* PropertyNotify routing:
@@ -1730,13 +1792,21 @@ static void handle_property_notify(xcb_property_notify_event_t *ev)
 
     if (ev->window != g_window) return;
     if (ev->state != XCB_PROPERTY_NEW_VALUE) return;
-    if (!g_pending_host.incr) return;
+    if (!g_pending_host.active || !g_pending_host.incr ||
+        ev->atom != g_pending_host.property) return;
 
     xcb_get_property_cookie_t pc = xcb_get_property(g_xcb, 1, g_window,
                                                     ev->atom, XCB_GET_PROPERTY_TYPE_ANY,
                                                     0, UINT32_MAX);
     xcb_get_property_reply_t *pr = xcb_get_property_reply(g_xcb, pc, NULL);
-    if (!pr) return;
+    if (!pr) {
+        finish_pending_host(true);
+        return;
+    }
+    if (pr->type == XCB_ATOM_NONE) {
+        free(pr);
+        return;
+    }
     uint32_t n = xcb_get_property_value_length(pr);
     void *val = xcb_get_property_value(pr);
 
@@ -1746,10 +1816,14 @@ static void handle_property_notify(xcb_property_notify_event_t *ev)
          * collapse DIBV5 → DIB). */
         uint32_t cf = g_pending_host.cf ? g_pending_host.cf
                                         : target_to_cf(g_pending_host.target);
-        if (cf == CF_HDROP && g_reader_fd >= 0 && g_pending_host.accum) {
+        bool replied = false;
+        if (pending_host_is_current() && cf == CF_HDROP &&
+            g_reader_fd >= 0 && g_pending_host.accum) {
             deliver_hdrop_to_host(g_pending_host.accum,
                                   g_pending_host.accum_len);
-        } else if (cf && g_reader_fd >= 0 && g_pending_host.accum) {
+            replied = true;
+        } else if (pending_host_is_current() && cf &&
+                   g_reader_fd >= 0 && g_pending_host.accum) {
             size_t cf_len = 0;
             uint8_t *cf_bytes = convert_x_to_cf(cf, g_pending_host.accum,
                                                  g_pending_host.accum_len, &cf_len);
@@ -1759,14 +1833,14 @@ static void handle_property_notify(xcb_property_notify_event_t *ev)
                 free(cf_bytes);
                 clip_log("→ host (INCR) FORMAT_DATA_RESP cf=%u (%zu bytes)",
                          cf, cf_len);
+                replied = true;
             }
         }
-        free(g_pending_host.accum);
-        g_pending_host.accum = NULL;
-        g_pending_host.accum_len = 0;
-        g_pending_host.accum_cap = 0;
-        g_pending_host.incr = false;
-        g_pending_host.active = false;
+        free(pr);
+        xcb_delete_property(g_xcb, g_window, ev->atom);
+        xcb_flush(g_xcb);
+        finish_pending_host(!replied);
+        return;
     } else {
         /* Accumulate. */
         if (g_pending_host.accum_len + n > g_pending_host.accum_cap) {
@@ -1805,6 +1879,10 @@ static void handle_property_notify(xcb_property_notify_event_t *ev)
 
 static void take_clipboard_ownership(xcb_timestamp_t time)
 {
+    g_guest_format_count = 0;
+    g_selection_owner = g_window;
+    g_selection_time = time;
+    g_targets_dirty = false;
     xcb_set_selection_owner(g_xcb, g_window, a_CLIPBOARD, time);
     xcb_flush(g_xcb);
     g_we_own_clipboard = true;
@@ -1813,6 +1891,9 @@ static void take_clipboard_ownership(xcb_timestamp_t time)
 static void release_clipboard_ownership(void)
 {
     if (!g_we_own_clipboard) return;
+    g_guest_format_count = 0;
+    g_selection_owner = XCB_NONE;
+    g_targets_dirty = false;
     xcb_set_selection_owner(g_xcb, XCB_NONE, a_CLIPBOARD, XCB_CURRENT_TIME);
     xcb_flush(g_xcb);
     g_we_own_clipboard = false;
@@ -1838,7 +1919,11 @@ static int handle_writer_message(int fd, const struct ClipHeader *h)
         }
         g_sync_enabled = flag ? true : false;
         clip_log("recv SYNC_ENABLE=%d", flag);
-        if (!g_sync_enabled) release_clipboard_ownership();
+        if (!g_sync_enabled) {
+            g_guest_format_count = 0;
+            g_targets_dirty = false;
+            release_clipboard_ownership();
+        }
         return 0;
     }
 
@@ -2078,7 +2163,7 @@ static int handle_reader_message(int fd, const struct ClipHeader *h)
             send_clip_msg(fd, CLIP_MSG_FORMAT_DATA_RESP, h->format, NULL, 0);
             return 0;
         }
-        xcb_atom_t target = cf_to_preferred_target(h->format);
+        xcb_atom_t target = guest_target_for_cf(h->format);
         if (target == XCB_ATOM_NONE) {
             send_clip_msg(fd, CLIP_MSG_FORMAT_DATA_RESP, h->format, NULL, 0);
             return 0;
@@ -2086,14 +2171,16 @@ static int handle_reader_message(int fd, const struct ClipHeader *h)
         g_pending_host.active = true;
         g_pending_host.cf     = h->format;
         g_pending_host.target = target;
+        g_pending_host.property = a_CLIP_DATA;
+        g_pending_host.owner = g_selection_owner;
+        g_pending_host.time = g_selection_time;
         g_pending_host.incr   = false;
         g_pending_host.accum  = NULL;
         g_pending_host.accum_len = 0;
         g_pending_host.accum_cap = 0;
-        /* Use a unique property atom on our window. */
-        xcb_atom_t prop = intern_atom("_APPSANDBOX_CLIP_DATA");
+        xcb_delete_property(g_xcb, g_window, a_CLIP_DATA);
         xcb_convert_selection(g_xcb, g_window, a_CLIPBOARD, target,
-                              prop, XCB_CURRENT_TIME);
+                              a_CLIP_DATA, g_pending_host.time);
         xcb_flush(g_xcb);
         clip_log("recv FORMAT_DATA_REQ cf=%u → XConvertSelection target=%u",
                  h->format, target);
@@ -2230,6 +2317,10 @@ int main(void)
                 int c = accept(listen_reader, NULL, NULL);
                 if (c < 0) continue;
                 if (g_reader_fd >= 0) close(g_reader_fd);
+                g_reader_fd = -1;
+                g_guest_format_count = 0;
+                finish_pending_host(false);
+                g_targets_dirty = false;
                 g_reader_fd = c;
                 uint32_t ready = CLIP_READY_MAGIC;
                 send_exact(c, &ready, 4);
@@ -2250,6 +2341,8 @@ int main(void)
                     g_writer_fd = -1;
                     release_clipboard_ownership();
                     g_sync_enabled = false;
+                    g_guest_format_count = 0;
+                    g_targets_dirty = false;
                     /* Abandon any in-flight host roundtrip so SelectionRequests
                      * don't stay rejected forever. */
                     if (g_pending_x.active) {
@@ -2273,8 +2366,9 @@ int main(void)
                     close(fd);
                     g_reader_fd = -1;
                     /* Drop any in-flight X→host fetch state. */
-                    free(g_pending_host.accum);
-                    memset(&g_pending_host, 0, sizeof(g_pending_host));
+                    g_guest_format_count = 0;
+                    finish_pending_host(false);
+                    g_targets_dirty = false;
                 }
             }
         }

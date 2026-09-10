@@ -28,7 +28,8 @@ extern "C" {
  *   lang       : UI/locale BCP-47 tag (e.g. "en-US")
  * Returns 0 on success. */
 int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const char *pass,
-                           const char *arch, int test_mode, int is_arm64, const char *lang);
+                           const char *arch, int test_mode, int is_arm64, const char *lang,
+                           const char *input_locale);
 
 /* setup.cmd -- first-logon: agent already staged at C:\Windows\AppSandbox\; register the service. */
 int asb_provision_setup_cmd(FILE *f);

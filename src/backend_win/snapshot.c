@@ -73,6 +73,11 @@ void snapshot_save(SnapshotTree *tree)
     int i, b;
 
     swprintf_s(path, MAX_PATH, L"%s\\tree.dat", tree->base_dir);
+    if (tree->count == 0 && tree->base_branch_count == 0) {
+        tree->base_vhdx[0] = L'\0';
+        DeleteFileW(path);
+        return;
+    }
     if (_wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f) return;
 
     fwprintf(f, L"[Base]\n%s\n\n", tree->base_vhdx);
@@ -221,6 +226,8 @@ void snapshot_init(SnapshotTree *tree, const wchar_t *base_dir)
     wcscpy_s(tree->base_dir, MAX_PATH, base_dir);
     CreateDirectoryW(base_dir, NULL);
     snapshot_load(tree);
+    if (tree->count == 0 && tree->base_branch_count == 0 && tree->base_vhdx[0] != L'\0')
+        snapshot_save(tree);
 }
 
 HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *name)
@@ -333,6 +340,27 @@ HRESULT snapshot_select_branch(SnapshotTree *tree, VmInstance *instance, int ind
 
     wcscpy_s(instance->vhdx_path, MAX_PATH, branches[branch_idx].vhdx_path);
     return S_OK;
+}
+
+HRESULT snapshot_ensure_writable(SnapshotTree *tree, VmInstance *instance)
+{
+    int i;
+
+    if (!tree || !instance) return E_INVALIDARG;
+    if (instance->running) return E_NOT_VALID_STATE;
+
+    if ((tree->count > 0 || tree->base_branch_count > 0) &&
+        tree->base_vhdx[0] != L'\0' &&
+        _wcsicmp(instance->vhdx_path, tree->base_vhdx) == 0)
+        return snapshot_new_branch(tree, instance, -2);
+
+    for (i = 0; i < tree->count; i++) {
+        if (tree->nodes[i].valid &&
+            _wcsicmp(instance->vhdx_path, tree->nodes[i].snap_vhdx) == 0)
+            return snapshot_new_branch(tree, instance, i);
+    }
+
+    return S_FALSE;
 }
 
 HRESULT snapshot_delete(SnapshotTree *tree, VmInstance *instance, int index)

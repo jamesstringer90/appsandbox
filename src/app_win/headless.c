@@ -242,10 +242,14 @@ static const char *derive_state(VmInstance *v)
 /* Cheap per-VM status object (no disk I/O -- snapshot tree is a separate route). */
 static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
 {
+    wchar_t disk_directory[MAX_PATH];
     pos += sprintf_s(out + pos, cap - pos, "{\"name\":");
     pos  = append_wstr(out, cap, pos, v->name);
     pos += sprintf_s(out + pos, cap - pos, ",\"osType\":");
     pos  = append_wstr(out, cap, pos, v->os_type);
+    asb_vm_disk_directory((AsbVm)v, disk_directory, MAX_PATH);
+    pos += sprintf_s(out + pos, cap - pos, ",\"diskDirectory\":");
+    pos = append_wstr(out, cap, pos, disk_directory);
     pos += sprintf_s(out + pos, cap - pos,
         ",\"state\":\"%s\",\"running\":%s,\"agentOnline\":%s,\"installComplete\":%s,"
         "\"building\":%s,\"progress\":%d,\"sshState\":%d,\"sshPort\":%lu,"
@@ -267,7 +271,7 @@ static int build_host_info(char *buf, int cap)
 {
     SYSTEM_INFO si; MEMORYSTATUSEX ms; ULARGE_INTEGER freeB;
     wchar_t pd[MAX_PATH];
-    int i, count, vmCores = 0, vmRamMb = 0, vmHddGb = 0;
+    int i, count, pos, vmCores = 0, vmRamMb = 0, vmHddGb = 0;
     GetSystemInfo(&si);
     ms.dwLength = sizeof(ms); GlobalMemoryStatusEx(&ms);
     if (!GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH)) wcscpy_s(pd, MAX_PATH, L"C:\\");
@@ -279,13 +283,17 @@ static int build_host_info(char *buf, int cap)
         if (v->running) { vmCores += (int)v->cpu_cores; vmRamMb += (int)v->ram_mb; }
         vmHddGb += (int)v->hdd_gb;
     }
-    return sprintf_s(buf, cap,
+    pos = sprintf_s(buf, cap,
         "{\"hostCores\":%lu,\"hostRamMb\":%llu,\"freeGb\":%llu,"
-        "\"vmCores\":%d,\"vmRamMb\":%d,\"vmHddGb\":%d}",
+        "\"vmCores\":%d,\"vmRamMb\":%d,\"vmHddGb\":%d,\"defaultDiskDirectory\":",
         (unsigned long)si.dwNumberOfProcessors,
         (unsigned long long)(ms.ullTotalPhys / (1024ULL * 1024)),
         (unsigned long long)(freeB.QuadPart / (1024ULL * 1024 * 1024)),
         vmCores, vmRamMb, vmHddGb);
+    asb_default_disk_directory(pd, MAX_PATH);
+    pos = append_wstr(buf, cap, pos, pd);
+    pos += sprintf_s(buf + pos, cap - pos, "}");
+    return pos;
 }
 
 /* ---- HTTP helpers ---- */
@@ -340,7 +348,7 @@ static void send_hr(HTTP_REQUEST_ID id, const char *action, const char *nu, HRES
 }
 
 /* Read the request entity body explicitly (reliable) -> wide string for json_get_*. */
-static void body_to_wide(PHTTP_REQUEST req, wchar_t *wout, int wcap)
+static BOOL body_to_wide(PHTTP_REQUEST req, wchar_t *wout, int wcap)
 {
     char body[8192]; int pos = 0;
     wout[0] = 0;
@@ -353,11 +361,15 @@ static void body_to_wide(PHTTP_REQUEST req, wchar_t *wout, int wcap)
         if (pos >= (int)sizeof(body) - 1) break;
     }
     body[pos] = 0;
+    if (memchr(body, 0, pos)) return FALSE;
     /* On failure (e.g. the converted body would exceed wcap) MultiByteToWideChar
        leaves the buffer partially written WITHOUT a NUL -- treat that as an
        empty body rather than parse garbage. */
-    if (!MultiByteToWideChar(CP_UTF8, 0, body, -1, wout, wcap))
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, body, -1, wout, wcap)) {
         wout[0] = 0;
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static int auth_ok(PHTTP_REQUEST req)
@@ -460,12 +472,7 @@ static void trim_ws(wchar_t *s)
     while (n > 0 && (s[n-1]==L' '||s[n-1]==L'\t'||s[n-1]==L'\r'||s[n-1]==L'\n')) s[--n] = 0;
 }
 
-/* Mirror the GUI's JS input guards (web/app.js validateVmName / validateUsername /
-   validatePassword + the RAM/range rules) so the API rejects exactly what the UI
-   would, rather than forwarding unvalidated input to asb_vm_create (the core trusts
-   a pre-validated front end). Returns an English error (NULL = valid). */
 static const char *validate_create(const wchar_t *name, const wchar_t *os,
-                                   const wchar_t *user, const wchar_t *pass,
                                    const wchar_t *tpl, const wchar_t *img,
                                    BOOL is_template, int ram_mb, int hdd_gb,
                                    int cpu_cores, int gpu_mode, int net_mode)
@@ -504,44 +511,6 @@ static const char *validate_create(const wchar_t *name, const wchar_t *os,
     if (!from_template && (!img || !img[0])) return "An image (ISO) or template is required.";
     if (is_template && from_template)        return "Cannot create a template from another template.";
     if (is_template && !is_win)              return "Templates are only supported for Windows.";
-
-    /* username / password -- GUI validates on a normal create (onCreateVm) but
-       not on a template build (onCreateTemplate); match that. */
-    if (!is_template) {
-        if (!user || !user[0]) return "Username is required.";
-        len = (int)wcslen(user);
-        if (is_linux) {
-            if (len > 32) return "Username cannot exceed 32 characters (Linux limit).";
-            if (!((user[0]>=L'a'&&user[0]<=L'z')||user[0]==L'_'))
-                return "Linux username must start with a lowercase letter or underscore.";
-            for (i = 0; i < len; i++) {
-                wchar_t ch = user[i];
-                if (!((ch>=L'a'&&ch<=L'z')||(ch>=L'0'&&ch<=L'9')||ch==L'_'||ch==L'-'))
-                    return "Linux username: lowercase letters, digits, '_' and '-' only.";
-            }
-        } else {
-            BOOL only_dots_ws = TRUE;
-            if (len > 20) return "Username cannot exceed 20 characters.";
-            for (i = 0; i < len; i++)   /* mirror app.js /^[.\s]+$/ */
-                if (!(user[i]==L'.' || user[i]==L' ' || user[i]==L'\t')) { only_dots_ws = FALSE; break; }
-            if (only_dots_ws) return "Username cannot be only dots or spaces.";
-            for (i = 0; i < len; i++)
-                if (wcschr(L"\"\\/[]:;|=,+*?<>", user[i])) return "Username contains invalid characters.";
-            if (user[len-1] == L'.') return "Username cannot end with a period.";
-            {
-                static const wchar_t *res[] = {L"CON",L"PRN",L"AUX",L"NUL",
-                    L"COM1",L"COM2",L"COM3",L"COM4",L"COM5",L"COM6",L"COM7",L"COM8",L"COM9",
-                    L"LPT1",L"LPT2",L"LPT3",L"LPT4",L"LPT5",L"LPT6",L"LPT7",L"LPT8",L"LPT9"};
-                int r; for (r = 0; r < (int)(sizeof(res)/sizeof(res[0])); r++)
-                    if (_wcsicmp(user, res[r]) == 0) return "Username is a reserved name.";
-            }
-        }
-        if (is_linux) {
-            if (!pass || !pass[0]) return "Password is required.";
-            if (WideCharToMultiByte(CP_UTF8,0,pass,-1,NULL,0,NULL,NULL) - 1 > 255)
-                return "Password is too long (max 255 bytes).";
-        }
-    }
 
     /* numeric ranges (HTML: ram>=512 step2, hdd>=1, cpu>=1; enums). 0 = unset
        -> the core fills a default, so only check explicitly-provided values. */
@@ -642,21 +611,55 @@ static int handle_request(PHTTP_REQUEST req)
             wchar_t body[8192];
             AsbVmConfig cfg; int iv; BOOL bv;
             wchar_t name[256]={0}, os[32]={0}, img[MAX_PATH]={0}, tpl[256]={0};
-            wchar_t user[128]={0}, pass[128]={0}, adapter[256]={0};
+            wchar_t user[128]={0}, pass[256]={0}, adapter[256]={0};
+            wchar_t disk_directory[MAX_PATH + 1]={0};
             char nu[256]={0};
-            body_to_wide(req, body, 8192);
+            if (!body_to_wide(req, body, 8192)) {
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                         "Request body must contain valid UTF-8 JSON without NUL bytes.");
+                return 0;
+            }
             ZeroMemory(&cfg, sizeof(cfg));
             json_get_string(body, L"name", name, 256);
             json_get_string(body, L"osType", os, 32);
             json_get_string(body, L"imagePath", img, MAX_PATH);
             json_get_string(body, L"templateName", tpl, 256);
-            json_get_string(body, L"adminUser", user, 128);
-            json_get_string(body, L"adminPass", pass, 128);
+            if (!json_get_string(body, L"adminUser", user, ARRAYSIZE(user))) {
+                const char *error = !json_has_key(body, L"adminUser")
+                    ? "Username is required."
+                    : user[0]
+                        ? (_wcsicmp(os, L"Linux") == 0 && !tpl[0]
+                            ? "Username cannot exceed 32 characters (Linux limit)."
+                            : "Username cannot exceed 20 characters.")
+                        : "adminUser must be a valid JSON string without NUL characters.";
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg", error);
+                return 0;
+            }
+            if (!json_get_string(body, L"adminPass", pass, ARRAYSIZE(pass))) {
+                const char *error = !json_has_key(body, L"adminPass")
+                    ? "Password is required."
+                    : pass[0]
+                        ? (_wcsicmp(os, L"Linux") == 0 && !tpl[0]
+                            ? "Password is too long (max 255 bytes)."
+                            : "Password is too long (max 127 characters for Windows).")
+                        : "adminPass must be a valid JSON string without NUL characters.";
+                SecureZeroMemory(pass, sizeof(pass));
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg", error);
+                return 0;
+            }
             json_get_string(body, L"netAdapter", adapter, 256);
+            if (!json_get_string(body, L"diskDirectory", disk_directory, MAX_PATH + 1) &&
+                json_has_key(body, L"diskDirectory")) {
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                         disk_directory[0] ? "Disk storage path is too long." : "diskDirectory must be a string without NUL characters.");
+                return 0;
+            }
+            trim_ws(disk_directory);
             trim_ws(name); trim_ws(user);   /* match the GUI's .value.trim() */
             cfg.name = name; cfg.os_type = os; cfg.image_path = img;
             cfg.template_name = tpl; cfg.username = user; cfg.password = pass;
             cfg.net_adapter = adapter;
+            cfg.disk_directory = disk_directory;
             if (json_get_int(body, L"ramMb", &iv)) cfg.ram_mb = (DWORD)iv;
             if (json_get_int(body, L"hddGb", &iv)) cfg.hdd_gb = (DWORD)iv;
             if (json_get_int(body, L"cpuCores", &iv)) cfg.cpu_cores = (DWORD)iv;
@@ -672,10 +675,51 @@ static int handle_request(PHTTP_REQUEST req)
                 return 0;
             }
             {
-                const char *verr = validate_create(name, os, user, pass, tpl, img,
+                const wchar_t *password_os = os;
+                const wchar_t *verr;
+                for (i = 0; tpl[0] && i < asb_template_count(); i++) {
+                    if (_wcsicmp(tpl, asb_template_name(i)) == 0) {
+                        password_os = asb_template_os_type(i);
+                        break;
+                    }
+                }
+                verr = asb_validate_username(password_os, user, name, cfg.is_template);
+                if (!verr) verr = asb_validate_password(password_os, pass);
+                if (verr) {
+                    char message[512];
+                    WideCharToMultiByte(CP_UTF8, 0, verr, -1, message, sizeof(message), NULL, NULL);
+                    SecureZeroMemory(pass, sizeof(pass));
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg", message);
+                    return 0;
+                }
+            }
+            {
+                const char *verr = validate_create(name, os, tpl, img,
                     cfg.is_template, (int)cfg.ram_mb, (int)cfg.hdd_gb, (int)cfg.cpu_cores,
                     cfg.gpu_mode, cfg.network_mode);
-                if (verr) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", verr); return 0; }
+                if (verr) {
+                    SecureZeroMemory(pass, sizeof(pass));
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg", verr);
+                    return 0;
+                }
+            }
+            {
+                const wchar_t *verr = asb_validate_disk_directory(name, disk_directory, cfg.is_template);
+                if (verr) {
+                    char message[512];
+                    WideCharToMultiByte(CP_UTF8, 0, verr, -1, message, sizeof(message), NULL, NULL);
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg", message);
+                    return 0;
+                }
+            }
+            {
+                const wchar_t *verr = asb_validate_template_disk_size(tpl, cfg.hdd_gb);
+                if (verr) {
+                    char message[512];
+                    WideCharToMultiByte(CP_UTF8, 0, verr, -1, message, sizeof(message), NULL, NULL);
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg", message);
+                    return 0;
+                }
             }
             WideCharToMultiByte(CP_UTF8,0,name,-1,nu,sizeof(nu),NULL,NULL);
             {

@@ -21,6 +21,7 @@
 #include <commctrl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <shlobj.h>
 
 #pragma comment(lib, "dwmapi.lib")
@@ -61,6 +62,7 @@ static VmDisplayIdd *g_idd_displays[ASB_MAX_VMS];
 #define WM_SHOW_ALERT          (WM_APP + 15)
 #define WM_VM_SHUTDOWN_TIMEOUT (WM_APP + 9)
 #define WM_PREREQ_DONE        (WM_APP + 17)
+#define WM_DISK_SPACE         (WM_APP + 19)
 
 /* Tray */
 #define TRAY_CMD_SHOW          1
@@ -125,6 +127,90 @@ static void safe_destroy_idd(int idx)
 
 /* ---- JSON state builders ---- */
 
+static int query_disk_free_gb(const wchar_t *selected)
+{
+    wchar_t supplied[MAX_PATH], path[MAX_PATH + 1];
+    ULARGE_INTEGER available;
+    ULONGLONG gb;
+    DWORD length, attrs;
+    size_t i, len;
+
+    if (!selected || !selected[0]) {
+        asb_default_disk_directory(supplied, MAX_PATH);
+    } else {
+        if (wcslen(selected) >= MAX_PATH) return -1;
+        wcscpy_s(supplied, MAX_PATH, selected);
+    }
+    len = wcslen(supplied);
+    for (i = 0; i < len; i++) {
+        if (supplied[i] == L'/') supplied[i] = L'\\';
+        if (supplied[i] < 32 || wcschr(L"*?\"<>|", supplied[i]) ||
+            (supplied[i] == L':' && i != 1))
+            return -1;
+    }
+    if (!((len >= 3 && ((supplied[0] >= L'A' && supplied[0] <= L'Z') ||
+                        (supplied[0] >= L'a' && supplied[0] <= L'z')) &&
+                        supplied[1] == L':' && supplied[2] == L'\\') ||
+          (len >= 5 && supplied[0] == L'\\' && supplied[1] == L'\\')))
+        return -1;
+    length = GetFullPathNameW(supplied, MAX_PATH, path, NULL);
+    if (!length || length >= MAX_PATH) return -1;
+    attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY))
+        return -1;
+    /* UNC volume queries require a trailing separator. */
+    if (path[length - 1] != L'\\') {
+        path[length++] = L'\\';
+        path[length] = 0;
+    }
+    if (!GetDiskFreeSpaceExW(path, &available, NULL, NULL)) return -1;
+    gb = available.QuadPart / (1024ULL * 1024 * 1024);
+    return gb > INT_MAX ? INT_MAX : (int)gb;
+}
+
+static void send_disk_space(const wchar_t *json, BOOL query)
+{
+    size_t input_len = wcslen(json);
+    wchar_t *path, *response;
+    JsonBuilder jb;
+    int request_id = 0, free_gb = -1;
+
+    /* Preserve the requested path in the reply even when it exceeds MAX_PATH
+       and is therefore rejected by the filesystem query. */
+    if (input_len > (((size_t)-1) / sizeof(wchar_t) - 128) / 2) return;
+    path = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                               (input_len + 1) * sizeof(wchar_t));
+    response = (wchar_t *)HeapAlloc(GetProcessHeap(), 0,
+                                   (input_len * 2 + 128) * sizeof(wchar_t));
+    if (!path || !response) {
+        if (path) HeapFree(GetProcessHeap(), 0, path);
+        if (response) HeapFree(GetProcessHeap(), 0, response);
+        return;
+    }
+    if (json_get_string(json, L"path", path, input_len + 1) && query)
+        free_gb = query_disk_free_gb(path);
+    json_get_int(json, L"requestId", &request_id);
+    jb_init(&jb, response, input_len * 2 + 128);
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"diskSpace");
+    jb_string(&jb, L"path", path);
+    jb_int(&jb, L"requestId", request_id);
+    jb_int(&jb, L"freeGb", free_gb);
+    jb_object_end(&jb);
+    /* WebView2 is apartment-bound; deliver the response on the UI thread. */
+    if (!PostMessageW(g_hwnd_main, WM_DISK_SPACE, 0, (LPARAM)response))
+        HeapFree(GetProcessHeap(), 0, response);
+    HeapFree(GetProcessHeap(), 0, path);
+}
+
+static DWORD WINAPI disk_space_thread(LPVOID param)
+{
+    wchar_t *json = (wchar_t *)param;
+    send_disk_space(json, TRUE);
+    free(json);
+    return 0;
+}
+
 static void build_host_info_json(JsonBuilder *jb)
 {
     SYSTEM_INFO si;
@@ -132,8 +218,7 @@ static void build_host_info_json(JsonBuilder *jb)
     DWORD host_cores, host_ram_mb;
     DWORD vm_cores = 0, vm_ram_mb = 0, vm_hdd_gb = 0;
     wchar_t base_dir[MAX_PATH];
-    ULARGE_INTEGER free_bytes;
-    DWORD free_gb = 0;
+    int free_gb;
     int i, count = asb_vm_count();
 
     GetSystemInfo(&si);
@@ -148,17 +233,16 @@ static void build_host_info_json(JsonBuilder *jb)
         if (v) vm_hdd_gb += v->hdd_gb;
     }
 
-    if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
-        wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
-    if (GetDiskFreeSpaceExW(base_dir, &free_bytes, NULL, NULL))
-        free_gb = (DWORD)(free_bytes.QuadPart / (1024ULL * 1024 * 1024));
+    asb_default_disk_directory(base_dir, MAX_PATH);
+    free_gb = query_disk_free_gb(base_dir);
 
     jb_int(jb, L"hostCores", (int)host_cores);
     jb_int(jb, L"hostRamMb", (int)host_ram_mb);
     jb_int(jb, L"vmCores", (int)vm_cores);
     jb_int(jb, L"vmRamMb", (int)vm_ram_mb);
-    jb_int(jb, L"freeGb", (int)free_gb);
+    jb_int(jb, L"freeGb", free_gb);
     jb_int(jb, L"vmHddGb", (int)vm_hdd_gb);
+    jb_string(jb, L"defaultDiskDirectory", base_dir);
 }
 
 static ULONGLONG get_file_size_bytes(const wchar_t *path)
@@ -185,6 +269,7 @@ static void jb_size_gb(JsonBuilder *jb, const wchar_t *key, ULONGLONG bytes)
 
 static void build_vm_json(JsonBuilder *jb, int i)
 {
+    wchar_t disk_directory[MAX_PATH];
     VmInstance *v = asb_vm_instance(asb_vm_get(i));
     SnapshotTree *st_ = asb_vm_snap_tree(asb_vm_get(i));
     if (!v || !st_) return;
@@ -192,6 +277,8 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_object_begin(jb);
     jb_string(jb, L"name", v->name);
     jb_string(jb, L"osType", v->os_type);
+    asb_vm_disk_directory(asb_vm_get(i), disk_directory, MAX_PATH);
+    jb_string(jb, L"diskDirectory", disk_directory);
     jb_bool(jb, L"running", v->running);
     jb_bool(jb, L"shuttingDown", v->shutdown_requested);
     jb_bool(jb, L"agentOnline", v->agent_online);
@@ -300,11 +387,11 @@ static void build_vm_json(JsonBuilder *jb, int i)
 
 static void send_vm_list(void)
 {
-    wchar_t buf[16384];
+    wchar_t buf[32768];
     JsonBuilder jb;
     int i, count = asb_vm_count();
 
-    jb_init(&jb, buf, 16384);
+    jb_init(&jb, buf, 32768);
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"vmListChanged");
 
@@ -316,9 +403,9 @@ static void send_vm_list(void)
     jb_array_end(&jb);
 
     {
-        wchar_t hi_buf[512];
+        wchar_t hi_buf[2048];
         JsonBuilder hi;
-        jb_init(&hi, hi_buf, 512);
+        jb_init(&hi, hi_buf, 2048);
         jb_object_begin(&hi);
         build_host_info_json(&hi);
         jb_object_end(&hi);
@@ -334,9 +421,9 @@ static void send_vm_list(void)
 
 static void send_host_info(void)
 {
-    wchar_t buf[512];
+    wchar_t buf[2048];
     JsonBuilder jb;
-    jb_init(&jb, buf, 512);
+    jb_init(&jb, buf, 2048);
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"hostInfo");
     build_host_info_json(&jb);
@@ -420,6 +507,14 @@ static void send_templates(void)
     webview2_post(buf);
 }
 
+static int CALLBACK disk_folder_browse_callback(HWND hwnd, UINT message, LPARAM lp, LPARAM data)
+{
+    (void)lp;
+    if (message == BFFM_INITIALIZED && data)
+        SendMessageW(hwnd, BFFM_SETSELECTIONW, TRUE, data);
+    return 0;
+}
+
 static void send_full_state(void)
 {
     wchar_t buf[32768];
@@ -440,9 +535,9 @@ static void send_full_state(void)
 
     /* Host info */
     {
-        wchar_t hi[512];
+        wchar_t hi[2048];
         JsonBuilder hj;
-        jb_init(&hj, hi, 512);
+        jb_init(&hj, hi, 2048);
         jb_object_begin(&hj);
         build_host_info_json(&hj);
         jb_object_end(&hj);
@@ -890,8 +985,8 @@ static void on_webview2_message(const wchar_t *json)
         }
         AsbVmConfig cfg;
         wchar_t name_buf[256] = {0}, os_buf[32] = {0}, img_buf[MAX_PATH] = {0};
-        wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[128] = {0};
-        wchar_t adapter_buf[256] = {0};
+        wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[256] = {0};
+        wchar_t adapter_buf[256] = {0}, disk_buf[MAX_PATH + 1] = {0};
         int val;
         BOOL is_tpl = FALSE;
 
@@ -899,9 +994,35 @@ static void on_webview2_message(const wchar_t *json)
         json_get_string(json, L"osType", os_buf, 32);
         json_get_string(json, L"imagePath", img_buf, MAX_PATH);
         json_get_string(json, L"templateName", tpl_buf, 256);
-        json_get_string(json, L"adminUser", user_buf, 128);
-        json_get_string(json, L"adminPass", pass_buf, 128);
+        if (!json_get_string(json, L"adminUser", user_buf, ARRAYSIZE(user_buf))) {
+            const wchar_t *error = !json_has_key(json, L"adminUser")
+                ? L"Username is required."
+                : user_buf[0]
+                    ? (_wcsicmp(os_buf, L"Linux") == 0 && !tpl_buf[0]
+                        ? L"Username cannot exceed 32 characters (Linux limit)."
+                        : L"Username cannot exceed 20 characters.")
+                    : L"adminUser must be a valid JSON string without NUL characters.";
+            ui_show_alert(error);
+            return;
+        }
+        if (!json_get_string(json, L"adminPass", pass_buf, ARRAYSIZE(pass_buf))) {
+            const wchar_t *error = !json_has_key(json, L"adminPass")
+                ? L"Password is required."
+                : pass_buf[0]
+                    ? (_wcsicmp(os_buf, L"Linux") == 0 && !tpl_buf[0]
+                        ? L"Password is too long (max 255 bytes)."
+                        : L"Password is too long (max 127 characters for Windows).")
+                    : L"adminPass must be a valid JSON string without NUL characters.";
+            SecureZeroMemory(pass_buf, sizeof(pass_buf));
+            ui_show_alert(error);
+            return;
+        }
         json_get_string(json, L"netAdapter", adapter_buf, 256);
+        if (!json_get_string(json, L"diskDirectory", disk_buf, MAX_PATH + 1) &&
+            json_has_key(json, L"diskDirectory")) {
+            ui_show_alert(L"Disk folder is invalid or too long.");
+            return;
+        }
         json_get_bool(json, L"isTemplate", &is_tpl);
 
         ZeroMemory(&cfg, sizeof(cfg));
@@ -913,6 +1034,7 @@ static void on_webview2_message(const wchar_t *json)
         cfg.password = pass_buf;
         cfg.net_adapter = adapter_buf;
         cfg.is_template = is_tpl;
+        cfg.disk_directory = disk_buf;
 
         if (json_get_int(json, L"hddGb", &val)) cfg.hdd_gb = (DWORD)val;
         if (json_get_int(json, L"ramMb", &val)) cfg.ram_mb = (DWORD)val;
@@ -995,7 +1117,7 @@ static void on_webview2_message(const wchar_t *json)
                 }
                 if (inst->admin_user[0])
                     _snwprintf_s(cmd, 1024, _TRUNCATE,
-                        L"cmd.exe /k ssh %s-p %lu %s@localhost",
+                        L"cmd.exe /v:off /k ssh %s-p %lu -l \"%s\" localhost",
                         keyopt, inst->ssh_port, inst->admin_user);
                 else
                     _snwprintf_s(cmd, 1024, _TRUNCATE,
@@ -1013,10 +1135,17 @@ static void on_webview2_message(const wchar_t *json)
         int idx;
         if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
             int j;
+            HRESULT hr;
             ui_log(L"Deleting VM \"%s\"...", asb_vm_name(asb_vm_get(idx)));
             safe_destroy_rdp(idx);
             safe_destroy_idd(idx);
-            asb_vm_delete(asb_vm_get(idx));
+            hr = asb_vm_delete(asb_vm_get(idx));
+            if (FAILED(hr)) {
+                ui_log(L"VM deletion failed (0x%08X). Check that its disk storage is available and writable.", hr);
+                ui_show_alert(L"VM deletion failed. Check that its disk storage is available and writable.");
+                send_vm_list();
+                return;
+            }
             /* Compact display arrays */
             for (j = idx; j < asb_vm_count(); j++) {
                 g_displays[j] = g_displays[j + 1];
@@ -1032,7 +1161,11 @@ static void on_webview2_message(const wchar_t *json)
         wchar_t tpl_name[256] = { 0 };
         json_get_string(json, L"name", tpl_name, 256);
         if (tpl_name[0] != L'\0') {
-            asb_template_delete(tpl_name);
+            HRESULT hr = asb_template_delete(tpl_name);
+            if (FAILED(hr)) {
+                ui_log(L"Template deletion failed (0x%08X). Check that its disk storage is available and writable.", hr);
+                ui_show_alert(L"Template deletion failed. Check that its disk storage is available and writable.");
+            }
             send_templates();
         }
     } else if (wcscmp(action, L"editVm") == 0) {
@@ -1053,13 +1186,47 @@ static void on_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"selectVm") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx)) g_selected_vm = idx;
+    } else if (wcscmp(action, L"getDiskSpace") == 0) {
+        wchar_t *copy = _wcsdup(json);
+        HANDLE thread = copy ? CreateThread(NULL, 0, disk_space_thread, copy, 0, NULL) : NULL;
+        if (thread) CloseHandle(thread);
+        else {
+            free(copy);
+            send_disk_space(json, FALSE);
+        }
+    } else if (wcscmp(action, L"browseDiskDirectory") == 0) {
+        BROWSEINFOW browse;
+        PIDLIST_ABSOLUTE selection;
+        wchar_t initial[MAX_PATH] = {0}, path[MAX_PATH] = {0};
+        json_get_string(json, L"path", initial, MAX_PATH);
+        if (!initial[0]) asb_default_disk_directory(initial, MAX_PATH);
+        ZeroMemory(&browse, sizeof(browse));
+        browse.hwndOwner = g_hwnd_main;
+        browse.lpszTitle = L"Choose a folder for VM disks";
+        browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
+        browse.lpfn = disk_folder_browse_callback;
+        browse.lParam = (LPARAM)initial;
+        selection = SHBrowseForFolderW(&browse);
+        if (selection) {
+            if (SHGetPathFromIDListW(selection, path)) {
+                wchar_t json_buf[2048];
+                JsonBuilder jb;
+                jb_init(&jb, json_buf, 2048);
+                jb_object_begin(&jb);
+                jb_string(&jb, L"type", L"diskDirectoryBrowseResult");
+                jb_string(&jb, L"path", path);
+                jb_object_end(&jb);
+                webview2_post(json_buf);
+            }
+            CoTaskMemFree(selection);
+        }
     } else if (wcscmp(action, L"browseImage") == 0) {
         OPENFILENAMEW ofn;
         wchar_t file[MAX_PATH] = { 0 };
         ZeroMemory(&ofn, sizeof(ofn));
         ofn.lStructSize = sizeof(ofn);
         ofn.hwndOwner = g_hwnd_main;
-        ofn.lpstrFilter = L"ISO Files (*.iso)\0*.iso\0VHDX Files (*.vhdx)\0*.vhdx\0All Files\0*.*\0";
+        ofn.lpstrFilter = L"ISO Files (*.iso)\0*.iso\0All Files\0*.*\0";
         ofn.lpstrFile = file;
         ofn.nMaxFile = MAX_PATH;
         ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
@@ -1457,6 +1624,16 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         wchar_t *log_text = (wchar_t *)lp;
         if (log_text) { ui_log_post(log_text); free(log_text); }
+        return 0;
+    }
+
+    case WM_DISK_SPACE:
+    {
+        wchar_t *response = (wchar_t *)lp;
+        if (response) {
+            webview2_post(response);
+            HeapFree(GetProcessHeap(), 0, response);
+        }
         return 0;
     }
 

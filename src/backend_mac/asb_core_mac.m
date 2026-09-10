@@ -188,6 +188,8 @@ static void save_vm_list(void) {
         fprintf(f, "[VM]\n");
         fprintf(f, "Name=%s\n", g_vms[i].name);
         fprintf(f, "OsType=%s\n", g_vms[i].os_type);
+        if (g_vms[i].disk_directory[0])
+            fprintf(f, "DiskDirectory=%s\n", g_vms[i].disk_directory);
         fprintf(f, "RamMB=%d\n", g_vms[i].ram_mb);
         fprintf(f, "HddGB=%d\n", g_vms[i].hdd_gb);
         fprintf(f, "CpuCores=%d\n", g_vms[i].cpu_cores);
@@ -222,7 +224,7 @@ static void load_vm_list(void) {
     FILE *f = fopen(url.fileSystemRepresentation, "r");
     if (!f) return;
 
-    char line[1024];
+    char line[2048];
     AsbVmMac *vm = NULL;
     BOOL in_settings = NO;
 
@@ -259,6 +261,8 @@ static void load_vm_list(void) {
             strlcpy(vm->name, line + 5, sizeof(vm->name));
         else if (strncmp(line, "OsType=", 7) == 0)
             strlcpy(vm->os_type, line + 7, sizeof(vm->os_type));
+        else if (strncmp(line, "DiskDirectory=", 14) == 0)
+            strlcpy(vm->disk_directory, line + 14, sizeof(vm->disk_directory));
         else if (strncmp(line, "RamMB=", 6) == 0)
             vm->ram_mb = atoi(line + 6);
         else if (strncmp(line, "HddGB=", 6) == 0)
@@ -1013,16 +1017,149 @@ static void start_install_flow(int idx, NSURL *restoreURL) {
 
 /* ---- Public: lifecycle ---- */
 
+/* Match ECMAScript String.trim exactly; Foundation's built-in whitespace set
+   includes NEL and excludes BOM, which would give the API different names. */
+static BOOL username_trim_character(unichar ch) {
+    return (ch >= 0x0009 && ch <= 0x000D) || ch == 0x0020 || ch == 0x00A0 ||
+           ch == 0x1680 || (ch >= 0x2000 && ch <= 0x200A) || ch == 0x2028 ||
+           ch == 0x2029 || ch == 0x202F || ch == 0x205F || ch == 0x3000 || ch == 0xFEFF;
+}
+
+static NSString *normalized_username(NSString *value) {
+    NSUInteger start = 0, end = value.length;
+    while (start < end && username_trim_character([value characterAtIndex:start])) start++;
+    while (end > start && username_trim_character([value characterAtIndex:end - 1])) end--;
+    return [value substringWithRange:NSMakeRange(start, end - start)];
+}
+
+NSString *asb_mac_validate_username(NSString *os_type, id username, NSString *vm_name) {
+    if (!username) return @"Username is required.";
+    if (![username isKindOfClass:[NSString class]])
+        return @"Username must be a string.";
+    NSString *value = normalized_username(username);
+    if (!value.length) return @"Username is required.";
+    for (NSUInteger i = 0; i < value.length; i++) {
+        unichar ch = [value characterAtIndex:i];
+        if (ch == 0) return @"Username cannot contain NUL characters.";
+        if (ch >= 0xD800 && ch <= 0xDBFF) {
+            if (++i >= value.length)
+                return @"Username contains invalid Unicode.";
+            ch = [value characterAtIndex:i];
+            if (ch < 0xDC00 || ch > 0xDFFF)
+                return @"Username contains invalid Unicode.";
+        } else if (ch >= 0xDC00 && ch <= 0xDFFF) {
+            return @"Username contains invalid Unicode.";
+        }
+    }
+
+    BOOL isWindows = os_type && [os_type caseInsensitiveCompare:@"Windows"] == NSOrderedSame;
+    if (isWindows) {
+        if (value.length > 20) return @"Username cannot exceed 20 characters.";
+        BOOL onlyDotsWhitespace = YES;
+        for (NSUInteger i = 0; i < value.length; i++) {
+            unichar ch = [value characterAtIndex:i];
+            if (ch < 32 || ch == 0xFFFE || ch == 0xFFFF ||
+                [@"\"\\/[]:;|=,+*?<>%@" rangeOfString:
+                    [NSString stringWithCharacters:&ch length:1]].location != NSNotFound)
+                return @"Username contains invalid characters.";
+            if (ch != '.' && !username_trim_character(ch)) onlyDotsWhitespace = NO;
+        }
+        if (onlyDotsWhitespace) return @"Username cannot be only dots or spaces.";
+        if ([value hasSuffix:@"."]) return @"Username cannot end with a period.";
+        NSArray *reserved = @[@"NONE",@"CON",@"PRN",@"AUX",@"NUL",
+            @"COM1",@"COM2",@"COM3",@"COM4",@"COM5",@"COM6",@"COM7",@"COM8",@"COM9",
+            @"LPT1",@"LPT2",@"LPT3",@"LPT4",@"LPT5",@"LPT6",@"LPT7",@"LPT8",@"LPT9"];
+        if ([reserved containsObject:value.uppercaseString])
+            return @"Username is a reserved name.";
+        if (vm_name && [vm_name caseInsensitiveCompare:value] == NSOrderedSame)
+            return @"Username cannot match the VM name (Windows computer name).";
+    } else {
+        if ([value lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 63)
+            return @"Username is too long (max 63 UTF-8 bytes in AppSandbox).";
+        for (NSUInteger i = 0; i < value.length; i++) {
+            unichar ch = [value characterAtIndex:i];
+            if (username_trim_character(ch))
+                return @"Username cannot contain spaces (macOS short account name).";
+        }
+        for (NSUInteger i = 0; i < value.length; i++) {
+            unichar ch = [value characterAtIndex:i];
+            if (ch < 32 || ch == 127 || ch == 0xFFFE || ch == 0xFFFF ||
+                ch == '/' || ch == '\\' || ch == ':')
+                return @"Username contains invalid characters.";
+        }
+        if ([value isEqualToString:@"."] || [value isEqualToString:@".."])
+            return @"Username cannot be . or .. (macOS short account name).";
+        if ([@[@"root",@"daemon",@"nobody",@"guest",@"shared"] containsObject:value.lowercaseString])
+            return @"Username is a reserved name.";
+    }
+    return nil;
+}
+
+NSString *asb_mac_validate_password(NSString *os_type, id password) {
+    if (!password) return @"Password is required.";
+    if (![password isKindOfClass:[NSString class]])
+        return @"Password must be a string.";
+    NSString *value = password;
+    if (!value.length) return @"Password is required.";
+
+    /* Validate before crossing the NUL-terminated UTF-8 API boundary. */
+    NSUInteger codePoints = 0;
+    for (NSUInteger i = 0; i < value.length; i++) {
+        unichar ch = [value characterAtIndex:i];
+        if (ch == 0) return @"Password cannot contain NUL characters.";
+        if (ch >= 0xD800 && ch <= 0xDBFF) {
+            if (++i >= value.length)
+                return @"Password contains invalid Unicode.";
+            ch = [value characterAtIndex:i];
+            if (ch < 0xDC00 || ch > 0xDFFF)
+                return @"Password contains invalid Unicode.";
+        } else if (ch >= 0xDC00 && ch <= 0xDFFF) {
+            return @"Password contains invalid Unicode.";
+        }
+        codePoints++;
+    }
+
+    if (os_type && [os_type caseInsensitiveCompare:@"Windows"] == NSOrderedSame) {
+        if (value.length > 127)
+            return @"Password is too long (max 127 characters for Windows).";
+    } else {
+        if (codePoints < 4)
+            return @"Password must be at least 4 characters (macOS minimum).";
+        if ([value lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 127)
+            return @"Password is too long (max 127 UTF-8 bytes in AppSandbox).";
+    }
+    return nil;
+}
+
 int asb_mac_vm_create(const char *name, const char *os_type,
                        int ram_mb, int hdd_gb, int cpu_cores,
                        int gpu_mode, int network_mode,
                        const char *image_path,
+                       const char *disk_directory,
                        const char *admin_user,
                        const char *admin_pass,
                        BOOL ssh_enabled,
                        BOOL ssh_deploy_key,
                        BOOL test_mode) {
     if (!name || !os_type) return BACKEND_ERR_INVALID_ARG;
+    NSString *username = admin_user ? [NSString stringWithUTF8String:admin_user] : nil;
+    NSString *usernameError = (admin_user && !username)
+        ? @"Username contains invalid Unicode."
+        : asb_mac_validate_username([NSString stringWithUTF8String:os_type], username,
+                                   [NSString stringWithUTF8String:name]);
+    if (usernameError) {
+        post_alert(name, "%s", usernameError.UTF8String);
+        return BACKEND_ERR_INVALID_ARG;
+    }
+    username = normalized_username(username);
+    NSString *password = admin_pass ? [NSString stringWithUTF8String:admin_pass] : nil;
+    NSString *passwordError = (admin_pass && !password)
+        ? @"Password contains invalid Unicode."
+        : asb_mac_validate_password([NSString stringWithUTF8String:os_type], password);
+    if (passwordError) {
+        post_alert(name, "%s", passwordError.UTF8String);
+        return BACKEND_ERR_INVALID_ARG;
+    }
     if (vm_index_of(name) >= 0) {
         post_alert(name, "A VM named '%s' already exists", name);
         return BACKEND_ERR_INVALID_ARG;
@@ -1032,11 +1169,25 @@ int asb_mac_vm_create(const char *name, const char *os_type,
         return BACKEND_ERR_FAILED;
     }
 
+    NSString *diskDirectory = disk_directory ? @(disk_directory) : @"";
+    NSString *diskError = [VmDir validationErrorForDiskDirectory:diskDirectory vmName:@(name)];
+    if (diskError) {
+        post_alert(name, "%s", diskError.UTF8String);
+        return BACKEND_ERR_INVALID_ARG;
+    }
+    diskDirectory = [VmDir normalizedDiskDirectory:diskDirectory];
+    NSString *imagePath = (image_path && image_path[0])
+        ? [NSString stringWithUTF8String:image_path] : nil;
+
     /* Prompt for admin up front so the user isn't blocked 20 minutes into
      * the install. Token is cached for the process lifetime; subsequent
      * VM creations reuse it silently. Windows-on-Mac has no privileged step
      * (build-windows + QEMU/HVF run unprivileged), so skip the prompt. */
     BOOL isWindows = (os_type && strcasecmp(os_type, "Windows") == 0);
+    if (isWindows && imagePath.length == 0) {
+        post_alert(name, "A Windows ISO must be selected to create a Windows VM");
+        return BACKEND_ERR_INVALID_ARG;
+    }
     if (!isWindows) {
         NSError *authErr = nil;
         if (![IsoPatchMac preauthorize:&authErr]) {
@@ -1051,18 +1202,15 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     memset(vm, 0, sizeof(*vm));
     strlcpy(vm->name, name, sizeof(vm->name));
     strlcpy(vm->os_type, os_type, sizeof(vm->os_type));
+    strlcpy(vm->disk_directory, diskDirectory.UTF8String, sizeof(vm->disk_directory));
     vm->ram_mb = ram_mb > 0 ? ram_mb : 8192;
     vm->hdd_gb = hdd_gb > 0 ? hdd_gb : 64;
     vm->cpu_cores = cpu_cores > 0 ? cpu_cores : 4;
     vm->gpu_mode = gpu_mode;
     vm->network_mode = network_mode;
     vm->test_mode = test_mode;   /* honored at start (Windows guest); not forced */
-    strlcpy(vm->admin_user,
-            (admin_user && admin_user[0]) ? admin_user : "user",
-            sizeof(vm->admin_user));
-    strlcpy(vm->admin_pass,
-            (admin_pass && admin_pass[0]) ? admin_pass : "test123",
-            sizeof(vm->admin_pass));
+    strlcpy(vm->admin_user, username.UTF8String, sizeof(vm->admin_user));
+    strlcpy(vm->admin_pass, admin_pass, sizeof(vm->admin_pass));
     vm->ssh_enabled = ssh_enabled;
     /* Key deploy needs SSH; prepare the AppSandbox keypair now so the instance
        carries the public key (the guest agent deploys it at runtime once the
@@ -1096,21 +1244,10 @@ int asb_mac_vm_create(const char *name, const char *os_type,
         return BACKEND_ERR_FAILED;
     }
 
-    NSString *imagePath = (image_path && image_path[0])
-        ? [NSString stringWithUTF8String:image_path] : nil;
-
     /* ---- Windows guest: from-scratch create from a Microsoft ISO. The user
        picks a .iso; we apply install.wim with our own NTFS writer + stage the
        agent/drivers, then boot via QEMU (always testMode). No IPSW, no DISM. ---- */
     if (vm->os_type[0] && strcasecmp(vm->os_type, "Windows") == 0) {
-        if (imagePath.length == 0) {
-            post_alert(name, "A Windows ISO must be selected to create a Windows VM");
-            g_vm_count--;
-            memset(&g_vms[idx], 0, sizeof(g_vms[idx]));
-            save_vm_list();
-            post_list_changed();
-            return BACKEND_ERR_INVALID_ARG;
-        }
         run_on_main(^{
             int i = vm_index_of(nsName.UTF8String);
             if (i >= 0) start_windows_build_flow(i, [NSURL fileURLWithPath:imagePath]);
@@ -1556,8 +1693,18 @@ int asb_mac_vm_edit(const char *name, const char *field, const char *value) {
         NSString *newName = [NSString stringWithUTF8String:value];
         NSURL *oldDir = [VmDir directoryForVm:oldName];
         NSURL *newDir = [VmDir directoryForVm:newName];
+        NSURL *oldDiskDir = [VmDir diskDirectoryForVm:oldName];
+        NSURL *newDiskDir = [[oldDiskDir URLByDeletingLastPathComponent]
+                                URLByAppendingPathComponent:newName isDirectory:YES];
+        BOOL external = ![oldDiskDir isEqual:oldDir];
         NSError *err = nil;
+        if (external && ![[NSFileManager defaultManager] moveItemAtURL:oldDiskDir toURL:newDiskDir error:&err]) {
+            post_alert(name, "Rename disk folder failed: %s", err.localizedDescription.UTF8String);
+            return BACKEND_ERR_FAILED;
+        }
         if (![[NSFileManager defaultManager] moveItemAtURL:oldDir toURL:newDir error:&err]) {
+            if (external)
+                [[NSFileManager defaultManager] moveItemAtURL:newDiskDir toURL:oldDiskDir error:nil];
             post_alert(name, "Rename failed: %s", err.localizedDescription.UTF8String);
             return BACKEND_ERR_FAILED;
         }

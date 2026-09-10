@@ -18,8 +18,9 @@
 typedef struct {
     char    name[256];
     char    os_type[32];
+    char    disk_directory[1024];  /* Optional disk parent; metadata stays in Application Support. */
     char    admin_user[64];
-    char    admin_pass[128];
+    char    admin_pass[512];       /* UTF-8 storage for up to 127 Windows UTF-16 units. */
     int     ram_mb;
     int     hdd_gb;
     int     cpu_cores;
@@ -64,10 +65,15 @@ int          asb_mac_vm_count(void);
 AsbVmMac    *asb_mac_vm_get(int index);
 AsbVmMac    *asb_mac_vm_find(const char *name);
 
+NSString *asb_mac_validate_username(NSString *os_type, id username, NSString *vm_name);
+
+NSString *asb_mac_validate_password(NSString *os_type, id password);
+
 int  asb_mac_vm_create(const char *name, const char *os_type,
                         int ram_mb, int hdd_gb, int cpu_cores,
                         int gpu_mode, int network_mode,
                         const char *image_path,
+                        const char *disk_directory,
                         const char *admin_user,
                         const char *admin_pass,
                         BOOL ssh_enabled,

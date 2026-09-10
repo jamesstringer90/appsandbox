@@ -19,6 +19,7 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <wtsapi32.h>
@@ -29,6 +30,7 @@
 #include "../transport/asb_transport.h"
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
@@ -394,18 +396,28 @@ static BOOL logoff_session(DWORD session_id)
 
 /* Run a command hidden and wait for it (used for takeown/icacls). The cmd buffer
    must be writable (CreateProcessW may modify it). */
-static void run_quiet(wchar_t *cmd)
+static DWORD run_quiet(wchar_t *cmd)
 {
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
+    DWORD result;
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
     if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
                        NULL, NULL, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, 30000);
+        DWORD wait = WaitForSingleObject(pi.hProcess, 30000);
+        if (wait == WAIT_OBJECT_0) {
+            if (!GetExitCodeProcess(pi.hProcess, &result))
+                result = GetLastError();
+        } else {
+            result = wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
+        }
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+    } else {
+        result = GetLastError();
     }
+    return result;
 }
 
 /* Deploy the AppSandbox public key into administrators_authorized_keys -- the file
@@ -542,6 +554,50 @@ static void gl_provision(const wchar_t *dir)
     agent_log("GL: provisioning complete.");
 }
 
+/* NVIDIA's installer makes DRS writable by desktop and packaged applications.
+   Plan9 transfers file bytes, not the host ACL, so establish these permissions
+   on the guest before seeding the profile database. */
+static BOOL nvidia_drs_prepare(const wchar_t *dir)
+{
+    wchar_t parent[MAX_PATH], sys[MAX_PATH], cmd[MAX_PATH * 2 + 160];
+    wchar_t *slash;
+    DWORD err, attrs;
+
+    wcscpy_s(parent, MAX_PATH, dir);
+    slash = wcsrchr(parent, L'\\');
+    if (!slash) return FALSE;
+    *slash = L'\0';
+    if (!CreateDirectoryW(parent, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        agent_log("NVIDIA DRS: cannot create parent directory (%lu).", GetLastError());
+        return FALSE;
+    }
+    if (!CreateDirectoryW(dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        agent_log("NVIDIA DRS: cannot create directory (%lu).", GetLastError());
+        return FALSE;
+    }
+    attrs = GetFileAttributesW(dir);
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        agent_log("NVIDIA DRS: destination is not an accessible directory.");
+        return FALSE;
+    }
+    if (!GetSystemDirectoryW(sys, MAX_PATH)) {
+        agent_log("NVIDIA DRS: GetSystemDirectory failed (%lu).", GetLastError());
+        return FALSE;
+    }
+
+    /* Grant Everyone and ALL APPLICATION PACKAGES inherited full control
+       within DRS. Numeric SIDs work with every guest language; preserve ACEs. */
+    swprintf_s(cmd, MAX_PATH * 2 + 160,
+               L"\"%s\\icacls.exe\" \"%s\" /grant *S-1-1-0:(OI)(CI)F "
+               L"*S-1-15-2-1:(OI)(CI)F /T /C /Q", sys, dir);
+    err = run_quiet(cmd);
+    if (err != ERROR_SUCCESS) {
+        agent_log("NVIDIA DRS: setting guest permissions failed (%lu).", err);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static DWORD WINAPI gpu_copy_thread(LPVOID param)
 {
     GpuCopyState *state = (GpuCopyState *)param;
@@ -577,8 +633,21 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
                   si->filter[0] ? " [filter: " : "",
                   si->filter[0] ? si->filter : "");
 
-        rc = p9_copy_share(50001, si->share_name, dest_wide,
-                           si->filter[0] ? si->filter : NULL, &files);
+        if (strcmp(si->share_name, "AppSandbox.NvidiaDrs") == 0) {
+            /* This list is also sent after reconnects. Seed missing files;
+               existing profiles belong to the guest. The host's runtime
+               lock file is recreated locally by NVIDIA when needed. */
+            const P9CopyOptions options = { TRUE, "nvdrswr.lk" };
+            if (nvidia_drs_prepare(dest_wide))
+                rc = p9_copy_share_ex(50001, si->share_name, dest_wide,
+                                     si->filter[0] ? si->filter : NULL,
+                                     &options, &files);
+            else
+                rc = P9_ERR_IO;
+        } else {
+            rc = p9_copy_share(50001, si->share_name, dest_wide,
+                               si->filter[0] ? si->filter : NULL, &files);
+        }
 
         if (rc != P9_OK) {
             agent_log("GPU copy share '%s' failed (rc=%d).", si->share_name, rc);
@@ -1807,6 +1876,38 @@ static void disable_hyperv_video(AsbConn *notify_sock)
 /* Forward declaration — defined after SSH proxy section */
 static void handle_ssh_enable(AsbConn *client, const char *tag);
 
+static ULONG primary_nic_index(void)
+{
+    ULONG buf_len = 15000;
+    ULONG index = 0;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        IP_ADAPTER_ADDRESSES *addrs, *cur;
+        ULONG ret;
+
+        addrs = (IP_ADAPTER_ADDRESSES *)HeapAlloc(GetProcessHeap(), 0, buf_len);
+        if (!addrs) return 0;
+        ret = GetAdaptersAddresses(AF_INET,
+            GAA_FLAG_INCLUDE_ALL_INTERFACES | GAA_FLAG_SKIP_ANYCAST |
+            GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+            NULL, addrs, &buf_len);
+        if (ret == NO_ERROR) {
+            for (cur = addrs; cur; cur = cur->Next) {
+                if (cur->IfType != IF_TYPE_ETHERNET_CSMACD || !cur->IfIndex)
+                    continue;
+                if (!index) index = cur->IfIndex;
+                if (cur->OperStatus == IfOperStatusUp) {
+                    index = cur->IfIndex;
+                    break;
+                }
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, addrs);
+        if (ret != ERROR_BUFFER_OVERFLOW) break;
+    }
+    return index;
+}
+
 static void handle_client(AsbConn *client)
 {
     char buf[256];
@@ -1961,13 +2062,18 @@ static void handle_client(AsbConn *client)
 
             if (ip[0] && prefix[0] && gateway[0]) {
                 wchar_t wcmd[512];
+                wchar_t nic[32] = L"Ethernet";
+                ULONG nic_index = primary_nic_index();
                 STARTUPINFOW si;
                 PROCESS_INFORMATION pi;
                 DWORD exit_code = 1;
 
+                if (nic_index)
+                    swprintf_s(nic, 32, L"%lu", nic_index);
+
                 swprintf_s(wcmd, 512,
-                    L"netsh interface ip set address \"Ethernet\" static %S %S %S",
-                    ip,
+                    L"netsh interface ip set address \"%s\" static %S %S %S",
+                    nic, ip,
                     /* Convert prefix length to subnet mask */
                     atoi(prefix) == 16 ? "255.255.0.0" :
                     atoi(prefix) == 24 ? "255.255.255.0" :
@@ -1995,7 +2101,7 @@ static void handle_client(AsbConn *client)
                     PROCESS_INFORMATION pi2;
 
                     swprintf_s(dns_cmd, 512,
-                        L"netsh interface ip set dns \"Ethernet\" static %S", gateway);
+                        L"netsh interface ip set dns \"%s\" static %S", nic, gateway);
                     ZeroMemory(&si2, sizeof(si2));
                     si2.cb = sizeof(si2);
                     ZeroMemory(&pi2, sizeof(pi2));
@@ -2007,7 +2113,7 @@ static void handle_client(AsbConn *client)
                     }
 
                     swprintf_s(dns_cmd, 512,
-                        L"netsh interface ip add dns \"Ethernet\" 8.8.8.8 index=2");
+                        L"netsh interface ip add dns \"%s\" 8.8.8.8 index=2", nic);
                     ZeroMemory(&si2, sizeof(si2));
                     si2.cb = sizeof(si2);
                     ZeroMemory(&pi2, sizeof(pi2));

@@ -75,6 +75,7 @@
 		6033000000000000000000DD /* firstboot.sh in Embed agent_mac */ = {isa = PBXBuildFile; fileRef = 1033000000000000000000DD /* firstboot.sh */; };
 		/* Framework target — Frameworks */
 		4011000000000000000000BB /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3001000000000000000000AA /* Cocoa.framework */; };
+		4016000000000000000000BB /* Carbon.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3016000000000000000000BB /* Carbon.framework */; };
 		4012000000000000000000BB /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3003000000000000000000AA /* Virtualization.framework */; };
 		4013000000000000000000BB /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3004000000000000000000AA /* Metal.framework */; };
 		4014000000000000000000BB /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3005000000000000000000AA /* Security.framework */; };
@@ -197,8 +198,10 @@
 		1040000000000000000000EE /* appsandbox-clipboard.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "appsandbox-clipboard.m"; sourceTree = "<group>"; };
 		C040000000000000000000EE /* appsandbox-clipboard */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "appsandbox-clipboard"; sourceTree = BUILT_PRODUCTS_DIR; };
 		1018000000000000000000AA /* asb_types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_types.h; sourceTree = "<group>"; };
+		1070000000000000000000AA /* protocol.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = protocol.h; sourceTree = "<group>"; };
 		1020000000000000000000BB /* AppSandboxCore-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "AppSandboxCore-Info.plist"; sourceTree = "<group>"; };
 		3001000000000000000000AA /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = System/Library/Frameworks/Cocoa.framework; sourceTree = SDKROOT; };
+		3016000000000000000000BB /* Carbon.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Carbon.framework; path = System/Library/Frameworks/Carbon.framework; sourceTree = SDKROOT; };
 		3002000000000000000000AA /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		3003000000000000000000AA /* Virtualization.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Virtualization.framework; path = System/Library/Frameworks/Virtualization.framework; sourceTree = SDKROOT; };
 		3004000000000000000000AA /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
@@ -254,6 +257,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				4011000000000000000000BB /* Cocoa.framework in Frameworks */,
+				4016000000000000000000BB /* Carbon.framework in Frameworks */,
 				4012000000000000000000BB /* Virtualization.framework in Frameworks */,
 				4013000000000000000000BB /* Metal.framework in Frameworks */,
 				4014000000000000000000BB /* Security.framework in Frameworks */,
@@ -393,6 +397,7 @@
 			isa = PBXGroup;
 			children = (
 				1018000000000000000000AA /* asb_types.h */,
+				1070000000000000000000AA /* protocol.h */,
 			);
 			name = core;
 			path = src/core;
@@ -436,6 +441,7 @@
 			isa = PBXGroup;
 			children = (
 				3001000000000000000000AA /* Cocoa.framework */,
+				3016000000000000000000BB /* Carbon.framework */,
 				3002000000000000000000AA /* WebKit.framework */,
 				3003000000000000000000AA /* Virtualization.framework */,
 				3004000000000000000000AA /* Metal.framework */,

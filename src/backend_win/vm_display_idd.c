@@ -31,6 +31,7 @@
 #include <stdarg.h>
 
 #include "vm_display_idd.h"
+#include "../core/protocol.h"
 #include "vm_clipboard.h"
 #include "vm_agent.h"
 #include "hcs_vm.h"
@@ -105,36 +106,13 @@ typedef struct AudioFrameHeader {
 #define MAX_DIRTY_RECTS     64
 #define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
 
-/* ---- Input protocol (host → guest) ---- */
-
-#define INPUT_MAGIC         0x4E495341  /* "ASIN" little-endian */
-#define INPUT_MOUSE_MOVE    0
-#define INPUT_MOUSE_BUTTON  1
-#define INPUT_MOUSE_WHEEL   2
-#define INPUT_KEY           3
-
-/* Button IDs for INPUT_MOUSE_BUTTON */
-#define INPUT_BTN_LEFT      0
-#define INPUT_BTN_RIGHT     1
-#define INPUT_BTN_MIDDLE    2
-
-#define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
-
-#pragma pack(push, 1)
-typedef struct InputPacket {
-    UINT32 magic;   /* INPUT_MAGIC */
-    UINT32 type;    /* INPUT_MOUSE_MOVE / BUTTON / WHEEL / KEY */
-    UINT32 param1;
-    UINT32 param2;
-    UINT32 param3;
-} InputPacket;
-#pragma pack(pop)
-
 /* ---- Window messages ---- */
 
 #define WM_VM_DISPLAY_CLOSED    (WM_APP + 5)
 #define WM_IDD_FRAME_READY      (WM_USER + 100)
 #define WM_IDD_FOCUS            (WM_USER + 101)
+#define WM_IDD_INPUT_READY      (WM_USER + 102)
+#define WM_IDD_CURSOR_CHANGED   (WM_USER + 103)
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -235,6 +213,23 @@ struct VmDisplayIdd {
 
     /* Input forwarding */
     volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
+    SRWLOCK        input_lock;
+    volatile LONG  keyboard_version;
+    volatile LONG  mouse_version;
+    volatile BOOL  frame_connected;
+    BOOL           relative_mouse;
+    BOOL           input_sizing;
+    UINT           mouse_buttons;
+    BOOL           raw_absolute_valid;
+    HANDLE         raw_absolute_device;
+    POINT          raw_absolute_position;
+    BOOL           mouse_sync_pending;
+    UINT32         mouse_sync_id;
+    ULONGLONG      mouse_sync_deadline;
+    POINT          mouse_sync_origin;
+    SOCKET         mouse_sync_socket;
+    InputPacket    mouse_reply;
+    int            mouse_reply_size;
     BOOL           mouse_in;        /* TRUE while cursor is inside the render area */
     BOOL           tracking;        /* TrackMouseEvent active */
 
@@ -243,12 +238,11 @@ struct VmDisplayIdd {
     volatile BOOL  transmit_hotkeys; /* TRUE = capture host hotkeys + send to guest */
     volatile BOOL  input_focused;    /* TRUE while our top-level window is active */
     HHOOK          kbd_hook;          /* WH_KEYBOARD_LL handle, NULL when not installed */
-    /* Held-key tracking (window-thread only, no lock). Indexed by virtual key.
-       held_down[vk]=1 means we forwarded a down with no matching up yet; the
-       saved scan/ext let us synthesize an accurate up when flushing. */
-    BYTE           held_down[256];
-    BYTE           held_scan[256];
-    BYTE           held_ext[256];
+    /* Legacy keys use VK indices; physical keys use scan/E0 or 512 + function VK. */
+    BYTE           held_down[768];
+    InputPacket    held_keys[768];
+    BYTE           hook_routes[768];
+    BOOL           input_menu_active;
 
     /* Guest cursor */
     HCURSOR        guest_cursor;    /* current cursor created from guest bitmap */
@@ -278,6 +272,11 @@ struct VmDisplayIdd {
 static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static DWORD WINAPI     idd_window_thread_proc(LPVOID param);
 static DWORD WINAPI     idd_recv_thread_proc(LPVOID param);
+static void idd_update_relative_mouse(VmDisplayIdd *d);
+static void idd_resume_absolute_mouse(VmDisplayIdd *d, const InputPacket *reply);
+static void idd_poll_mouse_position(VmDisplayIdd *d);
+static void window_to_vm_coords(HWND hwnd, int wx, int wy, UINT vm_w, UINT vm_h,
+                                UINT *vx, UINT *vy);
 
 /* ---- Window class ---- */
 
@@ -291,6 +290,8 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_SHOW_LOG       0x1020
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
+static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
+static HWND g_mouse_capture_hwnd;
 
 /* Listbox subclass — handles Ctrl+A / Ctrl+C */
 static LRESULT CALLBACK idd_log_listbox_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -483,16 +484,14 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
 
 /* ---- Send input packet to guest ---- */
 
-static UINT g_input_send_count = 0;
-
-static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
+static BOOL send_input_locked(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
 {
     InputPacket pkt;
     SOCKET s;
     int ret;
 
     s = d->input_socket;
-    if (s == INVALID_SOCKET) return;
+    if (s == INVALID_SOCKET) return FALSE;
 
     pkt.magic  = INPUT_MAGIC;
     pkt.type   = type;
@@ -505,14 +504,13 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
     if (ret == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK) {
-            /* Send buffer full: drop this packet (as the comment intends)
-               without tearing down the socket. */
-            return;
+            return FALSE;
         }
         idd_log(d, L"INPUT SEND ERR %d - flagging for reconnect.", err);
         /* Mark dead — recv thread owns the socket and will close + reconnect */
         d->input_socket = INVALID_SOCKET;
-        return;
+        PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
+        return FALSE;
     }
     if (ret != (int)sizeof(pkt)) {
         /* Partial send on a stream socket: the guest reads fixed-size 20-byte
@@ -521,19 +519,112 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
         idd_log(d, L"INPUT SEND short (%d/%d) - flagging for reconnect.",
                 ret, (int)sizeof(pkt));
         d->input_socket = INVALID_SOCKET;
+        PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
+{
+    AcquireSRWLockExclusive(&d->input_lock);
+    send_input_locked(d, type, p1, p2, p3);
+    ReleaseSRWLockExclusive(&d->input_lock);
+}
+
+static BOOL idd_clip_mouse(VmDisplayIdd *d)
+{
+    RECT rc;
+    if (!GetClientRect(d->render_hwnd, &rc) || IsRectEmpty(&rc)) return FALSE;
+    MapWindowPoints(d->render_hwnd, NULL, (POINT *)&rc, 2);
+    return ClipCursor(&rc);
+}
+
+static void idd_cancel_mouse_sync(VmDisplayIdd *d)
+{
+    POINT point;
+    if (!d->mouse_sync_pending) return;
+    d->mouse_sync_pending = FALSE;
+    if (GetForegroundWindow() == d->hwnd && GetCursorPos(&point) &&
+        WindowFromPoint(point) == d->render_hwnd)
+        SetCursor(!d->cursor_visible ? NULL :
+                  d->guest_cursor ? d->guest_cursor : LoadCursorW(NULL, IDC_ARROW));
+}
+
+static void idd_update_relative_mouse(VmDisplayIdd *d)
+{
+    POINT pt = {0};
+    BOOL active = !d->stop && d->frame_connected &&
+                   d->mouse_version == INPUT_MOUSE_VERSION &&
+                   d->input_socket != INVALID_SOCKET && d->input_focused &&
+                   !d->input_menu_active && !d->input_sizing &&
+                   GetForegroundWindow() == d->hwnd && !IsIconic(d->hwnd) &&
+                   GetCursorPos(&pt) && WindowFromPoint(pt) == d->render_hwnd;
+    BOOL capture = active && !d->cursor_visible;
+    BOOL sync_absolute = FALSE;
+    if (!active || capture) idd_cancel_mouse_sync(d);
+    AcquireSRWLockExclusive(&g_mouse_capture_lock);
+    if (capture == d->relative_mouse &&
+        (!capture || g_mouse_capture_hwnd == d->hwnd)) {
+        ReleaseSRWLockExclusive(&g_mouse_capture_lock);
         return;
     }
-
-    g_input_send_count++;
-
-    /* Log non-move events only (moves are too noisy) */
-    if (type != INPUT_MOUSE_MOVE) {
-        static const wchar_t *type_names[] = {
-            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY"
-        };
-        const wchar_t *name = type < 4 ? type_names[type] : L"?";
-        idd_log(d, L"INPUT %s p1=%u p2=%u p3=%u (#%u)", name, p1, p2, p3, g_input_send_count);
+    if (capture) {
+        RAWINPUTDEVICE mouse = { 0x01, 0x02, 0, d->hwnd };
+        d->relative_mouse = FALSE;
+        if (RegisterRawInputDevices(&mouse, 1, sizeof(mouse))) {
+            if (idd_clip_mouse(d)) {
+                g_mouse_capture_hwnd = d->hwnd;
+                d->relative_mouse = TRUE;
+                d->mouse_in = TRUE;
+                d->raw_absolute_valid = FALSE;
+                SetCursor(NULL);
+            } else {
+                mouse.dwFlags = RIDEV_REMOVE;
+                mouse.hwndTarget = NULL;
+                RegisterRawInputDevices(&mouse, 1, sizeof(mouse));
+            }
+        }
+    } else {
+        if (g_mouse_capture_hwnd == d->hwnd) {
+            sync_absolute = d->relative_mouse && active && d->cursor_visible;
+            RAWINPUTDEVICE mouse = { 0x01, 0x02, RIDEV_REMOVE, NULL };
+            RegisterRawInputDevices(&mouse, 1, sizeof(mouse));
+            ClipCursor(NULL);
+            g_mouse_capture_hwnd = NULL;
+        }
+        d->relative_mouse = FALSE;
+        d->raw_absolute_valid = FALSE;
     }
+    ReleaseSRWLockExclusive(&g_mouse_capture_lock);
+    if (sync_absolute && d->frame_width && d->frame_height) {
+        if (d->mouse_version == INPUT_MOUSE_VERSION) {
+            if (++d->mouse_sync_id == 0) ++d->mouse_sync_id;
+            d->mouse_sync_origin = pt;
+            d->mouse_sync_deadline = GetTickCount64() + 250;
+            AcquireSRWLockExclusive(&d->input_lock);
+            d->mouse_sync_socket = d->input_socket;
+            d->mouse_sync_pending = send_input_locked(d, INPUT_MOUSE_POSITION_QUERY,
+                                                      d->mouse_sync_id, 0, 0);
+            ReleaseSRWLockExclusive(&d->input_lock);
+            if (d->mouse_sync_pending) {
+                SetCursor(NULL);
+                return;
+            }
+        }
+        idd_resume_absolute_mouse(d, NULL);
+    }
+}
+
+static void idd_flush_mouse_buttons(VmDisplayIdd *d)
+{
+    for (UINT button = INPUT_BTN_LEFT; button <= INPUT_BTN_MIDDLE; button++) {
+        if (d->mouse_buttons & (1u << button))
+            send_input(d, INPUT_MOUSE_BUTTON, button, 0, 0);
+    }
+    d->mouse_buttons = 0;
+    if (GetCapture() == d->render_hwnd) ReleaseCapture();
 }
 
 /* ==================================================================
@@ -594,13 +685,8 @@ static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path)
  * Keyboard hotkey capture
  * ================================================================== */
 
-/* Maximal reserved-hotkey set: keys the host shell would normally consume.
-   In Default mode these are withheld from the guest (host handles them); in
-   Transmit mode they are captured and forwarded to the guest instead.
-   alt_down must reflect whether Alt is currently held (LLKHF_ALTDOWN from the
-   low-level hook, or GetKeyState(VK_MENU) from the wndproc path).
-   Note: Ctrl+Alt+Del and Win+L are secure (SAS) sequences that no user-mode
-   hook can intercept — they always reach the host. */
+/* Host shortcuts withheld from the guest in Default mode.
+   alt_down reflects GetKeyState(VK_MENU) in the window procedure. */
 static BOOL idd_is_reserved_hotkey(DWORD vk, BOOL alt_down)
 {
     switch (vk) {
@@ -625,35 +711,60 @@ static BOOL idd_is_reserved_hotkey(DWORD vk, BOOL alt_down)
    change can release anything still down. Runs on the window thread only. */
 static void idd_forward_key(VmDisplayIdd *d, DWORD vk, DWORD scan, BOOL ext, BOOL up)
 {
-    UINT32 flags = 0;
-    if (ext) flags |= 1;
-    if (up)  flags |= 2;
-    send_input(d, INPUT_KEY, vk, scan, flags);
-
-    if (vk < 256) {
-        if (up) {
-            d->held_down[vk] = 0;
-        } else {
-            d->held_down[vk] = 1;
-            d->held_scan[vk] = (BYTE)scan;
-            d->held_ext[vk]  = (BYTE)(ext ? 1 : 0);
-        }
+    UINT32 type = INPUT_KEY, index = vk;
+    InputPacket pkt;
+    AcquireSRWLockExclusive(&d->input_lock);
+    if (d->keyboard_version == INPUT_KEYBOARD_VERSION) {
+        type = INPUT_KEY_PHYSICAL;
+        if (vk == VK_PAUSE || vk == VK_CANCEL) { scan = 0; ext = FALSE; }
+        /* Windows flags right Shift and Num Lock as extended without a physical E0 prefix. */
+        if (scan == 0x36 || scan == 0x45) ext = FALSE;
+        if (vk == VK_PACKET || scan > 255) goto done;
+        if (scan == 0 && vk != VK_CANCEL && vk != VK_PAUSE &&
+            vk != VK_SNAPSHOT && vk != VK_SLEEP &&
+            !(vk >= VK_BROWSER_BACK && vk <= VK_LAUNCH_APP2)) goto done;
+        index = scan ? scan + (ext ? 256 : 0) : 512 + vk;
     }
+    pkt.magic = INPUT_MAGIC;
+    pkt.type = type;
+    pkt.param1 = vk;
+    pkt.param2 = scan;
+    pkt.param3 = ext ? INPUT_KEY_EXTENDED : 0;
+    if (type == INPUT_KEY_PHYSICAL &&
+        index < ARRAYSIZE(d->held_down) && d->held_down[index])
+        pkt = d->held_keys[index];
+    if (type == INPUT_KEY_PHYSICAL && up && (scan == 0xF1 || scan == 0xF2) &&
+        !d->held_down[index]) {
+        /* Some Korean keyboard drivers report only the key release. */
+        if (!send_input_locked(d, pkt.type, pkt.param1, pkt.param2, pkt.param3)) goto done;
+        d->held_down[index] = 1;
+        d->held_keys[index] = pkt;
+    }
+    if (up) pkt.param3 |= INPUT_KEY_UP;
+    if (send_input_locked(d, pkt.type, pkt.param1, pkt.param2, pkt.param3) &&
+        index < ARRAYSIZE(d->held_down)) {
+        d->held_down[index] = !up;
+        if (!up) d->held_keys[index] = pkt;
+    }
+done:
+    ReleaseSRWLockExclusive(&d->input_lock);
 }
 
 /* Send key-up for every key we believe is still held in the guest, then
    clear tracking. Called when our window loses activation, when Transmit
-   mode is turned off, and on teardown — this is the core stuck-key fix. */
+   mode is turned off, and on teardown. */
 static void idd_flush_held_keys(VmDisplayIdd *d)
 {
-    int vk;
-    for (vk = 0; vk < 256; vk++) {
-        if (d->held_down[vk]) {
-            UINT32 flags = 2 | (d->held_ext[vk] ? 1 : 0);
-            send_input(d, INPUT_KEY, (UINT32)vk, d->held_scan[vk], flags);
-            d->held_down[vk] = 0;
+    AcquireSRWLockExclusive(&d->input_lock);
+    for (int i = 0; i < ARRAYSIZE(d->held_down); i++) {
+        if (d->held_down[i]) {
+            const InputPacket *pkt = &d->held_keys[i];
+            send_input_locked(d, pkt->type, pkt->param1, pkt->param2,
+                              pkt->param3 | INPUT_KEY_UP);
+            d->held_down[i] = 0;
         }
     }
+    ReleaseSRWLockExclusive(&d->input_lock);
 }
 
 /* Thread-local owner: a WH_KEYBOARD_LL callback runs on the thread that
@@ -661,19 +772,57 @@ static void idd_flush_held_keys(VmDisplayIdd *d)
    without a global registry, keeping multiple displays independent. */
 static __declspec(thread) VmDisplayIdd *t_hook_display;
 
+enum { KEY_ROUTE_HOST = 1, KEY_ROUTE_GUEST, KEY_ROUTE_BOTH };
+
+static BOOL idd_is_modifier(DWORD vk)
+{
+    return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU ||
+           (vk >= VK_LSHIFT && vk <= VK_RMENU);
+}
+
 static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
 {
     VmDisplayIdd *d = t_hook_display;
-
-    if (code == HC_ACTION && d && !d->stop &&
-        d->input_focused && d->transmit_hotkeys) {
+    if (code == HC_ACTION && d && !d->stop) {
         const KBDLLHOOKSTRUCT *k = (const KBDLLHOOKSTRUCT *)lp;
-        BOOL up  = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
-        BOOL alt = (k->flags & LLKHF_ALTDOWN) != 0;
-        if (idd_is_reserved_hotkey(k->vkCode, alt)) {
-            idd_forward_key(d, k->vkCode, k->scanCode,
-                            (k->flags & LLKHF_EXTENDED) != 0, up);
-            return 1;  /* swallow so the host shell doesn't act on it */
+        BOOL up = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
+        BOOL ext = (k->flags & LLKHF_EXTENDED) != 0;
+        BOOL focused = d->input_focused && GetForegroundWindow() == d->hwnd;
+        if (d->keyboard_version != INPUT_KEYBOARD_VERSION) {
+            if (focused && d->transmit_hotkeys) {
+                idd_forward_key(d, k->vkCode, k->scanCode, ext, up);
+                return 1;
+            }
+        } else {
+            DWORD scan = (k->vkCode == VK_PAUSE || k->vkCode == VK_CANCEL)
+                         ? 0 : k->scanCode;
+            if (scan == 0x36 || scan == 0x45) ext = FALSE;
+            if (scan > 255 || k->vkCode > 255) return CallNextHookEx(NULL, code, wp, lp);
+            UINT index = scan ? scan + (ext ? 256 : 0) : 512 + k->vkCode;
+            BYTE route = d->hook_routes[index];
+            BOOL pulse = k->vkCode == VK_PAUSE || k->vkCode == VK_CANCEL;
+            if (!focused || d->input_menu_active) {
+                d->hook_routes[index] = up || pulse ? 0 : KEY_ROUTE_HOST;
+                return CallNextHookEx(NULL, code, wp, lp);
+            }
+            if (!route) {
+                if (up && scan != 0xF1 && scan != 0xF2)
+                    return CallNextHookEx(NULL, code, wp, lp);
+                if (d->transmit_hotkeys) {
+                    route = KEY_ROUTE_GUEST;
+                } else if (idd_is_reserved_hotkey(k->vkCode, (k->flags & LLKHF_ALTDOWN) != 0) ||
+                           (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
+                           (GetAsyncKeyState(VK_RWIN) & 0x8000)) {
+                    route = KEY_ROUTE_HOST;
+                } else {
+                    route = idd_is_modifier(k->vkCode) ? KEY_ROUTE_BOTH : KEY_ROUTE_GUEST;
+                }
+            }
+            /* Releases and repeats follow the key-down destination even if modifiers changed. */
+            d->hook_routes[index] = up || pulse ? 0 : route;
+            if (route != KEY_ROUTE_HOST)
+                idd_forward_key(d, k->vkCode, k->scanCode, ext, up);
+            if (route == KEY_ROUTE_GUEST) return 1;
         }
     }
     return CallNextHookEx(NULL, code, wp, lp);
@@ -682,6 +831,13 @@ static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
 static void idd_install_kbd_hook(VmDisplayIdd *d)
 {
     if (d->kbd_hook) return;
+    ZeroMemory(d->hook_routes, sizeof(d->hook_routes));
+    AcquireSRWLockShared(&d->input_lock);
+    if (d->keyboard_version == INPUT_KEYBOARD_VERSION) {
+        for (UINT i = 0; i < ARRAYSIZE(d->held_down); i++)
+            if (d->held_down[i]) d->hook_routes[i] = KEY_ROUTE_BOTH;
+    }
+    ReleaseSRWLockShared(&d->input_lock);
     t_hook_display = d;
     d->kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL, idd_ll_keyboard_proc,
                                      d->hInstance, 0);
@@ -699,6 +855,14 @@ static void idd_remove_kbd_hook(VmDisplayIdd *d)
         idd_log(d, L"Hotkey capture disabled.");
     }
     t_hook_display = NULL;
+}
+
+static void idd_update_kbd_hook(VmDisplayIdd *d)
+{
+    if (d->transmit_hotkeys || d->keyboard_version == INPUT_KEYBOARD_VERSION)
+        idd_install_kbd_hook(d);
+    else
+        idd_remove_kbd_hook(d);
 }
 
 /* Compute letterboxed/pillarboxed viewport within client rect */
@@ -749,6 +913,92 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy,
     *vy = (UINT)local_y;
     if (*vx >= vm_w) *vx = vm_w - 1;
     if (*vy >= vm_h) *vy = vm_h - 1;
+}
+
+static void idd_resume_absolute_mouse(VmDisplayIdd *d, const InputPacket *reply)
+{
+    POINT point;
+    UINT vx, vy;
+    if (d->stop || !d->frame_connected || !d->input_focused ||
+        d->input_menu_active || d->input_sizing || d->relative_mouse ||
+        !d->cursor_visible || !d->frame_width || !d->frame_height ||
+        GetForegroundWindow() != d->hwnd || IsIconic(d->hwnd) ||
+        !GetCursorPos(&point) || WindowFromPoint(point) != d->render_hwnd) {
+        idd_cancel_mouse_sync(d);
+        return;
+    }
+
+    if (reply && reply->param1 < d->frame_width && reply->param2 < d->frame_height) {
+        RECT rc;
+        float x, y, width, height;
+        LONG dx = point.x - d->mouse_sync_origin.x;
+        LONG dy = point.y - d->mouse_sync_origin.y;
+        if (GetClientRect(d->render_hwnd, &rc) && !IsRectEmpty(&rc)) {
+            compute_letterbox(rc.right, rc.bottom, d->frame_width, d->frame_height,
+                              &x, &y, &width, &height);
+            POINT target = {
+                (LONG)(x + (reply->param1 + 0.5f) * width / d->frame_width) + dx,
+                (LONG)(y + (reply->param2 + 0.5f) * height / d->frame_height) + dy
+            };
+            if (target.x < (LONG)x) target.x = (LONG)x;
+            if (target.y < (LONG)y) target.y = (LONG)y;
+            if (target.x >= (LONG)(x + width)) target.x = (LONG)(x + width) - 1;
+            if (target.y >= (LONG)(y + height)) target.y = (LONG)(y + height) - 1;
+            if (ClientToScreen(d->render_hwnd, &target)) {
+                SetCursorPos(target.x, target.y);
+                GetCursorPos(&point);
+            }
+        }
+    }
+    d->mouse_sync_pending = FALSE;
+    ScreenToClient(d->render_hwnd, &point);
+    window_to_vm_coords(d->render_hwnd, point.x, point.y,
+                        d->frame_width, d->frame_height, &vx, &vy);
+    send_input(d, INPUT_MOUSE_MOVE, vx, vy, 0);
+    SetCursor(d->guest_cursor ? d->guest_cursor : LoadCursorW(NULL, IDC_ARROW));
+}
+
+static void idd_poll_mouse_position(VmDisplayIdd *d)
+{
+    InputPacket reply;
+    BOOL received = FALSE, disconnected = FALSE;
+    if (!d->mouse_sync_pending) return;
+    idd_update_relative_mouse(d);
+    if (!d->mouse_sync_pending) return;
+    AcquireSRWLockExclusive(&d->input_lock);
+    if (d->input_socket != INVALID_SOCKET && d->input_socket == d->mouse_sync_socket) {
+        for (int i = 0; i < 16; i++) {
+            int n = recv(d->input_socket, (char *)&d->mouse_reply + d->mouse_reply_size,
+                         (int)sizeof(InputPacket) - d->mouse_reply_size, 0);
+            if (n <= 0) {
+                disconnected = n == 0 || WSAGetLastError() != WSAEWOULDBLOCK;
+                if (disconnected) {
+                    d->input_socket = INVALID_SOCKET;
+                    PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
+                }
+                break;
+            }
+            d->mouse_reply_size += n;
+            if (d->mouse_reply_size != sizeof(InputPacket)) continue;
+            d->mouse_reply_size = 0;
+            if (d->mouse_reply.magic == INPUT_MAGIC &&
+                d->mouse_reply.type == INPUT_MOUSE_POSITION_REPLY &&
+                d->mouse_reply.param3 == d->mouse_sync_id) {
+                reply = d->mouse_reply;
+                received = TRUE;
+                break;
+            }
+        }
+    } else {
+        disconnected = TRUE;
+    }
+    ReleaseSRWLockExclusive(&d->input_lock);
+    if (disconnected)
+        idd_cancel_mouse_sync(d);
+    else if (received)
+        idd_resume_absolute_mouse(d, &reply);
+    else if (GetTickCount64() >= d->mouse_sync_deadline)
+        idd_resume_absolute_mouse(d, NULL);
 }
 
 /* ---- Reliable recv: read exactly `len` bytes ---- */
@@ -819,6 +1069,83 @@ static SOCKET connect_to_hv_service(const GUID *vm_runtime_id, const GUID *servi
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&sock_timeout, sizeof(sock_timeout));
 
     return s;
+}
+
+static SOCKET connect_input(VmDisplayIdd *d)
+{
+    static volatile LONG request_id;
+    GUID svc;
+    UINT32 ready = 0;
+    InputPacket queries[] = {
+        { INPUT_MAGIC, INPUT_KEYBOARD_QUERY, INPUT_KEYBOARD_VERSION, 0, 0 },
+        { INPUT_MAGIC, INPUT_MOUSE_QUERY, INPUT_MOUSE_VERSION, 0, 0 }
+    };
+    InputPacket reply = {0};
+    int got = 0, version = 1, mouse_version = 0;
+    BOOL keyboard_reply = FALSE, mouse_reply = FALSE;
+    ULONGLONG deadline;
+    u_long nonblock = 1;
+    DWORD zero_timeout = 0;
+    hcs_service_guid(d->os_type, 3, &svc);
+    SOCKET s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
+    if (s == INVALID_SOCKET) return s;
+    if (!recv_exact(s, &ready, sizeof(ready)) || ready != INPUT_READY_MAGIC)
+        goto failed;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
+    if (ioctlsocket(s, FIONBIO, &nonblock) != 0) goto failed;
+    queries[0].param2 = queries[1].param2 = (UINT32)InterlockedIncrement(&request_id);
+    if (send(s, (const char *)queries, sizeof(queries), 0) != sizeof(queries))
+        goto failed;
+    /* Old helpers ignore the query. A late or incomplete reply cannot change
+       the mode after the socket has been made available to the window thread. */
+    deadline = GetTickCount64() + 500;
+    while ((!keyboard_reply || !mouse_reply) && !d->stop) {
+        fd_set read_set;
+        struct timeval timeout;
+        LONGLONG remaining = (LONGLONG)(deadline - GetTickCount64());
+        if (remaining <= 0) break;
+        timeout.tv_sec = 0;
+        timeout.tv_usec = (long)remaining * 1000;
+        FD_ZERO(&read_set);
+        FD_SET(s, &read_set);
+        int result = select(0, &read_set, NULL, NULL, &timeout);
+        if (result == SOCKET_ERROR) goto failed;
+        if (result == 0) break;
+        int n = recv(s, (char *)&reply + got, (int)sizeof(reply) - got, 0);
+        if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
+        if (n <= 0) goto failed;
+        got += n;
+        if (got == sizeof(reply)) {
+            if (reply.magic == INPUT_MAGIC && reply.param2 == queries[0].param2 &&
+                reply.param3 == 0) {
+                if (reply.type == INPUT_KEYBOARD_REPLY) {
+                    keyboard_reply = TRUE;
+                    if (reply.param1 == INPUT_KEYBOARD_VERSION)
+                        version = INPUT_KEYBOARD_VERSION;
+                } else if (reply.type == INPUT_MOUSE_REPLY) {
+                    mouse_reply = TRUE;
+                    if (reply.param1 == INPUT_MOUSE_VERSION)
+                        mouse_version = INPUT_MOUSE_VERSION;
+                }
+            }
+            got = 0;
+        }
+    }
+    if (d->stop) goto failed;
+    AcquireSRWLockExclusive(&d->input_lock);
+    ZeroMemory(d->held_down, sizeof(d->held_down));
+    d->keyboard_version = version;
+    d->mouse_version = mouse_version;
+    d->mouse_reply = reply;
+    d->mouse_reply_size = got;
+    d->input_socket = s;
+    ReleaseSRWLockExclusive(&d->input_lock);
+    PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
+    idd_log(d, L"Input connected + ready (keyboard v%d).", version);
+    return s;
+failed:
+    closesocket(s);
+    return INVALID_SOCKET;
 }
 
 /* ==================================================================
@@ -1348,7 +1675,9 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
                       B,G,R = XOR color values.
            We extract A into a 1bpp monochrome hbmMask and BGR into hbmColor. */
         UINT mask_row_bytes = (width + 7) / 8;
-        UINT mask_pitch = ((mask_row_bytes + 3) & ~3u);
+        /* CreateBitmap consumes WORD-aligned rows, unlike a DWORD-aligned
+           DIB. */
+        UINT mask_pitch = (mask_row_bytes + 1) & ~1u;
         void *color_bits = NULL;
         BYTE *mask_buf;
         UINT row, col;
@@ -1462,9 +1791,9 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
                    dst_pitch);
         }
 
-        /* AND mask, 1bpp, DWORD-aligned rows. Bit set = transparent. */
+        /* AND mask, 1bpp, WORD-aligned for CreateBitmap. Bit set = transparent. */
         mask_row_bytes = (width + 7) / 8;
-        mask_pitch     = (mask_row_bytes + 3) & ~3u;
+        mask_pitch     = (mask_row_bytes + 1) & ~1u;
         mask_buf = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                       (size_t)mask_pitch * height);
         if (!mask_buf) {
@@ -1547,27 +1876,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         FrameHeader hdr;
 
         /* Ensure input channel is connected (independent of frame channel) */
-        if (input_s == INVALID_SOCKET) {
-            GUID svc; hcs_service_guid(d->os_type, 3, &svc);
-            input_s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
-            if (input_s != INVALID_SOCKET) {
-                UINT32 ready_magic = 0;
-                if (recv_exact(input_s, &ready_magic, sizeof(ready_magic)) &&
-                    ready_magic == INPUT_READY_MAGIC) {
-                    DWORD zero_timeout = 0;
-                    u_long nb = 1;
-                    setsockopt(input_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
-                    ioctlsocket(input_s, FIONBIO, &nb);
-                    d->input_socket = input_s;
-                    g_input_send_count = 0;
-                    idd_log(d, L"Input connected + ready (GUID :0003).");
-                } else {
-                    idd_log(d, L"Input handshake failed - closing.");
-                    closesocket(input_s);
-                    input_s = INVALID_SOCKET;
-                }
-            }
-        }
+        if (input_s == INVALID_SOCKET)
+            input_s = connect_input(d);
 
         /* Clipboard module (handles :0005 + :0006 internally) */
         if (!d->clipboard) {
@@ -1599,6 +1909,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
 
         idd_log(d, L"Frame channel connected.");
+        d->cursor_visible = TRUE;
+        PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
 
         /* Receive loop — reads magic first to dispatch frame vs cursor */
         while (!d->stop) {
@@ -1620,7 +1932,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                                 sizeof(CursorHeader) - sizeof(UINT32)))
                     break;
 
-                d->cursor_visible = chdr.visible;
+                BOOL cursor_changed = d->cursor_visible != (chdr.visible != 0);
+                d->cursor_visible = chdr.visible != 0;
 
                 if (chdr.shape_updated && chdr.shape_data_size > 0) {
                     BYTE *cursor_buf;
@@ -1649,16 +1962,14 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                             d->guest_cursor = new_cursor;
                             d->cursor_shape_id = chdr.shape_id;
                             if (old) DestroyCursor(old);
-                            /* Force cursor update if mouse is in window */
-                            if (d->render_hwnd)
-                                PostMessageW(d->render_hwnd, WM_SETCURSOR,
-                                             (WPARAM)d->render_hwnd,
-                                             MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+                            cursor_changed = TRUE;
                         }
                     }
 
                     HeapFree(GetProcessHeap(), 0, cursor_buf);
                 }
+                if (cursor_changed)
+                    PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
                 continue;  /* back to message loop */
             }
 
@@ -1792,6 +2103,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             d->frame_dirty = TRUE;
             d->recv_count++;
             LeaveCriticalSection(&d->frame_cs);
+            if (!d->frame_connected) {
+                d->frame_connected = TRUE;
+                PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
+            }
 
             /* Signal the window thread to repaint */
             if (d->hwnd && IsWindow(d->hwnd))
@@ -1803,30 +2118,14 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 input_s = INVALID_SOCKET;
                 idd_log(d, L"Input socket closed, will reconnect...");
             }
-            if (input_s == INVALID_SOCKET) {
-                GUID svc; hcs_service_guid(d->os_type, 3, &svc);
-                SOCKET new_s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
-                if (new_s != INVALID_SOCKET) {
-                    UINT32 ready_magic = 0;
-                    if (recv_exact(new_s, &ready_magic, sizeof(ready_magic)) &&
-                        ready_magic == INPUT_READY_MAGIC) {
-                        DWORD zero_timeout = 0;
-                        u_long nb = 1;
-                        setsockopt(new_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
-                        ioctlsocket(new_s, FIONBIO, &nb);
-                        input_s = new_s;
-                        d->input_socket = new_s;
-                        g_input_send_count = 0;
-                        idd_log(d, L"Input reconnected + ready (GUID :0003).");
-                    } else {
-                        closesocket(new_s);
-                    }
-                }
-                /* If connect/handshake fails, will retry next frame */
-            }
+            if (input_s == INVALID_SOCKET)
+                input_s = connect_input(d);
         }
 
         /* Frame channel lost — close it but keep input alive */
+        d->frame_connected = FALSE;
+        d->cursor_visible = TRUE;
+        PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
         closesocket(s);
         idd_log(d, L"Frame channel disconnected, reconnecting...");
 
@@ -1846,7 +2145,13 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     }
 
     /* Final cleanup — close input socket on thread exit */
+    AcquireSRWLockExclusive(&d->input_lock);
     d->input_socket = INVALID_SOCKET;
+    d->keyboard_version = 1;
+    d->mouse_version = 0;
+    ZeroMemory(d->held_down, sizeof(d->held_down));
+    ReleaseSRWLockExclusive(&d->input_lock);
+    PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
     if (input_s != INVALID_SOCKET) {
         closesocket(input_s);
     }
@@ -1996,10 +2301,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     /* Start a present timer for steady rendering */
     SetTimer(d->hwnd, IDT_PRESENT, PRESENT_MS, NULL);
 
-    /* Install the hotkey hook on this (message-pumping) thread if the
-       persisted setting has Transmit mode enabled. */
-    if (d->transmit_hotkeys)
-        idd_install_kbd_hook(d);
+    idd_update_kbd_hook(d);
 
     /* Message pump */
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
@@ -2027,6 +2329,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
 
+    if (d && d->mouse_sync_pending &&
+        (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
+         msg == WM_MBUTTONDOWN || msg == WM_MOUSEWHEEL))
+        idd_resume_absolute_mouse(d, NULL);
+
     switch (msg) {
     case WM_SYSCOMMAND:
         if (d && (wp & 0xFFF0) == IDM_AUDIO_MUTE) {
@@ -2052,13 +2359,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                               MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
             }
-            if (d->transmit_hotkeys) {
-                idd_install_kbd_hook(d);
-            } else {
-                idd_remove_kbd_hook(d);
+            if (!d->transmit_hotkeys) {
                 /* Release anything the guest may be holding from this mode. */
                 idd_flush_held_keys(d);
             }
+            idd_update_kbd_hook(d);
             idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys);
             idd_log(d, d->transmit_hotkeys
                         ? L"Transmit Keyboard Hotkeys: ON."
@@ -2091,9 +2396,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                guest before tearing the window down. */
             idd_remove_kbd_hook(d);
             idd_flush_held_keys(d);
+            idd_flush_mouse_buttons(d);
 
             /* Stop recv threads */
             d->stop = TRUE;
+            idd_update_relative_mouse(d);
 
             /* Destroy clipboard module */
             if (d->clipboard) {
@@ -2147,6 +2454,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
+        if (d) {
+            d->stop = TRUE;
+            idd_update_relative_mouse(d);
+        }
         if (d) d->hwnd = NULL;
         PostQuitMessage(0);
         return 0;
@@ -2180,8 +2491,31 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
             d3d_resize_swap_chain(d);
+            if (d->relative_mouse) {
+                AcquireSRWLockExclusive(&g_mouse_capture_lock);
+                if (g_mouse_capture_hwnd == hwnd) idd_clip_mouse(d);
+                ReleaseSRWLockExclusive(&g_mouse_capture_lock);
+            }
+            idd_update_relative_mouse(d);
         }
         return 0;
+
+    case WM_MOVE:
+        if (d && d->relative_mouse) {
+            AcquireSRWLockExclusive(&g_mouse_capture_lock);
+            if (g_mouse_capture_hwnd == hwnd) idd_clip_mouse(d);
+            ReleaseSRWLockExclusive(&g_mouse_capture_lock);
+            idd_update_relative_mouse(d);
+        }
+        break;
+
+    case WM_ENTERSIZEMOVE:
+    case WM_EXITSIZEMOVE:
+        if (d) {
+            d->input_sizing = msg == WM_ENTERSIZEMOVE;
+            idd_update_relative_mouse(d);
+        }
+        break;
 
     case WM_PAINT:
     {
@@ -2194,6 +2528,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_TIMER:
         if (wp == IDT_PRESENT && d) {
+            if (d->mouse_sync_pending) idd_poll_mouse_position(d);
             if (d->frame_dirty)
                 d3d_render_frame(d);
         }
@@ -2227,6 +2562,41 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SetForegroundWindow(hwnd);
         return 0;
 
+    case WM_IDD_INPUT_READY:
+        if (d && !d->stop) {
+            idd_cancel_mouse_sync(d);
+            idd_update_kbd_hook(d);
+            idd_update_relative_mouse(d);
+        }
+        return 0;
+
+    case WM_IDD_CURSOR_CHANGED:
+        if (d && d->render_hwnd) {
+            idd_update_relative_mouse(d);
+            POINT pt;
+            if (GetCursorPos(&pt) && WindowFromPoint(pt) == d->render_hwnd)
+                SendMessageW(d->render_hwnd, WM_SETCURSOR,
+                             (WPARAM)d->render_hwnd,
+                             MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+        }
+        return 0;
+
+    case WM_ENTERMENULOOP:
+        if (d) {
+            d->input_menu_active = TRUE;
+            if (d->keyboard_version == INPUT_KEYBOARD_VERSION) idd_flush_held_keys(d);
+            idd_flush_mouse_buttons(d);
+            idd_update_relative_mouse(d);
+        }
+        break;
+
+    case WM_EXITMENULOOP:
+        if (d) {
+            d->input_menu_active = FALSE;
+            idd_update_relative_mouse(d);
+        }
+        break;
+
     case WM_SETFOCUS:
         if (d && d->clipboard)
             vm_clipboard_set_sync_enabled(d->clipboard, TRUE);
@@ -2245,8 +2615,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ACTIVATE:
         if (d) {
             d->input_focused = (LOWORD(wp) != WA_INACTIVE);
-            if (!d->input_focused)
+            if (!d->input_focused) {
                 idd_flush_held_keys(d);
+                idd_flush_mouse_buttons(d);
+            }
+            idd_update_relative_mouse(d);
         }
         break;
 
@@ -2254,6 +2627,41 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 1;  /* We handle all painting via D3D11 */
 
     /* ---- Mouse tracking (events forwarded from render child) ---- */
+    case WM_INPUT:
+        if (d && d->relative_mouse && d->input_focused &&
+            d->frame_connected && !d->cursor_visible &&
+            d->mouse_version == INPUT_MOUSE_VERSION &&
+            GetForegroundWindow() == hwnd) {
+            RAWINPUT raw = {0};
+            UINT size = sizeof(raw);
+            if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &raw, &size,
+                                sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+                raw.header.dwType == RIM_TYPEMOUSE) {
+                LONG dx = raw.data.mouse.lLastX, dy = raw.data.mouse.lLastY;
+                if (raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) {
+                    BOOL virtual_desktop = (raw.data.mouse.usFlags & MOUSE_VIRTUAL_DESKTOP) != 0;
+                    POINT pt = {
+                        MulDiv(dx, GetSystemMetrics(virtual_desktop ? SM_CXVIRTUALSCREEN : SM_CXSCREEN), 65535),
+                        MulDiv(dy, GetSystemMetrics(virtual_desktop ? SM_CYVIRTUALSCREEN : SM_CYSCREEN), 65535)
+                    };
+                    dx = dy = 0;
+                    if (d->raw_absolute_valid && d->raw_absolute_device == raw.header.hDevice) {
+                        dx = pt.x - d->raw_absolute_position.x;
+                        dy = pt.y - d->raw_absolute_position.y;
+                    }
+                    d->raw_absolute_valid = TRUE;
+                    d->raw_absolute_device = raw.header.hDevice;
+                    d->raw_absolute_position = pt;
+                } else {
+                    d->raw_absolute_valid = FALSE;
+                }
+                if (dx || dy) {
+                    send_input(d, INPUT_MOUSE_RELATIVE, (UINT32)dx, (UINT32)dy, 0);
+                }
+            }
+        }
+        break;
+
     case WM_MOUSEMOVE:
         if (d) {
             if (!d->tracking && d->render_hwnd) {
@@ -2266,10 +2674,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 d->tracking = TRUE;
             }
             d->mouse_in = TRUE;
+            if (!d->relative_mouse && !d->cursor_visible)
+                idd_update_relative_mouse(d);
 
-            {
+            if (!d->relative_mouse && !d->mouse_sync_pending && d->frame_width && d->frame_height) {
                 UINT vx, vy;
-                /* lp coords are relative to render child */
                 window_to_vm_coords(d->render_hwnd,
                                     (int)(short)LOWORD(lp), (int)(short)HIWORD(lp),
                                     d->frame_width, d->frame_height, &vx, &vy);
@@ -2282,12 +2691,15 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             d->mouse_in = FALSE;
             d->tracking = FALSE;
+            idd_update_relative_mouse(d);
         }
         return 0;
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            if (d && d->guest_cursor)
+            if (d && (!d->cursor_visible || d->mouse_sync_pending))
+                SetCursor(NULL);
+            else if (d && d->guest_cursor)
                 SetCursor(d->guest_cursor);
             else
                 SetCursor(LoadCursorW(NULL, IDC_ARROW));
@@ -2300,25 +2712,41 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d && d->mouse_in) {
             if (d->render_hwnd) SetCapture(d->render_hwnd);
             send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 1, 0);
+            d->mouse_buttons |= 1u << INPUT_BTN_LEFT;
         }
         return 0;
     case WM_LBUTTONUP:
         ReleaseCapture();
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 0, 0);
+        if (d && (d->mouse_in || (d->mouse_buttons & (1u << INPUT_BTN_LEFT)))) {
+            send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 0, 0);
+            d->mouse_buttons &= ~(1u << INPUT_BTN_LEFT);
+        }
         return 0;
 
     case WM_RBUTTONDOWN:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 1, 0);
+        if (d && d->mouse_in) {
+            send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 1, 0);
+            d->mouse_buttons |= 1u << INPUT_BTN_RIGHT;
+        }
         return 0;
     case WM_RBUTTONUP:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 0, 0);
+        if (d && (d->mouse_in || (d->mouse_buttons & (1u << INPUT_BTN_RIGHT)))) {
+            send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 0, 0);
+            d->mouse_buttons &= ~(1u << INPUT_BTN_RIGHT);
+        }
         return 0;
 
     case WM_MBUTTONDOWN:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 1, 0);
+        if (d && d->mouse_in) {
+            send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 1, 0);
+            d->mouse_buttons |= 1u << INPUT_BTN_MIDDLE;
+        }
         return 0;
     case WM_MBUTTONUP:
-        if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 0, 0);
+        if (d && (d->mouse_in || (d->mouse_buttons & (1u << INPUT_BTN_MIDDLE)))) {
+            send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 0, 0);
+            d->mouse_buttons &= ~(1u << INPUT_BTN_MIDDLE);
+        }
         return 0;
 
     case WM_MOUSEWHEEL:
@@ -2326,7 +2754,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     /* ---- Keyboard input forwarding (gated on window activation) ----
-       In Transmit mode reserved hotkeys are captured by the low-level hook
+       In Transmit mode key events are captured by the low-level hook
        and never reach here. The mode check below covers Default mode: a
        reserved hotkey is neither forwarded to the guest nor consumed — it
        falls through to DefWindowProc so the host handles it normally (this
@@ -2344,6 +2772,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (!d->transmit_hotkeys &&
             idd_is_reserved_hotkey((DWORD)wp, (GetKeyState(VK_MENU) & 0x8000) != 0))
             break;  /* Default mode: let the host handle this hotkey. */
+        if (d->kbd_hook && d->keyboard_version == INPUT_KEYBOARD_VERSION)
+            return 0;  /* The hook already forwarded modifiers passed through to the host. */
         if (d->input_focused)
             idd_forward_key(d, (DWORD)wp, scan, ext, up);
         return 0;
@@ -2378,9 +2808,12 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->main_hwnd   = main_hwnd;
     d->open         = TRUE;
     d->stop         = FALSE;
+    InitializeSRWLock(&d->input_lock);
+    d->keyboard_version   = 1;
     d->input_socket       = INVALID_SOCKET;
     d->audio_socket       = INVALID_SOCKET;
     d->clipboard          = NULL;
+    d->cursor_visible     = TRUE;
 
     /* Load the per-VM display setting, creating display_settings.json with
        the default (off) if this VM doesn't have one yet. The hook itself is

@@ -742,7 +742,7 @@ int do_prefetch_build_deps(const wchar_t *codename,
     /* ---- 4. Mark seeds in_closure ---- */
     const char *seeds[] = {
         "libasound2-dev", "libxcb1-dev", "libxcb-xfixes0-dev",
-        "libdrm-dev", "pkg-config",
+        "libdrm-dev", "libsystemd-dev", "pkg-config",
         "openssh-server"  /* for ssh_enabled VMs; firstboot installs conditionally */
     };
     int closure_count = 0;
