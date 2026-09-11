@@ -460,6 +460,128 @@ static ULONGLONG file_size_w(const wchar_t *path)
     return ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
 }
 
+/* Case-insensitive wcsstr. */
+static const wchar_t *wcsistr(const wchar_t *hay, const wchar_t *needle)
+{
+    size_t n = wcslen(needle);
+    for (; *hay; hay++)
+        if (_wcsnicmp(hay, needle, n) == 0)
+            return hay;
+    return NULL;
+}
+
+/* The NGX (DLSS) loader linked into games asks dxgkrnl for the driver-store
+   path without the TranslatePath flag and gets the HOST path back
+   (System32\DriverStore\FileRepository\<dir>). In the guest that path doesn't
+   exist — the files live under HostDriverStore — so _nvngx.dll is never found
+   and DLSS is never offered. Make the host path valid: a junction
+   DriverStore\FileRepository\<dir> -> HostDriverStore\FileRepository\<dir>.
+   Vendor-agnostic and idempotent; FileRepository is TrustedInstaller-owned so
+   take it first. */
+static void driverstore_junction(const wchar_t *dest)
+{
+    static const wchar_t marker[] = L"\\HostDriverStore\\FileRepository\\";
+    wchar_t sys[MAX_PATH], repo[MAX_PATH], link[MAX_PATH], cmd[MAX_PATH * 3];
+    const wchar_t *leaf;
+    DWORD attrs;
+
+    leaf = wcsistr(dest, marker);
+    if (!leaf) return;
+    leaf += wcslen(marker);
+    if (!*leaf || wcschr(leaf, L'\\')) return;   /* expect exactly one component */
+    if (!GetSystemDirectoryW(sys, MAX_PATH)) return;
+
+    swprintf_s(repo, MAX_PATH, L"%s\\DriverStore\\FileRepository", sys);
+    swprintf_s(link, MAX_PATH, L"%s\\%s", repo, leaf);
+    attrs = GetFileAttributesW(link);
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+            agent_log("DriverStore junction already present: %ls", link);
+        else
+            agent_log("DriverStore: %ls exists as a real directory - leaving it alone", link);
+        return;
+    }
+
+    swprintf_s(cmd, MAX_PATH * 3, L"%s\\takeown.exe /f \"%s\" /a", sys, repo);
+    run_quiet(cmd);
+    swprintf_s(cmd, MAX_PATH * 3, L"%s\\icacls.exe \"%s\" /grant *S-1-5-18:(M)", sys, repo);
+    run_quiet(cmd);
+    swprintf_s(cmd, MAX_PATH * 3, L"%s\\cmd.exe /c mklink /J \"%s\" \"%s\"", sys, link, dest);
+    run_quiet(cmd);
+
+    attrs = GetFileAttributesW(link);
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT))
+        agent_log("DriverStore junction created: %ls -> %ls", link, dest);
+    else
+        agent_log("DriverStore junction failed for %ls (%lu)", link, GetLastError());
+}
+
+/* TRUE if `path` is our nvapi64 proxy (exports appsandbox_nvapi_proxy). Loaded
+   without running DllMain or resolving imports, so it's safe on any DLL. */
+static BOOL is_nvapi_proxy(const wchar_t *path)
+{
+    HMODULE m = LoadLibraryExW(path, NULL, DONT_RESOLVE_DLL_REFERENCES);
+    BOOL yes = FALSE;
+    if (m) {
+        yes = GetProcAddress(m, "appsandbox_nvapi_proxy") != NULL;
+        FreeLibrary(m);
+    }
+    return yes;
+}
+
+/* NVIDIA GPU-PV guests: NVAPI works, except the two calls that map a physical
+   GPU to its WDDM adapter LUID (there is no NVIDIA KMD in the guest to ask) —
+   they answer NVAPI_NOT_SUPPORTED and NGX treats that as unsupported hardware,
+   so DLSS stays greyed out. tools/nvapi-proxy is a forwarding nvapi64.dll that
+   fills in just those two answers with the LUID of the caller's D3D device.
+   Deploy it over System32\nvapi64.dll, keeping NVIDIA's stub as nvapi64_orig.dll
+   (the proxy loads it from there). Same TrustedInstaller dance as opengl32
+   above. Self-heals when a driver update re-stages NVIDIA's stub via
+   CopyToVmWhenNewer, and upgrades itself when the proxy changes. */
+static void nvapi_proxy_provision(const wchar_t *dir)
+{
+    wchar_t sys[MAX_PATH], src[MAX_PATH], dst[MAX_PATH], orig[MAX_PATH], oldp[MAX_PATH];
+    wchar_t cmd[MAX_PATH * 2];
+
+    swprintf_s(src, MAX_PATH, L"%s\\nvapi64_proxy.dll", dir);
+    if (file_size_w(src) == (ULONGLONG)-1)
+        return;                                   /* not shipped on this build */
+    if (!GetSystemDirectoryW(sys, MAX_PATH)) return;
+    swprintf_s(dst,  MAX_PATH, L"%s\\nvapi64.dll", sys);
+    swprintf_s(orig, MAX_PATH, L"%s\\nvapi64_orig.dll", sys);
+    swprintf_s(oldp, MAX_PATH, L"%s\\nvapi64.dll.old", sys);
+
+    if (file_size_w(dst) == (ULONGLONG)-1) {
+        agent_log("NVAPI proxy: no System32\\nvapi64.dll (no NVIDIA GPU-PV driver) - skipping.");
+        return;
+    }
+    if (is_nvapi_proxy(dst)) {
+        if (file_size_w(dst) == file_size_w(src)) {
+            agent_log("NVAPI proxy: already current in System32.");
+            return;
+        }
+        agent_log("NVAPI proxy: updating deployed proxy.");
+    } else {
+        /* NVIDIA's stub (fresh guest or re-staged by a driver update): keep it
+           as the original the proxy forwards to. Overwrite a stale copy. */
+        if (!CopyFileW(dst, orig, FALSE)) {
+            agent_log("NVAPI proxy: cannot preserve NVIDIA nvapi64.dll (%lu) - not deploying.", GetLastError());
+            return;
+        }
+        agent_log("NVAPI proxy: preserved NVIDIA stub as nvapi64_orig.dll.");
+    }
+
+    swprintf_s(cmd, MAX_PATH * 2, L"%s\\takeown.exe /f \"%s\"", sys, dst);
+    run_quiet(cmd);
+    swprintf_s(cmd, MAX_PATH * 2, L"%s\\icacls.exe \"%s\" /grant *S-1-5-18:F", sys, dst);
+    run_quiet(cmd);
+    MoveFileExW(dst, oldp, MOVEFILE_REPLACE_EXISTING);  /* rename in-use aside */
+    if (CopyFileW(src, dst, FALSE))
+        agent_log("NVAPI proxy: deployed to System32\\nvapi64.dll.");
+    else
+        agent_log("NVAPI proxy: copy to System32 failed (%lu).", GetLastError());
+}
+
 /* Provision the D3D mapping layers after the agent has copied them into `dir`
    (C:\Windows\AppSandbox\d3dlayers) over Plan9. Runs as SYSTEM from the GPU copy
    thread, AFTER the GPU driver copy. Deploys Mesa's standalone opengl32 trio +
@@ -552,6 +674,9 @@ static void gl_provision(const wchar_t *dir)
     }
 
     agent_log("GL: provisioning complete.");
+
+    /* NVIDIA GPU-PV: NVAPI proxy so NGX/DLSS can initialise (see above). */
+    nvapi_proxy_provision(dir);
 }
 
 /* NVIDIA's installer makes DRS writable by desktop and packaged applications.
@@ -654,6 +779,9 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
             failed_shares++;
         } else {
             agent_log("GPU copy share '%s' done (%d files).", si->share_name, files);
+            /* Driver-store shares: also make the host-side path resolve
+               (needed by NVIDIA's NVAPI/NGX loaders, harmless otherwise). */
+            driverstore_junction(dest_wide);
         }
         total_files += files;
 

@@ -1,0 +1,4 @@
+LIBRARY nvapi64
+EXPORTS
+    nvapi_QueryInterface
+    appsandbox_nvapi_proxy

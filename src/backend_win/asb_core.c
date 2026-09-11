@@ -89,6 +89,17 @@ static void prepare_gl_layers_share(GpuDriverShareList *shares)
         CopyFileW(src, dst, FALSE);  /* best-effort; trio may not be staged yet */
     }
 
+    /* NVAPI forwarding proxy for GPU-PV guests (tools/nvapi-proxy). It rides the
+     * same share; the agent deploys it over System32\nvapi64.dll only when an
+     * NVIDIA driver was copied into the guest — without it NGX/DLSS refuses to
+     * initialise in a paravirtualized guest. See nvapi_proxy_provision(). */
+    swprintf_s(res, MAX_PATH, L"%s\\resources\\nvapi-proxy", exe);
+    if (GetFileAttributesW(res) == INVALID_FILE_ATTRIBUTES)
+        swprintf_s(res, MAX_PATH, L"%s\\nvapi-proxy", exe);
+    swprintf_s(src, MAX_PATH, L"%s\\nvapi64.dll", res);
+    swprintf_s(dst, MAX_PATH, L"%s\\nvapi64_proxy.dll", dir);
+    CopyFileW(src, dst, FALSE);  /* best-effort; absent on builds without the proxy */
+
     gpu_append_gl_layers_share(shares, dir);
 }
 
