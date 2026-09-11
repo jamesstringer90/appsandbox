@@ -529,6 +529,74 @@ static BOOL is_nvapi_proxy(const wchar_t *path)
     return yes;
 }
 
+/* TRUE if `dst` is a copy of `src` (same size and last-write time, which
+   CopyFile preserves). A missing `dst` counts as different. */
+static BOOL same_file_stamp(const wchar_t *src, const wchar_t *dst)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a, b;
+    if (!GetFileAttributesExW(src, GetFileExInfoStandard, &a) ||
+        !GetFileAttributesExW(dst, GetFileExInfoStandard, &b))
+        return FALSE;
+    return a.nFileSizeLow == b.nFileSizeLow && a.nFileSizeHigh == b.nFileSizeHigh &&
+           CompareFileTime(&a.ftLastWriteTime, &b.ftLastWriteTime) == 0;
+}
+
+/* NVIDIA's nvapi64.dll as shipped by the active display driver: the
+   HostDriverStore directory that also carries nvapi64_impl.dll (a guest keeps
+   the directories of earlier drivers around; the newest one wins). */
+static BOOL nvapi_driver_stub(wchar_t *out, size_t cch)
+{
+    wchar_t sys[MAX_PATH], repo[MAX_PATH], pattern[MAX_PATH], probe[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    WIN32_FILE_ATTRIBUTE_DATA impl;
+    FILETIME best = { 0, 0 };
+    HANDLE hf;
+    BOOL found = FALSE;
+
+    if (!GetSystemDirectoryW(sys, MAX_PATH)) return FALSE;
+    swprintf_s(repo, MAX_PATH, L"%s\\HostDriverStore\\FileRepository", sys);
+    swprintf_s(pattern, MAX_PATH, L"%s\\*", repo);
+    hf = FindFirstFileW(pattern, &fd);
+    if (hf == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.')
+            continue;
+        swprintf_s(probe, MAX_PATH, L"%s\\%s\\nvapi64_impl.dll", repo, fd.cFileName);
+        if (!GetFileAttributesExW(probe, GetFileExInfoStandard, &impl))
+            continue;
+        swprintf_s(probe, MAX_PATH, L"%s\\%s\\nvapi64.dll", repo, fd.cFileName);
+        if (file_size_w(probe) == (ULONGLONG)-1)
+            continue;
+        if (!found || CompareFileTime(&impl.ftLastWriteTime, &best) > 0) {
+            found = TRUE;
+            best = impl.ftLastWriteTime;
+            wcscpy_s(out, cch, probe);
+        }
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+    return found;
+}
+
+/* Bring nvapi64_orig.dll (what the deployed proxy forwards to) up to the
+   driver's own nvapi64.dll when they differ. The file may be mapped by a
+   running game, so rename it aside first, like opengl32 above. */
+static void nvapi_orig_refresh(const wchar_t *orig, const wchar_t *sys)
+{
+    wchar_t stub[MAX_PATH], oldp[MAX_PATH];
+
+    if (!nvapi_driver_stub(stub, MAX_PATH) || same_file_stamp(stub, orig))
+        return;
+    swprintf_s(oldp, MAX_PATH, L"%s\\nvapi64_orig.dll.old", sys);
+    MoveFileExW(orig, oldp, MOVEFILE_REPLACE_EXISTING);
+    if (CopyFileW(stub, orig, FALSE)) {
+        agent_log("NVAPI proxy: refreshed nvapi64_orig.dll from %ls.", stub);
+        DeleteFileW(oldp);                        /* fails while mapped; harmless */
+    } else {
+        agent_log("NVAPI proxy: refreshing nvapi64_orig.dll failed (%lu) - keeping the previous one.", GetLastError());
+        MoveFileExW(oldp, orig, MOVEFILE_REPLACE_EXISTING);
+    }
+}
+
 /* NVIDIA GPU-PV guests: NVAPI works, except the two calls that map a physical
    GPU to its WDDM adapter LUID (there is no NVIDIA KMD in the guest to ask) —
    they answer NVAPI_NOT_SUPPORTED and NGX treats that as unsupported hardware,
@@ -536,8 +604,10 @@ static BOOL is_nvapi_proxy(const wchar_t *path)
    fills in just those two answers with the LUID of the caller's D3D device.
    Deploy it over System32\nvapi64.dll, keeping NVIDIA's stub as nvapi64_orig.dll
    (the proxy loads it from there). Same TrustedInstaller dance as opengl32
-   above. Self-heals when a driver update re-stages NVIDIA's stub via
-   CopyToVmWhenNewer, and upgrades itself when the proxy changes. */
+   above. Upgrades itself when the proxy changes, and keeps nvapi64_orig.dll in
+   step with the driver: the proxy carries a 99.0 version resource so dxgkrnl's
+   CopyToVmWhenNewer never puts NVIDIA's stub back over it, which also means
+   nothing else would refresh the stub after a driver update. */
 static void nvapi_proxy_provision(const wchar_t *dir)
 {
     wchar_t sys[MAX_PATH], src[MAX_PATH], dst[MAX_PATH], orig[MAX_PATH], oldp[MAX_PATH];
@@ -555,8 +625,14 @@ static void nvapi_proxy_provision(const wchar_t *dir)
         agent_log("NVAPI proxy: no System32\\nvapi64.dll (no NVIDIA GPU-PV driver) - skipping.");
         return;
     }
+    /* Files renamed aside by an earlier update while a game (or Steam,
+       Sunshine...) still had them mapped: gone by now, so clean up. */
+    DeleteFileW(oldp);
+    swprintf_s(cmd, MAX_PATH * 2, L"%s\\nvapi64_orig.dll.old", sys);
+    DeleteFileW(cmd);
     if (is_nvapi_proxy(dst)) {
-        if (file_size_w(dst) == file_size_w(src)) {
+        nvapi_orig_refresh(orig, sys);
+        if (same_file_stamp(src, dst)) {
             agent_log("NVAPI proxy: already current in System32.");
             return;
         }
@@ -576,10 +652,12 @@ static void nvapi_proxy_provision(const wchar_t *dir)
     swprintf_s(cmd, MAX_PATH * 2, L"%s\\icacls.exe \"%s\" /grant *S-1-5-18:F", sys, dst);
     run_quiet(cmd);
     MoveFileExW(dst, oldp, MOVEFILE_REPLACE_EXISTING);  /* rename in-use aside */
-    if (CopyFileW(src, dst, FALSE))
+    if (CopyFileW(src, dst, FALSE)) {
         agent_log("NVAPI proxy: deployed to System32\\nvapi64.dll.");
-    else
+        DeleteFileW(oldp);                        /* fails while mapped; harmless */
+    } else {
         agent_log("NVAPI proxy: copy to System32 failed (%lu).", GetLastError());
+    }
 }
 
 /* Provision the D3D mapping layers after the agent has copied them into `dir`

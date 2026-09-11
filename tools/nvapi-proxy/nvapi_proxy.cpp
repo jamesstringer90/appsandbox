@@ -24,7 +24,8 @@
  * Using the device's own LUID matters: a GPU-PV guest can expose several
  * VRD adapters with the same name and different LUIDs.
  *
- * Log: %SystemRoot%\AppSandbox\nvapi_proxy.log (init + emulated answers).
+ * Log: %SystemRoot%\AppSandbox\nvapi_proxy.log (init + emulated answers),
+ * or %TEMP%\nvapi_proxy.log when the game's account cannot write there.
  * Set ASB_NVAPI_TRACE=1 in the game's environment to also log every
  * interface id requested.
  *
@@ -87,7 +88,12 @@ static void logf(const char *fmt, ...)
 
     if (!GetWindowsDirectoryW(path, MAX_PATH)) return;
     wcscat_s(path, MAX_PATH, L"\\AppSandbox\\nvapi_proxy.log");
-    if (_wfopen_s(&f, path, L"a") != 0 || !f) return;
+    if (_wfopen_s(&f, path, L"a") != 0 || !f) {
+        /* Games run unelevated and C:\Windows\AppSandbox is admin-only. */
+        if (!GetTempPathW(MAX_PATH, path)) return;
+        wcscat_s(path, MAX_PATH, L"nvapi_proxy.log");
+        if (_wfopen_s(&f, path, L"a") != 0 || !f) return;
+    }
     GetLocalTime(&st);
     fprintf(f, "[%02d:%02d:%02d.%03d pid=%lu] ", st.wHour, st.wMinute, st.wSecond,
             st.wMilliseconds, GetCurrentProcessId());
@@ -113,10 +119,11 @@ static bool load_orig(void)
     return g_qi != NULL;
 }
 
-/* LUID of the first hardware NVIDIA adapter DXGI enumerates — fallback when
-   no device has been seen yet (a caller asking for the mapping before
-   creating a device). */
-static bool nvidia_adapter_luid(LUID *out)
+/* Walk DXGI's hardware NVIDIA adapters. With `want` NULL the first one is
+   returned in `out` (fallback when no device has been seen yet: a caller
+   asking for the mapping before creating a device); otherwise TRUE only if
+   `want` is one of them. */
+static bool nvidia_adapter_luid(const LUID *want, LUID *out)
 {
     typedef HRESULT (WINAPI *CreateFactory1_t)(REFIID, void **);
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
@@ -134,47 +141,54 @@ static bool nvidia_adapter_luid(LUID *out)
         if (factory->EnumAdapters1(i, &ad) != S_OK || !ad) break;
         ad->GetDesc1(&d);
         ad->Release();
-        if (d.VendorId == 0x10DE && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-            *out = d.AdapterLuid;
-            found = true;
-        }
+        if (d.VendorId != 0x10DE || (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
+        if (want && (want->LowPart != d.AdapterLuid.LowPart || want->HighPart != d.AdapterLuid.HighPart)) continue;
+        if (out) *out = d.AdapterLuid;
+        found = true;
     }
     factory->Release();
     return found;
 }
 
-/* LUID of the adapter behind a D3D11 or D3D12 device. */
+/* LUID of the adapter behind a D3D11 or D3D12 device, if it is an NVIDIA one
+   (a guest can also carry another vendor's paravirtualized GPU; a device on
+   that one must not become "the NVIDIA adapter"). */
 static bool luid_from_device(IUnknown *dev, LUID *out)
 {
     IDXGIDevice *dxgiDev = NULL;
     ID3D12Device *d12 = NULL;
+    LUID l = {};
+    bool ok = false;
 
     if (!dev) return false;
     if (SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgiDev)) && dxgiDev) {
         IDXGIAdapter *ad = NULL;
-        bool ok = false;
         if (SUCCEEDED(dxgiDev->GetAdapter(&ad)) && ad) {
             DXGI_ADAPTER_DESC d;
             ad->GetDesc(&d);
-            *out = d.AdapterLuid;
+            l = d.AdapterLuid;
             ad->Release();
             ok = true;
         }
         dxgiDev->Release();
-        return ok;
-    }
-    if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device), (void **)&d12)) && d12) {
-        *out = d12->GetAdapterLuid();
+    } else if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device), (void **)&d12)) && d12) {
+        l = d12->GetAdapterLuid();
         d12->Release();
-        return true;
+        ok = true;
     }
-    return false;
+    if (!ok || !nvidia_adapter_luid(&l, NULL)) return false;
+    *out = l;
+    return true;
 }
 
 static bool current_luid(LUID *out)
 {
-    if (g_haveDeviceLuid) { *out = g_deviceLuid; return true; }
-    return nvidia_adapter_luid(out);
+    bool have;
+    EnterCriticalSection(&g_cs);
+    have = g_haveDeviceLuid;
+    if (have) *out = g_deviceLuid;
+    LeaveCriticalSection(&g_cs);
+    return have || nvidia_adapter_luid(NULL, out);
 }
 
 static NvAPI_Status __cdecl my_IsFatbin(IsFatbin_t real, const char *tag, IUnknown *dev, bool *sup)
@@ -182,7 +196,11 @@ static NvAPI_Status __cdecl my_IsFatbin(IsFatbin_t real, const char *tag, IUnkno
     LUID l = {};
     NvAPI_Status r;
 
-    if (luid_from_device(dev, &l)) { g_deviceLuid = l; g_haveDeviceLuid = true; }
+    if (luid_from_device(dev, &l)) {
+        EnterCriticalSection(&g_cs);
+        g_deviceLuid = l; g_haveDeviceLuid = true;
+        LeaveCriticalSection(&g_cs);
+    }
     r = real ? real(dev, sup) : NVAPI_NOT_SUPPORTED;
     if (g_trace)
         logf("%s(dev=%p) = %d supported=%d luid=%08X%08X", tag, dev, r,
