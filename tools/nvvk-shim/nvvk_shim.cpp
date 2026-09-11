@@ -64,6 +64,10 @@ typedef PFN_vkVoidFunction (*PFN_GetProcAddr)(VkInstance, const char *);
 typedef VkResult (*PFN_EnumAdapterPD)(VkInstance, LUID, unsigned int *, VkPhysicalDevice *);
 
 static HMODULE g_self, g_real;
+static ULONG_PTR g_real_base, g_real_end;      /* nvoglv64.dll image range, for the stack check */
+static PFN_Negotiate   g_real_negotiate;       /* the real ICD's entry points, resolved once */
+static PFN_GetProcAddr g_real_gipa, g_real_gpdpa;
+static PFN_EnumAdapterPD g_real_enum_adapter;
 static volatile LONG g_init;
 static LUID g_nv_luid;                        /* the NVIDIA paravirtualized adapter the driver is pointed at */
 static LUID g_nv_luids[16];                   /* every NVIDIA paravirtualized adapter */
@@ -86,7 +90,10 @@ static PFN_KMT real_OpenAdapterFromHdc, real_OpenAdapterFromLuid, real_CloseAdap
                real_EnumAdapters2, real_QueryAdapterInfo;
 static PFN_NtUserEnumDisplayDevices real_EnumDisplayDevices;
 
-/* TRUE if nvoglv64.dll is within the first frames of the current call stack. */
+/* TRUE if nvoglv64.dll is within the first frames of the current call stack.
+   The hooks stay in place for the life of the process, so this runs on every
+   EnumDisplayDevices / OpenAdapterFromHdc of the process: once the driver is
+   loaded it is a plain address-range check, no loader lock. */
 static bool nv_on_stack(void)
 {
     void *frames[12];
@@ -95,12 +102,16 @@ static bool nv_on_stack(void)
         HMODULE m = NULL;
         wchar_t path[MAX_PATH];
         const wchar_t *base;
+        if (g_real_base) {
+            if ((ULONG_PTR)frames[i] >= g_real_base && (ULONG_PTR)frames[i] < g_real_end) return true;
+            continue;
+        }
+        /* Still inside the driver's DllMain: the module is not ours yet. */
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                 (LPCWSTR)frames[i], &m) || !m)
             continue;
-        if (g_real) { if (m == g_real) return true; continue; }
-        GetModuleFileNameW(m, path, MAX_PATH);      /* still inside its DllMain */
+        GetModuleFileNameW(m, path, MAX_PATH);
         base = wcsrchr(path, L'\\'); base = base ? base + 1 : path;
         if (_wcsicmp(base, L"nvoglv64.dll") == 0) return true;
     }
@@ -229,6 +240,8 @@ static void find_primary_display(void)
             if (t.StateFlags & want) { wcscpy_s(g_primary_name, t.DeviceName); break; }
         }
     }
+    if (!g_primary_name[0])                      /* no desktop (session 0): give the driver a real name anyway */
+        wcscpy_s(g_primary_name, L"\\\\.\\DISPLAY1");
 }
 
 static NTSTATUS NTAPI hook_EnumDisplayDevices(PUNICODE_STRING dev, DWORD i, PDISPLAY_DEVICEW d, DWORD f)
@@ -307,6 +320,18 @@ static void init_once(void)
     wcscat_s(path, L"nvoglv64.dll");
     g_real = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     logf_("nvoglv64.dll -> %p (%ls)", (void *)g_real, path);
+    if (g_real) {
+        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((BYTE *)g_real + ((IMAGE_DOS_HEADER *)g_real)->e_lfanew);
+        g_real_negotiate = (PFN_Negotiate)GetProcAddress(g_real, "vk_icdNegotiateLoaderICDInterfaceVersion");
+        g_real_gipa      = (PFN_GetProcAddr)GetProcAddress(g_real, "vk_icdGetInstanceProcAddr");
+        g_real_gpdpa     = (PFN_GetProcAddr)GetProcAddress(g_real, "vk_icdGetPhysicalDeviceProcAddr");
+        /* Interface >= 7: the loader asks vk_icdGetInstanceProcAddr for this, so do the same. */
+        g_real_enum_adapter = g_real_gipa ? (PFN_EnumAdapterPD)g_real_gipa(NULL, "vk_icdEnumerateAdapterPhysicalDevices") : NULL;
+        if (!g_real_enum_adapter)
+            g_real_enum_adapter = (PFN_EnumAdapterPD)GetProcAddress(g_real, "vk_icdEnumerateAdapterPhysicalDevices");
+        g_real_base = (ULONG_PTR)g_real;
+        g_real_end  = g_real_base + nt->OptionalHeader.SizeOfImage;
+    }
     InterlockedExchange(&g_init, 2);
 }
 
@@ -314,47 +339,35 @@ extern "C" {
 
 __declspec(dllexport) VkResult vk_icdNegotiateLoaderICDInterfaceVersion(unsigned int *pVersion)
 {
-    PFN_Negotiate f;
     init_once();
-    f = g_real ? (PFN_Negotiate)GetProcAddress(g_real, "vk_icdNegotiateLoaderICDInterfaceVersion") : NULL;
-    return f ? f(pVersion) : VK_ERROR_INCOMPATIBLE_DRIVER;
+    return g_real_negotiate ? g_real_negotiate(pVersion) : VK_ERROR_INCOMPATIBLE_DRIVER;
 }
 
 __declspec(dllexport) VkResult vk_icdEnumerateAdapterPhysicalDevices(VkInstance instance, LUID luid,
                                                                      unsigned int *pCount, VkPhysicalDevice *pDevices)
 {
-    PFN_GetProcAddr gipa;
-    PFN_EnumAdapterPD f;
     init_once();
-    /* Interface >= 7: the loader asks vk_icdGetInstanceProcAddr for this, so do the same. */
-    gipa = g_real ? (PFN_GetProcAddr)GetProcAddress(g_real, "vk_icdGetInstanceProcAddr") : NULL;
-    f = gipa ? (PFN_EnumAdapterPD)gipa(NULL, "vk_icdEnumerateAdapterPhysicalDevices") : NULL;
-    if (!f && g_real) f = (PFN_EnumAdapterPD)GetProcAddress(g_real, "vk_icdEnumerateAdapterPhysicalDevices");
-    if (!f) return VK_ERROR_INCOMPATIBLE_DRIVER;
+    if (!g_real_enum_adapter) return VK_ERROR_INCOMPATIBLE_DRIVER;
     for (int i = 0; i < g_nv_luid_count; i++)
         if (luid.LowPart == g_nv_luids[i].LowPart && luid.HighPart == g_nv_luids[i].HighPart) {
             luid = g_nv_luid;
             break;
         }
-    return f(instance, luid, pCount, pDevices);
+    return g_real_enum_adapter(instance, luid, pCount, pDevices);
 }
 
 __declspec(dllexport) PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName)
 {
-    PFN_GetProcAddr f;
     init_once();
     if (pName && g_nv_luid_count && strcmp(pName, "vk_icdEnumerateAdapterPhysicalDevices") == 0)
         return (PFN_vkVoidFunction)vk_icdEnumerateAdapterPhysicalDevices;
-    f = g_real ? (PFN_GetProcAddr)GetProcAddress(g_real, "vk_icdGetInstanceProcAddr") : NULL;
-    return f ? f(instance, pName) : NULL;
+    return g_real_gipa ? g_real_gipa(instance, pName) : NULL;
 }
 
 __declspec(dllexport) PFN_vkVoidFunction vk_icdGetPhysicalDeviceProcAddr(VkInstance instance, const char *pName)
 {
-    PFN_GetProcAddr f;
     init_once();
-    f = g_real ? (PFN_GetProcAddr)GetProcAddress(g_real, "vk_icdGetPhysicalDeviceProcAddr") : NULL;
-    return f ? f(instance, pName) : NULL;
+    return g_real_gpdpa ? g_real_gpdpa(instance, pName) : NULL;
 }
 
 /* Marker the agent looks for to recognise its own DLL. */

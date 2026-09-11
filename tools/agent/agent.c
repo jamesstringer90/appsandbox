@@ -479,14 +479,17 @@ static BOOL same_file_stamp(const wchar_t *src, const wchar_t *dst)
 static int nvvk_patch_manifest(const wchar_t *json)
 {
     static const char icd_key[] = "\"ICD\"", from[] = ".\\\\nvoglv64.dll", to[] = ".\\\\asb_nvvk.dll";
-    char buf[8192], *icd, *hit;
+    const DWORD cap = 64 * 1024;                  /* the manifest is ~1 KB; anything larger is not ours to touch */
+    char *buf, *icd, *hit;
     HANDLE h;
     DWORD n = 0, w = 0;
     int rc = -1;
 
     h = CreateFileW(json, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) return -1;
-    if (ReadFile(h, buf, sizeof(buf) - 1, &n, NULL) && n > 0 && n < sizeof(buf) - 1) {
+    buf = (char *)malloc(cap);
+    if (!buf) { CloseHandle(h); return -1; }
+    if (ReadFile(h, buf, cap - 1, &n, NULL) && n > 0 && n < cap - 1) {
         buf[n] = 0;
         icd = strstr(buf, icd_key);
         if (icd && strstr(icd, to))
@@ -497,6 +500,7 @@ static int nvvk_patch_manifest(const wchar_t *json)
                 rc = 1;
         }
     }
+    free(buf);
     CloseHandle(h);
     return rc;
 }
