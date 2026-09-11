@@ -460,6 +460,105 @@ static ULONGLONG file_size_w(const wchar_t *path)
     return ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
 }
 
+/* TRUE if `dst` is a copy of `src` (same size and last-write time, which
+   CopyFile preserves). A missing `dst` counts as different. */
+static BOOL same_file_stamp(const wchar_t *src, const wchar_t *dst)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a, b;
+    if (!GetFileAttributesExW(src, GetFileExInfoStandard, &a) ||
+        !GetFileAttributesExW(dst, GetFileExInfoStandard, &b))
+        return FALSE;
+    return a.nFileSizeLow == b.nFileSizeLow && a.nFileSizeHigh == b.nFileSizeHigh &&
+           CompareFileTime(&a.ftLastWriteTime, &b.ftLastWriteTime) == 0;
+}
+
+/* Point one guest copy of NVIDIA's Vulkan manifest at our shim: the ICD's
+   library_path ".\\nvoglv64.dll" becomes ".\\asb_nvvk.dll" (same length, the
+   layer entries further down keep pointing at nvoglv64.dll). Returns 1 if it
+   rewrote the file, 0 if it was already ours, -1 if untouched. */
+static int nvvk_patch_manifest(const wchar_t *json)
+{
+    static const char icd_key[] = "\"ICD\"", from[] = ".\\\\nvoglv64.dll", to[] = ".\\\\asb_nvvk.dll";
+    const DWORD cap = 64 * 1024;                  /* the manifest is ~1 KB; anything larger is not ours to touch */
+    char *buf, *icd, *hit;
+    HANDLE h;
+    DWORD n = 0, w = 0;
+    int rc = -1;
+
+    h = CreateFileW(json, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    buf = (char *)malloc(cap);
+    if (!buf) { CloseHandle(h); return -1; }
+    if (ReadFile(h, buf, cap - 1, &n, NULL) && n > 0 && n < cap - 1) {
+        buf[n] = 0;
+        icd = strstr(buf, icd_key);
+        if (icd && strstr(icd, to))
+            rc = 0;
+        else if (icd && (hit = strstr(icd, from)) != NULL) {
+            memcpy(hit, to, sizeof(to) - 1);
+            if (SetFilePointer(h, 0, NULL, FILE_BEGIN) == 0 && WriteFile(h, buf, n, &w, NULL) && w == n)
+                rc = 1;
+        }
+    }
+    free(buf);
+    CloseHandle(h);
+    return rc;
+}
+
+/* NVIDIA GPU-PV guests: native Vulkan. The loader already finds NVIDIA's
+   nv-vk64.json on its own (VulkanDriverName comes back from the host through
+   the paravirtualized adapter and resolves into HostDriverStore), and the
+   driver itself works through the VRD, but nvoglv64.dll looks for its GPUs
+   behind GDI display devices and in a guest none belongs to it, so it reports
+   no device and Vulkan games get Mesa's Vulkan-on-D3D12 (Dozen) instead.
+   tools/nvvk-shim is a small ICD wrapper that fixes that discovery (see
+   nvvk_shim.cpp). Drop it next to nvoglv64.dll in every driver-store copy
+   that ships a Vulkan manifest and point the manifest at it. Runs after each
+   GPU copy: a driver update brings a new directory with a fresh manifest.
+   32-bit (nv-vk32.json) is left alone: no x86 shim yet. */
+static void nvvk_shim_provision(const wchar_t *dir)
+{
+    wchar_t src[MAX_PATH], sys[MAX_PATH], repo[MAX_PATH], pattern[MAX_PATH];
+    wchar_t json[MAX_PATH], dst[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE hf;
+    int dirs = 0;
+
+    swprintf_s(src, MAX_PATH, L"%s\\asb_nvvk.dll", dir);
+    if (file_size_w(src) == (ULONGLONG)-1)
+        return;                                   /* not shipped on this build */
+    if (!GetSystemDirectoryW(sys, MAX_PATH)) return;
+    swprintf_s(repo, MAX_PATH, L"%s\\HostDriverStore\\FileRepository", sys);
+    swprintf_s(pattern, MAX_PATH, L"%s\\*", repo);
+
+    hf = FindFirstFileW(pattern, &fd);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    do {
+        int rc;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.')
+            continue;
+        swprintf_s(json, MAX_PATH, L"%s\\%s\\nv-vk64.json", repo, fd.cFileName);
+        if (file_size_w(json) == (ULONGLONG)-1)
+            continue;                             /* not an NVIDIA display driver dir */
+        dirs++;
+        swprintf_s(dst, MAX_PATH, L"%s\\%s\\asb_nvvk.dll", repo, fd.cFileName);
+        if (!same_file_stamp(src, dst) && !CopyFileW(src, dst, FALSE)) {
+            agent_log("NVVK shim: copy to %ls failed (%lu) - leaving manifest alone.", dst, GetLastError());
+            continue;                             /* in use by a running app; next boot */
+        }
+        rc = nvvk_patch_manifest(json);
+        if (rc == 1)
+            agent_log("NVVK shim: registered as Vulkan ICD in %ls", json);
+        else if (rc == 0)
+            agent_log("NVVK shim: already registered in %ls", json);
+        else
+            agent_log("NVVK shim: %ls not rewritten (unexpected format or write failed).", json);
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+    if (!dirs)
+        agent_log("NVVK shim: no NVIDIA Vulkan manifest in HostDriverStore - skipping.");
+}
+
 /* Provision the D3D mapping layers after the agent has copied them into `dir`
    (C:\Windows\AppSandbox\d3dlayers) over Plan9. Runs as SYSTEM from the GPU copy
    thread, AFTER the GPU driver copy. Deploys Mesa's standalone opengl32 trio +
@@ -552,6 +651,9 @@ static void gl_provision(const wchar_t *dir)
     }
 
     agent_log("GL: provisioning complete.");
+
+    /* NVIDIA GPU-PV: native Vulkan ICD shim (see above). */
+    nvvk_shim_provision(dir);
 }
 
 /* NVIDIA's installer makes DRS writable by desktop and packaged applications.
