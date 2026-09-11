@@ -1,0 +1,7 @@
+LIBRARY asb_nvvk
+EXPORTS
+    vk_icdNegotiateLoaderICDInterfaceVersion
+    vk_icdGetInstanceProcAddr
+    vk_icdGetPhysicalDeviceProcAddr
+    vk_icdEnumerateAdapterPhysicalDevices
+    appsandbox_nvvk_shim
