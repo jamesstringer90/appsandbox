@@ -460,6 +460,71 @@ static ULONGLONG file_size_w(const wchar_t *path)
     return ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
 }
 
+/* TRUE if `dst` is a copy of `src` (same size and last-write time, which
+   CopyFile preserves). A missing `dst` counts as different. */
+static BOOL same_file_stamp(const wchar_t *src, const wchar_t *dst)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a, b;
+    if (!GetFileAttributesExW(src, GetFileExInfoStandard, &a) ||
+        !GetFileAttributesExW(dst, GetFileExInfoStandard, &b))
+        return FALSE;
+    return a.nFileSizeLow == b.nFileSizeLow && a.nFileSizeHigh == b.nFileSizeHigh &&
+           CompareFileTime(&a.ftLastWriteTime, &b.ftLastWriteTime) == 0;
+}
+
+/* TRUE if `path` exports `marker`. Mapped without running DllMain or resolving
+   imports, so it's safe on any DLL. */
+static BOOL dll_has_export(const wchar_t *path, const char *marker)
+{
+    HMODULE m = LoadLibraryExW(path, NULL, DONT_RESOLVE_DLL_REFERENCES);
+    BOOL yes = FALSE;
+    if (m) {
+        yes = GetProcAddress(m, marker) != NULL;
+        FreeLibrary(m);
+    }
+    return yes;
+}
+
+/* TRUE if an NVIDIA display driver copied from the host ships its OpenGL/Vulkan
+   ICD: some HostDriverStore\FileRepository\*\nvoglv64.dll exists. That is
+   the file Microsoft's opengl32 will be pointed at by the paravirtualized
+   adapter (KMTQAITYPE_UMOPENGLINFO comes back translated into HostDriverStore). */
+static BOOL nvidia_gl_icd_present(void)
+{
+    wchar_t sys[MAX_PATH], pattern[MAX_PATH], icd[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE hf;
+    BOOL found = FALSE;
+
+    if (!GetSystemDirectoryW(sys, MAX_PATH)) return FALSE;
+    swprintf_s(pattern, MAX_PATH, L"%s\\HostDriverStore\\FileRepository\\*", sys);
+    hf = FindFirstFileW(pattern, &fd);
+    if (hf == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.')
+            continue;
+        swprintf_s(icd, MAX_PATH, L"%s\\HostDriverStore\\FileRepository\\%s\\nvoglv64.dll", sys, fd.cFileName);
+        if (file_size_w(icd) != (ULONGLONG)-1) found = TRUE;
+    } while (!found && FindNextFileW(hf, &fd));
+    FindClose(hf);
+    return found;
+}
+
+/* Replace the in-use, TrustedInstaller-owned `dst` with `src`: take ownership,
+   grant SYSTEM, rename the mapped file aside, copy ours in. */
+static BOOL replace_system_dll(const wchar_t *sys, const wchar_t *src, const wchar_t *dst, const wchar_t *aside)
+{
+    wchar_t cmd[MAX_PATH * 2];
+    swprintf_s(cmd, MAX_PATH * 2, L"%s\\takeown.exe /f \"%s\"", sys, dst);
+    run_quiet(cmd);
+    swprintf_s(cmd, MAX_PATH * 2, L"%s\\icacls.exe \"%s\" /grant *S-1-5-18:F", sys, dst);
+    run_quiet(cmd);
+    MoveFileExW(dst, aside, MOVEFILE_REPLACE_EXISTING);
+    if (!CopyFileW(src, dst, FALSE)) return FALSE;
+    DeleteFileW(aside);                           /* fails while still mapped; harmless */
+    return TRUE;
+}
+
 /* Provision the D3D mapping layers after the agent has copied them into `dir`
    (C:\Windows\AppSandbox\d3dlayers) over Plan9. Runs as SYSTEM from the GPU copy
    thread, AFTER the GPU driver copy. Deploys Mesa's standalone opengl32 trio +
@@ -485,12 +550,19 @@ static void gl_provision(const wchar_t *dir)
         }
     }
 
-    /* OpenGL: deploy Mesa's standalone opengl32 trio into System32. */
+    /* OpenGL: what goes into System32 as opengl32.dll.
+       - NVIDIA GPU-PV guest with the wrapper shipped (tools/nvgl-wrapper): the
+         wrapper, with Microsoft's opengl32.dll kept beside it as asb_gl_ms.dll.
+         Microsoft's code already finds NVIDIA's ICD through the paravirtualized
+         adapter; the wrapper only fixes the ICD's GPU discovery (same trick as
+         the Vulkan shim), so OpenGL apps run on NVIDIA's own driver.
+       - otherwise Mesa's standalone opengl32 trio (OpenGL on D3D12). */
     if (GetSystemDirectoryW(sys, MAX_PATH)) {
-        wchar_t srcdll[MAX_PATH], dstdll[MAX_PATH], bak[MAX_PATH], oldp[MAX_PATH];
-        wchar_t cmd[MAX_PATH * 2];
+        wchar_t srcdll[MAX_PATH], dstdll[MAX_PATH], bak[MAX_PATH], oldp[MAX_PATH], mesa[MAX_PATH], msdll[MAX_PATH];
+        BOOL use_nv, cur_wrapper, cur_mesa, cur_ms;
+        const wchar_t *what;
 
-        /* gallium_wgl.dll + z-1.dll: copied into System32 (opengl32 imports them). */
+        /* gallium_wgl.dll + z-1.dll: copied into System32 (Mesa's opengl32 imports them). */
         swprintf_s(srcdll, MAX_PATH, L"%s\\gallium_wgl.dll", dir);
         swprintf_s(dstdll, MAX_PATH, L"%s\\gallium_wgl.dll", sys);
         CopyFileW(srcdll, dstdll, FALSE);
@@ -498,29 +570,61 @@ static void gl_provision(const wchar_t *dir)
         swprintf_s(dstdll, MAX_PATH, L"%s\\z-1.dll", sys);
         CopyFileW(srcdll, dstdll, FALSE);
 
-        /* opengl32.dll is TrustedInstaller-owned and memory-mapped. Replace it
-           only when it isn't already our build (size differs) — self-heals if
-           Windows servicing/SFC restores Microsoft's. Back up the MS copy once,
-           take ownership + grant SYSTEM, rename the in-use file aside, copy ours. */
-        swprintf_s(srcdll, MAX_PATH, L"%s\\opengl32.dll", dir);
+        swprintf_s(mesa,   MAX_PATH, L"%s\\opengl32.dll", dir);
+        swprintf_s(srcdll, MAX_PATH, L"%s\\asb_opengl32.dll", dir);
         swprintf_s(dstdll, MAX_PATH, L"%s\\opengl32.dll", sys);
-        if (file_size_w(srcdll) != (ULONGLONG)-1 &&
-            file_size_w(srcdll) != file_size_w(dstdll)) {
-            swprintf_s(bak,  MAX_PATH, L"%s\\opengl32.dll.msbak", sys);
-            swprintf_s(oldp, MAX_PATH, L"%s\\opengl32.dll.old", sys);
-            if (file_size_w(bak) == (ULONGLONG)-1)
-                CopyFileW(dstdll, bak, TRUE);  /* back up pristine MS copy once */
-            swprintf_s(cmd, MAX_PATH * 2, L"%s\\takeown.exe /f \"%s\"", sys, dstdll);
-            run_quiet(cmd);
-            swprintf_s(cmd, MAX_PATH * 2, L"%s\\icacls.exe \"%s\" /grant *S-1-5-18:F", sys, dstdll);
-            run_quiet(cmd);
-            MoveFileExW(dstdll, oldp, MOVEFILE_REPLACE_EXISTING);  /* rename in-use aside */
-            if (CopyFileW(srcdll, dstdll, FALSE))
-                agent_log("GL: deployed Mesa opengl32 trio to System32.");
+        swprintf_s(bak,    MAX_PATH, L"%s\\opengl32.dll.msbak", sys);
+        swprintf_s(oldp,   MAX_PATH, L"%s\\opengl32.dll.old", sys);
+        swprintf_s(msdll,  MAX_PATH, L"%s\\asb_gl_ms.dll", sys);
+        DeleteFileW(oldp);                        /* left by an earlier swap while mapped */
+
+        /* What is in System32 right now: our wrapper, Mesa's, or Microsoft's
+           (fresh guest, or Windows servicing put it back). Keep Microsoft's
+           current build as the backup the wrapper forwards to. */
+        cur_wrapper = dll_has_export(dstdll, "appsandbox_nvgl_wrapper");
+        cur_mesa = !cur_wrapper && file_size_w(mesa) != (ULONGLONG)-1 && file_size_w(mesa) == file_size_w(dstdll);
+        cur_ms = !cur_wrapper && !cur_mesa && file_size_w(dstdll) != (ULONGLONG)-1;
+        if (cur_ms && !same_file_stamp(dstdll, bak)) {
+            if (CopyFileW(dstdll, bak, FALSE))
+                agent_log("GL: saved Microsoft opengl32.dll as opengl32.dll.msbak.");
             else
-                agent_log("GL: opengl32 -> System32 failed (%lu).", GetLastError());
+                agent_log("GL: cannot back up Microsoft opengl32.dll (%lu).", GetLastError());
+        }
+
+        use_nv = file_size_w(srcdll) != (ULONGLONG)-1 && file_size_w(bak) != (ULONGLONG)-1 && nvidia_gl_icd_present();
+        if (use_nv && !same_file_stamp(bak, msdll)) {
+            wchar_t msold[MAX_PATH];
+            swprintf_s(msold, MAX_PATH, L"%s\\asb_gl_ms.dll.old", sys);
+            DeleteFileW(msold);
+            MoveFileExW(msdll, msold, MOVEFILE_REPLACE_EXISTING);   /* may be mapped by a running app */
+            if (CopyFileW(bak, msdll, FALSE)) {
+                agent_log("GL: staged Microsoft opengl32.dll as asb_gl_ms.dll.");
+                DeleteFileW(msold);
+            } else {
+                agent_log("GL: asb_gl_ms.dll copy failed (%lu) - falling back to Mesa.", GetLastError());
+                MoveFileExW(msold, msdll, MOVEFILE_REPLACE_EXISTING);
+                use_nv = FALSE;
+            }
+        }
+        if (!use_nv) {
+            wcscpy_s(srcdll, MAX_PATH, mesa);
+            what = L"Mesa opengl32 trio";
         } else {
-            agent_log("GL: Mesa opengl32 already current in System32.");
+            what = L"NVIDIA OpenGL wrapper";
+        }
+
+        /* opengl32.dll is TrustedInstaller-owned and memory-mapped. Replace it
+           only when it isn't already the one we want (size or timestamp differ);
+           self-heals if Windows servicing/SFC restores Microsoft's. */
+        if (file_size_w(srcdll) == (ULONGLONG)-1) {
+            agent_log("GL: no opengl32 to deploy in %ls.", dir);
+        } else if (same_file_stamp(srcdll, dstdll) ||
+                   (!use_nv && cur_mesa && file_size_w(srcdll) == file_size_w(dstdll))) {
+            agent_log("GL: %ls already current in System32.", what);
+        } else if (replace_system_dll(sys, srcdll, dstdll, oldp)) {
+            agent_log("GL: deployed %ls to System32.", what);
+        } else {
+            agent_log("GL: opengl32 -> System32 failed (%lu).", GetLastError());
         }
     } else {
         agent_log("GL: GetSystemDirectory failed; OpenGL not deployed.");

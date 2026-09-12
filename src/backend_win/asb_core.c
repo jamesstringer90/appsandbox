@@ -89,6 +89,17 @@ static void prepare_gl_layers_share(GpuDriverShareList *shares)
         CopyFileW(src, dst, FALSE);  /* best-effort; trio may not be staged yet */
     }
 
+    /* Native OpenGL wrapper for NVIDIA GPU-PV guests (tools/nvgl-wrapper). Rides
+     * the same share; the agent installs it as System32\opengl32.dll over
+     * Microsoft's (kept beside it as asb_gl_ms.dll) so OpenGL apps get NVIDIA's
+     * own ICD instead of Mesa's OpenGL-on-D3D12. See gl_provision() in the agent. */
+    swprintf_s(res, MAX_PATH, L"%s\\resources\\nvgl-wrapper", exe);
+    if (GetFileAttributesW(res) == INVALID_FILE_ATTRIBUTES)
+        swprintf_s(res, MAX_PATH, L"%s\\nvgl-wrapper", exe);
+    swprintf_s(src, MAX_PATH, L"%s\\asb_opengl32.dll", res);
+    swprintf_s(dst, MAX_PATH, L"%s\\asb_opengl32.dll", dir);
+    CopyFileW(src, dst, FALSE);  /* best-effort; absent on builds without the wrapper */
+
     gpu_append_gl_layers_share(shares, dir);
 }
 
