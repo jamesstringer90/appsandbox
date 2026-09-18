@@ -100,7 +100,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;bcrypt.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ImportLibrary>$(OutDir)appsandbox_core.lib</ImportLibrary>
     </Link>
   </ItemDefinitionGroup>
@@ -118,7 +118,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;bcrypt.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ImportLibrary>$(OutDir)appsandbox_core.lib</ImportLibrary>
     </Link>
   </ItemDefinitionGroup>
@@ -140,7 +140,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;bcrypt.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ImportLibrary>$(OutDir)appsandbox_core.lib</ImportLibrary>
     </Link>
   </ItemDefinitionGroup>
@@ -162,7 +162,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;bcrypt.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ImportLibrary>$(OutDir)appsandbox_core.lib</ImportLibrary>
     </Link>
   </ItemDefinitionGroup>
@@ -171,6 +171,11 @@
     <ClCompile Include="src\backend_win\asb_display.c" />
     <ClCompile Include="src\backend_win\hcs_vm.c" />
     <ClCompile Include="src\backend_win\hcn_network.c" />
+    <ClCompile Include="src\backend_win\hcn_parse.c" />
+    <ClCompile Include="src\backend_win\hcn_inventory.c" />
+    <ClCompile Include="src\backend_win\hcn_wmi.c" />
+    <ClCompile Include="src\backend_win\hcn_external.c" />
+    <ClCompile Include="src\backend_win\json_reader.c" />
     <ClCompile Include="src\backend_win\gpu_enum.c" />
     <ClCompile Include="src\backend_win\disk_util.c" />
     <ClCompile Include="tools\provision\win_provision.c" />
@@ -190,6 +195,8 @@
     <ClInclude Include="src\ui.h" />
     <ClInclude Include="src\backend_win\hcs_vm.h" />
     <ClInclude Include="src\backend_win\hcn_network.h" />
+    <ClInclude Include="src\backend_win\hcn_private.h" />
+    <ClInclude Include="src\backend_win\json_reader.h" />
     <ClInclude Include="src\backend_win\gpu_enum.h" />
     <ClInclude Include="src\backend_win\disk_util.h" />
     <ClInclude Include="tools\provision\win_provision.h" />

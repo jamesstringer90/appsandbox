@@ -5,6 +5,11 @@
  * tray icon. All VM orchestration is in asb_core.c (the core library).
  */
 
+/* winsock2 before ui.h/windows.h: hcn_network.h needs the Winsock 2 +
+   ws2tcpip include chain (netioapi types); windows.h would otherwise
+   pull in Winsock 1.1 first and collide with it. */
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include "ui.h"
 #include "asb_core.h"
 #include "resource.h"
@@ -23,8 +28,10 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <shlobj.h>
+#include <shellapi.h>
 
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -101,7 +108,6 @@ static BOOL detect_home_edition(void)
 static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static void send_vm_list(void);
 static void send_full_state(void);
-static void send_adapters(void);
 static void send_templates(void);
 
 /* ---- Safe display teardown ---- */
@@ -451,50 +457,57 @@ static void send_host_info(void)
 #define IF_TYPE_IEEE80211 71
 #endif
 
+/* Selectable adapter entries. The names array is heap-allocated: the
+ * backend already omitted duplicate-name groups, so the capacity only
+ * bounds distinct-named NICs and is logged if reached. */
+#define UI_ADAPTER_CAP 64
+
 typedef struct {
-    wchar_t names[32][256];
+    wchar_t (*names)[256];
     int count;
-    int first_eth;
-    int first_wifi;
+    int capacity;
+    BOOL overflowed;   /* at least one distinct name was actually dropped */
 } AdapterList;
 
 static void adapter_enum_cb(const wchar_t *name, int if_type, void *ctx)
 {
     AdapterList *al = (AdapterList *)ctx;
-    if (al->count >= 32) return;
+    (void)if_type;   /* the default is (Auto) at index 0; type tracking is gone */
+    if (al->count >= al->capacity) {
+        al->overflowed = TRUE;   /* log only when an entry was really dropped */
+        return;
+    }
     wcscpy_s(al->names[al->count], 256, name);
-    if (if_type == IF_TYPE_ETHERNET_CSMACD && al->first_eth < 0)
-        al->first_eth = al->count + 1;
-    else if (if_type == IF_TYPE_IEEE80211 && al->first_wifi < 0)
-        al->first_wifi = al->count + 1;
     al->count++;
 }
 
-static void send_adapters(void)
+/* Collect the backend's safe adapter list (L0-based; duplicate-name
+   groups already omitted there). The capacity is applied only after the
+   backend's full duplicate-group detection, and only then logged.
+   Returns FALSE on allocation failure (the caller emits "(Auto)" only). */
+static BOOL collect_adapters(AdapterList *al)
 {
-    wchar_t buf[8192];
-    JsonBuilder jb;
-    AdapterList al;
-    int def_idx, i;
+    al->capacity = UI_ADAPTER_CAP;
+    al->count = 0;
+    al->overflowed = FALSE;
+    al->names = (wchar_t (*)[256])HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                            UI_ADAPTER_CAP * 256 * sizeof(wchar_t));
+    if (!al->names)
+        return FALSE;
+    hcn_enum_adapters(adapter_enum_cb, al);
+    if (al->overflowed)
+        ui_log(L"External: adapter list capped at %d distinct names; the "
+               L"rest are omitted from the dropdown (Explicit lookup still "
+               L"resolves the full inventory).", al->capacity);
+    return TRUE;
+}
 
-    al.count = 0; al.first_eth = -1; al.first_wifi = -1;
-    hcn_enum_adapters(adapter_enum_cb, &al);
-    def_idx = (al.first_eth >= 0) ? al.first_eth : (al.first_wifi >= 0) ? al.first_wifi : 0;
-
-    jb_init(&jb, buf, 8192);
-    jb_object_begin(&jb);
-    jb_string(&jb, L"type", L"adapters");
-    jb_array_begin(&jb, L"adapters");
-    for (i = 0; i < al.count; i++) {
-        if (i > 0) jb_append(&jb, L",");
-        jb_append(&jb, L"\"");
-        jb_append_escaped(&jb, al.names[i]);
-        jb_append(&jb, L"\"");
+static void free_adapters(AdapterList *al)
+{
+    if (al->names) {
+        HeapFree(GetProcessHeap(), 0, al->names);
+        al->names = NULL;
     }
-    jb_array_end(&jb);
-    jb_int(&jb, L"defaultIndex", def_idx);
-    jb_object_end(&jb);
-    webview2_post(buf);
 }
 
 static void send_templates(void)
@@ -529,11 +542,22 @@ static int CALLBACK disk_folder_browse_callback(HWND hwnd, UINT message, LPARAM 
 
 static void send_full_state(void)
 {
-    wchar_t buf[131072];
+    /* The buffer is heap-allocated with headroom for the full
+       adapter list including JSON-escaping expansion (worst case about
+       twice the raw name length) plus the VM/template sections - and
+       the builder's overflow flag is the mechanical backstop: a filled
+       buffer suppresses the post instead of emitting partial JSON. */
+    wchar_t *buf;
     JsonBuilder jb;
     int i, count;
 
-    jb_init(&jb, buf, ARRAYSIZE(buf));
+    buf = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                               131072 * sizeof(wchar_t));
+    if (!buf) {
+        ui_log(L"UI: full-state buffer allocation failed.");
+        return;
+    }
+    jb_init(&jb, buf, 131072);
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"fullState");
 
@@ -559,23 +583,30 @@ static void send_full_state(void)
         jb.count++;
     }
 
-    /* Adapters */
+    /* Adapters: the backend's safe list (L0, bound NICs visible,
+       duplicate groups omitted). The default is index 0: (Auto) -
+       selecting External does not pin an adapter. */
     {
         AdapterList al;
-        int def_idx;
-        al.count = 0; al.first_eth = -1; al.first_wifi = -1;
-        hcn_enum_adapters(adapter_enum_cb, &al);
-        def_idx = (al.first_eth >= 0) ? al.first_eth : (al.first_wifi >= 0) ? al.first_wifi : 0;
 
-        jb_array_begin(&jb, L"adapters");
-        for (i = 0; i < al.count; i++) {
-            if (i > 0) jb_append(&jb, L",");
-            jb_append(&jb, L"\"");
-            jb_append_escaped(&jb, al.names[i]);
-            jb_append(&jb, L"\"");
+        if (collect_adapters(&al)) {
+            jb_array_begin(&jb, L"adapters");
+            for (i = 0; i < al.count; i++) {
+                if (i > 0) jb_append(&jb, L",");
+                jb_append(&jb, L"\"");
+                jb_append_escaped(&jb, al.names[i]);
+                jb_append(&jb, L"\"");
+            }
+            jb_array_end(&jb);
+            jb_int(&jb, L"defaultAdapter", 0);
+            free_adapters(&al);
+        } else {
+            ui_log(L"UI: adapter list allocation failed; the dropdown is "
+                   L"(Auto) only.");
+            jb_array_begin(&jb, L"adapters");
+            jb_array_end(&jb);
+            jb_int(&jb, L"defaultAdapter", 0);
         }
-        jb_array_end(&jb);
-        jb_int(&jb, L"defaultAdapter", def_idx);
     }
 
     /* Templates */
@@ -593,7 +624,14 @@ static void send_full_state(void)
     }
 
     jb_object_end(&jb);
-    webview2_post(buf);
+    if (jb.overflow) {
+        /* Mechanism, not sizing: a filled buffer means the JSON above is
+           partial - never post it ("never emit partial JSON"). */
+        ui_log(L"UI: full-state message exceeded the buffer; not posted.");
+    } else {
+        webview2_post(buf);
+    }
+    HeapFree(GetProcessHeap(), 0, buf);
 }
 
 /* ---- UI logging ---- */
@@ -607,20 +645,33 @@ static void ui_log_post(const wchar_t *msg)
     jb_string(&jb, L"type", L"log");
     jb_string(&jb, L"message", msg);
     jb_object_end(&jb);
+    if (jb.overflow)
+        return;   /* partial JSON is never posted */
     webview2_post(json);
 }
 
 static void ui_show_alert(const wchar_t *message)
 {
     if (GetCurrentThreadId() == g_ui_thread_id) {
-        wchar_t buf[1024];
-        swprintf_s(buf, 1024, L"{\"type\":\"alert\",\"message\":\"%s\"}", message);
-        webview2_post(buf);
+        /* The message text is JSON-escaped through the builder: the
+           reason strings contain quotes and raw %s formatting would
+           emit invalid JSON. 4096-wide buffer for the
+           one-line reason plus wrapping. */
+        wchar_t json[4096];
+        JsonBuilder jb;
+        jb_init(&jb, json, 4096);
+        jb_object_begin(&jb);
+        jb_string(&jb, L"type", L"alert");
+        jb_string(&jb, L"message", message ? message : L"");
+        jb_object_end(&jb);
+        if (jb.overflow)
+            return;   /* partial JSON is never posted */
+        webview2_post(json);
     } else if (g_hwnd_main) {
-        size_t len = wcslen(message) + 1;
+        size_t len = wcslen(message ? message : L"") + 1;
         wchar_t *copy = (wchar_t *)malloc(len * sizeof(wchar_t));
         if (copy) {
-            wcscpy_s(copy, len, message);
+            wcscpy_s(copy, len, message ? message : L"");
             PostMessageW(g_hwnd_main, WM_SHOW_ALERT, 0, (LPARAM)copy);
         }
     }
@@ -1222,6 +1273,7 @@ static void on_webview2_message(const wchar_t *json)
                     if (!error) hr = asb_vm_set_gpu_selection(vm, mode, gpu_id);
                 }
                 else if (wcscmp(field, L"networkMode") == 0) hr = asb_vm_set_network(vm, _wtoi(value));
+                else if (wcscmp(field, L"netAdapter") == 0) hr = asb_vm_set_net_adapter(vm, value);
                 if (FAILED(hr)) ui_show_alert(error ? error : L"VM configuration could not be updated.");
                 else asb_save();
             }
@@ -1232,6 +1284,14 @@ static void on_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"selectVm") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx)) g_selected_vm = idx;
+    } else if (wcscmp(action, L"openUrl") == 0) {
+        /* A linkified URL in a modal (setModalMessage). A WebView2 window
+           cannot open new windows itself, so the host opens the default
+           browser. https only: never hand arbitrary schemes to the shell. */
+        wchar_t url[512];
+        if (json_get_string(json, L"url", url, 512) &&
+            wcsncmp(url, L"https://", 8) == 0)
+            ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
     } else if (wcscmp(action, L"getDiskSpace") == 0) {
         wchar_t *copy = _wcsdup(json);
         HANDLE thread = copy ? CreateThread(NULL, 0, disk_space_thread, copy, 0, NULL) : NULL;

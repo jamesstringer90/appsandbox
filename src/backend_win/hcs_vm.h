@@ -75,6 +75,8 @@ typedef struct {
     wchar_t     mac_address[18];
     GUID        network_id;
     GUID        endpoint_id;
+    GUID        external_adapter_interface_guid; /* External: this start's selected physical NIC T (runtime-only) */
+    BOOL        delete_network_on_last_release; /* External: TRUE only for the owned network created/validated by this start; FALSE for borrowed switches (runtime-only) */
     GUID        runtime_id;           /* VM RuntimeId for AF_HYPERV connections */
     wchar_t     resources_iso_path[MAX_PATH];
     BOOL        running;

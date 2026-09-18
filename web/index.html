@@ -29,6 +29,7 @@
                 <th>HDD (GB)</th>
                 <th>GPU</th>
                 <th>Network</th>
+                <th>Adapter</th>
                 <th class="win-only">Snapshot</th>
                 <th class="icon-col">&#x25B6;&#xFE0F;</th>
                 <th class="icon-col" title="IDD Display">&#x1F4FA;</th>
@@ -227,6 +228,11 @@
                         <option value="2">External</option>
                         <option value="3">Internal</option>
                     </select>
+                </div>
+
+                <label for="edit-net-adapter" id="edit-net-adapter-label" class="win-only">Adapter:</label>
+                <div id="edit-net-adapter-row" class="form-row win-only">
+                    <select id="edit-net-adapter"></select>
                 </div>
             </div>
             <span id="edit-vm-warn" class="field-warn" aria-live="polite"></span>

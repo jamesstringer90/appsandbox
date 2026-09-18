@@ -267,6 +267,8 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->gpu_id);
     pos += sprintf_s(out + pos, cap - pos, ",\"gpuName\":");
     pos = append_wstr(out, cap, pos, v->gpu_name);
+    pos += sprintf_s(out + pos, cap - pos, ",\"netAdapter\":");
+    pos = append_wstr(out, cap, pos, v->net_adapter);
     pos += sprintf_s(out + pos, cap - pos, "}");
     return pos;
 }
@@ -853,6 +855,11 @@ static int handle_request(PHTTP_REQUEST req)
                 if (json_get_int(body, L"networkMode", &iv)) {
                     if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal)"); return 0; }
                     hr = asb_vm_set_network(vm, iv);
+                }
+                {
+                    wchar_t adapter[256];
+                    if (json_get_string(body, L"netAdapter", adapter, 256))
+                        hr = asb_vm_set_net_adapter(vm, adapter);
                 }
                 asb_save();
                 if (SUCCEEDED(hr)) {

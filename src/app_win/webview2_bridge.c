@@ -447,6 +447,7 @@ void jb_init(JsonBuilder *jb, wchar_t *buf, size_t cap)
     jb->cap = cap;
     jb->len = 0;
     jb->count = 0;
+    jb->overflow = FALSE;
     if (cap > 0) buf[0] = L'\0';
 }
 
@@ -456,21 +457,40 @@ void jb_append(JsonBuilder *jb, const wchar_t *s)
     if (jb->len + slen < jb->cap) {
         wcscpy_s(jb->buf + jb->len, jb->cap - jb->len, s);
         jb->len += slen;
+    } else {
+        jb->overflow = TRUE;   /* partial JSON - the caller must not post */
     }
 }
 
 void jb_append_escaped(JsonBuilder *jb, const wchar_t *s)
 {
+    static const wchar_t hex[] = L"0123456789abcdef";
     const wchar_t *p;
     for (p = s; *p; p++) {
-        if (jb->len + 6 >= jb->cap) break;
+        if (jb->len + 6 >= jb->cap) {
+            jb->overflow = TRUE;
+            break;
+        }
         switch (*p) {
         case L'\\': jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L'\\'; break;
         case L'"':  jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L'"'; break;
         case L'\n': jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L'n'; break;
         case L'\r': jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L'r'; break;
         case L'\t': jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L't'; break;
-        default:    jb->buf[jb->len++] = *p; break;
+        default:
+            if (*p < 0x20) {
+                /* Raw control characters are not legal in JSON strings:
+                   emit the \uXXXX escape the 6-char guard reserved for. */
+                jb->buf[jb->len++] = L'\\';
+                jb->buf[jb->len++] = L'u';
+                jb->buf[jb->len++] = L'0';
+                jb->buf[jb->len++] = L'0';
+                jb->buf[jb->len++] = hex[(*p >> 4) & 0xF];
+                jb->buf[jb->len++] = hex[*p & 0xF];
+            } else {
+                jb->buf[jb->len++] = *p;
+            }
+            break;
         }
     }
     jb->buf[jb->len] = L'\0';

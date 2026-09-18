@@ -144,7 +144,6 @@ window.onHostMessage = function(msg) {
         case 'diskDirectoryBrowseResult': onDiskDirectoryBrowseResult(msg.path); break;
         case 'diskSpace':     onDiskSpace(msg); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
-        case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
         case 'alert':         showModal('Error', msg.message, 'OK'); break;
         case 'prereqRequired': onPrereqRequired(); break;
@@ -166,10 +165,10 @@ if (hostBridge.isWebView2) {
 
 function onFullState(msg) {
     updateVmList(msg.vms || []);
+    if (msg.adapters) populateAdapters(msg.adapters, msg.defaultAdapter);
     renderVmTable();
     revalidateVmName();
     if (msg.hostInfo) updateHostInfo(msg.hostInfo);
-    if (msg.adapters) populateAdapters(msg.adapters, msg.defaultAdapter);
     if (msg.templates) populateTemplates(msg.templates);
     if (!minSizeReported) {
         minSizeReported = true;
@@ -330,9 +329,13 @@ function populateAdapters(adapters, defaultIdx) {
             sel.appendChild(opt);
         });
     }
-    if (typeof defaultIdx === 'number' && defaultIdx >= 0 && defaultIdx < sel.options.length) {
-        sel.selectedIndex = defaultIdx;
-    }
+    /* (Auto) is index 0 and stays the default: switching to
+       External preserves Auto; a non-empty default adapter is never
+       pinned here. */
+    sel.selectedIndex = (typeof defaultIdx === 'number' && defaultIdx >= 0 && defaultIdx < sel.options.length)
+        ? defaultIdx : 0;
+    if (editVmState && !hostBridge.isMac)
+        populateEditVmAdapters(document.getElementById('edit-net-adapter').value);
 }
 
 /* ---- Templates ---- */
@@ -1032,6 +1035,7 @@ function buildRowCells(vm, i, statusTd) {
         makeCell(hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None'),
             hostBridge.isMac ? 'NAT (shared networking)'
                 : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
+        makeAdapterCell(vm),
     ];
     if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
     cells.push(
@@ -1057,7 +1061,7 @@ function renderVmTable() {
         tbody.innerHTML = '';
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = hostBridge.isMac ? 16 : 17;
+        td.colSpan = hostBridge.isMac ? 17 : 18;
         td.className = 'empty-state';
         var btn = document.createElement('button');
         btn.className = 'primary empty-state-btn';
@@ -1108,7 +1112,8 @@ function renderVmTable() {
             vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort,
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
-            vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode,
+            vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode, vm.netAdapter,
+            currentAdapters.join('\u0001'),
             selectedSnap.get(vm.name) || 'current',
             /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
                so makeSnapCell re-runs. These fields only change on user snapshot
@@ -1158,6 +1163,29 @@ function makeCell(text, title) {
     return td;
 }
 
+/* Adapter summary. Editing lives in the VM settings dialog. A missing
+   configured adapter keeps its name and warning until explicitly changed. */
+function makeAdapterCell(vm) {
+    var td = document.createElement('td');
+    if (hostBridge.isMac || vm.networkMode !== 2) {
+        td.textContent = '—';
+        td.className = 'adapter-off';
+        td.title = 'External mode only: the bridged adapter';
+        return td;
+    }
+    var stored = vm.netAdapter || '';
+    td.textContent = stored || '(Auto)';
+    if (stored && !hostBridge.isMac && currentAdapters.indexOf(stored) < 0) {
+        td.className = 'adapter-missing';
+        td.title = 'Configured adapter is not present on the host; the next start will fail External resolution';
+    } else {
+        td.title = stored
+            ? 'External network is bound to this adapter'
+            : 'External network picks the adapter automatically (Auto)';
+    }
+    return td;
+}
+
 function makeIconCell(cls, icon, active, handler, extraClass, title) {
     var td = document.createElement('td');
     td.className = 'icon-col';
@@ -1193,6 +1221,25 @@ function vmIndexByName(name) {
     return vms.findIndex(function(vm) { return vm.name === name; });
 }
 
+function populateEditVmAdapters(selected) {
+    var sel = document.getElementById('edit-net-adapter');
+    sel.innerHTML = '<option value="">(Auto)</option>';
+    currentAdapters.forEach(function(name) {
+        var opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+    });
+    if (selected && currentAdapters.indexOf(selected) < 0) {
+        var missing = document.createElement('option');
+        missing.value = selected;
+        missing.textContent = selected + ' (not present)';
+        missing.disabled = true;
+        sel.appendChild(missing);
+    }
+    sel.value = selected;
+}
+
 function openEditVmModal(idx) {
     var vm = vms[idx];
     if (!vm || vm.running || vm.buildingVhdx) return;
@@ -1203,6 +1250,7 @@ function openEditVmModal(idx) {
     document.getElementById('edit-cpu-cores').value = vm.cpuCores;
     setGpuSelection('edit-gpu-mode', vm);
     document.getElementById('edit-net-mode').value = String(vm.networkMode);
+    populateEditVmAdapters(vm.networkMode === 2 ? (vm.netAdapter || '') : '');
     updateEditVmModal();
     document.getElementById('edit-vm-overlay').classList.add('active');
     document.getElementById('edit-ram-size').focus();
@@ -1233,6 +1281,8 @@ function editVmValues() {
     if (!hostBridge.isMac) {
         Object.assign(values, selectedGpu('edit-gpu-mode'));
         values.networkMode = Number(document.getElementById('edit-net-mode').value);
+        if (values.networkMode === 2)
+            values.netAdapter = document.getElementById('edit-net-adapter').value;
     }
     return values;
 }
@@ -1256,6 +1306,10 @@ function updateEditVmModal() {
         el.disabled = !!disabled;
     });
     var values = editVmValues();
+    var showAdapter = !hostBridge.isMac && values.networkMode === 2;
+    document.getElementById('edit-net-adapter-label').style.display = showAdapter ? '' : 'none';
+    document.getElementById('edit-net-adapter-row').style.display = showAdapter ? '' : 'none';
+    document.getElementById('edit-net-adapter').disabled = !!disabled || !showAdapter;
     var error = disabled ? 'Stop the VM before editing its configuration.' : editVmValidationError(values);
     document.getElementById('edit-vm-warn').textContent = error;
     document.getElementById('btn-save-edit-vm').disabled = !!error;
@@ -1707,10 +1761,38 @@ function onPrereqResult(msg) {
 
 /* ---- Modal ---- */
 
+/* Fill the modal message element, turning bare http(s) URLs into clickable
+ * links. A link click hands the URL to the host (openUrl action), which
+ * opens the default browser - a WebView2 window cannot open new windows
+ * itself. Text nodes stay selectable (see the #modal-message CSS). */
+function setModalMessage(message) {
+    var el = document.getElementById('modal-message');
+    var re = /(https?:\/\/[^\s]+)/g;
+    var last = 0, m;
+    el.textContent = '';
+    while ((m = re.exec(message)) !== null) {
+        if (m.index > last)
+            el.appendChild(document.createTextNode(message.slice(last, m.index)));
+        var a = document.createElement('a');
+        a.href = m[1];
+        a.textContent = m[1];
+        (function(url) {
+            a.onclick = function(e) {
+                e.preventDefault();
+                sendCmd('openUrl', { url: url });
+            };
+        })(m[1]);
+        el.appendChild(a);
+        last = m.index + m[1].length;
+    }
+    if (last < message.length)
+        el.appendChild(document.createTextNode(message.slice(last)));
+}
+
 function showModal(title, message, confirmText, opts) {
     var previousFocus = document.activeElement;
     document.getElementById('modal-title').textContent = title;
-    document.getElementById('modal-message').textContent = message;
+    setModalMessage(message);
     var confirmBtn = document.getElementById('modal-confirm-btn');
     confirmBtn.textContent = confirmText || 'Confirm';
     confirmBtn.className = (opts && opts.confirmClass) || 'danger';

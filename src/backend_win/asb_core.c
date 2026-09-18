@@ -746,6 +746,19 @@ static void load_vm_list(void)
             g_vms[i].handle = NULL;
             g_vms[i].running = FALSE;
             if (resolve_vm_gpu_selection(&g_vms[i])) gpu_changed = TRUE;
+            /* Loaded rows get the explicit ground state: null IDs,
+               FALSE delete flag, network_cleaned == TRUE (nothing to
+               clean). The zero-init yields network_cleaned == FALSE,
+               harmless today only because of the null-GUID guards - set
+               it TRUE rather than relying on the guards. A non-ground
+               loaded row without a prior publication is a programming
+               error to log, never a delete path. */
+            ZeroMemory(&g_vms[i].network_id, sizeof(g_vms[i].network_id));
+            ZeroMemory(&g_vms[i].endpoint_id, sizeof(g_vms[i].endpoint_id));
+            ZeroMemory(&g_vms[i].external_adapter_interface_guid,
+                       sizeof(g_vms[i].external_adapter_interface_guid));
+            g_vms[i].delete_network_on_last_release = FALSE;
+            g_vms[i].network_cleaned = TRUE;
             if (vm_load_state_json(g_vms[i].vhdx_path))
                 g_vms[i].install_complete = TRUE;
             if (get_vm_disk_root(g_vms[i].vhdx_path, snap_dir) &&
@@ -970,18 +983,234 @@ static BOOL another_vm_uses_network_mode(const VmInstance *self, int mode)
     return FALSE;
 }
 
+/* ---- VM runtime network state: ground state, failed-start drain ----
+ *
+ * The VM's network/endpoint/ownership fields may only describe the current
+ * or the just-completed start attempt - never permissions left over from a
+ * previous boot. The ground state carries no resources: null
+ * GUIDs, no delete permission, and network_cleaned consistent with
+ * "nothing to clean" so repeated stop/delete is a no-op. */
+
+static const GUID ASB_ZERO_GUID = {0};
+
+/* Reset a stopped VM's runtime network state to the ground state before a
+   new start attempt. Only call when the VM holds no live network resources
+   (stopped / !handle); never on a VM whose HCS compute system still owns
+   its endpoint. Zeroes T alongside the IDs and the flag. */
+static void asb_vm_reset_network_runtime(VmInstance *vm)
+{
+    if (!vm) return;
+    ZeroMemory(&vm->network_id, sizeof(vm->network_id));
+    ZeroMemory(&vm->endpoint_id, sizeof(vm->endpoint_id));
+    ZeroMemory(&vm->external_adapter_interface_guid,
+               sizeof(vm->external_adapter_interface_guid));
+    vm->delete_network_on_last_release = FALSE;
+    vm->network_cleaned = TRUE;   /* empty state == nothing to clean */
+}
+
+/* Exact HCN endpoint-absence code. Empirically observed from HcnOpenEndpoint
+   of a deleted endpoint; the HCN headers ship no named constants. Only this
+   exact value counts as "endpoint does not exist" - every other failure
+   keeps the endpoint ID so a later cleanup can retry the delete. */
+#ifndef HCN_E_ENDPOINT_NOT_FOUND
+#define HCN_E_ENDPOINT_NOT_FOUND ((HRESULT)0x803B0002L)
+#endif
+
+/* Consume the HCN endpoint that was created for a start attempt whose HCS
+   compute-system create failed, and bring the published runtime state in
+   line with what actually remains. The single state transition shared by
+   the regular start thread and the synchronous create path (it cleans
+   this VM's endpoint only - it never deletes a network).
+
+   State table (endpoint-delete result x lifecycle):
+     gone (deleted or authoritative not-found):
+       borrowed external -> ground state (nothing of ours remains);
+       owned external     -> network survives (no new rollback); keep
+                             network_id + T + delete flag +
+                             network_cleaned=FALSE so a later explicit
+                             cleanup may delete the owned network under the
+                             existing ownership rules;
+       NAT/Internal       -> keep network_id + network_cleaned=FALSE; the
+                             later cleanup still tears the shared network
+                             down per the last-user rule and will not
+                             re-delete the now-cleared endpoint.
+     delete failed:
+       any mode -> keep endpoint_id + network_cleaned=FALSE so a later
+                   cleanup retries exactly this endpoint; never claim it
+                   was cleaned.
+
+   Returns S_OK when the endpoint is confirmed gone (deleted or exact
+   not-found). On any other delete failure the original HRESULT is
+   returned and the endpoint ID is kept. Never deletes a network itself. */
+static HRESULT asb_vm_consume_failed_start_endpoint(VmInstance *vm)
+{
+    HRESULT hr;
+
+    if (!vm)
+        return S_OK;
+    if (IsEqualGUID(&vm->endpoint_id, &ASB_ZERO_GUID))
+        return S_OK; /* no endpoint was created for this attempt */
+
+    hr = hcn_delete_endpoint(&vm->endpoint_id);
+    if (SUCCEEDED(hr) || hr == HCN_E_ENDPOINT_NOT_FOUND) {
+        /* The endpoint is confirmed gone: clear the published ID so no
+           later cleanup can delete it a second time. */
+        ZeroMemory(&vm->endpoint_id, sizeof(vm->endpoint_id));
+        if (vm->network_mode == NET_EXTERNAL &&
+            !vm->delete_network_on_last_release) {
+            /* Borrowed: nothing of ours remains; normalize to ground. */
+            asb_vm_reset_network_runtime(vm);
+        } else {
+            /* Owned External (the delete flag is set), NAT, or Internal:
+               the network deliberately survives (no new rollback); keep
+               the fields consistent with resources still pending
+               cleanup. */
+            vm->network_cleaned = FALSE;
+        }
+        return S_OK;
+    }
+
+    /* Delete failed: keep the endpoint ID and the un-cleaned state so a
+       later start or cleanup retries exactly this endpoint. */
+    asb_log(L"Warning: endpoint cleanup after failed start kept for retry "
+            L"(0x%08X).", hr);
+    vm->network_cleaned = FALSE;
+    return hr;
+}
+
+/* Process-local pending endpoint from a failed synchronous create whose
+   instance row was never published: the ID is kept so a later create or
+   start can retry the delete (zero == empty). */
+static GUID g_pending_sync_create_endpoint_id;
+
+/* Delete (or confirm gone) the pending failed-create endpoint. The slot
+   is only cleared on success; a failed delete keeps the GUID for a later
+   retry. */
+static HRESULT asb_drain_pending_create_endpoint(void)
+{
+    HRESULT hr;
+
+    if (IsEqualGUID(&g_pending_sync_create_endpoint_id, &ASB_ZERO_GUID))
+        return S_OK;
+
+    hr = hcn_delete_endpoint(&g_pending_sync_create_endpoint_id);
+    if (SUCCEEDED(hr) || hr == HCN_E_ENDPOINT_NOT_FOUND) {
+        ZeroMemory(&g_pending_sync_create_endpoint_id,
+                   sizeof(g_pending_sync_create_endpoint_id));
+        return S_OK;
+    }
+
+    asb_log(L"Warning: pending create endpoint delete failed (0x%08X); "
+            L"GUID retained.", hr);
+    return hr;
+}
+
+/* Remember an endpoint whose failed-start delete failed, so the next
+   create or start retries it. A non-empty slot is never overwritten: a
+   second failed create's endpoint is then NOT retained - the caller
+   logs the difference. Returns TRUE when the GUID was stored. */
+static BOOL asb_register_pending_create_endpoint(const GUID *endpoint_id)
+{
+    if (!endpoint_id || IsEqualGUID(endpoint_id, &ASB_ZERO_GUID))
+        return FALSE;
+    if (!IsEqualGUID(&g_pending_sync_create_endpoint_id, &ASB_ZERO_GUID))
+        return FALSE;
+    g_pending_sync_create_endpoint_id = *endpoint_id;
+    return TRUE;
+}
+
+/* Failed-create endpoint cleanup for the background creation threads
+   (this VM's endpoint only, never the network). A failed delete
+   registers the process-local pending slot so a later create/start
+   retries it - never a silent permanent leak (a borrowed-network
+   endpoint has no other recovery path: the startup sweep deletes
+   networks only, never endpoints by Name). */
+static void asb_thread_cleanup_failed_endpoint(const GUID *endpoint_id)
+{
+    HRESULT hr;
+
+    if (!endpoint_id || IsEqualGUID(endpoint_id, &ASB_ZERO_GUID))
+        return;
+    hr = hcn_delete_endpoint(endpoint_id);
+    if (SUCCEEDED(hr) || hr == HCN_E_ENDPOINT_NOT_FOUND)
+        return;
+    if (asb_register_pending_create_endpoint(endpoint_id))
+        asb_log(L"Warning: endpoint cleanup after failed create kept "
+                L"for retry (0x%08X).", hr);
+    else
+        asb_log(L"Warning: endpoint cleanup after failed create failed "
+                L"(0x%08X); retry slot occupied - this endpoint is not "
+                L"retained.", hr);
+}
+
+/* External sharing check: compares the ACTUAL network ID (binary GUID),
+   never the mode, adapter name, or switch name. Owned and borrowed
+   networks coexist; only an identical actual ID defers deletion. Used
+   by External cleanup; NAT/Internal keep
+   another_vm_uses_network_mode(). Running-only, g_cs-guarded by the
+   caller's lifecycle. */
+static BOOL another_running_vm_uses_external_network_id(const VmInstance *self,
+                                                         const GUID *network_id)
+{
+    int i;
+    if (!network_id) return FALSE;
+    for (i = 0; i < g_vm_count; i++) {
+        const VmInstance *v = &g_vms[i];
+        if (v == self) continue;
+        if (!v->running) continue;
+        if (v->network_cleaned) continue;
+        if (v->network_mode != NET_EXTERNAL) continue;
+        if (IsEqualGUID(&v->network_id, network_id)) return TRUE;
+    }
+    return FALSE;
+}
+
 ASB_API void asb_vm_cleanup_network(VmInstance *vm)
 {
     if (!vm) return;
     if (vm->network_mode == NET_NONE) return;
     if (vm->network_cleaned) return;
-    hcn_delete_endpoint(&vm->endpoint_id);
-    /* The HCN network is shared across all VMs of the same mode
-       (fixed GUID). Only tear it down if no other running VM is
-       still attached to it. */
-    if (!another_vm_uses_network_mode(vm, vm->network_mode))
-        hcn_delete_network(&vm->network_id);
-    vm->network_cleaned = TRUE;
+
+    /* Every VM owns its own endpoint; delete it first, always. A null
+       endpoint GUID (ground state - failed start, nothing acquired) is
+       skipped rather than sent to HCN. */
+    if (!IsEqualGUID(&vm->endpoint_id, &ASB_ZERO_GUID))
+        hcn_delete_endpoint(&vm->endpoint_id);
+
+    if (vm->network_mode == NET_EXTERNAL) {
+        /* Delete the network only when this start's owned flag is
+           TRUE, the actual network ID is non-null, and no other running
+           VM holds the same actual ID - then only through the pure-ID
+           owned-delete shield (never by mode, never by Name). A borrowed
+           network ID must never reach HcnDeleteNetwork. */
+        if (vm->delete_network_on_last_release &&
+            !IsEqualGUID(&vm->network_id, &ASB_ZERO_GUID)) {
+            if (IsEqualGUID(&vm->external_adapter_interface_guid, &ASB_ZERO_GUID)) {
+                /* T null together with a TRUE delete flag and a non-null
+                   network_id is a programming error to log loudly, never
+                   a silent skip. The shield still returns S_FALSE:
+                   owned_id(T) is not computable for a null T. */
+                asb_log(L"Error: External cleanup found a TRUE delete flag "
+                        L"with a null adapter GUID (programming error); "
+                        L"network delete skipped.");
+            }
+            if (!another_running_vm_uses_external_network_id(vm, &vm->network_id))
+                hcn_delete_owned_external_network(&vm->network_id,
+                                                  &vm->external_adapter_interface_guid);
+        }
+    } else if (!IsEqualGUID(&vm->network_id, &ASB_ZERO_GUID)) {
+        /* The HCN network is shared across all VMs of the same mode
+           (fixed GUID). Only tear it down if no other running VM is
+           still attached to it, and only when this start actually
+           acquired it (non-null ID). */
+        if (!another_vm_uses_network_mode(vm, vm->network_mode))
+            hcn_delete_network(&vm->network_id);
+    }
+
+    /* Normalize to the ground state (cleanup resets runtime
+       state, T included): cleanup is idempotent and no delete permission
+       outlives the resources it described. */
+    asb_vm_reset_network_runtime(vm);
 }
 
 static HRESULT ensure_vm_mac_address(VmInstance *vm)
@@ -1061,14 +1290,15 @@ static BOOL allocate_nat_ip(VmInstance *vm)
 static HRESULT try_endpoint_with_retry(const GUID *net_id, GUID *ep_id,
                                        wchar_t *ep_guid_str, size_t str_len,
                                        char *nat_ip, size_t nat_ip_size,
-                                       BOOL is_nat, const wchar_t *mac_address)
+                                       BOOL is_nat, const wchar_t *mac_address,
+                                       BOOL mark_borrowed)
 {
     HRESULT hr;
     int retry;
 
     hr = hcn_create_endpoint(net_id, ep_id, ep_guid_str, str_len,
                               (is_nat && nat_ip && nat_ip[0]) ? nat_ip : NULL,
-                              mac_address);
+                              mac_address, mark_borrowed);
     if (SUCCEEDED(hr) || !is_nat || !nat_ip || !nat_ip[0]) return hr;
 
     asb_log(L"Endpoint failed for %S, trying next IP...", nat_ip);
@@ -1078,7 +1308,7 @@ static HRESULT try_endpoint_with_retry(const GUID *net_id, GUID *ep_id,
         sprintf_s(nat_ip, nat_ip_size, "%d.%d.%d.%d", a, b, c, d + 1);
         asb_log(L"Retrying with %S...", nat_ip);
         hr = hcn_create_endpoint(net_id, ep_id, ep_guid_str, str_len, nat_ip,
-                                  mac_address);
+                                  mac_address, mark_borrowed);
         if (SUCCEEDED(hr)) return hr;
     }
     return hr;
@@ -1092,6 +1322,11 @@ typedef struct {
     GUID       network_id;
     GUID       endpoint_id;
     int        network_mode;
+    /* External runtime tuple carried with the IDs through the worker:
+       the selected physical NIC and this acquisition's delete
+       flag, published with the network ID as one group. */
+    GUID       external_adapter_interface_guid;
+    BOOL       delete_network_on_last_release;
 } StartVmArgs;
 
 static DWORD WINAPI start_vm_thread(LPVOID param)
@@ -1100,6 +1335,10 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     VmInstance *vm = args->vm;
     HRESULT hr;
     wchar_t endpoint_guid_str[64] = { 0 };
+    /* The one-line reason for this start's External acquisition
+       failure. Produced and consumed inside the thread; StartVmArgs
+       is input-only. */
+    wchar_t acquire_reason[1024];
 
     /* Allocate NAT IP before endpoint creation (only for NAT mode) */
     if (args->network_mode == NET_NAT) {
@@ -1112,10 +1351,30 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     }
 
     if (args->network_mode != NET_NONE) {
+        HcnExternalNetworkRef external_ref;
+        BOOL is_external = (args->network_mode == NET_EXTERNAL);
+
+        /* Reset the lifecycle tuple before this start's acquisition; only
+           a successful acquisition + endpoint write it back. */
+        args->delete_network_on_last_release = FALSE;
+        ZeroMemory(&args->external_adapter_interface_guid,
+                   sizeof(args->external_adapter_interface_guid));
+        ZeroMemory(&external_ref, sizeof(external_ref));
+        acquire_reason[0] = L'\0';
+
         switch (args->network_mode) {
         case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
         case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
-        case NET_EXTERNAL: hr = hcn_create_external_network(&args->network_id, args->vm->net_adapter); break;
+        case NET_EXTERNAL:
+            hr = hcn_acquire_external_network(vm->net_adapter, &external_ref,
+                                              acquire_reason,
+                                              ARRAYSIZE(acquire_reason));
+            if (SUCCEEDED(hr)) {
+                args->network_id = external_ref.network_id;
+                args->external_adapter_interface_guid =
+                    external_ref.adapter_interface_guid;
+            }
+            break;
         default:           hr = E_INVALIDARG; break;
         }
         if (SUCCEEDED(hr)) {
@@ -1123,17 +1382,54 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
                                           endpoint_guid_str, 64,
                                           vm->nat_ip, sizeof(vm->nat_ip),
                                           args->network_mode == NET_NAT,
-                                          vm->mac_address);
+                                          vm->mac_address,
+                                          is_external &&
+                                          !external_ref.delete_network_on_last_release);
             if (SUCCEEDED(hr) && args->network_mode == NET_NAT) save_vm_list();
             if (FAILED(hr)) {
+                /* The endpoint-creation exit keeps its originating report:
+                   a fixed one-line format carrying the endpoint
+                   HRESULT, not a reason label. The network (borrowed or owned)
+                   is never rolled back here (endpoint only). */
                 asb_log(L"Error: Network endpoint failed (0x%08X).", hr);
+                {
+                    wchar_t alert_buf[128];
+                    swprintf_s(alert_buf, ARRAYSIZE(alert_buf),
+                               L"Failed to start VM: HCN endpoint creation "
+                               L"failed (0x%08X).", hr);
+                    asb_alert(alert_buf);
+                }
                 if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
                 free(args); return 1;
             }
+            /* Handoff: actual network ID, endpoint ID, T, and the delete
+               flag from THIS acquisition, written as one group. The VM now
+               owns live network resources, so the cleanup guard comes off. */
             vm->network_id = args->network_id;
             vm->endpoint_id = args->endpoint_id;
+            vm->external_adapter_interface_guid =
+                args->external_adapter_interface_guid;
+            vm->delete_network_on_last_release =
+                external_ref.delete_network_on_last_release;
+            vm->network_cleaned = FALSE;
         } else {
-            asb_log(L"Error: Network unavailable (0x%08X).", hr);
+            if (is_external) {
+                /* Failure preserves NET_EXTERNAL and NetAdapter - no
+                   NET_NONE downgrade, no substitute target. The reason
+                   replaces the generic Network-unavailable line and
+                   surfaces through the existing asb_alert before the
+                   failure callback. */
+                if (acquire_reason[0]) {
+                    asb_log(L"%s", acquire_reason);
+                    asb_alert(acquire_reason);
+                } else {
+                    asb_log(L"Error: External network acquisition failed (0x%08X); "
+                            L"VM remains stopped and configured for External.", hr);
+                    asb_alert(L"Failed to start VM: External network unavailable.");
+                }
+            } else {
+                asb_log(L"Error: Network unavailable (0x%08X).", hr);
+            }
             if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
             free(args); return 1;
         }
@@ -1161,13 +1457,13 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     if (FAILED(hr)) {
         asb_log(L"Error: Failed to create compute system (0x%08X)", hr);
         asb_alert(L"Failed to start VM, check its configuration.");
-        /* HCS rejected the VM after we already created the HCN endpoint.
-           Free the endpoint so its IP reservation doesn't leak into the
-           next attempt as a phantom HCN_E_ADDR_INVALID_OR_RESERVED. */
-        if (endpoint_guid_str[0] != L'\0') {
-            hcn_delete_endpoint(&args->endpoint_id);
-            endpoint_guid_str[0] = L'\0';
-        }
+        /* HCS rejected the VM after the HCN endpoint was already created
+           and published. Consume the endpoint through the shared state
+           transition so the published fields match what actually remains
+           (deleted or kept-for-retry) and no later cleanup deletes it a
+           second time. The network (borrowed or owned) is never rolled
+           back here (endpoint only). */
+        asb_vm_consume_failed_start_endpoint(vm);
         if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
         free(args); return 1;
     }
@@ -1204,10 +1500,13 @@ typedef struct {
     wchar_t  endpoint_guid[64];
     GUID     network_id;
     GUID     endpoint_id;
+    /* External runtime tuple carried to the completion publication. */
+    GUID     external_adapter_interface_guid;
+    BOOL     delete_network_on_last_release;
     BOOL     has_network;
     wchar_t  net_adapter[256];
     HRESULT  result;
-    wchar_t  error_msg[512];
+    wchar_t  error_msg[1024];
     VmInstance *vm_inst;
     wchar_t  language[32];
     wchar_t  input_locale[128];
@@ -1351,7 +1650,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                                 g_progress_cb(vm_handle(pvm), pct, is_staging, g_progress_ud);
                         } else if (strncmp(line, "ERROR:", 6) == 0) {
                             if (args->error_msg[0] == L'\0')
-                                MultiByteToWideChar(CP_ACP, 0, line + 6, -1, args->error_msg, 512);
+                                MultiByteToWideChar(CP_ACP, 0, line + 6, -1, args->error_msg, ARRAYSIZE(args->error_msg));
                             args->result = E_FAIL;
                         } else if (strncmp(line, "LANG:", 5) == 0) {
                             MultiByteToWideChar(CP_ACP, 0, line + 5, -1, args->language, 32);
@@ -1415,12 +1714,30 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
 
     /* Network */
     if (args->config.network_mode != NET_NONE) {
+        HcnExternalNetworkRef external_ref;
+        BOOL is_external = (args->config.network_mode == NET_EXTERNAL);
         char *nat_ip = (args->vm_index >= 0 && args->vm_index < g_vm_count)
                         ? g_vms[args->vm_index].nat_ip : NULL;
+
+        /* Reset the lifecycle tuple before this create's acquisition. */
+        args->delete_network_on_last_release = FALSE;
+        ZeroMemory(&args->external_adapter_interface_guid,
+                   sizeof(args->external_adapter_interface_guid));
+        ZeroMemory(&external_ref, sizeof(external_ref));
+        args->error_msg[0] = L'\0';
+
         switch (args->config.network_mode) {
         case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
         case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
-        case NET_EXTERNAL: hr = hcn_create_external_network(&args->network_id, args->net_adapter); break;
+        case NET_EXTERNAL:
+            hr = hcn_acquire_external_network(args->net_adapter, &external_ref,
+                                              args->error_msg, ARRAYSIZE(args->error_msg));
+            if (SUCCEEDED(hr)) {
+                args->network_id = external_ref.network_id;
+                args->external_adapter_interface_guid =
+                    external_ref.adapter_interface_guid;
+            }
+            break;
         default:           hr = E_INVALIDARG; break;
         }
         if (SUCCEEDED(hr)) {
@@ -1430,17 +1747,36 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
             hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
                                           args->endpoint_guid, 64,
                                           nat_ip, ip_size, is_nat,
-                                          args->config.mac_address);
+                                          args->config.mac_address,
+                                          is_external &&
+                                          !external_ref.delete_network_on_last_release);
             if (SUCCEEDED(hr)) {
                 args->has_network = TRUE;
+                args->delete_network_on_last_release =
+                    external_ref.delete_network_on_last_release;
                 if (is_nat) save_vm_list();
             }
             /* If endpoint create fails, leave the network alone - it may be
                shared with other VMs. Orphan networks are cleaned up at next
                launch by hcn_cleanup_stale_networks(). */
         }
-        if (FAILED(hr))
+        if (FAILED(hr)) {
+            if (is_external) {
+                /* External failure is terminal: no HCS create, no
+                   NET_NONE downgrade - the created VHDX is kept and
+                   NetworkMode stays External. The acquisition failure exit
+                   writes the one-line reason into error_msg; an endpoint
+                   failure supplies its own one-line format. */
+                args->result = hr;
+                if (args->error_msg[0] == L'\0') {
+                    swprintf_s(args->error_msg, 512,
+                               L"External network endpoint failed (0x%08X)", hr);
+                }
+                goto done;
+            }
+            /* NAT/Internal: continue without a network. */
             args->config.network_mode = NET_NONE;
+        }
     }
 
     args->config.image_path[0] = L'\0';
@@ -1461,7 +1797,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                Free the endpoint so its IP reservation doesn't leak into the
                next attempt as a phantom HCN_E_ADDR_INVALID_OR_RESERVED. */
             if (args->has_network) {
-                hcn_delete_endpoint(&args->endpoint_id);
+                asb_thread_cleanup_failed_endpoint(&args->endpoint_id);
                 args->has_network = FALSE;
                 args->endpoint_guid[0] = L'\0';
             }
@@ -1476,7 +1812,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
             /* VM created but failed to start. Free the endpoint so its
                IP reservation doesn't leak into the next attempt. */
             if (args->has_network) {
-                hcn_delete_endpoint(&args->endpoint_id);
+                asb_thread_cleanup_failed_endpoint(&args->endpoint_id);
                 args->has_network = FALSE;
                 args->endpoint_guid[0] = L'\0';
             }
@@ -1535,6 +1871,13 @@ done:
                     inst->network_mode = heap_inst->network_mode;
                     inst->network_id = args->network_id;
                     inst->endpoint_id = args->endpoint_id;
+                    /* Success tuple published together: actual network ID,
+                       T, and the delete flag. */
+                    inst->external_adapter_interface_guid =
+                        args->external_adapter_interface_guid;
+                    inst->delete_network_on_last_release =
+                        args->delete_network_on_last_release;
+                    inst->network_cleaned = !args->has_network;
                     HeapFree(GetProcessHeap(), 0, heap_inst);
                     args->vm_inst = NULL;
                     hcs_register_vm_callback(inst);
@@ -1554,8 +1897,13 @@ done:
                 LeaveCriticalSection(&g_cs);
                 asb_log(L"VM \"%s\" created but failed to start: %s", inst->name, args->error_msg);
                 asb_log(L"You can adjust settings and start it manually.");
+                /* The completion alert prefers the reason in error_msg over
+                   the generic strings - it carries the real
+                   failure. */
                 if (args->result == (HRESULT)0x800705AF)
                     asb_alert(L"The host doesn't have enough resources to start this VM.");
+                else if (args->error_msg[0])
+                    asb_alert(args->error_msg);
                 else
                     asb_alert(L"Failed to start VM, check its configuration.");
                 save_vm_list();
@@ -2430,10 +2778,13 @@ typedef struct {
     wchar_t     endpoint_guid[64];
     GUID        network_id;
     GUID        endpoint_id;
+    /* External runtime tuple carried to the completion publication. */
+    GUID        external_adapter_interface_guid;
+    BOOL        delete_network_on_last_release;
     BOOL        has_network;
     wchar_t     net_adapter[256];
     HRESULT     result;
-    wchar_t     error_msg[512];
+    wchar_t     error_msg[1024];
     VmInstance *vm_inst;
     BOOL        vhdx_created;
     char        host_locale[64];
@@ -2564,7 +2915,7 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     hr = run_iso_patch_ubuntu(args->config.image_path, args->config.vhdx_path,
                               args->config.hdd_gb,
                               n_staged > 0 ? manifest : NULL,
-                              args->vm_unique_id, args->error_msg, 512);
+                              args->vm_unique_id, args->error_msg, ARRAYSIZE(args->error_msg));
     if (FAILED(hr)) {
         args->result = hr;
         if (args->error_msg[0] == L'\0')
@@ -2592,14 +2943,32 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         }
     }
 
-    /* ---- 5. Network + endpoint (same as vhdx_create_thread:1114). ---- */
+    /* ---- 5. Network + endpoint (same as vhdx_create_thread). ---- */
     if (args->config.network_mode != NET_NONE) {
+        HcnExternalNetworkRef external_ref;
+        BOOL is_external = (args->config.network_mode == NET_EXTERNAL);
         char *nat_ip = (args->vm_index >= 0 && args->vm_index < g_vm_count)
                         ? g_vms[args->vm_index].nat_ip : NULL;
+
+        /* Reset the lifecycle tuple before this create's acquisition. */
+        args->delete_network_on_last_release = FALSE;
+        ZeroMemory(&args->external_adapter_interface_guid,
+                   sizeof(args->external_adapter_interface_guid));
+        ZeroMemory(&external_ref, sizeof(external_ref));
+        args->error_msg[0] = L'\0';
+
         switch (args->config.network_mode) {
         case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
         case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
-        case NET_EXTERNAL: hr = hcn_create_external_network(&args->network_id, args->net_adapter); break;
+        case NET_EXTERNAL:
+            hr = hcn_acquire_external_network(args->net_adapter, &external_ref,
+                                              args->error_msg, ARRAYSIZE(args->error_msg));
+            if (SUCCEEDED(hr)) {
+                args->network_id = external_ref.network_id;
+                args->external_adapter_interface_guid =
+                    external_ref.adapter_interface_guid;
+            }
+            break;
         default:           hr = E_INVALIDARG; break;
         }
         if (SUCCEEDED(hr)) {
@@ -2609,17 +2978,34 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
             hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
                                           args->endpoint_guid, 64,
                                           nat_ip, ip_size, is_nat,
-                                          args->config.mac_address);
+                                          args->config.mac_address,
+                                          is_external &&
+                                          !external_ref.delete_network_on_last_release);
             if (SUCCEEDED(hr)) {
                 args->has_network = TRUE;
+                args->delete_network_on_last_release =
+                    external_ref.delete_network_on_last_release;
                 if (is_nat) save_vm_list();
             }
         }
-        if (FAILED(hr))
+        if (FAILED(hr)) {
+            if (is_external) {
+                /* External failure is terminal: no HCS create, no
+                   NET_NONE downgrade. The acquisition failure exit writes
+                   the one-line reason into error_msg; an endpoint failure
+                   supplies its own one-line format. */
+                args->result = hr;
+                if (args->error_msg[0] == L'\0') {
+                    swprintf_s(args->error_msg, 512,
+                               L"External network endpoint failed (0x%08X)", hr);
+                }
+                goto done;
+            }
             args->config.network_mode = NET_NONE;
+        }
     }
 
-    /* ---- 6. HCS create + start (same as vhdx_create_thread:1145). ---- */
+    /* ---- HCS create + start (same as vhdx_create_thread). ---- */
     {
         VmInstance temp_inst;
         ZeroMemory(&temp_inst, sizeof(temp_inst));
@@ -2630,8 +3016,10 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         if (FAILED(hr)) {
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to create HCS VM (0x%08X)", hr);
+            /* Endpoint only; a failed delete goes to the pending
+               slot for retry, never a silent leak. */
             if (args->has_network) {
-                hcn_delete_endpoint(&args->endpoint_id);
+                asb_thread_cleanup_failed_endpoint(&args->endpoint_id);
                 args->has_network = FALSE;
                 args->endpoint_guid[0] = L'\0';
             }
@@ -2644,7 +3032,7 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
             swprintf_s(args->error_msg, 512, L"Failed to start VM (0x%08X)", hr);
             hcs_close_vm(&temp_inst);
             if (args->has_network) {
-                hcn_delete_endpoint(&args->endpoint_id);
+                asb_thread_cleanup_failed_endpoint(&args->endpoint_id);
                 args->has_network = FALSE;
                 args->endpoint_guid[0] = L'\0';
             }
@@ -2661,7 +3049,7 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     }
 
 done:
-    /* ---- Completion (same as vhdx_create_thread:1206). ---- */
+    /* ---- Completion (same as vhdx_create_thread). ---- */
     {
         VmInstance *inst;
         int idx;
@@ -2689,6 +3077,13 @@ done:
                     inst->network_mode = heap_inst->network_mode;
                     inst->network_id = args->network_id;
                     inst->endpoint_id = args->endpoint_id;
+                    /* Success tuple published together: actual network ID,
+                       T, and the delete flag. */
+                    inst->external_adapter_interface_guid =
+                        args->external_adapter_interface_guid;
+                    inst->delete_network_on_last_release =
+                        args->delete_network_on_last_release;
+                    inst->network_cleaned = !args->has_network;
                     HeapFree(GetProcessHeap(), 0, heap_inst);
                     args->vm_inst = NULL;
                     hcs_register_vm_callback(inst);
@@ -2704,8 +3099,12 @@ done:
                 LeaveCriticalSection(&g_cs);
                 asb_log(L"VM \"%s\" created but failed to start: %s", inst->name, args->error_msg);
                 asb_log(L"You can adjust settings and start it manually.");
+                /* The completion alert prefers the reason in error_msg over
+                   the generic strings. */
                 if (args->result == (HRESULT)0x800705AF)
                     asb_alert(L"The host doesn't have enough resources to start this VM.");
+                else if (args->error_msg[0])
+                    asb_alert(args->error_msg);
                 else
                     asb_alert(L"Failed to start VM, check its configuration.");
                 save_vm_list();
@@ -2837,6 +3236,19 @@ ASB_API void asb_cleanup(void)
     }
 
     hcs_cleanup();
+    /* Final drain of the process-local pending-create endpoint (14):
+       cleanup is the last automatic retry point; a leftover after this
+       needs manual removal (operations documentation). Failure only
+       logs - cleanup still proceeds. */
+    {
+        HRESULT drain_hr = asb_drain_pending_create_endpoint();
+        if (FAILED(drain_hr)) {
+            wchar_t guid_str[64];
+            StringFromGUID2(&g_pending_sync_create_endpoint_id, guid_str, 64);
+            asb_log(L"Warning: pending create endpoint %s still present "
+                    L"after cleanup (0x%08X).", guid_str, drain_hr);
+        }
+    }
     hcn_cleanup();
     DeleteCriticalSection(&g_cs);
     g_initialized = FALSE;
@@ -2846,6 +3258,20 @@ ASB_API void asb_detach(void)
 {
     int i;
     if (!g_initialized) return;
+
+    /* Drain the process-local pending-create endpoint before abandoning
+       HCS resources (14): the VMs keep running, but nothing of ours may
+       be left behind on the HCN side. Failure only logs - detach still
+       proceeds. */
+    {
+        HRESULT drain_hr = asb_drain_pending_create_endpoint();
+        if (FAILED(drain_hr)) {
+            wchar_t guid_str[64];
+            StringFromGUID2(&g_pending_sync_create_endpoint_id, guid_str, 64);
+            asb_log(L"Warning: pending create endpoint %s still present "
+                    L"after detach (0x%08X).", guid_str, drain_hr);
+        }
+    }
 
     /* Cleanly release HCS resources WITHOUT terminating running VMs.
        Used by short-lived consumers that start a VM
@@ -3110,6 +3536,57 @@ ASB_API const wchar_t *asb_validate_password(const wchar_t *os_type,
     return NULL;
 }
 
+/* COM-owning worker for the synchronous create path's External acquire:
+   asb_vm_create runs on the UI/WebView2 thread and already blocks;
+   the acquire (WMI topology, up to the 60s-class deadline in the worst
+   case) runs here, and the caller waits - the same worker-arg/wait shape
+   the background create threads use. No WMI work is initialized in the
+   UI STA. The reason is captured into a local buffer and logged in the
+   worker; AsbStateCallback is not widened. */
+typedef struct {
+    const wchar_t *net_adapter;
+    HcnExternalNetworkRef ref;
+    wchar_t reason[1024];
+    HRESULT hr;
+} SyncExternalAcquireArgs;
+
+static DWORD WINAPI sync_external_acquire_thread(LPVOID param)
+{
+    SyncExternalAcquireArgs *args = (SyncExternalAcquireArgs *)param;
+
+    args->reason[0] = L'\0';
+    ZeroMemory(&args->ref, sizeof(args->ref));
+    args->hr = hcn_acquire_external_network(args->net_adapter, &args->ref,
+                                            args->reason,
+                                            ARRAYSIZE(args->reason));
+    if (FAILED(args->hr) && args->reason[0])
+        asb_log(L"%s", args->reason);
+    return 0;
+}
+
+/* Run one External acquire on its own COM-owning worker and wait for it.
+   The args struct is caller stack storage; the wait pins its lifetime. */
+static HRESULT sync_external_acquire(const wchar_t *net_adapter,
+                                     HcnExternalNetworkRef *out)
+{
+    SyncExternalAcquireArgs args;
+    HANDLE thread;
+
+    ZeroMemory(&args, sizeof(args));
+    args.net_adapter = net_adapter;
+    ZeroMemory(out, sizeof(*out));
+
+    thread = CreateThread(NULL, 0, sync_external_acquire_thread, &args, 0, NULL);
+    if (!thread)
+        return HRESULT_FROM_WIN32(GetLastError());
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+
+    if (SUCCEEDED(args.hr))
+        *out = args.ref;
+    return args.hr;
+}
+
 ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 {
     VmConfig cfg;
@@ -3268,6 +3745,16 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         }
     }
 
+    /* Drain the process-local pending-create endpoint before a new
+       acquire: a failed drain (endpoint delete still failing)
+       blocks this create - the retry is the drain itself, never a
+       silently leaked endpoint. */
+    {
+        HRESULT pending_hr = asb_drain_pending_create_endpoint();
+        if (FAILED(pending_hr))
+            return pending_hr;
+    }
+
     inst = &g_vms[g_vm_count];
     ZeroMemory(inst, sizeof(VmInstance));
     inst->unique_id = g_next_vm_id++;
@@ -3363,6 +3850,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->building_vhdx = TRUE;
             inst->vhdx_progress = 0;
             memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
+            /* Fresh row: establish the no-resources ground state before
+               the async acquisition. */
+            asb_vm_reset_network_runtime(inst);
 
             { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
               snapshot_init(&g_snap_trees[g_vm_count], sd); }
@@ -3434,6 +3924,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->building_vhdx = TRUE;
             inst->vhdx_progress = 0;
             memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
+            /* Fresh row: establish the no-resources ground state before
+               the async acquisition. */
+            asb_vm_reset_network_runtime(inst);
 
             { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
               snapshot_init(&g_snap_trees[g_vm_count], sd); }
@@ -3561,7 +4054,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     }
     SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
 
-    inst->network_cleaned = FALSE;
+    /* Fresh row: establish the no-resources ground state before the first
+       acquisition attempt. */
+    asb_vm_reset_network_runtime(inst);
 
     /* Allocate NAT IP before endpoint creation */
     if (cfg.network_mode == NET_NAT) {
@@ -3575,13 +4070,34 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
     /* Networking */
     if (cfg.network_mode != NET_NONE) {
+        HcnExternalNetworkRef external_ref;
+        BOOL is_external = (cfg.network_mode == NET_EXTERNAL);
+
+        /* Fresh row: the ground state was established above; only this
+           acquisition writes the lifecycle tuple back. */
+        ZeroMemory(&external_ref, sizeof(external_ref));
+
         switch (cfg.network_mode) {
         case NET_NAT:      hr = hcn_create_nat_network(&inst->network_id); break;
         case NET_INTERNAL: hr = hcn_create_internal_network(&inst->network_id); break;
-        case NET_EXTERNAL: hr = hcn_create_external_network(&inst->network_id, inst->net_adapter); break;
+        case NET_EXTERNAL:
+            hr = sync_external_acquire(inst->net_adapter, &external_ref);
+            if (SUCCEEDED(hr))
+                inst->network_id = external_ref.network_id;
+            break;
         default:           hr = E_INVALIDARG; break;
         }
         if (FAILED(hr)) {
+            if (is_external) {
+                /* External failure is terminal for synchronous create:
+                   the original HRESULT is returned (the worker
+                   logged the one-line reason), no HCS VM is created, no VM row
+                   or vms.cfg entry is added, and the External intent is
+                   preserved - never downgraded to NET_NONE. */
+                asb_log(L"Error: External network acquisition failed (0x%08X); "
+                        L"no VM was created.", hr);
+                return hr;
+            }
             asb_log(L"Warning: Network failed (0x%08X). Continuing without.", hr);
             cfg.network_mode = NET_NONE;
         } else {
@@ -3589,12 +4105,33 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                                           endpoint_guid_str, 64,
                                           inst->nat_ip, sizeof(inst->nat_ip),
                                           cfg.network_mode == NET_NAT,
-                                          inst->mac_address);
+                                          inst->mac_address,
+                                          is_external &&
+                                          !external_ref.delete_network_on_last_release);
             if (SUCCEEDED(hr) && cfg.network_mode == NET_NAT) save_vm_list();
             if (FAILED(hr)) {
+                if (is_external) {
+                    /* Terminal: keep the External intent, no HCS
+                       create, no network rollback (borrowed or owned). */
+                    asb_log(L"Error: External network endpoint failed (0x%08X); "
+                            L"no VM was created.", hr);
+                    return hr;
+                }
                 asb_log(L"Warning: Endpoint failed (0x%08X).", hr);
                 /* Leave the shared network alone - other VMs may be using it. */
                 cfg.network_mode = NET_NONE;
+            } else {
+                /* Endpoint created: publish the success tuple together -
+                   actual network ID, T, and the delete flag - and
+                   take the cleanup guard off (this row now owns live
+                   network resources for every mode). */
+                if (is_external) {
+                    inst->external_adapter_interface_guid =
+                        external_ref.adapter_interface_guid;
+                    inst->delete_network_on_last_release =
+                        external_ref.delete_network_on_last_release;
+                }
+                inst->network_cleaned = FALSE;
             }
         }
     }
@@ -3607,11 +4144,27 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (FAILED(hr)) {
         asb_log(L"Error: Failed to create compute system (0x%08X)", hr);
         asb_alert(L"Failed to start VM, check its configuration.");
-        /* HCS rejected the VM after we already created the HCN endpoint.
-           Free the endpoint so its IP reservation doesn't leak. */
-        if (endpoint_guid_str[0] != L'\0') {
-            hcn_delete_endpoint(&inst->endpoint_id);
-            endpoint_guid_str[0] = L'\0';
+        /* HCS rejected the VM after the HCN endpoint was already created
+           and written into the instance. Consume it through the same
+           shared state transition as the background start thread (endpoint
+           only, never the network). If the endpoint delete
+           fails, copy that GUID into the process-local pending slot so a
+           later create or start can retry it; the instance is not added
+           to the VM list. */
+        {
+            HRESULT ep_hr = asb_vm_consume_failed_start_endpoint(inst);
+            if (FAILED(ep_hr)) {
+                if (asb_register_pending_create_endpoint(&inst->endpoint_id)) {
+                    asb_log(L"Error: compute system create failed (0x%08X); "
+                            L"endpoint delete failed (0x%08X); endpoint "
+                            L"retained for retry.", hr, ep_hr);
+                } else {
+                    asb_log(L"Error: compute system create failed (0x%08X); "
+                            L"endpoint delete failed (0x%08X); retry slot "
+                            L"occupied - this endpoint is not retained.",
+                            hr, ep_hr);
+                }
+            }
         }
         remove_dir_recursive(vhdx_dir);
         return hr;
@@ -3715,6 +4268,27 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
     }
 
     if (!inst->handle) {
+        HRESULT pending_hr;
+
+        pending_hr = asb_drain_pending_create_endpoint();
+        if (FAILED(pending_hr)) {
+            if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
+            return pending_hr;
+        }
+
+        /* A leftover endpoint from a failed start must be deleted (or
+           confirmed gone) before runtime reset or a new acquisition. Do
+           not call the general network cleanup here: that path may
+           delete an owned network. */
+        if (!inst->network_cleaned &&
+            !IsEqualGUID(&inst->endpoint_id, &ASB_ZERO_GUID)) {
+            pending_hr = asb_vm_consume_failed_start_endpoint(inst);
+            if (FAILED(pending_hr)) {
+                if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
+                return pending_hr;
+            }
+        }
+
         /* Need to re-create HCS system - do it in a background thread */
         StartVmArgs *args = (StartVmArgs *)calloc(1, sizeof(StartVmArgs));
         if (!args) return E_OUTOFMEMORY;
@@ -3735,7 +4309,10 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->config.ssh_enabled = inst->ssh_enabled;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
         args->network_mode = inst->network_mode;
-        inst->network_cleaned = FALSE;
+        /* The leftover endpoint, if any, is gone. Clear remaining runtime
+           fields (T included) before the new attempt: a successful
+           start publishes the new tuple over any residual one. */
+        asb_vm_reset_network_runtime(inst);
         asb_log(L"Starting VM \"%s\" (background)...", inst->name);
         CloseHandle(CreateThread(NULL, 0, start_vm_thread, args, 0, NULL));
     } else {
@@ -4083,7 +4660,40 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     if (idx < 0) return E_INVALIDARG;
     if (g_vms[idx].running) return E_ACCESSDENIED;
     if (mode < 0 || mode > 3) return E_INVALIDARG;
+    if (mode == g_vms[idx].network_mode)
+        return S_OK;   /* no actual change: skip the clear and the re-save */
     g_vms[idx].network_mode = mode;
+    /* The adapter is a sub-property of External mode: leaving External
+       clears it, so no invisible per-NIC selection survives a mode switch
+       and re-entering External always starts from (Auto). */
+    if (mode != NET_EXTERNAL)
+        g_vms[idx].net_adapter[0] = L'\0';
+    save_vm_list();
+    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    return S_OK;
+}
+
+/* Set the External adapter by FriendlyName. NULL/empty/"(Auto)" select the
+   Auto walk; any other string is stored verbatim and resolved against the
+   full eligible inventory at the next start (an unknown name fails the
+   Explicit walk with the one-line reason). The value is kept but inert
+   while the mode is not External - only an actual mode change clears it
+   (a same-value set-mode call is a no-op). */
+ASB_API HRESULT asb_vm_set_net_adapter(AsbVm vm, const wchar_t *adapter)
+{
+    int idx = vm_index_of(vm);
+    const wchar_t *val = adapter;
+
+    if (idx < 0) return E_INVALIDARG;
+    if (g_vms[idx].running) return E_ACCESSDENIED;
+    if (val && wcscmp(val, L"(Auto)") == 0)
+        val = NULL;
+    if (val && val[0] && wcslen(val) >= ARRAYSIZE(g_vms[idx].net_adapter))
+        return E_INVALIDARG;
+    if (!val || !val[0])
+        g_vms[idx].net_adapter[0] = L'\0';
+    else
+        wcscpy_s(g_vms[idx].net_adapter, ARRAYSIZE(g_vms[idx].net_adapter), val);
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
     return S_OK;
