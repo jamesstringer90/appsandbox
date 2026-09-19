@@ -60,6 +60,7 @@ static BOOL get_branch_list(SnapshotTree *tree, int index,
  *    Name=Snapshot 1
  *    Vhdx=C:\...\snapshots\snapshot_def67890-....vhdx
  *    Created=<FILETIME as decimal uint64>
+ *    Parent=abc99999-...          (only when taken on another snapshot)
  *    [Branch]
  *    Guid=ghi11111-...
  *    Name=2026-03-21 14:35:00
@@ -102,6 +103,8 @@ void snapshot_save(SnapshotTree *tree)
             ft.HighPart = tree->nodes[i].created.dwHighDateTime;
             fwprintf(f, L"Created=%llu\n", ft.QuadPart);
         }
+        if (tree->nodes[i].parent_guid[0] != L'\0')
+            fwprintf(f, L"Parent=%s\n", tree->nodes[i].parent_guid);
         fwprintf(f, L"\n");
 
         for (b = 0; b < tree->nodes[i].branch_count; b++) {
@@ -213,6 +216,8 @@ static void snapshot_load(SnapshotTree *tree)
             node->created.dwLowDateTime  = ft.LowPart;
             node->created.dwHighDateTime = ft.HighPart;
         }
+        else if (wcsncmp(line, L"Parent=", 7) == 0)
+            wcscpy_s(node->parent_guid, 64, line + 7);
     }
 
     fclose(f);
@@ -237,6 +242,11 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
     wchar_t branch_guid[64];
     wchar_t vhdx_path[MAX_PATH];
     wchar_t branch_path[MAX_PATH];
+    wchar_t parent_guid[64] = L"";
+    BranchEntry *cur_branches = NULL;
+    int *cur_count = NULL;
+    const wchar_t *cur_parent;
+    int cur_snap, cur_branch, i;
     HRESULT hr;
 
     if (!tree || !instance || !name)
@@ -255,8 +265,37 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
     generate_guid_string(snap_guid, 64);
     swprintf_s(vhdx_path, MAX_PATH, L"%s\\snapshot_%s.vhdx", tree->base_dir, snap_guid);
 
-    hr = vhdx_create_differencing(vhdx_path, tree->base_vhdx);
-    if (FAILED(hr)) return hr;
+    /* The snapshot must hold what the VM runs on now, not the base: a fork of
+       the base would silently leave everything since the first snapshot on a
+       branch the VM no longer boots. */
+    snapshot_find_current(tree, instance->vhdx_path, &cur_snap, &cur_branch);
+    if (cur_branch >= 0) {
+        /* On a working branch: freeze that branch as the snapshot. It must then
+           leave the branch list, because booting it again would write to a
+           disk the new branch depends on. */
+        if (!get_branch_list(tree, cur_snap, &cur_branches, &cur_count, &cur_parent))
+            return E_UNEXPECTED;
+        if (!MoveFileExW(instance->vhdx_path, vhdx_path, 0))
+            return HRESULT_FROM_WIN32(GetLastError());
+        if (cur_snap >= 0)
+            wcscpy_s(parent_guid, 64, tree->nodes[cur_snap].guid);
+    } else {
+        /* On a frozen disk (the base, or a snapshot's own disk): it already is
+           the current state, so the snapshot forks it. Anything else is a disk
+           this tree does not know, and forking the base would lose it. */
+        if (_wcsicmp(instance->vhdx_path, tree->base_vhdx) != 0) {
+            for (i = 0; i < tree->count; i++) {
+                if (tree->nodes[i].valid &&
+                    _wcsicmp(instance->vhdx_path, tree->nodes[i].snap_vhdx) == 0)
+                    break;
+            }
+            if (i == tree->count)
+                return E_NOT_VALID_STATE;
+            wcscpy_s(parent_guid, 64, tree->nodes[i].guid);
+        }
+        hr = vhdx_create_differencing(vhdx_path, instance->vhdx_path);
+        if (FAILED(hr)) return hr;
+    }
 
     /* Auto-create first branch with GUID filename */
     generate_guid_string(branch_guid, 64);
@@ -264,8 +303,19 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
 
     hr = vhdx_create_differencing(branch_path, vhdx_path);
     if (FAILED(hr)) {
-        DeleteFileW(vhdx_path);
+        if (cur_branches)
+            MoveFileExW(vhdx_path, instance->vhdx_path, 0);  /* give the branch back */
+        else
+            DeleteFileW(vhdx_path);
         return hr;
+    }
+
+    /* The frozen branch is the snapshot now */
+    if (cur_branches) {
+        for (i = cur_branch; i < *cur_count - 1; i++)
+            cur_branches[i] = cur_branches[i + 1];
+        ZeroMemory(&cur_branches[*cur_count - 1], sizeof(BranchEntry));
+        (*cur_count)--;
     }
 
     /* Record snapshot */
@@ -274,6 +324,7 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
     wcscpy_s(node->guid, 64, snap_guid);
     wcscpy_s(node->name, 128, name);
     wcscpy_s(node->snap_vhdx, MAX_PATH, vhdx_path);
+    wcscpy_s(node->parent_guid, 64, parent_guid);
     GetSystemTimeAsFileTime(&node->created);
     node->valid = TRUE;
 
@@ -371,6 +422,15 @@ HRESULT snapshot_delete(SnapshotTree *tree, VmInstance *instance, int index)
     if (!tree || !instance) return E_INVALIDARG;
     if (index < 0 || index >= tree->count) return E_INVALIDARG;
     if (!tree->nodes[index].valid) return E_NOT_VALID_STATE;
+
+    /* A snapshot taken on this one is a differencing child of its disk */
+    if (tree->nodes[index].guid[0] != L'\0') {
+        for (i = 0; i < tree->count; i++) {
+            if (tree->nodes[i].valid &&
+                _wcsicmp(tree->nodes[i].parent_guid, tree->nodes[index].guid) == 0)
+                return HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY);
+        }
+    }
 
     /* Check if currently on any of this snapshot's branches */
     for (b = 0; b < tree->nodes[index].branch_count; b++) {
@@ -495,6 +555,22 @@ void snapshot_find_current(SnapshotTree *tree, const wchar_t *vhdx_path, int *sn
             }
         }
     }
+}
+
+int snapshot_parent_index(SnapshotTree *tree, int snap_idx)
+{
+    int i;
+
+    if (!tree || snap_idx < 0 || snap_idx >= tree->count || !tree->nodes[snap_idx].valid)
+        return -1;
+    if (tree->nodes[snap_idx].parent_guid[0] == L'\0')
+        return -2;
+    for (i = 0; i < tree->count; i++) {
+        if (i != snap_idx && tree->nodes[i].valid &&
+            _wcsicmp(tree->nodes[i].guid, tree->nodes[snap_idx].parent_guid) == 0)
+            return i;
+    }
+    return -1;
 }
 
 BOOL snapshot_get_branch_time(SnapshotTree *tree, int snap_idx, int branch_idx, FILETIME *ft)

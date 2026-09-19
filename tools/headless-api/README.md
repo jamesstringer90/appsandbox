@@ -186,7 +186,7 @@ methods return `(http_status, body)` so you can branch on the status code.
 | `status(name)` | one VM's status (raises `KeyError` on 404) |
 | `ssh_info(name)` | `{host, port, user, sshState, enabled, keyDeployed}` (loopback-forwarded SSH; `sshState 4` = ready + key deployed) |
 | `templates()` | `[{name, osType}, …]` |
-| `snapshots(name)` | list of `{index, name, branchCount, branches:[…]}` |
+| `snapshots(name)` | list of `{index, name, parent, branchCount, branches:[…]}` (`parent`: index of the snapshot it was taken on, `-2` = the base) |
 | `snapshots_full(name)` | the above **plus** `current: {snapIndex, branchIndex}` |
 
 A **status object** has: `name, osType, state, running, agentOnline,

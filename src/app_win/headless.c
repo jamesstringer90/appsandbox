@@ -1009,7 +1009,8 @@ static int handle_request(PHTTP_REQUEST req)
                     if (semitted++) pos += sprintf_s(buf + pos, sizeof(buf) - pos, ",");
                     pos += sprintf_s(buf + pos, sizeof(buf) - pos, "{\"index\":%d,\"name\":", info.index);
                     pos  = append_wstr(buf, sizeof(buf), pos, info.name);
-                    pos += sprintf_s(buf + pos, sizeof(buf) - pos, ",\"branchCount\":%d,\"branches\":[", info.branch_count);
+                    pos += sprintf_s(buf + pos, sizeof(buf) - pos, ",\"parent\":%d,\"branchCount\":%d,\"branches\":[",
+                                     info.parent_index, info.branch_count);
                     bemitted = 0;
                     for (b = 0; b < info.branch_count; b++) {
                         AsbBranchInfo bi;
