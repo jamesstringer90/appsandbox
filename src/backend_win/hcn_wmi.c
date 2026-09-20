@@ -46,12 +46,6 @@
 #define WMI_REL_PATH_MAX        512
 #define WMI_WQL_MAX             768
 
-typedef enum {
-    WMI_WALK_OK,            /* unique chain from a port to its switch */
-    WMI_WALK_NOT_CONNECTED, /* authoritative: port has no active connection */
-    WMI_WALK_ERROR          /* ambiguity, malformed topology, or query failure */
-} WmiWalkResult;
-
 /* Classify a WMI session-establishment failure: infrastructure or
  * namespace absence is PROVIDER_ABSENT; access denied, security setup,
  * COM initialization and every other failure is ERROR. */
@@ -77,6 +71,7 @@ HRESULT wmi_session_open(WmiSession *s)
 
     s->svc = NULL;
     s->com_ref_owned = FALSE;
+    s->cancel_event = NULL;
 
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (hr == S_OK || hr == S_FALSE) {
@@ -390,6 +385,15 @@ static HRESULT wmi_run_query(WmiSession *s, const wchar_t *wql, size_t max_objec
     out->objects = NULL;
     out->count = 0;
     *kind = TOPOLOGY_ERROR;
+
+    /* The cancellation channel: a signalled event stops the build
+       before this query is issued (a NULL event skips the check - the
+       acquire and External paths). Between Next calls is optional. */
+    if (s->cancel_event &&
+        WaitForSingleObject((HANDLE)s->cancel_event, 0) == WAIT_OBJECT_0) {
+        *kind = TOPOLOGY_ERROR;
+        return HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED);
+    }
 
     bstr_lang = SysAllocString(L"WQL");
     bstr_query = SysAllocString(wql);
@@ -755,6 +759,13 @@ static BOOL wmi_probe_host_system_visible(WmiSession *s, ULONGLONG deadline)
     ULONG returned = 0;
     HRESULT hr;
     BOOL visible = FALSE;
+
+    /* The first query of every census build does not go through the
+       shared helper - check the cancellation channel here too, so a
+       signal raised before the build starts issues no WMI query at all. */
+    if (s->cancel_event &&
+        WaitForSingleObject((HANDLE)s->cancel_event, 0) == WAIT_OBJECT_0)
+        return FALSE;
 
     bstr_lang = SysAllocString(L"WQL");
     bstr_query = SysAllocString(L"SELECT * FROM Msvm_ComputerSystem");
@@ -1319,4 +1330,195 @@ WmiProviderStatus wmi_probe_provider_installed(void)
     result = WMI_PROVIDER_INSTALLED;
     ui_log(L"External: Hyper-V WMI provider installed.");
     return result;
+}
+
+/* ---- Internal vSwitch census builder ----
+ *
+ * The sibling builder: WMI-only, re-enumerates Msvm_VirtualEthernetSwitch
+ * for the Name GUID + ElementName (joined to the topology BY GUID - a
+ * topology GUID with no name row is unreadable; a census row the
+ * topology lacks is an inconsistent inventory) and Msvm_InternalEthernetPort
+ * for the host-vNIC iport census, walking each iport to its switch with
+ * the existing 4-hop walker (identical hop sequence, different start
+ * class). ElementName conversion runs through the shared character rule
+ * (source length via SysStringLen - wcslen cannot see embedded NULs),
+ * the placeholder replacing any unusable name, and classification
+ * through the pure function over the RAW records. Never writes
+ * out_kind, never frees the topology, no HCN I/O, no request struct;
+ * the deadline is caller-supplied (the acquire passes the start
+ * tolerance, the ui.c worker the display tolerance). */
+
+/* Read a property as the raw BSTR (ownership moves to the caller;
+ * SysFreeString it). NULL when absent/not a string: a length-prefixed
+ * BSTR survives an embedded NUL, which is exactly why the caller must
+ * measure with SysStringLen. */
+static BSTR wmi_get_bstr_prop(IWbemClassObject *obj, const wchar_t *prop)
+{
+    VARIANT v;
+    BSTR result = NULL;
+
+    VariantInit(&v);
+    if (SUCCEEDED(obj->lpVtbl->Get(obj, prop, 0, &v, NULL, NULL)) &&
+        v.vt == VT_BSTR && v.bstrVal) {
+        result = v.bstrVal;
+        v.bstrVal = NULL;   /* ownership moved to the caller */
+    }
+    VariantClear(&v);
+    return result;
+}
+
+/* One census name row: the re-enumerated switch's identity plus its
+   converted name, joined to the topology by GUID. */
+typedef struct {
+    GUID id;
+    BOOL has_id;
+    HcnRawSwitchResult sw;
+    BOOL joined;
+} CensusNameRow;
+
+HRESULT wmi_build_internal_census(WmiSession *s, const WmiTopology *topology,
+                                  ULONGLONG deadline,
+                                  HcnInternalSwitchCensus *out)
+{
+    HcnRawSwitchResult raw_switches[WMI_MAX_ENUM_OBJECTS];
+    HcnRawIportResult raw_iports[WMI_MAX_ENUM_OBJECTS];
+    CensusNameRow *name_rows;
+    size_t raw_switch_count = 0, raw_iport_count = 0, name_row_count = 0;
+    WmiObjects objs;
+    TopologyResultKind kind;
+    size_t i;
+    HRESULT hr;
+
+    ZeroMemory(out, sizeof(*out));
+    out->state = HCN_CENSUS_UNAVAILABLE;
+    out->reason_code = HCN_IR_INVENTORY_UNAVAILABLE;
+
+    name_rows = (CensusNameRow *)HeapAlloc(GetProcessHeap(),
+                                           HEAP_ZERO_MEMORY,
+                                           WMI_MAX_ENUM_OBJECTS *
+                                               sizeof(CensusNameRow));
+    if (!name_rows)
+        return E_OUTOFMEMORY;
+
+    /* 1. Enumerate the switches for Name GUID + ElementName. */
+    hr = wmi_run_query(s, L"SELECT * FROM Msvm_VirtualEthernetSwitch",
+                       WMI_MAX_ENUM_OBJECTS, deadline, &objs, &kind);
+    if (FAILED(hr)) {
+        HeapFree(GetProcessHeap(), 0, name_rows);
+        if (kind == TOPOLOGY_CAP_OVERFLOW)
+            out->capped = TRUE;
+        return hr;
+    }
+    for (i = 0; i < objs.count; i++) {
+        wchar_t *guid_text = wmi_get_string_prop(objs.objects[i], L"Name");
+        GUID id;
+
+        if (!guid_text || !wmi_guid_from_microsoft_id(guid_text, &id) ||
+            name_row_count >= WMI_MAX_ENUM_OBJECTS) {
+            /* A switch without a GUID Name is unidentifiable: the same
+               fail-closed treatment the topology build applies. */
+            wmi_free_prop_string(guid_text);
+            wmi_objects_free(&objs);
+            HeapFree(GetProcessHeap(), 0, name_rows);
+            return E_FAIL;
+        }
+        wmi_free_prop_string(guid_text);
+        name_rows[name_row_count].id = id;
+        name_rows[name_row_count].has_id = TRUE;
+        {
+            BSTR element_name = wmi_get_bstr_prop(objs.objects[i], L"ElementName");
+            internal_switch_name_to_raw(element_name,
+                                        &name_rows[name_row_count].sw);
+            if (element_name)
+                SysFreeString(element_name);
+        }
+        name_row_count++;
+    }
+    wmi_objects_free(&objs);
+
+    /* 2. Join to the topology BY GUID: every topology switch gets a RAW
+       record (a topology GUID with no name row is unreadable). The
+       bound-external-port count comes from the topology - the census
+       never re-walks external ports. */
+    for (i = 0; i < topology->switch_count &&
+                raw_switch_count < WMI_MAX_ENUM_OBJECTS; i++) {
+        HcnRawSwitchResult *sw = &raw_switches[raw_switch_count];
+        size_t n;
+        BOOL found = FALSE;
+
+        ZeroMemory(sw, sizeof(*sw));
+        sw->id = topology->switches[i].id;
+        sw->has_id = topology->switches[i].has_id;
+        sw->bound_external_ports = topology->switches[i].bound_external_ports;
+        for (n = 0; n < name_row_count; n++) {
+            if (name_rows[n].joined || !name_rows[n].has_id)
+                continue;
+            if (IsEqualGUID(&name_rows[n].id, &sw->id)) {
+                sw->name_unusable = name_rows[n].sw.name_unusable;
+                sw->name_unreadable = name_rows[n].sw.name_unreadable;
+                wcsncpy_s(sw->name, INTERNAL_SWITCH_CAP, name_rows[n].sw.name,
+                          _TRUNCATE);
+                name_rows[n].joined = TRUE;
+                found = TRUE;
+                break;
+            }
+        }
+        if (!found) {
+            /* The topology switch has no census name row: the
+               ElementName is unreadable. */
+            sw->name_unreadable = TRUE;
+        }
+        raw_switch_count++;
+    }
+    for (i = 0; i < name_row_count; i++) {
+        if (!name_rows[i].joined) {
+            /* A census-enumerated switch the topology lacks: an
+               inconsistent inventory (the only measured producer of new
+               switch objects is VMMS switch creation, racing the build).
+               Fail closed - never fabricate a complete census. */
+            HeapFree(GetProcessHeap(), 0, name_rows);
+            return E_FAIL;
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, name_rows);
+
+    /* 3. The host-side iport census: Msvm_InternalEthernetPort Name (the
+       product-port skip's input, parsed as a GUID) + ElementName (the
+       production conversion) + the 4-hop walk. A failing walk is an
+       attribution input, never a build failure. */
+    hr = wmi_run_query(s, L"SELECT * FROM Msvm_InternalEthernetPort",
+                       WMI_MAX_ENUM_OBJECTS, deadline, &objs, &kind);
+    if (FAILED(hr)) {
+        /* An unreadable class after the provider was established is the
+           census builder's own UNAVAILABLE - never a provider-absence
+           downgrade (the host simply cannot be seen). */
+        if (kind == TOPOLOGY_CAP_OVERFLOW)
+            out->capped = TRUE;
+        return hr;
+    }
+    for (i = 0; i < objs.count && raw_iport_count < WMI_MAX_ENUM_OBJECTS; i++) {
+        HcnRawIportResult *ip = &raw_iports[raw_iport_count];
+        wchar_t *guid_text = wmi_get_string_prop(objs.objects[i], L"Name");
+        BSTR element_name = wmi_get_bstr_prop(objs.objects[i], L"ElementName");
+
+        ZeroMemory(ip, sizeof(*ip));
+        if (guid_text && wmi_guid_from_microsoft_id(guid_text, &ip->iport_name_id))
+            ip->has_name_id = TRUE;
+        wmi_free_prop_string(guid_text);
+
+        internal_iport_name_to_raw(element_name, ip);
+        if (element_name)
+            SysFreeString(element_name);
+
+        ip->walk_result = wmi_walk_port_to_switch(s, objs.objects[i], deadline,
+                                                  &ip->reached_switch_id);
+        raw_iport_count++;
+    }
+    wmi_objects_free(&objs);
+
+    /* 4. The pure classification fills the census (entries, classes,
+       flags, state). */
+    hcn_internal_classify_switches(raw_switches, raw_switch_count, raw_iports,
+                                   raw_iport_count, out);
+    return S_OK;
 }

@@ -32,13 +32,10 @@ PFN_HcnQueryNetworkProperties pfnQueryNetProps;
 
 /* ---- Shared network-create lock ---- */
 
-/* Thin accessors for the static g_network_lock (hcn_private.h). The
-   owned External create's re-check-then-create region and the
-   owned-delete shield hold it, restoring the serialization upstream
-   d307a22 gives its fixed-GUID lookup+create ("concurrently started
-   VMs reuse the same network") for the create this branch performs -
-   without it, a concurrent second create has no ALREADY_EXISTS
-   recovery and fails closed. */
+/* Thin accessors for the static g_network_lock (hcn_private.h). Owned
+   External and Internal create regions hold it across re-check+create;
+   the shared owned-delete core holds it across the actual-ID check and
+   HcnDeleteNetwork call. */
 void hcn_network_lock_acquire(void)
 {
     AcquireSRWLockExclusive(&g_network_lock);
@@ -81,16 +78,12 @@ BOOL hcn_init(void)
     return TRUE;
 }
 
-/* Fixed GUIDs for AppSandbox networks so we can clean up across runs */
-const GUID APPSANDBOX_NAT_GUID = {
-    0xA5B01234, 0x5678, 0x9ABC,
-    { 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }
-};
+/* Fixed GUIDs for AppSandbox networks so we can clean up across runs.
+   The two the pure classify TU also compares against compile from the
+   single-source initializers in hcn_private.h. */
+const GUID APPSANDBOX_NAT_GUID = APPSANDBOX_NAT_GUID_INIT;
 
-const GUID APPSANDBOX_INTERNAL_GUID = {
-    0xA5B01234, 0x5678, 0x9ABC,
-    { 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x77 }
-};
+const GUID APPSANDBOX_INTERNAL_GUID = APPSANDBOX_INTERNAL_GUID_INIT;
 
 const GUID APPSANDBOX_EXTERNAL_GUID = {
     0xA5B01234, 0x5678, 0x9ABC,
@@ -270,43 +263,6 @@ HRESULT hcn_create_nat_network(GUID *network_id)
     }
     if (network && pfnCloseNet)
         pfnCloseNet(network);
-
-    ReleaseSRWLockExclusive(&g_network_lock);
-    return hr;
-}
-
-HRESULT hcn_create_internal_network(GUID *network_id)
-{
-    wchar_t settings[1024];
-    void *network = NULL;
-    PWSTR error_record = NULL;
-    HRESULT hr;
-
-    if (!g_hcn_dll || !pfnCreateNet)
-        return E_NOT_VALID_STATE;
-
-    *network_id = APPSANDBOX_INTERNAL_GUID;
-
-    AcquireSRWLockExclusive(&g_network_lock);
-    if (hcn_network_exists(&APPSANDBOX_INTERNAL_GUID)) {
-        ReleaseSRWLockExclusive(&g_network_lock);
-        return S_OK;
-    }
-
-    swprintf_s(settings, 1024,
-        L"{"
-        L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
-        L"\"Name\":\"AppSandboxInternal\","
-        L"\"Type\":\"ICS\""
-        L"}");
-
-    hr = pfnCreateNet(network_id, settings, &network, &error_record);
-
-    if (error_record) {
-        if (FAILED(hr)) ui_log(L"HCN Internal error: %s", error_record);
-        hcn_free_string(error_record);
-    }
-    if (network && pfnCloseNet) pfnCloseNet(network);
 
     ReleaseSRWLockExclusive(&g_network_lock);
     return hr;
@@ -493,6 +449,54 @@ HRESULT hcn_delete_network(const GUID *network_id)
     return hr;
 }
 
+/* Shared owned-delete core. The wrappers decide what ID is owned for
+   their mode; this layer only compares binary IDs and serializes that
+   comparison with the HCN delete against concurrent create/re-check
+   regions. The mode-specific wrappers keep their own logging and
+   not-found policy. The output flag distinguishes a missing export from
+   an HCN call that itself returns the same HRESULT. */
+HRESULT hcn_delete_network_if_owned(const GUID *network_id,
+                                    const GUID *expected_owned_id,
+                                    BOOL *out_delete_attempted,
+                                    PWSTR *out_error_record)
+{
+    PWSTR error_record = NULL;
+    HRESULT hr;
+
+    if (out_error_record)
+        *out_error_record = NULL;
+    if (out_delete_attempted)
+        *out_delete_attempted = FALSE;
+
+    if (!network_id || !expected_owned_id ||
+        IsEqualGUID(network_id, &GUID_NULL) ||
+        IsEqualGUID(expected_owned_id, &GUID_NULL))
+        return S_FALSE;
+
+    hcn_network_lock_acquire();
+    if (!IsEqualGUID(network_id, expected_owned_id)) {
+        hcn_network_lock_release();
+        return S_FALSE;
+    }
+
+    if (!pfnDeleteNet) {
+        hcn_network_lock_release();
+        return E_NOT_VALID_STATE;
+    }
+
+    if (out_delete_attempted)
+        *out_delete_attempted = TRUE;
+    hr = pfnDeleteNet(network_id, &error_record);
+    hcn_network_lock_release();
+
+    if (out_error_record)
+        *out_error_record = error_record;
+    else if (error_record)
+        hcn_free_string(error_record);
+
+    return SUCCEEDED(hr) ? S_OK : hr;
+}
+
 HRESULT hcn_delete_endpoint(const GUID *endpoint_id)
 {
     PWSTR error_record = NULL;
@@ -516,4 +520,41 @@ HRESULT hcn_delete_endpoint(const GUID *endpoint_id)
     }
     if (error_record) hcn_free_string(error_record);
     return hr;
+}
+
+/* ---- Internal vSwitch census support (the stale-ping notifier) ----
+ * The acquire's failure exit fires the registered callback - the single
+ * stale-ping emission site (the acquire itself lives in
+ * hcn_internal.c; the pair lives here because it is the HCN layer's
+ * own state, and asb_core.h is never included by hcn_*.c). The public
+ * asb_set_census_stale_callback in asb_core.h delegates. Registration
+ * is once, before any worker thread exists. */
+
+static void (*g_census_stale_cb)(void *user_data) = NULL;
+static void *g_census_stale_user_data = NULL;
+
+void hcn_set_census_stale_callback(void (*cb)(void *user_data),
+                                   void *user_data)
+{
+    g_census_stale_cb = cb;
+    g_census_stale_user_data = user_data;
+}
+
+void hcn_notify_census_stale(void)
+{
+    if (g_census_stale_cb)
+        g_census_stale_cb(g_census_stale_user_data);
+}
+
+/* Free a census (the classify TU's HeapAlloc'd entries). Safe on the
+   UNAVAILABLE early-exit shape by construction. */
+void hcn_internal_switch_census_free(HcnInternalSwitchCensus *c)
+{
+    if (!c)
+        return;
+    if (c->entries) {
+        HeapFree(GetProcessHeap(), 0, c->entries);
+        c->entries = NULL;
+    }
+    c->count = 0;
 }

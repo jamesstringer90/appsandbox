@@ -317,6 +317,8 @@ tr.selected td { background: #1a3a5a; }
 /* Adapter column — inert placeholder for non-External modes; warning tint
    when the configured adapter is no longer present on the host */
 td.adapter-off { color: var(--text-dim); }
+td.switch-warn { color: #d9a036; }
+td.switch-invalid { color: #d9a036; font-style: italic; }
 td.adapter-missing { color: #d9a036; }
 
 /* Icon columns — fixed width, centered in both header and body */

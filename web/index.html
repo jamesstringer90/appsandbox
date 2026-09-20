@@ -29,7 +29,7 @@
                 <th>HDD (GB)</th>
                 <th>GPU</th>
                 <th>Network</th>
-                <th>Adapter</th>
+                <th>Attachment</th>
                 <th class="win-only">Snapshot</th>
                 <th class="icon-col">&#x25B6;&#xFE0F;</th>
                 <th class="icon-col" title="IDD Display">&#x1F4FA;</th>
@@ -141,6 +141,8 @@
                 </select>
                 <label id="net-adapter-label" style="text-align:left">Adapter:</label>
                 <select id="net-adapter"></select>
+                <label id="net-internal-switch-label" style="text-align:left;display:none">Switch:</label>
+                <select id="net-internal-switch" style="display:none"></select>
             </div>
 
             <label>Username:</label>
@@ -233,6 +235,11 @@
                 <label for="edit-net-adapter" id="edit-net-adapter-label" class="win-only">Adapter:</label>
                 <div id="edit-net-adapter-row" class="form-row win-only">
                     <select id="edit-net-adapter"></select>
+                </div>
+
+                <label for="edit-internal-switch" id="edit-internal-switch-label" class="win-only" style="display:none">Switch:</label>
+                <div id="edit-internal-switch-row" class="form-row win-only" style="display:none">
+                    <select id="edit-internal-switch"></select>
                 </div>
             </div>
             <span id="edit-vm-warn" class="field-warn" aria-live="polite"></span>

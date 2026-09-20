@@ -155,6 +155,7 @@
     <ClCompile Include="..\..\src\backend_win\hcn_parse.c" />
     <ClCompile Include="..\..\src\backend_win\hcn_inventory.c" />
     <ClCompile Include="..\..\src\backend_win\hcn_wmi.c" />
+    <ClCompile Include="..\..\src\backend_win\hcn_internal_policy.c" />
     <ClCompile Include="..\..\src\backend_win\hcn_external.c" />
     <ClCompile Include="..\..\src\backend_win\json_reader.c" />
   </ItemGroup>

@@ -4,9 +4,9 @@ Strict-parse acceptance for the headless VM-response JSON.
 The three production response kinds -- the /vms list, the single-VM
 GET, and the PUT edit response -- must parse as complete JSON with
 every network field a MEMBER of the VM object: one closing brace per
-VM object, after every field, in the order
-displayOpen, gpuId, gpuName, netAdapter. The assertions are strict
-parses plus an exact key-order check on the parsed object; no
+VM object, after every field, in the order displayOpen, gpuId, gpuName,
+netAdapter, internalSwitch, internalSwitchInvalid. The assertions are
+strict parses plus an exact key-order check on the parsed object; no
 substring search.
 
 The fixture is pinned by SIZE, not by story: the measured 1-VM
@@ -52,9 +52,10 @@ LIST_ROWS = [
     "[VM]\r\nName=shape-4d\r\nOsType=Windows\r\nNetworkMode=0\r\n\r\n",
 ]
 
-# The trailing key sequence every VM object must end with (0.1.8 adds
-# gpuId/gpuName; netAdapter lands INSIDE the object, before the brace).
-VM_TAIL_KEYS = ["displayOpen", "gpuId", "gpuName", "netAdapter"]
+# The trailing key sequence every VM object must end with, including the
+# Internal selector and its invalid-state flag added by vSwitch reuse.
+VM_TAIL_KEYS = ["displayOpen", "gpuId", "gpuName", "netAdapter",
+                "internalSwitch", "internalSwitchInvalid"]
 
 _failures = []
 

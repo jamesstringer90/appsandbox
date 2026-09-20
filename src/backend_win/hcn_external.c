@@ -1983,54 +1983,46 @@ static void lookup_adapter_description(const GUID *iface, wchar_t *buf, size_t c
     FreeMibTable(table);
 }
 
-/* The shared owned-ID compare-and-delete core (declared in
-   hcn_private.h): pure binary identity - delete only when the ID is
-   the derived owned ID for the adapter. The identity check and the
-   delete run under the shared network lock so a last-user delete
-   cannot interleave with a concurrent acquire's re-check-then-create
-   for the same adapter. */
-HRESULT hcn_delete_network_if_owned(const GUID *network_id,
-                                    const GUID *adapter_interface_guid)
+/* External wrapper: derive the per-adapter owned ID here, then let the
+   shared binary-ID core serialize the comparison and actual delete.
+   Logging and the measured delete-not-found policy stay External-local. */
+HRESULT hcn_delete_owned_external_network(const GUID *network_id,
+                                          const GUID *adapter_interface_guid)
 {
-    GUID owned;
+    GUID owned_id;
     PWSTR error_record = NULL;
+    BOOL delete_attempted = FALSE;
     HRESULT hr;
 
-    /* Pure binary ID comparison; no Name parsing, no HCN topology query. */
     if (!network_id || !adapter_interface_guid ||
         IsEqualGUID(network_id, &GUID_NULL) ||
         IsEqualGUID(adapter_interface_guid, &GUID_NULL))
-        return S_FALSE;   /* null ID/T: no delete */
+        return S_FALSE;
 
-    if (FAILED(hcn_external_owned_id(adapter_interface_guid, &owned))) {
-        /* owned_id(T) is not computable: never delete on a guess. */
+    if (FAILED(hcn_external_owned_id(adapter_interface_guid, &owned_id))) {
         ui_log(L"External: owned-delete shield could not derive the owned ID.");
         return S_FALSE;
     }
 
-    hcn_network_lock_acquire();
-    if (!IsEqualGUID(network_id, &owned)) {
-        hcn_network_lock_release();
+    hr = hcn_delete_network_if_owned(network_id, &owned_id,
+                                     &delete_attempted, &error_record);
+    if (!delete_attempted && hr == S_FALSE) {
         /* A borrowed or foreign ID must never reach HcnDeleteNetwork,
            including startup/error/teardown. */
         wchar_t q[64];
-        guid_to_string(network_id, q, 64);
+        guid_to_string(network_id, q, ARRAYSIZE(q));
         ui_log(L"External: owned-delete shield refused network %s "
                L"(not the derived owned ID for this adapter).", q);
         return S_FALSE;
     }
-
-    if (!pfnDeleteNet) {
+    if (!delete_attempted && hr == E_NOT_VALID_STATE) {
         /* The delete export resolved away between init and release: a
            loud programming-state error, never a silent skip. */
-        hcn_network_lock_release();
         ui_log(L"External: owned-delete shield: HcnDeleteNetwork export is "
                L"unavailable; no delete attempted.");
-        return E_NOT_VALID_STATE;
+        return hr;
     }
 
-    hr = pfnDeleteNet(network_id, &error_record);
-    hcn_network_lock_release();
     if (error_record) {
         if (FAILED(hr))
             ui_log(L"External: HCN error: %s", error_record);
@@ -2060,13 +2052,6 @@ HRESULT hcn_delete_network_if_owned(const GUID *network_id,
     }
     ui_log(L"External: owned network deleted.");
     return S_OK;
-}
-
-/* Owned-delete shield. */
-HRESULT hcn_delete_owned_external_network(const GUID *network_id,
-                                          const GUID *adapter_interface_guid)
-{
-    return hcn_delete_network_if_owned(network_id, adapter_interface_guid);
 }
 
 /* Delete all AppSandbox networks left over from a previous run. Fast - no enumeration.

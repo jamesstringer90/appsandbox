@@ -58,6 +58,7 @@ def backup_or_die(bak):
             "the original config; restore it first (copy it back over %s, "
             "then delete the backup)" % (bak, CFG_PATH))
     if os.path.isfile(CFG_PATH):
+        os.makedirs(os.path.dirname(bak), exist_ok=True)
         shutil.copyfile(CFG_PATH, bak)
         print("backed up original config -> %s" % bak, flush=True)
         print("restore command if this round is killed: "
@@ -70,6 +71,7 @@ def backup_or_die(bak):
 
 
 def install_fixture(rows):
+    os.makedirs(os.path.dirname(CFG_PATH), exist_ok=True)
     with open(CFG_PATH, "wb") as f:
         f.write(b"\xef\xbb\xbf")                     # UTF-8 BOM, canonical form
         for row in rows:
