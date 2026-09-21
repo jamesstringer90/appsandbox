@@ -73,6 +73,7 @@ typedef struct {
     wchar_t  name[128];
     wchar_t  guid[64];
     int      branch_count;
+    int      parent_index;   /* snapshot it was taken on: -2 = base, -1 = unknown */
 } AsbSnapshotInfo;
 
 typedef struct {

@@ -363,9 +363,15 @@ static void build_vm_json(JsonBuilder *jb, int i)
                 jb_object_begin(jb);
                 jb_string(jb, L"name", st_->nodes[s].name);
                 jb_string(jb, L"date", date_buf);
+                jb_int(jb, L"parent", snapshot_parent_index(st_, s));
 
                 {
-                    ULONGLONG snap_size = get_file_size_bytes(st_->nodes[s].snap_vhdx);
+                    /* A snapshot taken on another one sits on that one's disk too */
+                    ULONGLONG snap_size = 0;
+                    int p, hops;
+                    for (p = s, hops = 0; p >= 0 && hops < MAX_SNAPSHOTS;
+                         p = snapshot_parent_index(st_, p), hops++)
+                        snap_size += get_file_size_bytes(st_->nodes[p].snap_vhdx);
                     jb_array_begin(jb, L"branches");
                     for (b = 0; b < st_->nodes[s].branch_count; b++) {
                         FILETIME bft;
