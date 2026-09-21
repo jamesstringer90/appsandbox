@@ -70,6 +70,11 @@ static NSDictionary *vmToJsDict(const AsbVmMac *vm) {
         @"gpuName":         isWindows ? @"Software (WARP)" : [HostInfo hostGpuName],
         @"networkMode":     @1,
         @"netAdapter":      @"",
+        /* Internal-selector payload stubs: the network-mode control is a
+           Mac stub (always NAT), so the switch pair never shows and the
+           web side stays absence-tolerant for the census. */
+        @"internalSwitch":  @"",
+        @"internalSwitchInvalid": @NO,
         @"isTemplate":      @NO,
         @"hypervVideoOff":  @NO,
         /* Disk-build phase: feed the shared web/app.js "Building Disk (X%)" / "Staging

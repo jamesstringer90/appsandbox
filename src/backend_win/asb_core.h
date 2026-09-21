@@ -56,6 +56,7 @@ typedef struct {
     int    gpu_mode;               /* ASB_GPU_NONE or ASB_GPU_DEFAULT */
     int    network_mode;           /* ASB_NET_NONE / NAT / EXTERNAL / INTERNAL */
     const wchar_t *net_adapter;    /* for external mode, or NULL for auto */
+    const wchar_t *internal_switch; /* for internal mode: the vSwitch ElementName, or NULL/empty for Auto */
     const wchar_t *username;
     const wchar_t *password;
     BOOL   test_mode;              /* TRUE = disable Secure Boot (test-signed drivers) */
@@ -196,6 +197,28 @@ ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores);
 ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode);
 ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *gpu_id);
 ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
+ASB_API HRESULT asb_vm_set_net_adapter(AsbVm vm, const wchar_t *adapter);
+
+/* Set the Internal-mode vSwitch selector. NULL/empty selects Auto; the
+   literal "(Auto)" is an ordinary explicit name. Non-empty names use
+   the shared storable-name rule; a rejected name returns E_INVALIDARG
+   with the interactive invalid-name line logged and alerted (name and
+   flag both unchanged). A successful
+   set clears the invalid flag; an actual change (string OR flag) marks
+   the network configuration dirty. */
+ASB_API HRESULT asb_vm_set_internal_switch(AsbVm vm, const wchar_t *name);
+
+/* The exported storable-name predicate (the headless pre-validation
+   runs in the exe and can only call exports): NULL and L"" are both the
+   empty Auto value and return TRUE; a non-empty name goes through the
+   shared character rule over wcslen. */
+ASB_API BOOL asb_vm_internal_switch_valid(const wchar_t *name);
+
+/* Internal-mode selector readers (symmetry with asb_vm_name/
+   asb_vm_network_mode): the stored ElementName (L"" = Auto) and the
+   invalid flag. */
+ASB_API const wchar_t *asb_vm_internal_switch(AsbVm vm);
+ASB_API BOOL asb_vm_internal_switch_invalid(AsbVm vm);
 
 /* ---- Snapshots ---- */
 
@@ -288,5 +311,22 @@ ASB_API int           asb_vm_index(AsbVm vm);
    even if network_cleaned is already TRUE. */
 ASB_API void          asb_vm_cleanup_network(VmInstance *vm);
 #endif
+
+/* ---- Internal vSwitch census ---- */
+
+/* The census stale-ping: fires from the HCN acquire's failure exit
+   (may be invoked from a worker thread - the consumer must marshal;
+   never webview2_post from the callback). One-shot registration during
+   UI initialization, before any worker thread exists. */
+typedef void (*AsbCensusStaleCallback)(void *user_data);
+ASB_API void asb_set_census_stale_callback(AsbCensusStaleCallback cb,
+                                           void *user_data);
+
+/* One-way inhibit for the HCN module unload: set by the UI's census
+   drain when a worker wait times out, never reset, no getter.
+   asb_cleanup then skips hcn_cleanup/FreeLibrary with one warning
+   log - never unload code under a live thread (the module is
+   reclaimed by the OS at process exit). */
+ASB_API void asb_inhibit_hcn_unload(void);
 
 #endif /* ASB_CORE_H */

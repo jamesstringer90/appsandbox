@@ -48,9 +48,12 @@
 #define ASB_PRODUCT_VER  ASB_VER_STR(ASB_VERSION_SHORT)
 #define DEFAULT_PORT     8787
 
-/* forward decls (used by the event callbacks defined below) */
+/* forward decls (used by the event callbacks and the response builder
+   defined below) */
 static void broadcast_event(const char *json);
 static int  append_wstr(char *out, int cap, int pos, const wchar_t *w);
+static void send_json(HTTP_REQUEST_ID id, USHORT status, const char *reason, const char *body);
+static void send_err(HTTP_REQUEST_ID id, USHORT status, const char *reason, const char *code, const char *msg);
 
 /* ---- SSE event broadcast (GET /v1/events) ---- */
 #define EV_CAP 256
@@ -239,36 +242,199 @@ static const char *derive_state(VmInstance *v)
     return "online";
 }
 
-/* Cheap per-VM status object (no disk I/O -- snapshot tree is a separate route). */
-static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
+/* ---- The capacity-checked VM response builder ----
+ *
+ * Shared by the list / single-VM / edit responses: a heap buffer with
+ * complete-write appenders - a write that cannot fit IN FULL fails the
+ * whole build (never a truncated selector, a pos that continues past a
+ * failed write, or partial JSON), one detectable 2x grow/retry, and an
+ * explicit HTTP error on the final failure. Lengths are computed from
+ * the ENCODED output (JSON escapes are 6 bytes per escaped byte); the
+ * wide-string conversion is exact-size two-pass - no fixed intermediate
+ * that would silently empty an over-long field. */
+typedef struct {
+    char *buf;
+    size_t cap;
+    size_t pos;
+    BOOL ok;
+} RespBuild;
+
+static BOOL resp_alloc(RespBuild *rb, size_t cap)
+{
+    rb->buf = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cap);
+    rb->cap = cap;
+    rb->pos = 0;
+    rb->ok = (rb->buf != NULL);
+    return rb->ok;
+}
+
+static void resp_free(RespBuild *rb)
+{
+    if (rb->buf)
+        HeapFree(GetProcessHeap(), 0, rb->buf);
+    rb->buf = NULL;
+    rb->cap = 0;
+    rb->pos = 0;
+    rb->ok = FALSE;
+}
+
+/* Fixed-format segments (keys, numbers, punctuation): _TRUNCATE makes a
+   would-be truncation detectable (-1) instead of silent. */
+static BOOL resp_fmt(RespBuild *rb, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    if (!rb->ok) return FALSE;
+    va_start(ap, fmt);
+    n = _vsnprintf_s(rb->buf + rb->pos, rb->cap - rb->pos, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        rb->ok = FALSE;
+        return FALSE;
+    }
+    rb->pos += (size_t)n;
+    return TRUE;
+}
+
+/* A JSON string value with the minimal escaping JSON requires. The whole
+   value is written or the build fails - no clamping, no prefix. */
+static BOOL resp_json_str(RespBuild *rb, const char *s)
+{
+    if (!rb->ok) return FALSE;
+    if (rb->pos + 1 >= rb->cap) { rb->ok = FALSE; return FALSE; }
+    rb->buf[rb->pos++] = '"';
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        char esc[8];
+        size_t n = 0;
+
+        if (c == '"' || c == '\\') { esc[n++] = '\\'; esc[n++] = (char)c; }
+        else if (c == '\n') { esc[n++] = '\\'; esc[n++] = 'n'; }
+        else if (c == '\r') { esc[n++] = '\\'; esc[n++] = 'r'; }
+        else if (c == '\t') { esc[n++] = '\\'; esc[n++] = 't'; }
+        else if (c < 0x20) { n = 6; sprintf_s(esc, sizeof(esc), "\\u%04x", c); }
+        else { esc[n++] = (char)c; }
+
+        /* +2: the closing quote and the NUL must still fit. */
+        if (rb->pos + n + 2 > rb->cap) { rb->ok = FALSE; return FALSE; }
+        memcpy(rb->buf + rb->pos, esc, n);
+        rb->pos += n;
+    }
+    if (rb->pos + 2 > rb->cap) { rb->ok = FALSE; return FALSE; }
+    rb->buf[rb->pos++] = '"';
+    rb->buf[rb->pos] = 0;
+    return TRUE;
+}
+
+/* Exact-size two-pass conversion: the UTF-8 byte length first, then the
+   conversion into an exact-size scratch. A conversion failure fails the
+   build explicitly - never a silently emptied field. */
+static BOOL resp_wstr(RespBuild *rb, const wchar_t *w)
+{
+    int n;
+    char *u;
+    BOOL ok;
+
+    if (!rb->ok || !w) { rb->ok = FALSE; return FALSE; }
+    n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (n <= 0) { rb->ok = FALSE; return FALSE; }
+    u = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)n);
+    if (!u) { rb->ok = FALSE; return FALSE; }
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, n, NULL, NULL) != n) {
+        HeapFree(GetProcessHeap(), 0, u);
+        rb->ok = FALSE;
+        return FALSE;
+    }
+    ok = resp_json_str(rb, u);
+    HeapFree(GetProcessHeap(), 0, u);
+    return ok;
+}
+
+/* One VM's status object (the post-supplement shape: every field inside
+   the object, the brace after them all - the new fields included). */
+static BOOL resp_vm_object(RespBuild *rb, VmInstance *v)
 {
     wchar_t disk_directory[MAX_PATH];
-    pos += sprintf_s(out + pos, cap - pos, "{\"name\":");
-    pos  = append_wstr(out, cap, pos, v->name);
-    pos += sprintf_s(out + pos, cap - pos, ",\"osType\":");
-    pos  = append_wstr(out, cap, pos, v->os_type);
+
+    if (!resp_fmt(rb, "{\"name\":") ||
+        !resp_wstr(rb, v->name) ||
+        !resp_fmt(rb, ",\"osType\":") ||
+        !resp_wstr(rb, v->os_type))
+        return FALSE;
     asb_vm_disk_directory((AsbVm)v, disk_directory, MAX_PATH);
-    pos += sprintf_s(out + pos, cap - pos, ",\"diskDirectory\":");
-    pos = append_wstr(out, cap, pos, disk_directory);
-    pos += sprintf_s(out + pos, cap - pos,
-        ",\"state\":\"%s\",\"running\":%s,\"agentOnline\":%s,\"installComplete\":%s,"
-        "\"building\":%s,\"progress\":%d,\"sshState\":%d,\"sshPort\":%lu,"
-        "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,\"networkMode\":%d,"
-        "\"displayOpen\":%s,\"gpuId\":",
-        derive_state(v),
-        v->running ? "true" : "false", v->agent_online ? "true" : "false",
-        v->install_complete ? "true" : "false", v->building_vhdx ? "true" : "false",
-        v->vhdx_progress,
-        (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state,   /* 4 = ready + key deployed */
-        (unsigned long)v->ssh_port,
-        (unsigned long)v->ram_mb, (unsigned long)v->hdd_gb, (unsigned long)v->cpu_cores,
-        v->gpu_mode, v->network_mode,
-        display_is_open(v->unique_id) ? "true" : "false");
-    pos = append_wstr(out, cap, pos, v->gpu_id);
-    pos += sprintf_s(out + pos, cap - pos, ",\"gpuName\":");
-    pos = append_wstr(out, cap, pos, v->gpu_name);
-    pos += sprintf_s(out + pos, cap - pos, "}");
-    return pos;
+    if (!resp_fmt(rb, ",\"diskDirectory\":") ||
+        !resp_wstr(rb, disk_directory) ||
+        !resp_fmt(rb,
+            ",\"state\":\"%s\",\"running\":%s,\"agentOnline\":%s,\"installComplete\":%s,"
+            "\"building\":%s,\"progress\":%d,\"sshState\":%d,\"sshPort\":%lu,"
+            "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,\"networkMode\":%d,"
+            "\"displayOpen\":%s,\"gpuId\":",
+            derive_state(v),
+            v->running ? "true" : "false", v->agent_online ? "true" : "false",
+            v->install_complete ? "true" : "false", v->building_vhdx ? "true" : "false",
+            v->vhdx_progress,
+            (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state,
+            (unsigned long)v->ssh_port,
+            (unsigned long)v->ram_mb, (unsigned long)v->hdd_gb, (unsigned long)v->cpu_cores,
+            v->gpu_mode, v->network_mode,
+            display_is_open(v->unique_id) ? "true" : "false") ||
+        !resp_wstr(rb, v->gpu_id) ||
+        !resp_fmt(rb, ",\"gpuName\":") ||
+        !resp_wstr(rb, v->gpu_name) ||
+        !resp_fmt(rb, ",\"netAdapter\":") ||
+        !resp_wstr(rb, v->net_adapter) ||
+        !resp_fmt(rb, ",\"internalSwitch\":") ||
+        !resp_wstr(rb, v->internal_switch) ||
+        !resp_fmt(rb, ",\"internalSwitchInvalid\":%s",
+                  v->internal_switch_invalid ? "true" : "false"))
+        return FALSE;
+    return resp_fmt(rb, "}");
+}
+
+/* The three VM responses share one emitter: a 512 KB heap floor (the
+   historical static buffer's size, the realistic worst case plus
+   margin), ONE retry at 2x on detected exhaustion, and an explicit
+   HTTP error on allocation or final serialization failure. only != NULL
+   selects the single-object shape; NULL builds the list. */
+static void send_vm_response(HTTP_REQUEST_ID id, VmInstance *only)
+{
+    RespBuild rb;
+    size_t cap = (size_t)ASB_MAX_VMS * 16384;
+    int attempt;
+
+    for (attempt = 0; attempt < 2; attempt++, cap *= 2) {
+        if (!resp_alloc(&rb, cap)) {
+            resp_free(&rb);
+            send_err(id, 500, "Internal Server Error", "alloc_failed",
+                     "response buffer allocation failed");
+            return;
+        }
+        if (only != NULL) {
+            resp_vm_object(&rb, only);
+        } else {
+            int i, count = asb_vm_count(), emitted = 0;
+
+            if (resp_fmt(&rb, "{\"vms\":[")) {
+                for (i = 0; i < count && rb.ok; i++) {
+                    VmInstance *v = asb_vm_instance(asb_vm_get(i));
+                    if (!v) continue;
+                    if (emitted && !resp_fmt(&rb, ",")) break;
+                    if (!resp_vm_object(&rb, v)) break;
+                    emitted++;
+                }
+                resp_fmt(&rb, "]}");
+            }
+        }
+        if (rb.ok) {
+            send_json(id, 200, "OK", rb.buf);
+            resp_free(&rb);
+            return;
+        }
+        resp_free(&rb);
+    }
+    send_err(id, 500, "Internal Server Error", "too_large",
+             "the VM response exceeded the capacity retry");
 }
 
 static int build_host_info(char *buf, int cap)
@@ -621,16 +787,7 @@ static int handle_request(PHTTP_REQUEST req)
     /* ---- /v1/vms (collection) ---- */
     if (wcscmp(path, L"/v1/vms") == 0) {
         if (verb == HttpVerbGET) {
-            int count = asb_vm_count(), emitted = 0;
-            pos = sprintf_s(buf, sizeof(buf), "{\"vms\":[");
-            for (i = 0; i < count; i++) {
-                VmInstance *v = asb_vm_instance(asb_vm_get(i));
-                if (!v) continue;
-                if (emitted++) pos += sprintf_s(buf + pos, sizeof(buf) - pos, ",");
-                pos = append_vm_json(buf, sizeof(buf), pos, v);
-            }
-            sprintf_s(buf + pos, sizeof(buf) - pos, "]}");
-            send_json(req->RequestId, 200, "OK", buf);
+            send_vm_response(req->RequestId, NULL);
             return 0;
         }
         if (verb == HttpVerbPOST) {
@@ -639,6 +796,7 @@ static int handle_request(PHTTP_REQUEST req)
             AsbVmConfig cfg; int iv; BOOL bv;
             wchar_t name[256]={0}, os[32]={0}, img[MAX_PATH]={0}, tpl[256]={0};
             wchar_t user[128]={0}, pass[256]={0}, adapter[256]={0};
+            wchar_t isw[INTERNAL_SWITCH_CAP]={0};
             wchar_t disk_directory[MAX_PATH + 1]={0};
             wchar_t gpu_id[512]={0};
             char nu[256]={0};
@@ -676,6 +834,15 @@ static int handle_request(PHTTP_REQUEST req)
                 return 0;
             }
             json_get_string(body, L"netAdapter", adapter, 256);
+            /* reject-on-false (the diskDirectory precedent): a present key
+               whose decode fails aborts the create. */
+            if (!json_get_string(body, L"internalSwitch", isw, INTERNAL_SWITCH_CAP) &&
+                json_has_key(body, L"internalSwitch")) {
+                SecureZeroMemory(pass, sizeof(pass));
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                         "internalSwitch must be a valid string without NUL characters");
+                return 0;
+            }
             if (!json_get_string(body, L"diskDirectory", disk_directory, MAX_PATH + 1) &&
                 json_has_key(body, L"diskDirectory")) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
@@ -687,6 +854,7 @@ static int handle_request(PHTTP_REQUEST req)
             cfg.name = name; cfg.os_type = os; cfg.image_path = img;
             cfg.template_name = tpl; cfg.username = user; cfg.password = pass;
             cfg.net_adapter = adapter;
+            cfg.internal_switch = isw;
             cfg.disk_directory = disk_directory;
             cfg.gpu_id = gpu_id;
             if (json_get_int(body, L"ramMb", &iv)) cfg.ram_mb = (DWORD)iv;
@@ -708,6 +876,21 @@ static int handle_request(PHTTP_REQUEST req)
             if (json_get_bool(body, L"sshEnabled", &bv)) cfg.ssh_enabled = bv;
             if (json_get_bool(body, L"sshDeployKey", &bv)) cfg.ssh_deploy_key = bv;
             if (json_get_bool(body, L"isTemplate", &bv)) cfg.is_template = bv;
+            /* asb_vm_create rejects non-roundtrippable selector names with
+               E_INVALIDARG, but send_hr maps create failures to HTTP 500.
+               Validate at the API boundary so an invalid Internal selector
+               is a client 400 and cannot enter the asynchronous create path.
+               Template creates intentionally ignore this field because the
+               core forces their network mode to None; other non-Internal
+               creates clear the selector in the core. */
+            if (!cfg.is_template && cfg.network_mode == NET_INTERNAL &&
+                isw[0] && !asb_vm_internal_switch_valid(isw)) {
+                SecureZeroMemory(pass, sizeof(pass));
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                         "internalSwitch is invalid (too long, or it contains CR/LF/NUL, "
+                         "an unpaired surrogate, or U+FFFF)");
+                return 0;
+            }
             if (cfg.ssh_deploy_key && !cfg.ssh_enabled) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                          "sshDeployKey requires sshEnabled");
@@ -797,13 +980,14 @@ static int handle_request(PHTTP_REQUEST req)
             VmInstance *inst = asb_vm_instance(vm);
             if (!inst) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
             if (verb == HttpVerbGET) {
-                append_vm_json(buf, sizeof(buf), 0, inst);
-                send_json(req->RequestId, 200, "OK", buf);
+                send_vm_response(req->RequestId, inst);
                 return 0;
             }
             if (verb == HttpVerbPUT) {   /* edit (PUT instead of PATCH: PATCH isn't in the http.sys verb enum) */
                 wchar_t body[8192], gpu_id[512] = {0};
-                int iv, gpu_mode = GPU_DEFAULT; BOOL has_gpu;
+                wchar_t isw[INTERNAL_SWITCH_CAP] = {0};
+                int iv, gpu_mode = GPU_DEFAULT;
+                BOOL has_gpu, has_internal_switch;
                 HRESULT hr = S_OK;
                 /* config is locked while building or running -- return a clean 409,
                    not the generic 500 that asb_vm_set_*'s E_ACCESSDENIED would
@@ -821,6 +1005,30 @@ static int handle_request(PHTTP_REQUEST req)
                 if (!body_to_wide(req, body, ARRAYSIZE(body))) {
                     send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                              "Request body must contain valid UTF-8 JSON without NUL bytes.");
+                    return 0;
+                }
+                /* The internal switch selector is decoded and validated at
+                   the TOP of the handler, BEFORE any setter runs: a 400
+                   leaves the row completely untouched (no half-applied
+                   network configuration - the strict clear's ordering
+                   requires that a request carrying both networkMode and an
+                   INVALID selector mutates neither). The decoded value is
+                   retained for the selector setter below. The decoder's
+                   FALSE is the rejection (it rejects embedded NUL, an
+                   over-long value, and malformed escapes); the exported
+                   predicate also rejects a lone surrogate and U+FFFF. */
+                has_internal_switch = json_get_string(
+                    body, L"internalSwitch", isw, ARRAYSIZE(isw));
+                if (!has_internal_switch && json_has_key(body, L"internalSwitch")) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "internalSwitch must be a valid string without NUL characters");
+                    return 0;
+                }
+                if (has_internal_switch && isw[0] &&
+                    !asb_vm_internal_switch_valid(isw)) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "internalSwitch is invalid (too long, or it contains CR/LF/NUL, "
+                             "an unpaired surrogate, or U+FFFF)");
                     return 0;
                 }
                 has_gpu = json_has_key(body, L"gpuMode") || json_has_key(body, L"gpuId");
@@ -854,10 +1062,20 @@ static int handle_request(PHTTP_REQUEST req)
                     if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal)"); return 0; }
                     hr = asb_vm_set_network(vm, iv);
                 }
+                {
+                    wchar_t adapter[256];
+                    if (json_get_string(body, L"netAdapter", adapter, 256))
+                        hr = asb_vm_set_net_adapter(vm, adapter);
+                }
+                /* The selector arm - after the mode arm (mode first, then
+                   selector; two SEQUENTIAL INDEPENDENT if blocks, never an
+                   if/else chain: a request carrying both fields runs both
+                   arms, and JSON member order is not a contract). */
+                if (has_internal_switch)
+                    hr = asb_vm_set_internal_switch(vm, isw);
                 asb_save();
                 if (SUCCEEDED(hr)) {
-                    append_vm_json(buf, sizeof(buf), 0, inst);
-                    send_json(req->RequestId, 200, "OK", buf);
+                    send_vm_response(req->RequestId, inst);
                 } else {
                     send_hr(req->RequestId, "editVm", nu, hr);
                 }
