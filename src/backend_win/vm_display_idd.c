@@ -22,9 +22,11 @@
 
 #pragma warning(push)
 #pragma warning(disable: 4201) /* nameless struct/union in SDK headers */
-#include <d3d11.h>
-#include <dxgi.h>
+#include <d3d11_1.h>
+#include <dxgi1_2.h>
 #include <d3dcompiler.h>
+#include <winternl.h>
+#include <d3dkmthk.h>
 #pragma warning(pop)
 
 #include <stdio.h>
@@ -178,11 +180,21 @@ typedef struct CursorHeader {
 
 /* ---- Display context ---- */
 
+typedef struct {
+    ID3D11Texture2D *texture;
+    ID3D11ShaderResourceView *srv;
+    IDXGIKeyedMutex *mutex;
+    UINT64 sequence;
+    BOOL ready;
+    BOOL pending;
+} IddSharedSlot;
+
 struct VmDisplayIdd {
     VmInstance  *vm;
     wchar_t      vm_name[256];     /* copy of vm->name for safe logging after VM teardown */
     GUID         runtime_id;       /* copy of vm->runtime_id for safe HvSocket after teardown */
     wchar_t      os_type[32];      /* copy of vm->os_type for picking the service GUID variant */
+    wchar_t      gpu_id[512];
     HINSTANCE    hInstance;
     HWND         main_hwnd;
     HWND         hwnd;
@@ -199,6 +211,14 @@ struct VmDisplayIdd {
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11SamplerState      *sampler;
+    IddSharedSlot            shared_slots[DISPLAY_GPU_SLOTS];
+    int                     shared_front;
+    UINT64                  shared_session;
+    UINT64                  shared_sequence;
+    BOOL                    shared_offered;
+    BOOL                    shared_ready;
+    BOOL                    shared_disabled;
+    SOCKET                  frame_socket;
 
     /* Frame buffer (CPU-side, updated by recv thread) */
     BYTE          *frame_buf;
@@ -1200,7 +1220,14 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
             DWORD no_timeout = 0;
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
         }
+        EnterCriticalSection(&d->frame_cs);
+        if (d->stop) {
+            LeaveCriticalSection(&d->frame_cs);
+            closesocket(s);
+            break;
+        }
         d->audio_socket = s;
+        LeaveCriticalSection(&d->frame_cs);
 
         /* Read one-shot AudioHeader.
            The guest closes without sending a header when the VAD endpoint
@@ -1330,10 +1357,10 @@ session_cleanup:
         if (pEnum)  { IMMDeviceEnumerator_Release(pEnum); pEnum = NULL; }
         if (renderfmt) { CoTaskMemFree(renderfmt); renderfmt = NULL; }
 
-        if (d->audio_socket != INVALID_SOCKET) {
-            closesocket(d->audio_socket);
-            d->audio_socket = INVALID_SOCKET;
-        }
+        EnterCriticalSection(&d->frame_cs);
+        d->audio_socket = INVALID_SOCKET;
+        LeaveCriticalSection(&d->frame_cs);
+        closesocket(s);
         if (session_logged) {
             idd_log(d, L"Audio session ended.");
             session_logged = FALSE;
@@ -1341,12 +1368,15 @@ session_cleanup:
 
         if (d->stop) break;
         /* Back off when the guest keeps rejecting us (VAD not ready) */
-        Sleep(header_misses > 3 ? 5000 : 500);
+        {
+            int wait, delay = header_misses > 3 ? 5000 : 500;
+            for (wait = 0; wait < delay && !d->stop; wait += 100)
+                Sleep(100);
+        }
     }
 
     if (scratch) HeapFree(GetProcessHeap(), 0, scratch);
     if (com_ok)  CoUninitialize();
-    d->audio_recv_thread = NULL;
     return 0;
 }
 
@@ -1371,6 +1401,188 @@ static BOOL d3d_compile_shader(const char *hlsl, const char *entry,
     }
     if (errors) errors->lpVtbl->Release(errors);
     return TRUE;
+}
+
+typedef struct {
+    HANDLE resource;
+    GUID vm_id;
+    UINT64 process_id;
+    UINT64 guest_handle;
+    ACCESS_MASK access;
+    UINT flags;
+} IddDuplicateResource;
+
+C_ASSERT(sizeof(IddDuplicateResource) == 48);
+C_ASSERT(sizeof(DisplayGpuPacket) == 68);
+
+static void idd_shared_release(VmDisplayIdd *d)
+{
+    UINT i;
+    for (i = 0; i < DISPLAY_GPU_SLOTS; ++i) {
+        IddSharedSlot *slot = &d->shared_slots[i];
+        if ((int)i == d->shared_front && slot->mutex)
+            slot->mutex->lpVtbl->ReleaseSync(slot->mutex, 0);
+        if (slot->srv) slot->srv->lpVtbl->Release(slot->srv);
+        if (slot->mutex) slot->mutex->lpVtbl->Release(slot->mutex);
+        if (slot->texture) slot->texture->lpVtbl->Release(slot->texture);
+        ZeroMemory(slot, sizeof(*slot));
+    }
+    d->shared_front = -1;
+    d->shared_ready = FALSE;
+    d->shared_sequence = 0;
+}
+
+static BOOL idd_send_gpu(SOCKET s, const DisplayGpuPacket *packet)
+{
+    const char *bytes = (const char *)packet;
+    int remaining = sizeof(*packet);
+    while (remaining) {
+        int sent = send(s, bytes, remaining, 0);
+        if (sent <= 0) return FALSE;
+        bytes += sent;
+        remaining -= sent;
+    }
+    return TRUE;
+}
+
+static BOOL idd_shared_offer(VmDisplayIdd *d, SOCKET s, const DisplayGpuPacket *caps, UINT index)
+{
+    typedef LONG (WINAPI *DuplicateFn)(IddDuplicateResource *);
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    DuplicateFn duplicate = gdi ? (DuplicateFn)GetProcAddress(gdi, "D3DKMTDuplicateHandle") : NULL;
+    ID3D11Texture2D *texture = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    IDXGIKeyedMutex *mutex = NULL;
+    IDXGIResource1 *resource = NULL;
+    IDXGIDevice *dxgi_device = NULL;
+    IDXGIAdapter *adapter = NULL;
+    DXGI_ADAPTER_DESC adapter_desc;
+    D3D11_TEXTURE2D_DESC desc = {0};
+    IddDuplicateResource args = {0};
+    DisplayGpuPacket offer = {0};
+    HANDLE handle = NULL;
+    HRESULT hr = E_NOTIMPL;
+    LONG status;
+
+    offer.magic = DISPLAY_GPU_MAGIC;
+    offer.type = DISPLAY_GPU_OFFER;
+    offer.version = DISPLAY_GPU_VERSION;
+    offer.session = caps->session;
+    offer.process_id = caps->process_id;
+    offer.slot = index;
+    if (caps->status != S_OK) {
+        hr = (HRESULT)caps->status;
+        goto done;
+    }
+    if (!duplicate || !caps->process_id ||
+        caps->width != DEFAULT_WIDTH || caps->height != DEFAULT_HEIGHT ||
+        caps->format != DXGI_FORMAT_B8G8R8A8_UNORM) goto done;
+
+    hr = d->device->lpVtbl->QueryInterface(d->device, &IID_IDXGIDevice, (void **)&dxgi_device);
+    if (FAILED(hr)) goto done;
+    hr = dxgi_device->lpVtbl->GetAdapter(dxgi_device, &adapter);
+    if (FAILED(hr)) goto done;
+    hr = adapter->lpVtbl->GetDesc(adapter, &adapter_desc);
+    if (FAILED(hr)) goto done;
+    if (adapter_desc.VendorId != caps->vendor_id || adapter_desc.DeviceId != caps->device_id) {
+        hr = DXGI_ERROR_UNSUPPORTED;
+        goto done;
+    }
+
+    desc.Width = caps->width;
+    desc.Height = caps->height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = (DXGI_FORMAT)caps->format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    hr = d->device->lpVtbl->CreateTexture2D(d->device, &desc, NULL, &texture);
+    if (FAILED(hr)) goto done;
+    hr = d->device->lpVtbl->CreateShaderResourceView(d->device, (ID3D11Resource *)texture, NULL, &srv);
+    if (FAILED(hr)) goto done;
+    hr = texture->lpVtbl->QueryInterface(texture, &IID_IDXGIKeyedMutex, (void **)&mutex);
+    if (FAILED(hr)) goto done;
+    hr = texture->lpVtbl->QueryInterface(texture, &IID_IDXGIResource1, (void **)&resource);
+    if (FAILED(hr)) goto done;
+    hr = resource->lpVtbl->CreateSharedHandle(resource, NULL,
+            DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, NULL, &handle);
+    if (FAILED(hr)) goto done;
+
+    args.resource = handle;
+    args.vm_id = d->runtime_id;
+    args.process_id = caps->process_id;
+    args.flags = 1; /* D3DKMT same-access flag. */
+    status = duplicate(&args);
+    hr = status < 0 ? HRESULT_FROM_NT(status) : (args.guest_handle ? S_OK : E_FAIL);
+    if (FAILED(hr)) goto done;
+    offer.handle = args.guest_handle;
+    offer.width = caps->width;
+    offer.height = caps->height;
+    offer.format = caps->format;
+    EnterCriticalSection(&d->frame_cs);
+    d->shared_slots[index].texture = texture;
+    d->shared_slots[index].srv = srv;
+    d->shared_slots[index].mutex = mutex;
+    LeaveCriticalSection(&d->frame_cs);
+    texture = NULL;
+    srv = NULL;
+    mutex = NULL;
+
+done:
+    if (handle) CloseHandle(handle);
+    if (resource) resource->lpVtbl->Release(resource);
+    if (adapter) adapter->lpVtbl->Release(adapter);
+    if (dxgi_device) dxgi_device->lpVtbl->Release(dxgi_device);
+    if (mutex) mutex->lpVtbl->Release(mutex);
+    if (srv) srv->lpVtbl->Release(srv);
+    if (texture) texture->lpVtbl->Release(texture);
+    offer.status = (UINT32)hr;
+    return idd_send_gpu(s, &offer);
+}
+
+static IDXGIAdapter *idd_gpu_adapter(const wchar_t *device_path)
+{
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    PFND3DKMT_OPENADAPTERFROMDEVICENAME open_adapter = gdi
+        ? (PFND3DKMT_OPENADAPTERFROMDEVICENAME)GetProcAddress(gdi, "D3DKMTOpenAdapterFromDeviceName") : NULL;
+    PFND3DKMT_CLOSEADAPTER close_adapter = gdi
+        ? (PFND3DKMT_CLOSEADAPTER)GetProcAddress(gdi, "D3DKMTCloseAdapter") : NULL;
+    D3DKMT_OPENADAPTERFROMDEVICENAME opened = {0};
+    D3DKMT_CLOSEADAPTER closed = {0};
+    IDXGIFactory1 *factory = NULL;
+    IDXGIAdapter1 *adapter = NULL;
+    IDXGIAdapter *selected = NULL;
+    UINT index;
+    NTSTATUS status;
+
+    if (!device_path || !device_path[0] || !open_adapter || !close_adapter)
+        return NULL;
+    opened.pDeviceName = device_path;
+    status = open_adapter(&opened);
+    if (status < 0) {
+        ui_log(L"IDD: selected GPU adapter lookup failed (0x%08X)", (UINT)status);
+        return NULL;
+    }
+    closed.hAdapter = opened.hAdapter;
+    close_adapter(&closed);
+
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory)))
+        return NULL;
+    for (index = 0; SUCCEEDED(factory->lpVtbl->EnumAdapters1(factory, index, &adapter)); index++) {
+        DXGI_ADAPTER_DESC1 desc;
+        if (SUCCEEDED(adapter->lpVtbl->GetDesc1(adapter, &desc)) &&
+            desc.AdapterLuid.LowPart == opened.AdapterLuid.LowPart &&
+            desc.AdapterLuid.HighPart == opened.AdapterLuid.HighPart) {
+            selected = (IDXGIAdapter *)adapter;
+            break;
+        }
+        adapter->lpVtbl->Release(adapter);
+        adapter = NULL;
+    }
+    factory->lpVtbl->Release(factory);
+    return selected;
 }
 
 static BOOL d3d_init(VmDisplayIdd *d)
@@ -1398,10 +1610,30 @@ static BOOL d3d_init(VmDisplayIdd *d)
     scd.Windowed                           = TRUE;
     scd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
 
-    hr = D3D11CreateDeviceAndSwapChain(
-        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
-        NULL, 0, D3D11_SDK_VERSION,
-        &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
+    {
+        IDXGIAdapter *adapter = idd_gpu_adapter(d->gpu_id);
+        hr = E_FAIL;
+        if (adapter) {
+            hr = D3D11CreateDeviceAndSwapChain(
+                adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
+                NULL, 0, D3D11_SDK_VERSION,
+                &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
+            adapter->lpVtbl->Release(adapter);
+            if (FAILED(hr)) {
+                ui_log(L"IDD: selected GPU device creation failed (0x%08X); using raw display", hr);
+                if (d->swap_chain) { d->swap_chain->lpVtbl->Release(d->swap_chain); d->swap_chain = NULL; }
+                if (d->ctx) { d->ctx->lpVtbl->Release(d->ctx); d->ctx = NULL; }
+                if (d->device) { d->device->lpVtbl->Release(d->device); d->device = NULL; }
+            }
+        }
+        if (FAILED(hr)) {
+            d->gpu_id[0] = L'\0';
+            hr = D3D11CreateDeviceAndSwapChain(
+                NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+                NULL, 0, D3D11_SDK_VERSION,
+                &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
+        }
+    }
 
     if (FAILED(hr)) {
         ui_log(L"IDD: D3D11CreateDeviceAndSwapChain failed (0x%08X)", hr);
@@ -1547,13 +1779,62 @@ static void d3d_render_frame(VmDisplayIdd *d)
     HRESULT hr;
     float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     BOOL frame_uploaded = FALSE;
+    BOOL shared = FALSE;
+    ID3D11ShaderResourceView *frame_srv;
+    ID3D11ShaderResourceView *null_srv = NULL;
+    UINT i;
+    int newest = -1;
 
     if (!d->device || !d->ctx || !d->swap_chain || !d->rtv)
         return;
 
-    /* Upload frame data to GPU texture if dirty */
-    if (d->frame_dirty) {
-        EnterCriticalSection(&d->frame_cs);
+    EnterCriticalSection(&d->frame_cs);
+    shared = d->shared_ready;
+    if (shared) {
+        UINT64 sequence = d->shared_front >= 0
+            ? d->shared_slots[d->shared_front].sequence : 0;
+        d->frame_dirty = FALSE;
+        for (i = 0; i < DISPLAY_GPU_SLOTS; ++i) {
+            IddSharedSlot *slot = &d->shared_slots[i];
+            if (!slot->pending) continue;
+            hr = slot->mutex->lpVtbl->AcquireSync(slot->mutex, 1, 0);
+            if (hr != S_OK) {
+                if (hr != WAIT_TIMEOUT) goto shared_error;
+                d->frame_dirty = TRUE;
+                continue;
+            }
+            slot->pending = FALSE;
+            if (slot->sequence > sequence) {
+                if (newest >= 0) {
+                    IddSharedSlot *old = &d->shared_slots[newest];
+                    hr = old->mutex->lpVtbl->ReleaseSync(old->mutex, 0);
+                    if (FAILED(hr)) {
+                        slot->mutex->lpVtbl->ReleaseSync(slot->mutex, 0);
+                        goto shared_error;
+                    }
+                }
+                newest = (int)i;
+                sequence = slot->sequence;
+            } else {
+                hr = slot->mutex->lpVtbl->ReleaseSync(slot->mutex, 0);
+                if (FAILED(hr)) goto shared_error;
+            }
+        }
+        if (newest >= 0) {
+            if (d->shared_front >= 0) {
+                IddSharedSlot *old = &d->shared_slots[d->shared_front];
+                hr = old->mutex->lpVtbl->ReleaseSync(old->mutex, 0);
+                if (FAILED(hr)) goto shared_error;
+            }
+            d->shared_front = newest;
+            newest = -1;
+            frame_uploaded = TRUE;
+        }
+        if (d->shared_front < 0) {
+            LeaveCriticalSection(&d->frame_cs);
+            return;
+        }
+    } else if (d->frame_dirty) {
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1574,7 +1855,6 @@ static void d3d_render_frame(VmDisplayIdd *d)
                     (ID3D11Resource *)d->frame_tex, 0);
         }
         d->frame_dirty = FALSE;
-        LeaveCriticalSection(&d->frame_cs);
         frame_uploaded = TRUE;
     }
 
@@ -1613,17 +1893,35 @@ static void d3d_render_frame(VmDisplayIdd *d)
 
     d->ctx->lpVtbl->VSSetShader(d->ctx, d->vs, NULL, 0);
     d->ctx->lpVtbl->PSSetShader(d->ctx, d->ps, NULL, 0);
-    d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 1, &d->frame_srv);
+    frame_srv = shared ? d->shared_slots[d->shared_front].srv : d->frame_srv;
+    d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 1, &frame_srv);
     d->ctx->lpVtbl->PSSetSamplers(d->ctx, 0, 1, &d->sampler);
 
     /* Draw fullscreen triangle (3 vertices, no vertex buffer) */
     d->ctx->lpVtbl->Draw(d->ctx, 3, 0);
+    d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 1, &null_srv);
+    if (shared) {
+        d->ctx->lpVtbl->Flush(d->ctx);
+    }
 
+    LeaveCriticalSection(&d->frame_cs);
     d->swap_chain->lpVtbl->Present(d->swap_chain, 0, 0);
+    return;
+
+shared_error:
+    if (newest >= 0) {
+        IddSharedSlot *slot = &d->shared_slots[newest];
+        slot->mutex->lpVtbl->ReleaseSync(slot->mutex, 0);
+    }
+    d->shared_disabled = TRUE;
+    if (d->frame_socket != INVALID_SOCKET)
+        shutdown(d->frame_socket, SD_BOTH);
+    LeaveCriticalSection(&d->frame_cs);
 }
 
 static void d3d_cleanup(VmDisplayIdd *d)
 {
+    idd_shared_release(d);
     if (d->sampler)    { d->sampler->lpVtbl->Release(d->sampler);       d->sampler = NULL; }
     if (d->ps)         { d->ps->lpVtbl->Release(d->ps);                 d->ps = NULL; }
     if (d->vs)         { d->vs->lpVtbl->Release(d->vs);                 d->vs = NULL; }
@@ -1908,6 +2206,30 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             continue;
         }
 
+        EnterCriticalSection(&d->frame_cs);
+        if (d->stop) {
+            LeaveCriticalSection(&d->frame_cs);
+            closesocket(s);
+            break;
+        }
+        d->frame_socket = s;
+        d->shared_offered = FALSE;
+        d->shared_session = 0;
+        LeaveCriticalSection(&d->frame_cs);
+        if (_wcsicmp(d->os_type, L"windows") == 0 && d->gpu_id[0] && !d->shared_disabled) {
+            static volatile LONG gpu_session_id;
+            DisplayGpuPacket query = {0};
+            DWORD send_timeout = 1000;
+            query.magic = DISPLAY_GPU_MAGIC;
+            query.type = DISPLAY_GPU_QUERY;
+            query.version = DISPLAY_GPU_VERSION;
+            query.session = ((UINT64)GetCurrentProcessId() << 32) |
+                            (UINT32)InterlockedIncrement(&gpu_session_id);
+            d->shared_session = query.session;
+            setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&send_timeout, sizeof(send_timeout));
+            if (!idd_send_gpu(s, &query)) shutdown(s, SD_BOTH);
+        }
+
         idd_log(d, L"Frame channel connected.");
         d->cursor_visible = TRUE;
         PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
@@ -1919,10 +2241,62 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             UINT32 rect_count;
             UINT32 i;
             UINT32 magic;
+            BOOL resolution_changed = FALSE;
 
             /* Peek at magic to determine message type */
             if (!recv_exact(s, &magic, sizeof(magic)))
                 break;
+
+            if (magic == DISPLAY_GPU_MAGIC) {
+                DisplayGpuPacket packet;
+                packet.magic = magic;
+                if (!recv_exact(s, (BYTE *)&packet + sizeof(magic), sizeof(packet) - sizeof(magic)))
+                    break;
+                if (packet.version != DISPLAY_GPU_VERSION || !d->shared_session ||
+                    packet.session != d->shared_session) break;
+                if (packet.type == DISPLAY_GPU_CAPS) {
+                    UINT slot;
+                    if (d->shared_offered) break;
+                    d->shared_offered = TRUE;
+                    for (slot = 0; slot < DISPLAY_GPU_SLOTS; ++slot) {
+                        if (!idd_shared_offer(d, s, &packet, slot)) break;
+                    }
+                    if (slot != DISPLAY_GPU_SLOTS) break;
+                } else if (packet.type == DISPLAY_GPU_READY) {
+                    BOOL ready = TRUE;
+                    UINT slot;
+                    if (packet.slot >= DISPLAY_GPU_SLOTS) break;
+                    EnterCriticalSection(&d->frame_cs);
+                    if (packet.status != S_OK) {
+                        idd_shared_release(d);
+                        LeaveCriticalSection(&d->frame_cs);
+                        continue;
+                    }
+                    d->shared_slots[packet.slot].ready = d->shared_slots[packet.slot].texture != NULL;
+                    for (slot = 0; slot < DISPLAY_GPU_SLOTS; ++slot)
+                        ready = ready && d->shared_slots[slot].ready;
+                    d->shared_ready = ready;
+                    LeaveCriticalSection(&d->frame_cs);
+                } else if (packet.type == DISPLAY_GPU_FRAME) {
+                    EnterCriticalSection(&d->frame_cs);
+                    if (!d->shared_ready || packet.slot >= DISPLAY_GPU_SLOTS ||
+                        d->shared_slots[packet.slot].pending || (int)packet.slot == d->shared_front ||
+                        packet.frame_seq <= d->shared_sequence) {
+                        LeaveCriticalSection(&d->frame_cs);
+                        break;
+                    }
+                    d->shared_sequence = packet.frame_seq;
+                    d->shared_slots[packet.slot].sequence = packet.frame_seq;
+                    d->shared_slots[packet.slot].pending = TRUE;
+                    d->frame_dirty = TRUE;
+                    d->recv_count++;
+                    LeaveCriticalSection(&d->frame_cs);
+                    goto frame_received;
+                } else if (packet.type != DISPLAY_GPU_HEARTBEAT) {
+                    break;
+                }
+                continue;
+            }
 
             if (magic == CURSOR_MAGIC) {
                 /* Read rest of cursor header (already read magic) */
@@ -2036,9 +2410,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->frame_width  = hdr.width;
                     d->frame_height = hdr.height;
                     d->frame_stride = new_stride;
-                    idd_log(d, L"Frame resolution changed: %ux%u (stride=%u)",
-                            hdr.width, hdr.height, hdr.stride);
-                    idd_log(d, L"Resolution changed to %ux%u.", hdr.width, hdr.height);
+                    resolution_changed = TRUE;
                 } else {
                     LeaveCriticalSection(&d->frame_cs);
                     break;
@@ -2103,6 +2475,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             d->frame_dirty = TRUE;
             d->recv_count++;
             LeaveCriticalSection(&d->frame_cs);
+            if (resolution_changed) {
+                idd_log(d, L"Frame resolution changed: %ux%u (stride=%u)",
+                        hdr.width, hdr.height, hdr.stride);
+                idd_log(d, L"Resolution changed to %ux%u.", hdr.width, hdr.height);
+            }
+frame_received:
             if (!d->frame_connected) {
                 d->frame_connected = TRUE;
                 PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
@@ -2123,6 +2501,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
 
         /* Frame channel lost — close it but keep input alive */
+        EnterCriticalSection(&d->frame_cs);
+        d->frame_socket = INVALID_SOCKET;
+        idd_shared_release(d);
+        LeaveCriticalSection(&d->frame_cs);
         d->frame_connected = FALSE;
         d->cursor_visible = TRUE;
         PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
@@ -2303,6 +2685,9 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     idd_update_kbd_hook(d);
 
+    if (d->stop)
+        PostMessageW(d->hwnd, WM_CLOSE, 0, 0);
+
     /* Message pump */
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
@@ -2315,6 +2700,14 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 /* ==================================================================
  * Window procedure
  * ================================================================== */
+
+static void idd_join_thread(HANDLE thread)
+{
+    while (MsgWaitForMultipleObjects(1, &thread, FALSE, INFINITE, QS_SENDMESSAGE) == WAIT_OBJECT_0 + 1) {
+        MSG msg;
+        PeekMessageW(&msg, NULL, 0, 0, PM_NOREMOVE);
+    }
+}
 
 static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -2402,6 +2795,18 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             d->stop = TRUE;
             idd_update_relative_mouse(d);
 
+            EnterCriticalSection(&d->frame_cs);
+            if (d->frame_socket != INVALID_SOCKET)
+                shutdown(d->frame_socket, SD_BOTH);
+            if (d->audio_socket != INVALID_SOCKET)
+                shutdown(d->audio_socket, SD_BOTH);
+            LeaveCriticalSection(&d->frame_cs);
+            if (d->recv_thread) {
+                idd_join_thread(d->recv_thread);
+                CloseHandle(d->recv_thread);
+                d->recv_thread = NULL;
+            }
+
             /* Destroy clipboard module */
             if (d->clipboard) {
                 vm_clipboard_destroy(d->clipboard);
@@ -2410,20 +2815,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             /* Wait for audio recv thread (:0004) */
             if (d->audio_recv_thread) {
-                if (d->audio_socket != INVALID_SOCKET) {
-                    closesocket(d->audio_socket);
-                    d->audio_socket = INVALID_SOCKET;
-                }
-                WaitForSingleObject(d->audio_recv_thread, 2000);
+                idd_join_thread(d->audio_recv_thread);
                 CloseHandle(d->audio_recv_thread);
                 d->audio_recv_thread = NULL;
-            }
-
-            /* Wait briefly for recv thread to exit */
-            if (d->recv_thread) {
-                WaitForSingleObject(d->recv_thread, 2000);
-                CloseHandle(d->recv_thread);
-                d->recv_thread = NULL;
             }
 
             d->open = FALSE;
@@ -2804,6 +3198,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     wcscpy_s(d->vhdx_path, MAX_PATH, vm->vhdx_path);
     d->runtime_id   = vm->runtime_id;
     wcscpy_s(d->os_type, 32, vm->os_type);
+    wcscpy_s(d->gpu_id, 512, vm->gpu_id);
     d->hInstance    = hInstance;
     d->main_hwnd   = main_hwnd;
     d->open         = TRUE;
@@ -2812,6 +3207,8 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->keyboard_version   = 1;
     d->input_socket       = INVALID_SOCKET;
     d->audio_socket       = INVALID_SOCKET;
+    d->frame_socket       = INVALID_SOCKET;
+    d->shared_front       = -1;
     d->clipboard          = NULL;
     d->cursor_visible     = TRUE;
 
@@ -2860,24 +3257,20 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
 
     /* Wait for window thread (pumping messages to stay responsive) */
     if (display->window_thread) {
-        DWORD result;
-        do {
-            result = MsgWaitForMultipleObjects(
-                1, &display->window_thread, FALSE, 5000, QS_ALLINPUT);
-            if (result == WAIT_OBJECT_0 + 1) {
-                MSG msg;
-                while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
-        } while (result == WAIT_OBJECT_0 + 1);
+        idd_join_thread(display->window_thread);
         CloseHandle(display->window_thread);
     }
 
+    EnterCriticalSection(&display->frame_cs);
+    if (display->frame_socket != INVALID_SOCKET)
+        shutdown(display->frame_socket, SD_BOTH);
+    if (display->audio_socket != INVALID_SOCKET)
+        shutdown(display->audio_socket, SD_BOTH);
+    LeaveCriticalSection(&display->frame_cs);
+
     /* recv_thread is cleaned up by WM_CLOSE handler, but guard just in case */
     if (display->recv_thread) {
-        WaitForSingleObject(display->recv_thread, 3000);
+        idd_join_thread(display->recv_thread);
         CloseHandle(display->recv_thread);
     }
 
@@ -2889,11 +3282,7 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
 
     /* audio_recv_thread guard */
     if (display->audio_recv_thread) {
-        if (display->audio_socket != INVALID_SOCKET) {
-            closesocket(display->audio_socket);
-            display->audio_socket = INVALID_SOCKET;
-        }
-        WaitForSingleObject(display->audio_recv_thread, 3000);
+        idd_join_thread(display->audio_recv_thread);
         CloseHandle(display->audio_recv_thread);
     }
 

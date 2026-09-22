@@ -337,6 +337,262 @@ static HRESULT VddCreateStagingTexture(VDD_SWAP_PROC* proc, UINT width, UINT hei
     return proc->pDevice->CreateTexture2D(&desc, nullptr, &proc->pStagingTex);
 }
 
+static BOOL VddGpuTextureCompatible(ID3D11Texture2D* texture)
+{
+    static_assert(sizeof(DisplayGpuPacket) == 68, "GPU display packet layout");
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture->GetDesc(&desc);
+    return desc.Width == VDD_WIDTH && desc.Height == VDD_HEIGHT &&
+        desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM && desc.SampleDesc.Count == 1 &&
+        desc.SampleDesc.Quality == 0 && desc.ArraySize == 1 && desc.MipLevels == 1;
+}
+
+static BOOL VddSendGpuPacket(VDD_SWAP_PROC* proc, UINT type, HRESULT status, UINT slot = 0)
+{
+    if (!proc->hClientConn) return FALSE;
+    DisplayGpuPacket packet = {};
+    packet.magic = DISPLAY_GPU_MAGIC;
+    packet.type = type;
+    packet.session = proc->gpuSession;
+    packet.frame_seq = proc->frameSeq;
+    packet.process_id = GetCurrentProcessId();
+    packet.width = VDD_WIDTH;
+    packet.height = VDD_HEIGHT;
+    packet.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    packet.status = (UINT32)status;
+    packet.version = DISPLAY_GPU_VERSION;
+    packet.slot = slot;
+    if (type == DISPLAY_GPU_CAPS) {
+        IDXGIDevice* device = NULL;
+        IDXGIAdapter* adapter = NULL;
+        DXGI_ADAPTER_DESC desc = {};
+        HRESULT hr = proc->pDevice->QueryInterface(IID_PPV_ARGS(&device));
+        if (hr == S_OK) hr = device->GetAdapter(&adapter);
+        if (hr == S_OK) hr = adapter->GetDesc(&desc);
+        if (hr == S_OK) {
+            packet.vendor_id = desc.VendorId;
+            packet.device_id = desc.DeviceId;
+            /* Microsoft Basic Render Driver. */
+            if (desc.VendorId == 0x1414 && desc.DeviceId == 0x008c)
+                packet.status = (UINT32)DXGI_ERROR_UNSUPPORTED;
+        } else packet.status = (UINT32)hr;
+        if (adapter) adapter->Release();
+        if (device) device->Release();
+    }
+    if (VddSendAll(proc->hClientConn, (const char*)&packet, sizeof(packet)) == 0)
+        return TRUE;
+    VddCloseConn(&proc->hClientConn);
+    return FALSE;
+}
+
+static BOOL VddReleaseGpuTexture(VDD_SWAP_PROC* proc, BOOL preserve)
+{
+    BOOL captured = FALSE;
+    VDD_GPU_SLOT* last = &proc->gpuSlots[proc->gpuLastSlot];
+    if (preserve && proc->bGpuPendingFrame && proc->pGpuPendingTex && proc->pStagingTex) {
+        proc->pDeviceContext->CopyResource(proc->pStagingTex, proc->pGpuPendingTex);
+        proc->pDeviceContext->Flush();
+        captured = proc->pDevice->GetDeviceRemovedReason() == S_OK;
+    }
+    if (preserve && !captured && proc->bGpuHasFrame && last->pMutex && proc->pStagingTex) {
+        ULONGLONG deadline = GetTickCount64() + 100;
+        do {
+            if (proc->bStopNetwork) break;
+            UINT64 key = 0;
+            HRESULT hr = last->pMutex->AcquireSync(key, 0);
+            if (hr == (HRESULT)WAIT_TIMEOUT) {
+                key = 1;
+                hr = last->pMutex->AcquireSync(key, 0);
+            }
+            if (hr == S_OK) {
+                proc->pDeviceContext->CopyResource(proc->pStagingTex, last->pTexture);
+                proc->pDeviceContext->Flush();
+                last->pMutex->ReleaseSync(key);
+                captured = TRUE;
+                break;
+            }
+            if (hr != (HRESULT)WAIT_TIMEOUT) break;
+            if (WaitForSingleObject(proc->hTerminateEvent, 10) == WAIT_OBJECT_0) break;
+        } while (GetTickCount64() < deadline);
+        if (!captured) VddLog("GPU: could not preserve disconnected viewer's last frame");
+    }
+    for (UINT i = 0; i < DISPLAY_GPU_SLOTS; ++i) {
+        VDD_GPU_SLOT* slot = &proc->gpuSlots[i];
+        if (slot->pMutex) slot->pMutex->Release();
+        if (slot->pTexture) slot->pTexture->Release();
+        if (slot->hTexture) CloseHandle(slot->hTexture);
+        slot->pMutex = NULL;
+        slot->pTexture = NULL;
+        slot->hTexture = NULL;
+    }
+    proc->bGpuPoolReady = FALSE;
+    proc->gpuNextSlot = 0;
+    proc->gpuLastSlot = 0;
+    proc->bGpuHasFrame = FALSE;
+    if (proc->pGpuPendingTex) proc->pGpuPendingTex->Release();
+    proc->pGpuPendingTex = NULL;
+    proc->bGpuPendingFrame = FALSE;
+    return captured;
+}
+
+static void VddPollGpuControl(VDD_SWAP_PROC* proc)
+{
+    if (!proc->hClientConn || asb_conn_socket_u64(proc->hClientConn) == ~0ull) return;
+    for (UINT count = 0; count < 8 && proc->hClientConn; ++count) {
+        int ready = asb_poll(proc->hClientConn, 0);
+        if (ready == 0) break;
+        if (ready < 0) { VddCloseConn(&proc->hClientConn); break; }
+        int received = asb_recv(proc->hClientConn,
+            (char*)&proc->gpuControl + proc->gpuControlBytes,
+            (int)(sizeof(proc->gpuControl) - proc->gpuControlBytes));
+        if (received <= 0) { VddCloseConn(&proc->hClientConn); break; }
+        proc->gpuControlBytes += (UINT)received;
+        if (proc->gpuControlBytes < sizeof(proc->gpuControl)) continue;
+        DisplayGpuPacket packet = proc->gpuControl;
+        proc->gpuControlBytes = 0;
+        if (packet.magic != DISPLAY_GPU_MAGIC || packet.version != DISPLAY_GPU_VERSION) {
+            VddCloseConn(&proc->hClientConn);
+            break;
+        }
+        if (packet.type == DISPLAY_GPU_QUERY && packet.session && !proc->gpuSession) {
+            proc->gpuSession = packet.session;
+        } else if (packet.type == DISPLAY_GPU_OFFER && proc->bGpuCapsSent &&
+                   packet.session == proc->gpuSession && packet.slot < DISPLAY_GPU_SLOTS &&
+                   !proc->gpuSlots[packet.slot].bOfferSeen) {
+            /* Replayed handles may already have been reused by the process. */
+            VDD_GPU_SLOT* slot = &proc->gpuSlots[packet.slot];
+            slot->bOfferSeen = TRUE;
+            HRESULT hr = E_INVALIDARG;
+            ID3D11Device1* device = NULL;
+            HANDLE handle = (HANDLE)(ULONG_PTR)packet.handle;
+            BOOL validTarget = handle && handle != INVALID_HANDLE_VALUE &&
+                packet.process_id == GetCurrentProcessId();
+            for (UINT i = 0; i < DISPLAY_GPU_SLOTS; ++i) {
+                if (i != packet.slot && proc->gpuSlots[i].hTexture == handle)
+                    validTarget = FALSE;
+            }
+            if (validTarget) slot->hTexture = handle;
+            if (validTarget && !proc->bGpuPoolFailed &&
+                packet.width == VDD_WIDTH && packet.height == VDD_HEIGHT &&
+                packet.format == DXGI_FORMAT_B8G8R8A8_UNORM &&
+                proc->bGpuSourceCompatible) {
+                hr = proc->pDevice->QueryInterface(IID_PPV_ARGS(&device));
+                if (hr == S_OK)
+                    hr = device->OpenSharedResource1(handle, IID_PPV_ARGS(&slot->pTexture));
+            }
+            if (device) device->Release();
+            if (hr == S_OK && !VddGpuTextureCompatible(slot->pTexture)) hr = E_INVALIDARG;
+            if (hr == S_OK) hr = slot->pTexture->QueryInterface(IID_PPV_ARGS(&slot->pMutex));
+            if (hr != S_OK) {
+                proc->bGpuPoolFailed = TRUE;
+                VddReleaseGpuTexture(proc, FALSE);
+            } else {
+                proc->bGpuPoolReady = TRUE;
+                for (UINT i = 0; i < DISPLAY_GPU_SLOTS; ++i) {
+                    if (!proc->gpuSlots[i].pTexture || !proc->gpuSlots[i].pMutex)
+                        proc->bGpuPoolReady = FALSE;
+                }
+            }
+            VddSendGpuPacket(proc, DISPLAY_GPU_READY, hr, packet.slot);
+        }
+    }
+    if (proc->hClientConn && proc->gpuSession && !proc->bGpuCapsSent && proc->bGpuSourceKnown) {
+        proc->bGpuCapsSent = TRUE;
+        VddSendGpuPacket(proc, DISPLAY_GPU_CAPS,
+            proc->bGpuSourceCompatible ? S_OK : DXGI_ERROR_UNSUPPORTED);
+    }
+}
+
+static BOOL VddPublishGpuFrame(VDD_SWAP_PROC* proc, ID3D11Texture2D* source,
+    UINT presentationFrame = 0, UINT64 acquiredQpc = 0)
+{
+    if (!proc->bGpuPoolReady || !proc->hClientConn) return FALSE;
+    if (proc->bStopNetwork || WaitForSingleObject(proc->hTerminateEvent, 0) == WAIT_OBJECT_0)
+        return TRUE;
+    HRESULT hr = E_INVALIDARG;
+    UINT failedSlot = proc->gpuNextSlot;
+    if (VddGpuTextureCompatible(source)) {
+        for (UINT count = 0; count < DISPLAY_GPU_SLOTS; ++count) {
+            UINT index = (proc->gpuNextSlot + count) % DISPLAY_GPU_SLOTS;
+            VDD_GPU_SLOT* slot = &proc->gpuSlots[index];
+            LARGE_INTEGER releasedQpc = {}, sendStartQpc = {}, sendEndQpc = {};
+            hr = slot->pMutex->AcquireSync(0, 0);
+            if (hr == (HRESULT)WAIT_TIMEOUT) continue;
+            failedSlot = index;
+            if (hr != S_OK) break;
+            proc->pDeviceContext->CopyResource(slot->pTexture, source);
+            proc->pDeviceContext->Flush();
+            hr = slot->pMutex->ReleaseSync(1);
+            if (acquiredQpc) QueryPerformanceCounter(&releasedQpc);
+            if (hr != S_OK) break;
+            proc->gpuLastSlot = index;
+            proc->gpuNextSlot = (index + 1) % DISPLAY_GPU_SLOTS;
+            ++proc->frameSeq;
+            if (acquiredQpc) QueryPerformanceCounter(&sendStartQpc);
+            BOOL sent = VddSendGpuPacket(proc, DISPLAY_GPU_FRAME, S_OK, index);
+            if (acquiredQpc) QueryPerformanceCounter(&sendEndQpc);
+            if (sent && acquiredQpc) {
+                IDDCX_FRAME_STATISTICS_STEP step = {};
+                IDARG_IN_REPORTFRAMESTATISTICS args = {};
+                proc->gpuReEncodeNumber = proc->bGpuFrameReported &&
+                    proc->gpuReportedFrame == presentationFrame ? proc->gpuReEncodeNumber + 1 : 0;
+                proc->bGpuFrameReported = TRUE;
+                proc->gpuReportedFrame = presentationFrame;
+                step.Size = sizeof(step);
+                step.Type = IDDCX_FRAME_STATISTICS_STEP_TYPE_DRIVER_DEFINED_1;
+                step.QpcTime = releasedQpc.QuadPart;
+                args.FrameStatistics.Size = sizeof(args.FrameStatistics);
+                args.FrameStatistics.PresentationFrameNumber = presentationFrame;
+                args.FrameStatistics.FrameStatus = IDDCX_FRAME_STATUS_COMPLETED;
+                args.FrameStatistics.ReEncodeNumber = proc->gpuReEncodeNumber;
+                args.FrameStatistics.FrameSliceTotal = 1;
+                args.FrameStatistics.FrameAcquireQpcTime = acquiredQpc;
+                args.FrameStatistics.FrameProcessingStepsCount = 1;
+                args.FrameStatistics.pFrameProcessingStep = &step;
+                args.FrameStatistics.SendStartQpcTime = sendStartQpc.QuadPart;
+                args.FrameStatistics.SendStopQpcTime = sendEndQpc.QuadPart;
+                args.FrameStatistics.ProcessedPixelCount = VDD_WIDTH * VDD_HEIGHT;
+                args.FrameStatistics.FrameSizeInBytes = sizeof(DisplayGpuPacket);
+                NTSTATUS status = IddCxSwapChainReportFrameStatistics(proc->hSwapChain, &args);
+                UNREFERENCED_PARAMETER(status);
+            }
+            if (sent) {
+                proc->bGpuHasFrame = TRUE;
+                proc->bGpuPendingFrame = FALSE;
+            }
+            return sent;
+        }
+        if (hr == (HRESULT)WAIT_TIMEOUT) {
+            if (source == proc->pGpuPendingTex) return TRUE;
+            hr = S_OK;
+            if (!proc->pGpuPendingTex) {
+                D3D11_TEXTURE2D_DESC desc = {};
+                source->GetDesc(&desc);
+                desc.Usage = D3D11_USAGE_DEFAULT;
+                desc.BindFlags = 0;
+                desc.CPUAccessFlags = 0;
+                desc.MiscFlags = 0;
+                hr = proc->pDevice->CreateTexture2D(&desc, NULL, &proc->pGpuPendingTex);
+            }
+            if (hr == S_OK) {
+                proc->pDeviceContext->CopyResource(proc->pGpuPendingTex, source);
+                proc->pDeviceContext->Flush();
+                hr = proc->pDevice->GetDeviceRemovedReason();
+                if (hr == S_OK) {
+                    proc->bGpuPendingFrame = TRUE;
+                    return TRUE;
+                }
+            }
+        }
+    }
+    VddLog("GPU: handoff failed slot=%u status=0x%08X; resuming full CPU frame", failedSlot, hr);
+    proc->bGpuPoolFailed = TRUE;
+    VddReleaseGpuTexture(proc, FALSE);
+    VddSendGpuPacket(proc, DISPLAY_GPU_READY,
+        hr == (HRESULT)WAIT_ABANDONED ? E_FAIL : hr, failedSlot);
+    return FALSE;
+}
+
 /* ========================================================================= */
 /*  Swap chain processor thread                                              */
 /* ========================================================================= */
@@ -500,17 +756,25 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
         waitCount = 3;
     }
 
-    /* Track staging texture row pitch (set on first capture) and whether
-       we have a valid frame in the staging texture for resend on idle. */
     BOOL bHasFrame = FALSE;
     BOOL bSentFullFrame = FALSE;   /* TRUE after first full frame sent to current client */
-    UINT cachedRowPitch = VDD_STRIDE;
 
 
     /* Main frame acquisition loop */
     for (;;)
     {
         IDXGIResource* pSurface = NULL;
+        UINT presentationFrame = 0;
+        LARGE_INTEGER acquiredQpc = {};
+        if (proc->bStopNetwork || WaitForSingleObject(proc->hTerminateEvent, 0) == WAIT_OBJECT_0)
+            break;
+
+        if (!proc->hClientConn && proc->gpuSession) {
+            if (proc->bGpuHasFrame || proc->bGpuPendingFrame) bHasFrame = VddReleaseGpuTexture(proc, TRUE);
+            else VddReleaseGpuTexture(proc, FALSE);
+            proc->gpuSession = 0;
+            bSentFullFrame = FALSE;
+        }
 
         /* Check for pending new connection from network thread */
         {
@@ -527,14 +791,46 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                     else { asb_abandon(proc->hClientConn); proc->hClientConn = NULL; }  /* ivshmem */
                     VddLog("Frame: replaced previous client connection");
                 }
+                if (proc->bGpuHasFrame || proc->bGpuPendingFrame) bHasFrame = VddReleaseGpuTexture(proc, TRUE);
+                else VddReleaseGpuTexture(proc, FALSE);
                 asb_stream_reset(pending);   /* ivshmem: align the fresh full frame at ring offset 0 (no-op on PC) */
                 proc->hClientConn = pending;
+                asb_set_timeout(pending, 1000, 1000);
                 proc->frameSeq = 0;
+                proc->gpuSession = 0;
+                proc->gpuReportedFrame = 0;
+                proc->gpuReEncodeNumber = 0;
+                proc->bGpuFrameReported = FALSE;
+                proc->bGpuCapsSent = FALSE;
+                proc->bGpuPoolFailed = FALSE;
+                ZeroMemory(proc->gpuSlots, sizeof(proc->gpuSlots));
+                proc->gpuControlBytes = 0;
                 bSentFullFrame = FALSE;   /* new connection -> first frame is full (the reconnect trigger) */
                 VddLog("Frame: new client connection active");
             }
         }
 
+        VddPollGpuControl(proc);
+        if (proc->bGpuPoolReady && proc->bGpuPendingFrame) {
+            /* Publishing can release the pending texture on failure. */
+            ID3D11Texture2D* pending = proc->pGpuPendingTex;
+            pending->AddRef();
+            if (!VddPublishGpuFrame(proc, pending)) {
+                proc->pDeviceContext->CopyResource(proc->pStagingTex, pending);
+                proc->pDeviceContext->Flush();
+                bHasFrame = proc->pDevice->GetDeviceRemovedReason() == S_OK;
+                VddReleaseGpuTexture(proc, FALSE);
+                bSentFullFrame = FALSE;
+            }
+            pending->Release();
+        }
+        /* An idle desktop may not produce another frame after negotiation. */
+        if (proc->bGpuPoolReady && !proc->bGpuHasFrame && bHasFrame) {
+            if (!VddPublishGpuFrame(proc, proc->pStagingTex)) {
+                VddReleaseGpuTexture(proc, FALSE);
+                bSentFullFrame = FALSE;
+            }
+        }
 
         /* Use v2 acquire when available */
 #pragma warning(suppress: 4127)
@@ -544,14 +840,18 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             bufferInArgs.Size = sizeof(bufferInArgs);
             hr = IddCxSwapChainReleaseAndAcquireBuffer2(proc->hSwapChain, &bufferInArgs, &buffer);
             pSurface = buffer.MetaData.pSurface;
+            presentationFrame = buffer.MetaData.PresentationFrameNumber;
         } else {
             IDARG_OUT_RELEASEANDACQUIREBUFFER buffer = { 0 };
             hr = IddCxSwapChainReleaseAndAcquireBuffer(proc->hSwapChain, &buffer);
             pSurface = buffer.MetaData.pSurface;
+            presentationFrame = buffer.MetaData.PresentationFrameNumber;
         }
+        if (hr == S_OK && proc->bGpuPoolReady) QueryPerformanceCounter(&acquiredQpc);
 
         if (hr == E_PENDING) {
-            DWORD waitResult = WaitForMultipleObjects(waitCount, waitHandles, FALSE, 100);
+            DWORD waitResult = WaitForMultipleObjects(waitCount, waitHandles, FALSE,
+                proc->bGpuPendingFrame ? 1 : 100);
             if (waitResult == WAIT_OBJECT_0 + 1) {
                 break;  /* Terminate */
             }
@@ -567,7 +867,9 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
 
             /* On timeout with a connected client and a cached frame, resend
                the staging texture contents to keep the connection alive. */
-            if (waitResult == WAIT_TIMEOUT && bHasFrame &&
+            if (waitResult == WAIT_TIMEOUT && proc->bGpuPoolReady && proc->hClientConn) {
+                if (!proc->bGpuPendingFrame) VddSendGpuPacket(proc, DISPLAY_GPU_HEARTBEAT, S_OK);
+            } else if (waitResult == WAIT_TIMEOUT && bHasFrame &&
                 proc->hClientConn != NULL && proc->pStagingTex)
             {
                 D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -624,6 +926,20 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 hr = pSurface->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&pTexture);
                 if (SUCCEEDED(hr) && pTexture)
                 {
+                    proc->bGpuSourceKnown = TRUE;
+                    proc->bGpuSourceCompatible = VddGpuTextureCompatible(pTexture);
+                    BOOL hadGpuTexture = proc->bGpuPoolReady;
+                    if (VddPublishGpuFrame(proc, pTexture, presentationFrame, acquiredQpc.QuadPart)) {
+                        bHasFrame = FALSE;
+                        pTexture->Release();
+                        pTexture = nullptr;
+                    } else if (hadGpuTexture) {
+                        VddReleaseGpuTexture(proc, FALSE);
+                        bSentFullFrame = FALSE;
+                    }
+                }
+                if (pTexture)
+                {
                     proc->pDeviceContext->CopyResource(proc->pStagingTex, pTexture);
 
                     D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -631,7 +947,6 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                     if (SUCCEEDED(hr))
                     {
                         bHasFrame = TRUE;
-                        cachedRowPitch = mapped.RowPitch;
 
                         if (proc->hClientConn != NULL)
                         {
@@ -772,6 +1087,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 VddLog("SwapChainRunCore: FinishedProcessingFrame FAILED hr=0x%08X, exiting for reassignment", hr);
                 break;
             }
+            if (proc->bGpuPoolReady) proc->pDeviceContext->Flush();
         } else {
             /* ACCESS_LOST can be transient (display mode change) — retry with
                exponential backoff up to MAX_RETRIES.  All other errors: exit
@@ -790,6 +1106,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             break;
         }
     }
+    VddReleaseGpuTexture(proc, FALSE);
 }
 
 /* ========================================================================= */
@@ -810,7 +1127,7 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
     if (proc->hThread)
     {
         VddLog("DestroySwapProc: waiting for swap chain thread...");
-        WaitForSingleObject(proc->hThread, 5000);
+        WaitForSingleObject(proc->hThread, INFINITE);
         VddLog("DestroySwapProc: swap chain thread exited");
         CloseHandle(proc->hThread);
     }
@@ -819,7 +1136,7 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
     if (proc->hNetworkThread)
     {
         VddLog("DestroySwapProc: waiting for network thread...");
-        WaitForSingleObject(proc->hNetworkThread, 5000);
+        WaitForSingleObject(proc->hNetworkThread, INFINITE);
         VddLog("DestroySwapProc: network thread exited");
         CloseHandle(proc->hNetworkThread);
     }
@@ -914,15 +1231,6 @@ static void VddInitAdapter(VDD_DEVICE_CONTEXT* ctx)
     adapterCaps.Size = sizeof(adapterCaps);
     VddLog("InitAdapter: IDDCX_ADAPTER_CAPS.Size=%u", (unsigned)adapterCaps.Size);
 
-    /* Set FP16 processing flag when supported */
-#pragma warning(suppress: 4127)
-    if (IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
-        adapterCaps.Flags = IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
-        VddLog("InitAdapter: FP16 flag set");
-    } else {
-        VddLog("InitAdapter: FP16 not available");
-    }
-
     adapterCaps.MaxMonitorsSupported = 1;
 
     adapterCaps.EndPointDiagnostics.Size = sizeof(adapterCaps.EndPointDiagnostics);
@@ -964,9 +1272,6 @@ static void VddInitAdapter(VDD_DEVICE_CONTEXT* ctx)
         pWrapper->pContext = ctx;
 
         VddLog("InitAdapter: IddCxAdapterInitAsync succeeded (adapter=%p)", (void*)adapterInitOut.AdapterObject);
-
-        /* Render-adapter selection is left to IddCx / the OS default (WARP); the VDD is
-           display-only and pins no render adapter. */
     }
     else
     {
@@ -1114,9 +1419,13 @@ NTSTATUS VddMonitorAssignSwapChain(
 
     proc->hSwapChain      = pInArgs->hSwapChain;
     proc->hAvailableEvent = pInArgs->hNextSurfaceAvailable;
-    proc->hTerminateEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    proc->hTerminateEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     VddLog("AssignSwapChain: hSwapChain=%p hAvailableEvent=%p hTerminateEvent=%p",
            (void*)proc->hSwapChain, (void*)proc->hAvailableEvent, (void*)proc->hTerminateEvent);
+    if (!proc->hTerminateEvent) {
+        free(proc);
+        return STATUS_NO_MEMORY;
+    }
 
     VddLog("AssignSwapChain: getting D3D11 device (LUID=%08X:%08X)...",
            pInArgs->RenderAdapterLuid.HighPart, pInArgs->RenderAdapterLuid.LowPart);
@@ -1498,6 +1807,27 @@ NTSTATUS VddMonitorSetGammaRamp(
 /*  IddCx: Adapter Init Finished                                            */
 /* ========================================================================= */
 
+static void VddPreferHardwareRenderAdapter(IDDCX_ADAPTER adapterObject)
+{
+#pragma warning(suppress: 4127)
+    if (!IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter)) return;
+    IDXGIFactory1* factory = NULL;
+    if (CreateDXGIFactory1(IID_PPV_ARGS(&factory)) != S_OK) return;
+    for (UINT index = 0; ; ++index) {
+        IDXGIAdapter1* adapter = NULL;
+        if (factory->EnumAdapters1(index, &adapter) != S_OK) break;
+        DXGI_ADAPTER_DESC1 desc = {};
+        HRESULT hr = adapter->GetDesc1(&desc);
+        adapter->Release();
+        if (hr != S_OK || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
+        IDARG_IN_ADAPTERSETRENDERADAPTER args = {};
+        args.PreferredRenderAdapter = desc.AdapterLuid;
+        IddCxAdapterSetRenderAdapter(adapterObject, &args);
+        break;
+    }
+    factory->Release();
+}
+
 _Use_decl_annotations_
 NTSTATUS VddAdapterInitFinished(
     IDDCX_ADAPTER AdapterObject,
@@ -1512,6 +1842,7 @@ NTSTATUS VddAdapterInitFinished(
     {
         VddLog("AdapterInitFinished: adapter init succeeded, creating monitor...");
         VddFinishInit(pWrapper->pContext);
+        VddPreferHardwareRenderAdapter(AdapterObject);
         NTSTATUS st = VddCreateMonitor(pWrapper->pContext);
         VddLog("AdapterInitFinished: VddCreateMonitor returned 0x%08X", st);
         return st;

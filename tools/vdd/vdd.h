@@ -34,6 +34,7 @@ Environment:
 
 #include "Trace.h"
 #include "../transport/asb_transport.h"   /* AsbConn — host connection (AF_HYPERV on PC, ivshmem on Mac) */
+#include "../../src/core/protocol.h"
 
 /* ============================================================================
  *  Display constants
@@ -179,6 +180,13 @@ static const BYTE VDD_EDID[] = {
 /* ============================================================================
  *  Swap chain processor state (heap-allocated per AssignSwapChain)
  * ============================================================================ */
+typedef struct _VDD_GPU_SLOT {
+    ID3D11Texture2D*     pTexture;
+    IDXGIKeyedMutex*     pMutex;
+    HANDLE              hTexture;
+    BOOL                bOfferSeen;
+} VDD_GPU_SLOT;
+
 typedef struct _VDD_SWAP_PROC {
     IDDCX_SWAPCHAIN     hSwapChain;
     HANDLE              hAvailableEvent;    /* from pInArgs->hNextSurfaceAvailable */
@@ -201,6 +209,24 @@ typedef struct _VDD_SWAP_PROC {
     AsbConn * volatile  hPendingConn;       /* new client from network thread, picked up by swap chain */
     volatile BOOL       bStopNetwork;
     UINT64              frameSeq;
+
+    VDD_GPU_SLOT        gpuSlots[DISPLAY_GPU_SLOTS];
+    ID3D11Texture2D*     pGpuPendingTex;
+    BOOL                bGpuPendingFrame;
+    UINT64              gpuSession;
+    UINT                gpuNextSlot;
+    UINT                gpuLastSlot;
+    UINT                gpuReportedFrame;
+    UINT                gpuReEncodeNumber;
+    BOOL                bGpuFrameReported;
+    BOOL                bGpuPoolReady;
+    BOOL                bGpuPoolFailed;
+    BOOL                bGpuCapsSent;
+    BOOL                bGpuHasFrame;
+    BOOL                bGpuSourceKnown;
+    BOOL                bGpuSourceCompatible;
+    DisplayGpuPacket    gpuControl;
+    UINT                gpuControlBytes;
 
     /* Hardware cursor */
     IDDCX_MONITOR       hMonitor;           /* needed for QueryHardwareCursor */

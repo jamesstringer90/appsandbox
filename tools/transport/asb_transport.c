@@ -93,6 +93,7 @@ struct AsbListener {
 struct AsbConn {
     int       channel;
     int       is_ivshmem;
+    DWORD     send_timeout_ms;
     /* PC */
     SOCKET    sock;
     /* Mac: pointers into the BAR for this slot */
@@ -379,7 +380,9 @@ AsbConn *asb_connect(int channel) {   /* guest connects out (9P) */
         AsbShmRegionDesc *r = find_region(channel); uint32_t s;
         if (!r) return NULL;
         for (s = 0; s < r->n_slots; s++) {
-            AsbConn tmp; bind_slot(&tmp, r, s);
+            AsbConn tmp;
+            memset(&tmp, 0, sizeof(tmp));
+            bind_slot(&tmp, r, s);
             MemoryBarrier();
             if (*tmp.state == ASB_SLOT_FREE) {
                 int waited = 0;
@@ -413,6 +416,7 @@ int asb_send(AsbConn *c, const void *buf, int len) {
     if (!c) return -1;
     if (c->is_ivshmem) {
         int off = 0;
+        ULONGLONG progress = c->send_timeout_ms ? GetTickCount64() : 0;
         while (off < len) {
             int n;
             MemoryBarrier();
@@ -423,7 +427,14 @@ int asb_send(AsbConn *c, const void *buf, int len) {
             if (*c->state != ASB_SLOT_ESTABLISHED ||
                 (c->my_host_token != 0 && *c->host_token != c->my_host_token)) return off ? off : -1;
             n = ring_write(c->g2h, c->g2h_data, (const uint8_t *)buf + off, len - off);
-            if (n > 0) off += n; else Sleep(0);   /* ring full: yield, retry (host draining) */
+            if (n > 0) {
+                off += n;
+                if (c->send_timeout_ms) progress = GetTickCount64();
+            } else {
+                if (c->send_timeout_ms && GetTickCount64() - progress >= c->send_timeout_ms)
+                    return off ? off : -1;
+                Sleep(0);
+            }
         }
         return off;
     }
@@ -485,7 +496,11 @@ int asb_poll(AsbConn *c, int timeout_ms) {
 }
 
 void asb_set_timeout(AsbConn *c, int recv_ms, int send_ms) {
-    if (!c || c->is_ivshmem) return;   /* ivshmem is poll-driven; nothing to set */
+    if (!c) return;
+    if (c->is_ivshmem) {
+        c->send_timeout_ms = send_ms > 0 ? (DWORD)send_ms : 0;
+        return;
+    }
     setsockopt(c->sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&recv_ms, sizeof(recv_ms));
     setsockopt(c->sock, SOL_SOCKET, SO_SNDTIMEO, (char *)&send_ms, sizeof(send_ms));
 }

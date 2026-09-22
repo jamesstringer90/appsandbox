@@ -49,4 +49,34 @@ typedef struct {
 } InputPacket;
 #pragma pack(pop)
 
+#define DISPLAY_GPU_MAGIC     0x50475341u /* ASGP */
+#define DISPLAY_GPU_VERSION   1
+#define DISPLAY_GPU_QUERY     1
+#define DISPLAY_GPU_CAPS      2
+#define DISPLAY_GPU_OFFER     3
+#define DISPLAY_GPU_READY     4
+#define DISPLAY_GPU_FRAME     5
+#define DISPLAY_GPU_HEARTBEAT 6
+#define DISPLAY_GPU_SLOTS     2
+
+/* Mutex key 0 grants guest writes; key 1 grants host reads. */
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic;
+    uint32_t type;
+    uint64_t session;
+    uint64_t handle;
+    uint64_t frame_seq;
+    uint32_t process_id;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t vendor_id;
+    uint32_t device_id;
+    uint32_t status;
+    uint32_t version;
+    uint32_t slot;
+} DisplayGpuPacket;
+#pragma pack(pop)
+
 #endif
