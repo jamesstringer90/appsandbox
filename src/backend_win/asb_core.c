@@ -47,6 +47,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 /* ---- Globals ---- */
 
 static GpuList g_gpu_list;
+static void asb_log(const wchar_t *fmt, ...);
 
 static const GpuInfo *find_gpu(const wchar_t *gpu_id)
 {
@@ -145,6 +146,51 @@ static void prepare_gl_layers_share(GpuDriverShareList *shares)
     }
 
     gpu_append_gl_layers_share(shares, dir);
+}
+
+/* Build the complete GPU share list in one place so initial creation, HCS
+ * recreation, and reconnect-to-running all advertise identical metadata. */
+static void prepare_gpu_shares(const wchar_t *os_type, int gpu_mode,
+                               const wchar_t *gpu_id, BOOL copy_nvidia_smi,
+                               GpuDriverShareList *shares)
+{
+    ZeroMemory(shares, sizeof(*shares));
+    if (gpu_mode != GPU_DEFAULT) return;
+
+    gpu_get_driver_shares(&g_gpu_list, shares);
+    /* For Linux guests, also expose the host's lxss\lib so the
+     * Linux agent mounts it at /usr/lib/wsl/lib alongside the
+     * per-GPU driver shares. Windows guests have no use for it. */
+    if (_wcsicmp(os_type, L"Linux") == 0) {
+        gpu_append_lxsslib_share(shares);
+    } else if (_wcsicmp(os_type, L"Windows") == 0) {
+        gpu_append_amd_gl_vk_driver_shares(&g_gpu_list, shares);
+        gpu_append_nvidia_drs_share(&g_gpu_list, shares);
+        gpu_append_nvidia_graphics_shim_share(&g_gpu_list, shares);
+        if (copy_nvidia_smi)
+            gpu_append_nvidia_smi_share(&g_gpu_list, gpu_id, shares);
+        prepare_gl_layers_share(shares);
+    }
+}
+
+static BOOL normalize_copy_nvidia_smi(BOOL requested, const wchar_t *os_type,
+                                      int gpu_mode, const wchar_t *gpu_id,
+                                      BOOL is_template)
+{
+    if (!requested) return FALSE;
+    if (is_template || !os_type || _wcsicmp(os_type, L"Windows") != 0) {
+        asb_log(L"NVIDIA-SMI: requested for an unsupported guest/template; ignoring option.");
+        return FALSE;
+    }
+    if (gpu_mode != GPU_DEFAULT) {
+        asb_log(L"NVIDIA-SMI: requested without Default GPU mode; ignoring option.");
+        return FALSE;
+    }
+    if (!gpu_nvidia_smi_selection_supported(&g_gpu_list, gpu_id)) {
+        asb_log(L"NVIDIA-SMI: requested but the selected GPU is not an unambiguous NVIDIA adapter; ignoring option.");
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static VmInstance g_vms[ASB_MAX_VMS];
@@ -566,6 +612,8 @@ static void save_vm_list(void)
             fwprintf(f, L"IsTemplate=1\n");
         if (g_vms[i].test_mode)
             fwprintf(f, L"TestMode=1\n");
+        if (g_vms[i].copy_nvidia_smi)
+            fwprintf(f, L"CopyNvidiaSmi=1\n");
         if (g_vms[i].admin_user[0])
             fwprintf(f, L"AdminUser=%s\n", g_vms[i].admin_user);
         if (g_vms[i].ssh_enabled)
@@ -719,6 +767,8 @@ static void load_vm_list(void)
             vm->is_template = (_wtoi(line + 11) != 0);
         else if (wcsncmp(line, L"TestMode=", 9) == 0)
             vm->test_mode = (_wtoi(line + 9) != 0);
+        else if (wcsncmp(line, L"CopyNvidiaSmi=", 14) == 0)
+            vm->copy_nvidia_smi = (_wtoi(line + 14) != 0);
         else if (wcsncmp(line, L"AdminUser=", 10) == 0)
             wcscpy_s(vm->admin_user, 128, line + 10);
         else if (wcsncmp(line, L"SshEnabled=", 11) == 0)
@@ -1139,20 +1189,9 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         }
     }
 
-    if (args->config.gpu_mode == GPU_DEFAULT) {
-        gpu_get_driver_shares(&g_gpu_list, &args->config.gpu_shares);
-        /* For Linux guests, also expose the host's lxss\lib so the
-         * Linux agent mounts it at /usr/lib/wsl/lib alongside the
-         * per-GPU driver shares. Windows guests have no use for it. */
-        if (_wcsicmp(args->config.os_type, L"Linux") == 0)
-            gpu_append_lxsslib_share(&args->config.gpu_shares);
-        else if (_wcsicmp(args->config.os_type, L"Windows") == 0) {
-            gpu_append_amd_gl_vk_driver_shares(&g_gpu_list, &args->config.gpu_shares);
-            gpu_append_nvidia_drs_share(&g_gpu_list, &args->config.gpu_shares);
-            gpu_append_nvidia_graphics_shim_share(&g_gpu_list, &args->config.gpu_shares);
-            prepare_gl_layers_share(&args->config.gpu_shares);
-        }
-    }
+    prepare_gpu_shares(args->config.os_type, args->config.gpu_mode,
+                       args->config.gpu_id, args->config.copy_nvidia_smi,
+                       &args->config.gpu_shares);
 
     asb_log(L"Re-creating HCS compute system for \"%s\"...", vm->name);
     hr = (endpoint_guid_str[0] != L'\0')
@@ -3174,6 +3213,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     cfg.network_mode = config->network_mode;
     cfg.test_mode = config->test_mode;
     cfg.ssh_enabled = config->ssh_enabled;
+    cfg.copy_nvidia_smi = config->copy_nvidia_smi;
     /* Key deploy needs SSH; prepare the AppSandbox keypair now so the build path
        stores the public key on the instance (the agent deploys it at runtime). */
     cfg.ssh_deploy_key = config->ssh_deploy_key && config->ssh_enabled;
@@ -3283,6 +3323,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         cfg.gpu_id[0] = L'\0';
         cfg.network_mode = NET_NONE;
     }
+    cfg.copy_nvidia_smi = normalize_copy_nvidia_smi(cfg.copy_nvidia_smi,
+        cfg.os_type, cfg.gpu_mode, cfg.gpu_id, is_template_create);
 
     if (cfg.network_mode != NET_NONE) {
         hr = ensure_vm_mac_address(inst);
@@ -3317,21 +3359,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     }
     swprintf_s(cfg.vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
 
-    /* GPU driver shares */
-    if (cfg.gpu_mode == GPU_DEFAULT && !is_template_create) {
-        gpu_get_driver_shares(&g_gpu_list, &cfg.gpu_shares);
-        /* Linux guests additionally consume %SystemRoot%\System32\lxss\lib
-         * (NVIDIA's WSL-staged Linux userspace .so files), mounted at
-         * /usr/lib/wsl/lib by the agent on first connect. */
-        if (_wcsicmp(cfg.os_type, L"Linux") == 0)
-            gpu_append_lxsslib_share(&cfg.gpu_shares);
-        else if (_wcsicmp(cfg.os_type, L"Windows") == 0) {
-            gpu_append_amd_gl_vk_driver_shares(&g_gpu_list, &cfg.gpu_shares);
-            gpu_append_nvidia_drs_share(&g_gpu_list, &cfg.gpu_shares);
-            gpu_append_nvidia_graphics_shim_share(&g_gpu_list, &cfg.gpu_shares);
-            prepare_gl_layers_share(&cfg.gpu_shares);
-        }
-    }
+    prepare_gpu_shares(cfg.os_type, cfg.gpu_mode, cfg.gpu_id,
+                       cfg.copy_nvidia_smi, &cfg.gpu_shares);
 
     /* ---- VHDX-first path (Windows, from ISO) ---- */
     {
@@ -3358,6 +3387,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->test_mode = cfg.test_mode;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
             inst->ssh_enabled = cfg.ssh_enabled;
+            inst->copy_nvidia_smi = cfg.copy_nvidia_smi;
             inst->ssh_deploy_key = cfg.ssh_deploy_key;
             if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
             inst->building_vhdx = TRUE;
@@ -3429,6 +3459,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->test_mode = cfg.test_mode;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
             inst->ssh_enabled = cfg.ssh_enabled;
+            inst->copy_nvidia_smi = cfg.copy_nvidia_smi;
             inst->ssh_deploy_key = cfg.ssh_deploy_key;
             if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
             inst->building_vhdx = TRUE;
@@ -3733,6 +3764,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->config.test_mode = inst->test_mode;
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
+        args->config.copy_nvidia_smi = inst->copy_nvidia_smi;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
         args->network_mode = inst->network_mode;
         inst->network_cleaned = FALSE;
@@ -4086,6 +4118,9 @@ ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *
     wcscpy_s(g_vms[idx].gpu_id, ARRAYSIZE(g_vms[idx].gpu_id),
         gpu_id && gpu_id[0] ? find_gpu(gpu_id)->interface_path : L"");
     update_vm_gpu_name(&g_vms[idx]);
+    g_vms[idx].copy_nvidia_smi = normalize_copy_nvidia_smi(
+        g_vms[idx].copy_nvidia_smi, g_vms[idx].os_type,
+        g_vms[idx].gpu_mode, g_vms[idx].gpu_id, g_vms[idx].is_template);
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
     return S_OK;
@@ -4369,6 +4404,9 @@ ASB_API void asb_reconnect_running(void)
     for (i = 0; i < g_vm_count; i++) {
         if (g_vms[i].running) continue;  /* already tracked */
         if (hcs_try_open_vm(&g_vms[i])) {
+            prepare_gpu_shares(g_vms[i].os_type, g_vms[i].gpu_mode,
+                               g_vms[i].gpu_id, g_vms[i].copy_nvidia_smi,
+                               &g_vms[i].gpu_shares);
             /* Full reconnect: we have a handle, so register callback + monitor */
             hcs_register_vm_callback(&g_vms[i]);
             hcs_start_monitor(&g_vms[i]);

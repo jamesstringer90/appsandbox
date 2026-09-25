@@ -119,6 +119,13 @@ def run_vm_lifecycle(spec):
     cfg = dict(name=name, osType=os_type, ramMb=ram, hddGb=hdd, cpuCores=cores,
                gpuMode=1, networkMode=1, testMode=True, sshEnabled=True, sshDeployKey=True,
                adminUser="user", adminPass="test123")
+    expect_nvidia_smi = False
+    if os_type == "Windows" and os.environ.get("ASB_TEST_NVIDIA_SMI") == "1":
+        nvidia = next((g for g in c.host().get("gpus", []) if g.get("isNvidia") is True), None)
+        if nvidia:
+            cfg["gpuId"] = nvidia["id"]
+            cfg["copyNvidiaSmi"] = True
+            expect_nvidia_smi = True
     if image:   # macOS may omit it (cached/auto-fetched restore image)
         cfg["imagePath"] = image
     try:
@@ -204,6 +211,9 @@ def run_vm_lifecycle(spec):
         check("status osType == %s" % os_type, son["osType"] == os_type, "got=%s" % son["osType"])
         check("status ramMb == %d" % ram, son["ramMb"] == ram, "got=%s" % son["ramMb"])
         check("status cpuCores == %d" % cores, son["cpuCores"] == cores, "got=%s" % son["cpuCores"])
+        check("copyNvidiaSmi status round-trips",
+              son.get("copyNvidiaSmi") == expect_nvidia_smi,
+              "expected=%r got=%r" % (expect_nvidia_smi, son.get("copyNvidiaSmi")))
 
         # --- SSH key auto-deploy (this VM was created with sshEnabled + sshDeployKey).
         #     Once online the guest agent writes the AppSandbox public key into the

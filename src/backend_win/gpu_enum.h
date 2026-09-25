@@ -3,6 +3,12 @@
 
 #include <windows.h>
 
+#ifdef ASB_BUILDING_DLL
+#define GPU_ENUM_API __declspec(dllexport)
+#else
+#define GPU_ENUM_API __declspec(dllimport)
+#endif
+
 #define MAX_GPUS 16
 #define MAX_GPU_SHARES 64
 
@@ -40,6 +46,8 @@ typedef struct {
    Returns TRUE on success. */
 BOOL gpu_enumerate(GpuList *list);
 BOOL gpu_is_available(const wchar_t *gpu_id);
+GPU_ENUM_API BOOL gpu_info_is_nvidia(const GpuInfo *gpu);
+BOOL gpu_nvidia_smi_selection_supported(const GpuList *gpu_list, const wchar_t *gpu_id);
 
 /* Get the DriverStore folder path for the default GPU-PV capable GPU.
    Returns TRUE and fills out_path on success.
@@ -56,6 +64,8 @@ BOOL gpu_get_driver_shares(GpuList *gpu_list, GpuDriverShareList *out);
 BOOL gpu_append_amd_gl_vk_driver_shares(const GpuList *gpu_list, GpuDriverShareList *list);
 BOOL gpu_append_nvidia_drs_share(const GpuList *gpu_list, GpuDriverShareList *list);
 BOOL gpu_append_nvidia_graphics_shim_share(const GpuList *gpu_list, GpuDriverShareList *list);
+BOOL gpu_append_nvidia_smi_share(const GpuList *gpu_list, const wchar_t *gpu_id,
+                                  GpuDriverShareList *list);
 
 /* Append the host's lxss\lib directory as a synthetic Plan9 share entry
    (name "AppSandbox.HostLxssLib") to a share list. Linux guests need

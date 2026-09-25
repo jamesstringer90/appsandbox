@@ -110,8 +110,10 @@ class Client:
 
     def create(self, **cfg):
         """Create a VM. Config keys: name, osType, imagePath|templateName, ramMb,
-        hddGb, cpuCores, gpuMode(0-2), networkMode(0-3), netAdapter, adminUser,
-        adminPass, testMode, sshEnabled, sshDeployKey, isTemplate. sshDeployKey
+        hddGb, cpuCores, gpuMode(0-2), copyNvidiaSmi, networkMode(0-3), netAdapter,
+        adminUser, adminPass, testMode, sshEnabled, sshDeployKey, isTemplate.
+        copyNvidiaSmi is an optional create-only Windows-host/Windows-guest flag
+        and defaults to False. sshDeployKey
         (requires sshEnabled) deploys the AppSandbox public key so you can SSH in
         with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
         once it lands. The daemon validates these exactly like the GUI; ramMb is

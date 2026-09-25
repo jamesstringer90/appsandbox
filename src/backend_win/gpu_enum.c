@@ -6,6 +6,7 @@
 #include <wbemidl.h>
 #include <oleauto.h>
 #include <stdio.h>
+#include <winver.h>
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
@@ -13,6 +14,7 @@
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "version.lib")
 
 /* {064092b3-625e-43bf-9eb5-dc845897dd59} — GPU Partition Adapter interface */
 static const GUID GUID_GPU_PARTITION_ADAPTER = {
@@ -474,7 +476,228 @@ BOOL gpu_is_available(const wchar_t *gpu_id)
     return found;
 }
 
+BOOL gpu_info_is_nvidia(const GpuInfo *gpu)
+{
+    if (!gpu) return FALSE;
+    return _wcsicmp(gpu->service, L"nvlddmkm") == 0 ||
+           _wcsnicmp(gpu->instance_path, L"PCI\\VEN_10DE&", 13) == 0;
+}
+
+static const GpuInfo *nvidia_smi_selected_gpu(const GpuList *gpu_list,
+                                               const wchar_t *gpu_id)
+{
+    int i;
+    if (!gpu_list) return NULL;
+    if (gpu_id && gpu_id[0]) {
+        for (i = 0; i < gpu_list->count; i++)
+            if (_wcsicmp(gpu_list->gpus[i].interface_path, gpu_id) == 0)
+                return gpu_info_is_nvidia(&gpu_list->gpus[i]) ? &gpu_list->gpus[i] : NULL;
+        return NULL;
+    }
+
+    /* HCS does not disclose which adapter AssignmentMode=Default will choose.
+       Only treat it as NVIDIA when every available GPU-PV adapter is NVIDIA. */
+    if (gpu_list->count == 0) return NULL;
+    for (i = 0; i < gpu_list->count; i++)
+        if (!gpu_info_is_nvidia(&gpu_list->gpus[i])) return NULL;
+    return &gpu_list->gpus[0];
+}
+
+BOOL gpu_nvidia_smi_selection_supported(const GpuList *gpu_list, const wchar_t *gpu_id)
+{
+    return nvidia_smi_selected_gpu(gpu_list, gpu_id) != NULL;
+}
+
 /* ---- Share helpers ---- */
+
+static BOOL file_exists(const wchar_t *path)
+{
+    DWORD attrs = GetFileAttributesW(path);
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static BOOL find_file_recursive(const wchar_t *dir, const wchar_t *filename,
+                                wchar_t *out, size_t out_count)
+{
+    wchar_t pattern[MAX_PATH], path[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE find;
+
+    if (!dir || !dir[0] || wcslen(dir) + 3 >= MAX_PATH) return FALSE;
+    swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
+    find = FindFirstFileW(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == 0 ||
+            (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0))) continue;
+        if (wcslen(dir) + wcslen(fd.cFileName) + 2 >= MAX_PATH) continue;
+        swprintf_s(path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                find_file_recursive(path, filename, out, out_count)) {
+                FindClose(find);
+                return TRUE;
+            }
+        } else if (_wcsicmp(fd.cFileName, filename) == 0) {
+            wcscpy_s(out, out_count, path);
+            FindClose(find);
+            return TRUE;
+        }
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    return FALSE;
+}
+
+static void parent_directory(const wchar_t *path, wchar_t *out, size_t out_count)
+{
+    wchar_t *slash;
+    wcscpy_s(out, out_count, path);
+    slash = wcsrchr(out, L'\\');
+    if (slash) *slash = 0;
+}
+
+static BOOL fixed_file_version(const wchar_t *path, VS_FIXEDFILEINFO *out)
+{
+    DWORD ignored = 0, size;
+    BYTE *data;
+    VS_FIXEDFILEINFO *info = NULL;
+    UINT info_size = 0;
+    BOOL ok = FALSE;
+
+    size = GetFileVersionInfoSizeW(path, &ignored);
+    if (!size) return FALSE;
+    data = HeapAlloc(GetProcessHeap(), 0, size);
+    if (!data) return FALSE;
+    if (GetFileVersionInfoW(path, 0, size, data) &&
+        VerQueryValueW(data, L"\\", (void **)&info, &info_size) &&
+        info && info_size >= sizeof(*info) && info->dwSignature == VS_FFI_SIGNATURE) {
+        *out = *info;
+        ok = TRUE;
+    }
+    HeapFree(GetProcessHeap(), 0, data);
+    return ok;
+}
+
+static BOOL nvidia_smi_versions_match(const wchar_t *exe, const wchar_t *dll)
+{
+    VS_FIXEDFILEINFO a, b;
+    if (!fixed_file_version(exe, &a) || !fixed_file_version(dll, &b)) return FALSE;
+    return a.dwFileVersionMS == b.dwFileVersionMS &&
+           a.dwFileVersionLS == b.dwFileVersionLS;
+}
+
+static int append_candidate(wchar_t paths[4][MAX_PATH], int count, const wchar_t *path)
+{
+    int i;
+    if (!file_exists(path)) return count;
+    for (i = 0; i < count; i++)
+        if (_wcsicmp(paths[i], path) == 0) return count;
+    if (count < 4) wcscpy_s(paths[count++], MAX_PATH, path);
+    return count;
+}
+
+static BOOL append_nvidia_smi_mapping(GpuDriverShareList *list, const wchar_t *name,
+                                      const wchar_t *source, const wchar_t *filter)
+{
+    GpuDriverShare *share = &list->shares[list->count++];
+    wcscpy_s(share->share_name, ARRAYSIZE(share->share_name), name);
+    wcscpy_s(share->host_path, ARRAYSIZE(share->host_path), source);
+    wcscpy_s(share->guest_path, ARRAYSIZE(share->guest_path), L"C:\\Windows\\System32");
+    wcscpy_s(share->file_filter, ARRAYSIZE(share->file_filter), filter);
+    return TRUE;
+}
+
+BOOL gpu_append_nvidia_smi_share(const GpuList *gpu_list, const wchar_t *gpu_id,
+                                  GpuDriverShareList *list)
+{
+#if defined(_M_X64)
+    const GpuInfo *gpu;
+    wchar_t exe_candidates[4][MAX_PATH] = {{0}}, dll_candidates[4][MAX_PATH] = {{0}};
+    wchar_t path[MAX_PATH], sys[MAX_PATH], nv_dir[MAX_PATH];
+    wchar_t exe_dir[MAX_PATH], dll_dir[MAX_PATH];
+    DWORD length;
+    int exe_count = 0, dll_count = 0, i, j, needed;
+
+    if (!gpu_list || !list) return FALSE;
+    for (i = 0; i < list->count; i++)
+        if (_wcsnicmp(list->shares[i].share_name, L"AppSandbox.NvidiaSmi", 20) == 0)
+            return TRUE;
+
+    gpu = nvidia_smi_selected_gpu(gpu_list, gpu_id);
+    if (!gpu) {
+        ui_log(L"NVIDIA-SMI: requested but the selected GPU is not an unambiguous NVIDIA adapter.");
+        return FALSE;
+    }
+
+    if (gpu->driver_store_path[0]) {
+        if (find_file_recursive(gpu->driver_store_path, L"nvidia-smi.exe", path, MAX_PATH))
+            exe_count = append_candidate(exe_candidates, exe_count, path);
+        if (find_file_recursive(gpu->driver_store_path, L"nvml.dll", path, MAX_PATH))
+            dll_count = append_candidate(dll_candidates, dll_count, path);
+    }
+
+    length = GetSystemDirectoryW(sys, MAX_PATH);
+    if (length && length < MAX_PATH) {
+        swprintf_s(path, MAX_PATH, L"%s\\nvidia-smi.exe", sys);
+        exe_count = append_candidate(exe_candidates, exe_count, path);
+        swprintf_s(path, MAX_PATH, L"%s\\nvml.dll", sys);
+        dll_count = append_candidate(dll_candidates, dll_count, path);
+    }
+
+    length = GetEnvironmentVariableW(L"ProgramFiles", nv_dir, MAX_PATH);
+    if (length && length < MAX_PATH &&
+        wcslen(nv_dir) + wcslen(L"\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe") < MAX_PATH) {
+        wcscat_s(nv_dir, MAX_PATH, L"\\NVIDIA Corporation\\NVSMI");
+        swprintf_s(path, MAX_PATH, L"%s\\nvidia-smi.exe", nv_dir);
+        exe_count = append_candidate(exe_candidates, exe_count, path);
+        swprintf_s(path, MAX_PATH, L"%s\\nvml.dll", nv_dir);
+        dll_count = append_candidate(dll_candidates, dll_count, path);
+    }
+
+    if (!exe_count) {
+        ui_log(L"NVIDIA-SMI: requested but nvidia-smi.exe was not found in the selected NVIDIA driver package or installed NVIDIA locations.");
+        return FALSE;
+    }
+    if (!dll_count) {
+        ui_log(L"NVIDIA-SMI: requested but nvml.dll was not found in the selected NVIDIA driver package or installed NVIDIA locations.");
+        return FALSE;
+    }
+
+    for (i = 0; i < exe_count; i++) {
+        for (j = 0; j < dll_count; j++) {
+            if (!nvidia_smi_versions_match(exe_candidates[i], dll_candidates[j])) continue;
+            parent_directory(exe_candidates[i], exe_dir, MAX_PATH);
+            parent_directory(dll_candidates[j], dll_dir, MAX_PATH);
+            needed = _wcsicmp(exe_dir, dll_dir) == 0 ? 1 : 2;
+            if (list->count + needed > MAX_GPU_SHARES) {
+                ui_log(L"NVIDIA-SMI: GPU share list is full, skipping optional utility.");
+                return FALSE;
+            }
+            if (needed == 1)
+                append_nvidia_smi_mapping(list, L"AppSandbox.NvidiaSmi", exe_dir,
+                                          L"nvidia-smi.exe;nvml.dll");
+            else {
+                append_nvidia_smi_mapping(list, L"AppSandbox.NvidiaSmi", exe_dir,
+                                          L"nvidia-smi.exe");
+                append_nvidia_smi_mapping(list, L"AppSandbox.NvidiaSmi.Nvml", dll_dir,
+                                          L"nvml.dll");
+            }
+            ui_log(L"NVIDIA-SMI: provision sources selected: %s and %s.",
+                   exe_candidates[i], dll_candidates[j]);
+            return TRUE;
+        }
+    }
+
+    ui_log(L"NVIDIA-SMI: nvidia-smi.exe and nvml.dll versions are incompatible; skipping optional utility.");
+    return FALSE;
+#else
+    (void)gpu_list;
+    (void)gpu_id;
+    (void)list;
+    ui_log(L"NVIDIA-SMI: x64 NVIDIA-SMI provisioning is unavailable on this host architecture.");
+    return FALSE;
+#endif
+}
 
 /* Add a share entry if the host_path is not already in the list.
    If filename is non-NULL, appends it to the file_filter (semicolon-separated).

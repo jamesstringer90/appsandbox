@@ -37,6 +37,10 @@ VM installs concurrently from the preserved original. A full run builds real
 guests — it is long (a Windows install + sysprep, or a macOS IPSW download +
 install, can each take 20–45 min) and uses real disk and bandwidth.
 
+On a Windows host with NVIDIA GPU-PV support, set `ASB_TEST_NVIDIA_SMI=1` to
+make the Windows lifecycle select an explicit NVIDIA adapter and exercise the
+opt-in `copyNvidiaSmi` status/provisioning path. It remains off by default.
+
 ## Files
 
 | File | What it covers |
