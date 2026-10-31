@@ -1502,7 +1502,7 @@ int asb_mac_open_display(const char *name) {
         AsbIvshmemTransport *t = g_transport_refs[idx];
         if (!t)                          return BACKEND_ERR_NOT_RUNNING;
         if (g_display_refs[idx]) {   /* already open -> focus */
-            [(IddDisplayWindow *)g_display_refs[idx] showDisplay];
+            [[(IddDisplayWindow *)g_display_refs[idx] window] makeKeyAndOrderFront:nil];
             return BACKEND_OK;
         }
         NSString *nsName = [NSString stringWithUTF8String:name];
@@ -1516,7 +1516,7 @@ int asb_mac_open_display(const char *name) {
     if (!g_vms[idx].running || !g_vms[idx].vz_handle) return BACKEND_ERR_NOT_RUNNING;
     if (!g_vms[idx].agent_online)                     return BACKEND_ERR_NOT_READY;
     if (g_display_refs[idx]) {   /* already open -> focus */
-        [(VzDisplayWindow *)g_display_refs[idx] showDisplay];
+        [[(VzDisplayWindow *)g_display_refs[idx] window] makeKeyAndOrderFront:nil];
         return BACKEND_OK;
     }
     VzDisplayWindow *display = [[VzDisplayWindow alloc] initWithVzVm:g_vms[idx].vz_handle];
