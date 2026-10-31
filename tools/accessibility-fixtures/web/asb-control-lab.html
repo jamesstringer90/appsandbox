@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>AppSandbox control lab</title>
+<style>body{font:18px system-ui;margin:24px;max-width:1050px;padding-bottom:110px}h1{font-size:28px}fieldset{margin:16px 0;padding:16px}button,input,select,textarea{font:inherit;margin:7px;padding:6px}label{display:inline-block;margin-right:12px}textarea{display:block;width:90%}table{border-collapse:collapse;width:90%}th,td{border:1px solid #888;padding:10px}[role=tab][aria-selected=true]{background:#c9e2ff}#log{position:fixed;bottom:0;left:0;right:0;background:#182638;color:white;margin:0;padding:10px;font-size:16px;z-index:5}.spacer{height:1600px;background:linear-gradient(#f8f8f8,#ecf4ff);padding:12px}#nested{height:150px;overflow:auto;border:2px solid #555}dialog{min-width:400px}details{margin:12px}</style>
+<h1 id="top">AppSandbox control lab</h1>
+<p>Local controls with observable outcomes. No data leaves this page.</p>
+<fieldset><legend>Buttons and choices</legend>
+<button id="press">Count press</button><output id="count">Press count: 0</output>
+<button disabled>Unavailable button</button>
+<label><input id="check" type="checkbox">Meal included</label>
+<label><input id="switch" type="checkbox" role="switch">Notifications</label>
+<label><input id="mixed" type="checkbox">Partially packed</label>
+<label><input type="radio" name="seat" value="Window">Window seat</label>
+<label><input type="radio" name="seat" value="Aisle">Aisle seat</label>
+</fieldset>
+<fieldset><legend>Values and menus</legend>
+<label>Volume <input id="volume" type="range" min="0" max="10" value="4"></label><output id="volout">Volume: 4</output>
+<label>Travelers <input id="number" type="number" min="1" max="9" value="2"></label>
+<label>Destination <select id="destination"><option>Gore</option><option>Queenstown</option><option>Dunedin</option></select></label>
+<label>Activities <select id="activities" size="3" multiple><option>Art gallery</option><option>Fishing</option><option>Aviation museum</option></select></label>
+<button id="open-dialog">Open trip dialog</button>
+</fieldset>
+<fieldset><legend>Text editing</legend>
+<label>Report title <input id="title" value="Draft trip report"></label>
+<label>Access code <input id="secret" type="password" value="sample-code"></label>
+<label>Read only reference <input id="readonly" readonly value="NZ-READONLY"></label>
+<label for="notes">Trip notes</label><textarea id="notes" rows="3">Plan a quiet morning in Gore. Visit the gallery after lunch.</textarea>
+<div aria-label="Rich trip notes" contenteditable="true" role="textbox" aria-multiline="true">A <b>bold</b> idea and an <i>italic</i> note.</div>
+</fieldset>
+<fieldset><legend>Tabs and disclosure</legend>
+<div role="tablist" aria-label="Trip sections"><button role="tab" aria-selected="true" id="tab-plan" aria-controls="panel">Plan</button><button role="tab" aria-selected="false" id="tab-cost" aria-controls="panel">Costs</button></div>
+<div id="panel" role="tabpanel" aria-labelledby="tab-plan">Plan panel: explore Gore.</div>
+<details id="details"><summary>Show packing details</summary><p>Packing details: raincoat, boots, and camera.</p></details>
+<ul role="tree" aria-label="Itinerary tree"><li role="treeitem" tabindex="0" aria-expanded="false" id="tree-day">Day one<ul role="group" hidden><li role="treeitem" tabindex="0">Morning gallery</li><li role="treeitem" tabindex="0">Afternoon walk</li></ul></li></ul>
+</fieldset>
+<table aria-label="Accommodation table"><caption>Accommodation choices</caption><thead><tr><th>Hotel</th><th>Nights</th><th>Cost</th></tr></thead><tbody><tr><td>River Lodge</td><td>2</td><td>$240</td></tr><tr><td>Town Inn</td><td>3</td><td>$330</td></tr></tbody></table>
+<p><label>Download progress <progress value="65" max="100">65%</progress></label> <meter aria-label="Disk usage" value="0.4">40%</meter></p>
+<div id="nested" tabindex="0" aria-label="Nested scrolling area"><p>Nested area start</p><div style="height:600px"></div><button id="nested-button">Nested bottom target</button><output id="nested-result">Nested target not pressed</output></div>
+<fieldset><legend>Long lists and nested selection</legend>
+<p id="long-list-label">Itinerary components</p><select id="long-list" aria-labelledby="long-list-label" size="5"></select><output id="long-list-result">Selected component: Component 01</output>
+<p id="multi-list-label">Packing components</p><select id="multi-list" aria-labelledby="multi-list-label" size="4" multiple></select><output id="multi-list-result">Selected packing: none</output>
+<div id="selection-nest" style="height:170px;overflow:auto;border:2px solid #555" tabindex="0" aria-label="Nested component region"><p>Nested component region start</p><div style="height:500px"></div><label><input type="checkbox" id="nested-check">Nested camera packed</label><p><label>Nested destination <select id="nested-destination"><option>Gore</option><option>Invercargill</option><option>Te Anau</option></select></label></p><output id="nested-selection-result">Nested selections unchanged</output></div>
+</fieldset>
+<fieldset><legend>Search suggestions and command menus</legend>
+<label>Search Southland towns <input id="town-search" list="town-options" autocomplete="off"></label><datalist id="town-options"><option value="Gore"><option value="Invercargill"><option value="Mataura"><option value="Te Anau"><option value="Winton"></datalist><output id="town-result">Town search: empty</output>
+<button id="command-button" aria-haspopup="menu" aria-expanded="false" aria-controls="command-menu">Trip commands</button>
+<div id="command-menu" role="menu" aria-label="Trip commands" hidden><button role="menuitem" tabindex="-1" id="command-copy">Copy itinerary summary</button><button role="menuitemcheckbox" tabindex="-1" aria-checked="false" id="command-favorite">Mark trip favorite</button><button role="menuitem" tabindex="-1" aria-haspopup="menu" aria-expanded="false" aria-controls="export-menu" id="command-export">Export options</button><div id="export-menu" role="menu" aria-label="Export options" hidden><button role="menuitem" tabindex="-1" id="export-text">Preview text export</button><button role="menuitem" tabindex="-1" id="export-calendar">Preview calendar export</button></div></div><output id="command-result">No command selected</output>
+</fieldset>
+<div class="spacer">Long page gap: controls below are initially offscreen.</div>
+<h2 id="bottom">Offscreen controls</h2><button id="offscreen-button">Offscreen count press</button><output id="off-count">Offscreen count: 0</output>
+<label><input id="offscreen-check" type="checkbox">Offscreen breakfast</label>
+<details id="offscreen-details"><summary>Offscreen itinerary details</summary><p>Tomorrow: visit the Hokonui Moonshine Museum.</p></details>
+<a href="#title" id="return-link">Return to report title</a>
+<p id="top-result">Navigation target reached.</p>
+<dialog id="dialog"><h2>Trip dialog</h2><label>Reference <input value="NZ-14"></label><button id="close-dialog">Close trip dialog</button></dialog>
+<output id="log" aria-live="polite">Last action: none</output>
+<script>
+let presses=0, offpresses=0;
+const $=id=>document.getElementById(id);
+const report=text=>$('log').textContent='Last action: '+text;
+$('mixed').indeterminate=true;
+for(let i=1;i<=80;i++) $('long-list').add(new Option('Component '+String(i).padStart(2,'0')+(i===73?' — Hokonui Museum ticket':''),String(i)));
+for(let i=1;i<=24;i++) $('multi-list').add(new Option('Packing item '+String(i).padStart(2,'0'),String(i)));
+$('long-list').onchange=()=>{$('long-list-result').textContent='Selected component: '+$('long-list').selectedOptions[0].textContent};
+$('multi-list').onchange=()=>{$('multi-list-result').textContent='Selected packing: '+([...$('multi-list').selectedOptions].map(x=>x.textContent).join(', ')||'none')};
+for(const id of ['nested-check','nested-destination']) $(id).onchange=()=>{$('nested-selection-result').textContent='Camera: '+$('nested-check').checked+'; Destination: '+$('nested-destination').value};
+$('town-search').oninput=()=>{$('town-result').textContent='Town search: '+($('town-search').value||'empty')};
+const setMenu=open=>{$('command-menu').hidden=!open;$('command-button').setAttribute('aria-expanded',String(open));if(open)$('command-copy').focus();else{$('export-menu').hidden=true;$('command-export').setAttribute('aria-expanded','false');$('command-button').focus()}};
+$('command-button').onclick=()=>setMenu($('command-menu').hidden);
+$('command-button').onkeydown=e=>{if(e.key==='ArrowDown'){setMenu(true);e.preventDefault()}};
+$('command-copy').onclick=()=>{$('command-result').textContent='Selected command: Copy itinerary summary';report('Copy itinerary summary');setMenu(false)};
+$('command-favorite').onclick=()=>{const enabled=$('command-favorite').getAttribute('aria-checked')!=='true';$('command-favorite').setAttribute('aria-checked',String(enabled));$('command-result').textContent='Favorite: '+enabled;report('Favorite: '+enabled);setMenu(false)};
+$('command-export').onclick=()=>{$('export-menu').hidden=false;$('command-export').setAttribute('aria-expanded','true');$('export-text').focus()};
+for(const id of ['export-text','export-calendar']) $(id).onclick=()=>{$('command-result').textContent='Selected command: '+$(id).textContent;report($(id).textContent);setMenu(false)};
+$('command-menu').onkeydown=e=>{const scope=e.target.closest('[role=menu]');const items=[...scope.children].filter(x=>x.matches('button'));const i=items.indexOf(document.activeElement);if(e.key==='ArrowDown'||e.key==='ArrowUp'){items[(i+(e.key==='ArrowDown'?1:items.length-1))%items.length].focus();e.preventDefault()}else if(e.key==='Home'||e.key==='End'){items[e.key==='Home'?0:items.length-1].focus();e.preventDefault()}else if(e.key==='Escape'){if(scope.id==='export-menu'){$('export-menu').hidden=true;$('command-export').setAttribute('aria-expanded','false');$('command-export').focus()}else setMenu(false);e.preventDefault()}else if(e.key==='ArrowRight'&&e.target.id==='command-export'){$('command-export').click();e.preventDefault()}else if(e.key==='ArrowLeft'&&scope.id==='export-menu'){$('export-menu').hidden=true;$('command-export').setAttribute('aria-expanded','false');$('command-export').focus();e.preventDefault()}};
+$('press').onclick=()=>{$('count').textContent='Press count: '+(++presses);report('Count press '+presses)};
+$('offscreen-button').onclick=()=>{$('off-count').textContent='Offscreen count: '+(++offpresses);report('Offscreen count press '+offpresses)};
+$('volume').oninput=()=>{$('volout').textContent='Volume: '+$('volume').value};
+$('open-dialog').onclick=()=>{$('dialog').showModal();report('Trip dialog opened')};
+$('close-dialog').onclick=()=>{$('dialog').close();report('Trip dialog closed')};
+for(const id of ['tab-plan','tab-cost']) $(id).onclick=()=>{for(const t of ['tab-plan','tab-cost'])$(t).setAttribute('aria-selected',String(t===id));$('panel').setAttribute('aria-labelledby',id);$('panel').textContent=id==='tab-cost'?'Costs panel: budget $2,400.':'Plan panel: explore Gore.';report($(id).textContent+' tab selected')};
+$('tree-day').onclick=e=>{if(e.target!==$('tree-day'))return;const open=$('tree-day').getAttribute('aria-expanded')!=='true';$('tree-day').setAttribute('aria-expanded',String(open));$('tree-day').querySelector('ul').hidden=!open;report('Day one '+(open?'expanded':'collapsed'))};
+$('tree-day').onkeydown=e=>{if(e.key==='ArrowRight'||e.key==='ArrowLeft'){const open=e.key==='ArrowRight';$('tree-day').setAttribute('aria-expanded',String(open));$('tree-day').querySelector('ul').hidden=!open;report('Day one '+(open?'expanded':'collapsed'));e.preventDefault()}};
+$('nested-button').onclick=()=>{$('nested-result').textContent='Nested target pressed';report('Nested bottom target pressed')};
+document.addEventListener('change',e=>{const el=e.target;report((el.labels?.[0]?.textContent||el.id||el.name).trim()+': '+(el.type==='password'?'•'.repeat(el.value.length)+' ('+el.value.length+' characters)':((el.type==='checkbox'||el.type==='radio')?el.checked:el.value)))});
+for(const id of ['details','offscreen-details']) $(id).ontoggle=()=>report(id+' '+($(id).open?'expanded':'collapsed'));
+</script></html>
