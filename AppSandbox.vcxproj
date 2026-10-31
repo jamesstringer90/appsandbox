@@ -222,50 +222,7 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
   <ItemGroup>
     <ResourceCompile Include="src\app_win\appsandbox.rc" />
   </ItemGroup>
-  <ItemGroup>
-    <ProjectReference Include="tools\agent\agent.vcxproj">
-      <Project>{D4E5F6A7-B8C9-0123-4567-89ABCDEF0123}</Project>
-      <LinkLibraryDependencies>false</LinkLibraryDependencies>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
-    <ProjectReference Include="tools\agent\appsandbox-input.vcxproj">
-      <Project>{A2B3C4D5-E6F7-8901-ABCD-EF2345678901}</Project>
-      <LinkLibraryDependencies>false</LinkLibraryDependencies>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
-    <ProjectReference Include="tools\agent\appsandbox-displays.vcxproj">
-      <Project>{B3C4D5E6-F7A8-9012-BCDE-F34567890123}</Project>
-      <LinkLibraryDependencies>false</LinkLibraryDependencies>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
-    <ProjectReference Include="tools\agent\appsandbox-clipboard.vcxproj">
-      <Project>{C3D4E5F6-A7B8-9012-CDEF-345678901234}</Project>
-      <LinkLibraryDependencies>false</LinkLibraryDependencies>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
-    <ProjectReference Include="tools\agent\appsandbox-clipboard-reader.vcxproj">
-      <Project>{D4E5F6A7-B8C9-0123-CDEF-456789012345}</Project>
-      <LinkLibraryDependencies>false</LinkLibraryDependencies>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
-    <ProjectReference Include="tools\agent\appsandbox-audio.vcxproj">
-      <Project>{E5F6A7B8-C9D0-1234-EF01-567890123456}</Project>
-      <LinkLibraryDependencies>false</LinkLibraryDependencies>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
-    <ProjectReference Include="tools\agent\appsandbox-accessibility.vcxproj">
-      <Project>{6937A6FD-B562-42B4-8189-8AE572D37651}</Project>
-      <LinkLibraryDependencies>false</LinkLibraryDependencies>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
-  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <Target Name="StageGuestAgents" AfterTargets="Build">
-    <ItemGroup>
-      <GuestAgent Include="$(OutDir)appsandbox-agent.exe;$(OutDir)appsandbox-input.exe;$(OutDir)appsandbox-displays.exe;$(OutDir)appsandbox-clipboard.exe;$(OutDir)appsandbox-clipboard-reader.exe;$(OutDir)appsandbox-audio.exe;$(OutDir)appsandbox-accessibility.exe" />
-    </ItemGroup>
-    <Copy SourceFiles="@(GuestAgent)" DestinationFolder="$(OutDir)resources" />
-  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>

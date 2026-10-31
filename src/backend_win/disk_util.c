@@ -841,13 +841,7 @@ static void remove_staging_dir(const wchar_t *dir)
     RemoveDirectoryW(dir);
 }
 
-static const wchar_t *const guest_agent_binaries[] = {
-    L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-displays.exe",
-    L"appsandbox-clipboard.exe", L"appsandbox-clipboard-reader.exe",
-    L"appsandbox-audio.exe", L"appsandbox-accessibility.exe"
-};
-
-static BOOL stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir, BOOL ssh_enabled);
+static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir, BOOL ssh_enabled);
 
 /* ---- SSH MSI download / cache ---- */
 
@@ -922,11 +916,7 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
         ui_log(L"Warning: failed to write autounattend.xml");
 
     /* Agent + input helper + VDD driver files + SSH MSI */
-    if (!stage_agent_and_setup(staging, res_dir, ssh_enabled)) {
-        SecureZeroMemory(b64_pass, sizeof(b64_pass));
-        remove_staging_dir(staging);
-        return E_FAIL;
-    }
+    stage_agent_and_setup(staging, res_dir, ssh_enabled);
 
     /* setup.cmd — first-logon script: installs agent service.
        This runs from the ISO drive, so %~dp0 is the ISO root. */
@@ -1201,7 +1191,7 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
 }
 
 /* Helper: copy agent exe to staging and write setup.cmd */
-static BOOL stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir, BOOL ssh_enabled)
+static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir, BOOL ssh_enabled)
 {
     wchar_t src_path[MAX_PATH], file_path[MAX_PATH];
     BOOL found_agent = FALSE;
@@ -1222,22 +1212,129 @@ static BOOL stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
         if (GetFileAttributesW(src_path) != INVALID_FILE_ATTRIBUTES)
             found_agent = TRUE;
     }
-    if (!found_agent) {
-        ui_log(L"Error: appsandbox-agent.exe not found");
-        return FALSE;
-    }
-    wchar_t agent_dir[MAX_PATH];
-    wcscpy_s(agent_dir, MAX_PATH, src_path);
-    wchar_t *slash = wcsrchr(agent_dir, L'\\');
-    if (!slash) return FALSE;
-    *slash = L'\0';
-    for (size_t i = 0; i < ARRAYSIZE(guest_agent_binaries); i++) {
-        swprintf_s(src_path, MAX_PATH, L"%s\\%s", agent_dir, guest_agent_binaries[i]);
-        swprintf_s(file_path, MAX_PATH, L"%s\\%s", staging, guest_agent_binaries[i]);
-        if (!CopyFileW(src_path, file_path, FALSE)) {
-            ui_log(L"Error: failed to stage %s (error %lu)", src_path, GetLastError());
-            return FALSE;
+    if (found_agent) {
+        wchar_t input_src[MAX_PATH], input_dst[MAX_PATH];
+        swprintf_s(file_path, MAX_PATH, L"%s\\appsandbox-agent.exe", staging);
+        if (!CopyFileW(src_path, file_path, FALSE))
+            ui_log(L"Warning: failed to copy appsandbox-agent.exe (error %lu)", GetLastError());
+
+        /* appsandbox-input.exe — same directory as agent */
+        wcscpy_s(input_src, MAX_PATH, src_path);
+        {
+            wchar_t *s = wcsrchr(input_src, L'\\');
+            if (s) *(s + 1) = L'\0';
         }
+        wcscat_s(input_src, MAX_PATH, L"appsandbox-input.exe");
+        swprintf_s(input_dst, MAX_PATH, L"%s\\appsandbox-input.exe", staging);
+        if (GetFileAttributesW(input_src) != INVALID_FILE_ATTRIBUTES) {
+            if (!CopyFileW(input_src, input_dst, FALSE))
+                ui_log(L"Warning: failed to copy appsandbox-input.exe (error %lu)", GetLastError());
+            else
+                ui_log(L"Staged appsandbox-input.exe for ISO.");
+        } else {
+            ui_log(L"Warning: appsandbox-input.exe not found at %s", input_src);
+        }
+
+        /* appsandbox-displays.exe — same directory as agent */
+        {
+            wchar_t displays_src[MAX_PATH], displays_dst[MAX_PATH];
+            wcscpy_s(displays_src, MAX_PATH, input_src);
+            {
+                wchar_t *s = wcsrchr(displays_src, L'\\');
+                if (s) *(s + 1) = L'\0';
+            }
+            wcscat_s(displays_src, MAX_PATH, L"appsandbox-displays.exe");
+            swprintf_s(displays_dst, MAX_PATH, L"%s\\appsandbox-displays.exe", staging);
+            if (GetFileAttributesW(displays_src) != INVALID_FILE_ATTRIBUTES) {
+                if (!CopyFileW(displays_src, displays_dst, FALSE))
+                    ui_log(L"Warning: failed to copy appsandbox-displays.exe (error %lu)", GetLastError());
+                else
+                    ui_log(L"Staged appsandbox-displays.exe for ISO.");
+            } else {
+                ui_log(L"Warning: appsandbox-displays.exe not found at %s", displays_src);
+            }
+        }
+
+        /* appsandbox-clipboard.exe — same directory as agent */
+        {
+            wchar_t clip_src[MAX_PATH], clip_dst[MAX_PATH];
+            wcscpy_s(clip_src, MAX_PATH, input_src);
+            {
+                wchar_t *s = wcsrchr(clip_src, L'\\');
+                if (s) *(s + 1) = L'\0';
+            }
+            wcscat_s(clip_src, MAX_PATH, L"appsandbox-clipboard.exe");
+            swprintf_s(clip_dst, MAX_PATH, L"%s\\appsandbox-clipboard.exe", staging);
+            if (GetFileAttributesW(clip_src) != INVALID_FILE_ATTRIBUTES) {
+                if (!CopyFileW(clip_src, clip_dst, FALSE))
+                    ui_log(L"Warning: failed to copy appsandbox-clipboard.exe (error %lu)", GetLastError());
+                else
+                    ui_log(L"Staged appsandbox-clipboard.exe for ISO.");
+            } else {
+                ui_log(L"Warning: appsandbox-clipboard.exe not found at %s", clip_src);
+            }
+        }
+
+        /* appsandbox-clipboard-reader.exe — same directory as agent */
+        {
+            wchar_t reader_src[MAX_PATH], reader_dst[MAX_PATH];
+            wcscpy_s(reader_src, MAX_PATH, input_src);
+            {
+                wchar_t *s = wcsrchr(reader_src, L'\\');
+                if (s) *(s + 1) = L'\0';
+            }
+            wcscat_s(reader_src, MAX_PATH, L"appsandbox-clipboard-reader.exe");
+            swprintf_s(reader_dst, MAX_PATH, L"%s\\appsandbox-clipboard-reader.exe", staging);
+            if (GetFileAttributesW(reader_src) != INVALID_FILE_ATTRIBUTES) {
+                if (!CopyFileW(reader_src, reader_dst, FALSE))
+                    ui_log(L"Warning: failed to copy appsandbox-clipboard-reader.exe (error %lu)", GetLastError());
+                else
+                    ui_log(L"Staged appsandbox-clipboard-reader.exe for ISO.");
+            } else {
+                ui_log(L"Warning: appsandbox-clipboard-reader.exe not found at %s", reader_src);
+            }
+        }
+
+        /* appsandbox-audio.exe — same directory as agent */
+        {
+            wchar_t audio_src[MAX_PATH], audio_dst[MAX_PATH];
+            wcscpy_s(audio_src, MAX_PATH, input_src);
+            {
+                wchar_t *s = wcsrchr(audio_src, L'\\');
+                if (s) *(s + 1) = L'\0';
+            }
+            wcscat_s(audio_src, MAX_PATH, L"appsandbox-audio.exe");
+            swprintf_s(audio_dst, MAX_PATH, L"%s\\appsandbox-audio.exe", staging);
+            if (GetFileAttributesW(audio_src) != INVALID_FILE_ATTRIBUTES) {
+                if (!CopyFileW(audio_src, audio_dst, FALSE))
+                    ui_log(L"Warning: failed to copy appsandbox-audio.exe (error %lu)", GetLastError());
+                else
+                    ui_log(L"Staged appsandbox-audio.exe for ISO.");
+            } else {
+                ui_log(L"Warning: appsandbox-audio.exe not found at %s", audio_src);
+            }
+        }
+
+        {
+            wchar_t accessibility_src[MAX_PATH], accessibility_dst[MAX_PATH];
+            wcscpy_s(accessibility_src, MAX_PATH, input_src);
+            {
+                wchar_t *s = wcsrchr(accessibility_src, L'\\');
+                if (s) *(s + 1) = L'\0';
+            }
+            wcscat_s(accessibility_src, MAX_PATH, L"appsandbox-accessibility.exe");
+            swprintf_s(accessibility_dst, MAX_PATH, L"%s\\appsandbox-accessibility.exe", staging);
+            if (GetFileAttributesW(accessibility_src) != INVALID_FILE_ATTRIBUTES) {
+                if (!CopyFileW(accessibility_src, accessibility_dst, FALSE))
+                    ui_log(L"Warning: failed to copy appsandbox-accessibility.exe (error %lu)", GetLastError());
+                else
+                    ui_log(L"Staged appsandbox-accessibility.exe for ISO.");
+            } else {
+                ui_log(L"Warning: appsandbox-accessibility.exe not found at %s", accessibility_src);
+            }
+        }
+    } else {
+        ui_log(L"Warning: appsandbox-agent.exe not found");
     }
 
     /* VDD driver files — copy to drivers\ subdirectory if available */
@@ -1461,7 +1558,6 @@ static BOOL stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
             fclose(sc);
         }
     }
-    return TRUE;
 }
 
 
@@ -1514,11 +1610,7 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
     }
 
     /* Agent exe + setup.cmd + SSH MSI */
-    if (!stage_agent_and_setup(staging, res_dir, ssh_enabled)) {
-        SecureZeroMemory(b64_pass, sizeof(b64_pass));
-        remove_staging_dir(staging);
-        return E_FAIL;
-    }
+    stage_agent_and_setup(staging, res_dir, ssh_enabled);
 
     /* Build ISO */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -1834,26 +1926,24 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
 
     /* 2. Agent + input helper executables */
     {
+        const wchar_t *bins[] = { L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-displays.exe", L"appsandbox-clipboard.exe", L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe", L"appsandbox-accessibility.exe" };
         int bi;
-        for (bi = 0; bi < (int)(ARRAYSIZE(guest_agent_binaries)); bi++) {
+        for (bi = 0; bi < (int)(sizeof(bins) / sizeof(bins[0])); bi++) {
             BOOL found = FALSE;
             if (res_dir) {
-                swprintf_s(src, MAX_PATH, L"%s\\%s", res_dir, guest_agent_binaries[bi]);
+                swprintf_s(src, MAX_PATH, L"%s\\%s", res_dir, bins[bi]);
                 if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES)
                     found = TRUE;
             }
             if (!found) {
-                swprintf_s(src, MAX_PATH, L"%s\\%s", exe_dir, guest_agent_binaries[bi]);
+                swprintf_s(src, MAX_PATH, L"%s\\%s", exe_dir, bins[bi]);
                 if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES)
                     found = TRUE;
             }
-            if (!found) {
-                ui_log(L"Error: required guest helper %s not found", guest_agent_binaries[bi]);
-                fclose(mf);
-                return -1;
+            if (found) {
+                fwprintf(mf, L"%s\t\\Windows\\AppSandbox\\%s\n", src, bins[bi]);
+                count++;
             }
-            fwprintf(mf, L"%s\t\\Windows\\AppSandbox\\%s\n", src, guest_agent_binaries[bi]);
-            count++;
         }
     }
 

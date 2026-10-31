@@ -593,18 +593,23 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
     return nil;
 }
 
+/* See iso_patch_mac.h. Cache the signed Windows release zip. Mirrors ensureOpenSSHMsiCached: a single
+ * atomic write to a version-named file under the AppSandbox support dir (sibling of VMs/), shared by
+ * the root daemon + GUI. build-windows extracts the needed members into its own per-build temp. */
 + (nullable NSString *)ensureSignedWinPayloadZipCached {
-    NSString *version = [[NSBundle bundleForClass:self] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-    if (!version.length) return nil;
-    NSString *name = [NSString stringWithFormat:@"AppSandbox-%@-win-arm64.zip", version];
-    NSString *urlStr = [NSString stringWithFormat:
-        @"https://github.com/jamesstringer90/appsandbox/releases/download/v%@/%@", version, name];
+    /* Signed ARM64 release: EV-signed agent EXEs + MS-attestation-signed drivers (VDD/VAD/AppSandboxSHM/
+     * devcon). The release version is pinned in the cached filename, so a newer release auto-invalidates
+     * the cache. The URL must stay publicly fetchable by an unauthenticated client. */
+    NSString *name   = @"AppSandbox-0.1.9-win-arm64.zip";
+    NSString *urlStr = @"https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.9/AppSandbox-0.1.9-win-arm64.zip";
     NSString *cacheDir = [[VmDir vmsRootDirectory] URLByDeletingLastPathComponent].path;
     [[NSFileManager defaultManager] createDirectoryAtPath:cacheDir
                               withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *dst = [cacheDir stringByAppendingPathComponent:name];
     if ([[NSFileManager defaultManager] fileExistsAtPath:dst]) return dst;   /* cache hit */
 
+    /* Synchronous download (follows the GitHub->CDN redirect). The atomic writeToFile makes concurrent
+     * creates race-safe (worst case: a redundant download), exactly like the OpenSSH MSI. */
     __block NSData *data = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     NSURLSessionDataTask *t = [[NSURLSession sharedSession]

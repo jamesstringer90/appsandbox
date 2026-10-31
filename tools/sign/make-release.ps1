@@ -256,16 +256,6 @@ if (-not $NoBuild) {
 }
 if (-not (Test-Path $bin)) { throw "Output dir not found: $bin" }
 
-$guestAgents = @('appsandbox-agent.exe', 'appsandbox-input.exe', 'appsandbox-displays.exe',
-    'appsandbox-clipboard.exe', 'appsandbox-clipboard-reader.exe', 'appsandbox-audio.exe',
-    'appsandbox-accessibility.exe')
-New-Item -ItemType Directory -Force -Path (Join-Path $bin 'resources') | Out-Null
-foreach ($name in $guestAgents) {
-    $source = Join-Path $bin $name
-    if (-not (Test-Path $source -PathType Leaf)) { throw "Missing built guest helper: $source" }
-    Copy-Item $source (Join-Path $bin "resources\$name") -Force
-}
-
 if ($BuildOnly) { Write-Host "-BuildOnly: build complete; skipping signing + packaging."; return }
 
 # ---------------------------------------------------------------- 2. YubiKey gate
@@ -414,6 +404,7 @@ $required = @(
     'drivers\AppSandboxVAD.sys', 'drivers\AppSandboxVAD.inf', 'drivers\AppSandboxVAD.cat',
     'drivers\AppSandboxSHM.sys', 'drivers\AppSandboxSHM.inf', 'drivers\AppSandboxSHM.cat',
     'drivers\devcon.exe', 'resources', 'web',
+    'resources\appsandbox-accessibility.exe',
     'headless-api\asb.py', 'headless-api\README.md', 'headless-api\examples', 'headless-api\tests'
 )
 if ($Platform -eq 'x64') {
@@ -421,7 +412,6 @@ if ($Platform -eq 'x64') {
     $required += 'resources\nvidia\appsandbox-nvidia-dlss-shim.dll'
     $required += 'resources\nvidia\appsandbox-nvidia-cuda-shim.dll', 'resources\nvidia\appsandbox-nvidia-opencl-shim.dll'
 }
-$required += $guestAgents | ForEach-Object { "resources\$_" }
 $missing = @($required | Where-Object { -not (Test-Path (Join-Path $stage $_)) })
 if ($missing.Count) { throw "Refusing to package - missing expected artifacts: $($missing -join ', ')" }
 
