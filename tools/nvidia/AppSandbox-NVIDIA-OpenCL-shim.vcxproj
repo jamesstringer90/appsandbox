@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|ARM64">
+      <Configuration>Debug</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64">
+      <Configuration>Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{AD44F837-587B-4C5D-8428-5DB42E36B8B0}</ProjectGuid>
+    <RootNamespace>nvidia_opencl</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <Import Project="nvidia-shim.props" />
+  <PropertyGroup Condition="'$(Platform)'=='ARM64'" Label="Configuration">
+    <ConfigurationType>Utility</ConfigurationType>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <SolutionDir Condition="'$(SolutionDir)'=='' Or '$(SolutionDir)'=='*Undefined*'">$(MSBuildThisFileDirectory)..\..\</SolutionDir>
+    <TargetName>appsandbox-nvidia-opencl-shim</TargetName>
+    <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)'=='x64'">
+    <OutDir>$(SolutionDir)bin\$(Configuration)\nvidia\</OutDir>
+    <IntDir>$(SolutionDir)obj\nvidia-opencl\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)'=='ARM64'">
+    <OutDir>$(SolutionDir)bin\$(Configuration)-ARM64\nvidia\</OutDir>
+    <IntDir>$(SolutionDir)obj\nvidia-opencl\$(Configuration)-ARM64\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <Link>
+      <AdditionalDependencies>$(IntDir)$(TargetName).exp;dxgi.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup Condition="'$(Platform)'=='x64'">
+    <ClCompile Include="opencl_shim.c" />
+    <ClCompile Include="adapter_identity.c" />
+    <ClInclude Include="adapter_identity.h" />
+    <CustomBuild Include="opencl_exports.def">
+      <Command>lib.exe /NOLOGO /DEF:"%(FullPath)" /MACHINE:X64 /OUT:"$(IntDir)$(TargetName).lib"</Command>
+      <Outputs>$(IntDir)$(TargetName).lib;$(IntDir)$(TargetName).exp</Outputs>
+      <LinkObjects>false</LinkObjects>
+    </CustomBuild>
+  </ItemGroup>
+  <Import Project="nvidia-shim.targets" />
+</Project>

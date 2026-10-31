@@ -3847,11 +3847,25 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     if (!get_vm_disk_root(inst->vhdx_path, dir)) return E_INVALIDARG;
     attrs = GetFileAttributesW(dir);
     if (attrs == INVALID_FILE_ATTRIBUTES) {
-        hr = HRESULT_FROM_WIN32(GetLastError());
-        asb_log(L"Error: VM disk folder is unavailable: %s (0x%08X).", dir, hr);
-        return hr;
-    }
-    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+            wchar_t parent[MAX_PATH];
+            DWORD parent_attrs;
+            asb_vm_disk_directory(vm, parent, MAX_PATH);
+            parent_attrs = GetFileAttributesW(parent);
+            if (parent_attrs == INVALID_FILE_ATTRIBUTES)
+                err = GetLastError();
+            else if (!(parent_attrs & FILE_ATTRIBUTE_DIRECTORY))
+                err = ERROR_DIRECTORY;
+            else
+                err = ERROR_SUCCESS;
+        }
+        if (err != ERROR_SUCCESS) {
+            hr = HRESULT_FROM_WIN32(err);
+            asb_log(L"Error: VM disk folder is unavailable: %s (0x%08X).", dir, hr);
+            return hr;
+        }
+    } else if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
 
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
@@ -3869,7 +3883,7 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     /* Recursively remove the whole VM folder, including subdirectories
        (snapshots\ and the build's _vhdx_staging\); a file-only delete would
        leave those and orphan the dir. */
-    if (!remove_dir_recursive(dir)) {
+    if (attrs != INVALID_FILE_ATTRIBUTES && !remove_dir_recursive(dir)) {
         hr = HRESULT_FROM_WIN32(GetLastError());
         asb_log(L"Error: Cannot remove VM disk folder: %s (0x%08X).", dir, hr);
         save_vm_list();

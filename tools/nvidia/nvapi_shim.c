@@ -1,6 +1,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <string.h>
+#include "cuda_opencl_adapter_hooks.h"
 
 typedef void *(__cdecl *QueryInterfaceFn)(UINT id);
 
@@ -8,12 +9,13 @@ static INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
 static QueryInterfaceFn g_query;
 
 #if defined(_M_X64)
+#include "adapter_identity.h"
 #pragma warning(push)
 #pragma warning(disable: 4201)
-#include <dxgi.h>
 #include <d3d12.h>
 #pragma warning(pop)
 
+#define NVAPI_GET_PHYSICAL_GPU_FROM_GPUID 0x5380ad1a
 #define NVAPI_OK 0
 #define NVAPI_NOT_SUPPORTED (-104)
 #define NVAPI_MAX_PHYSICAL_GPUS 64
@@ -50,16 +52,12 @@ static BOOL find_nvidia_adapter(const LUID *wanted, LUID *luid)
     UINT i;
 
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory))) return FALSE;
-    for (i = 0; !found; i++) {
+    for (i = 0; !found;) {
         IDXGIAdapter1 *adapter = NULL;
         DXGI_ADAPTER_DESC1 desc;
-        HRESULT result;
 
-        if (IDXGIFactory1_EnumAdapters1(factory, i, &adapter) != S_OK) break;
-        result = IDXGIAdapter1_GetDesc1(adapter, &desc);
+        if (nvidia_enum_dxgi_adapter(factory, &i, &adapter, &desc) != S_OK) break;
         IDXGIAdapter1_Release(adapter);
-        if (FAILED(result) || desc.VendorId != 0x10de ||
-            (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
         if (wanted && (wanted->LowPart != desc.AdapterLuid.LowPart ||
                        wanted->HighPart != desc.AdapterLuid.HighPart)) continue;
         if (luid) *luid = desc.AdapterLuid;
@@ -192,6 +190,10 @@ void *__cdecl nvapi_QueryInterface(UINT id)
 
     InitOnceExecuteOnce(&g_once, load_nvapi, NULL, NULL);
     if (!g_query) return NULL;
+#if defined(_M_X64)
+    /* CUDA resolves this during initialization, before its DXGI comparisons. */
+    if (id == NVAPI_GET_PHYSICAL_GPU_FROM_GPUID) nvidia_install_cuda_adapter_hook();
+#endif
     original = g_query(id);
 #if defined(_M_X64)
     switch (id) {

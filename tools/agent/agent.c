@@ -615,7 +615,15 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
         } else if (strcmp(si->share_name, "AppSandbox.Nvidia") == 0) {
             const P9CopyOptions options = {
                 FALSE, NULL, "appsandbox-nvidia-vk-gl-shim.dll;appsandbox-nvidia-vk-gl-shim32.dll;"
-                             "appsandbox-nvidia-dlss-shim.dll"
+                             "appsandbox-nvidia-dlss-shim.dll;appsandbox-nvidia-cuda-shim.dll;"
+                             "appsandbox-nvidia-opencl-shim.dll"
+            };
+            rc = p9_copy_share_ex(50001, si->share_name, dest_wide,
+                                 si->filter[0] ? si->filter : NULL,
+                                 &options, &files);
+        } else if (strncmp(si->share_name, "AppSandbox.Drv.", 15) == 0) {
+            const P9CopyOptions options = {
+                FALSE, NULL, NULL, nvidia_opencl_copy_target, nvidia_opencl_commit_copy
             };
             rc = p9_copy_share_ex(50001, si->share_name, dest_wide,
                                  si->filter[0] ? si->filter : NULL,
@@ -659,7 +667,7 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
 
     if (failed_shares == 0 && (gl_dir[0] || native_dir[0] || gpu_prefers_system_opengl()))
         gl_provision(gl_dir, native_dir);
-    if (failed_shares == 0 && !nvidia_dlss_provision(native_dir))
+    if (failed_shares == 0 && !nvidia_runtime_provision(native_dir))
         failed_shares++;
 
     /* Send final result to host */

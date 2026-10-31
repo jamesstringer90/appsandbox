@@ -20,6 +20,8 @@ typedef struct {
     BOOL keep_existing;
     const char *exclude_file; /* Optional case-insensitive leaf filename to skip. */
     const char *refresh_filter;
+    BOOL (*resolve_target)(const wchar_t *path, wchar_t target[MAX_PATH]);
+    BOOL (*commit_file)(const wchar_t *source, const wchar_t *target);
 } P9CopyOptions;
 
 /* Copy a single Plan9 share to a local directory via HvSocket.

@@ -33,18 +33,7 @@
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
-  <PropertyGroup Label="Configuration">
-    <ConfigurationType>DynamicLibrary</ConfigurationType>
-    <PlatformToolset>v143</PlatformToolset>
-    <CharacterSet>Unicode</CharacterSet>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
-    <UseDebugLibraries>true</UseDebugLibraries>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
-    <UseDebugLibraries>false</UseDebugLibraries>
-    <WholeProgramOptimization>true</WholeProgramOptimization>
-  </PropertyGroup>
+  <Import Project="nvidia-shim.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
     <SolutionDir Condition="'$(SolutionDir)'=='' Or '$(SolutionDir)'=='*Undefined*'">$(MSBuildThisFileDirectory)..\..\</SolutionDir>
@@ -69,65 +58,32 @@
     <IntDir>$(SolutionDir)obj\nvidia\$(Configuration)-Win32\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
-    <ClCompile>
-      <WarningLevel>Level4</WarningLevel>
-      <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <SDLCheck>true</SDLCheck>
-      <ConformanceMode>true</ConformanceMode>
-      <CompileAs>CompileAsC</CompileAs>
-    </ClCompile>
     <Link>
-      <SubSystem>Windows</SubSystem>
-      <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>$(IntDir)$(TargetName).exp;user32.lib;gdi32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-    </Link>
-  </ItemDefinitionGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
-    <ClCompile>
-      <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
-    </ClCompile>
-  </ItemDefinitionGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
-    <ClCompile>
-      <Optimization>MaxSpeed</Optimization>
-      <FunctionLevelLinking>true</FunctionLevelLinking>
-      <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-    </ClCompile>
-    <Link>
-      <EnableCOMDATFolding>true</EnableCOMDATFolding>
-      <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalDependencies>$(IntDir)$(TargetName).exp;user32.lib;gdi32.lib;advapi32.lib;dxgi.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="adapter_hooks.c" />
+    <ClCompile Include="adapter_identity.c" />
     <ClCompile Include="opengl_shim.c" />
     <ClCompile Include="vulkan_shim.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="adapter_hooks.h" />
+    <ClInclude Include="adapter_identity.h" />
     <CustomBuild Include="$(NvidiaExports)">
       <Command>lib.exe /NOLOGO /DEF:"%(FullPath)" /MACHINE:$(NvidiaMachine) /OUT:"$(IntDir)$(TargetName).lib"</Command>
       <Outputs>$(IntDir)$(TargetName).lib;$(IntDir)$(TargetName).exp</Outputs>
       <LinkObjects>false</LinkObjects>
     </CustomBuild>
   </ItemGroup>
-  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="BuildWin32Nvidia" AfterTargets="Build" Condition="'$(Platform)'=='x64'">
     <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="Build"
              Properties="Configuration=$(Configuration);Platform=Win32;SolutionDir=$(SolutionDir);OutDir=$(OutDir);IntDir=$(IntDir)Win32\" />
-  </Target>
-  <Target Name="StageNvidiaRuntime" AfterTargets="Build" Condition="'$(Platform)'=='x64' Or '$(Platform)'=='Win32'">
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(OutDir)..\resources\nvidia\" SkipUnchangedFiles="true" />
   </Target>
   <Target Name="CleanWin32Nvidia" AfterTargets="Clean" Condition="'$(Platform)'=='x64'">
     <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="Clean"
              Properties="Configuration=$(Configuration);Platform=Win32;SolutionDir=$(SolutionDir);OutDir=$(OutDir);IntDir=$(IntDir)Win32\" />
   </Target>
-  <Target Name="CleanNvidiaRuntime" AfterTargets="Clean" Condition="'$(Platform)'=='x64' Or '$(Platform)'=='Win32'">
-    <Delete Files="$(OutDir)..\resources\nvidia\$(TargetFileName)" />
-  </Target>
+  <Import Project="nvidia-shim.targets" />
 </Project>

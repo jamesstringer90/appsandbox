@@ -1,11 +1,9 @@
 #include "adapter_hooks.h"
+#include "adapter_identity.h"
 #include <stdio.h>
 #include <string.h>
 
 #if defined(_M_X64) || defined(_M_IX86)
-#include <winternl.h>
-#include <d3dkmthk.h>
-
 #if defined(_M_IX86)
 #define NVIDIA_ICD_NAME "nvoglv32.dll"
 #define NVIDIA_ICD_NAME_W L"nvoglv32.dll"
@@ -17,28 +15,14 @@
 typedef NTSTATUS (NTAPI *EnumDisplayDevicesFn)(PUNICODE_STRING, DWORD,
                                              PDISPLAY_DEVICEW, DWORD);
 typedef int (WINAPI *CudaInitFn)(unsigned);
-typedef int (WINAPI *CudaDeviceCountFn)(int *);
-typedef int (WINAPI *CudaDeviceGetFn)(int *, int);
-typedef int (WINAPI *CudaDevicePciFn)(char *, int, int);
-typedef int (WINAPI *CudaDeviceLuidFn)(char *, unsigned *, int);
-
-typedef struct {
-    LUID luid;
-    D3DKMT_DEVICE_IDS ids;
-    D3DKMT_ADAPTERADDRESS address;
-    BOOL has_address;
-} NvidiaAdapter;
 
 static INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
 static BOOL g_ready;
 static volatile LONG g_hooks_enabled;
-static PFND3DKMT_ENUMADAPTERS2 g_enum_adapters;
-static PFND3DKMT_QUERYADAPTERINFO g_query_adapter;
-static PFND3DKMT_OPENADAPTERFROMLUID g_open_luid;
-static PFND3DKMT_CLOSEADAPTER g_close_adapter;
+static NvidiaAdapterApi g_adapter;
 static PFND3DKMT_OPENADAPTERFROMHDC g_open_hdc;
 static EnumDisplayDevicesFn g_enum_displays;
-static NvidiaAdapter *g_adapters;
+static NvidiaAdapterIdentity *g_adapters;
 static ULONG g_adapter_count;
 static LUID g_luid;
 static LUID g_icd_luid;
@@ -50,17 +34,6 @@ static BOOL same_luid(LUID a, LUID b)
     return a.LowPart == b.LowPart && a.HighPart == b.HighPart;
 }
 
-static BOOL query_adapter(D3DKMT_HANDLE adapter, KMTQUERYADAPTERINFOTYPE type,
-                         void *data, UINT size)
-{
-    D3DKMT_QUERYADAPTERINFO query = {0};
-    query.hAdapter = adapter;
-    query.Type = type;
-    query.pPrivateDriverData = data;
-    query.PrivateDriverDataSize = size;
-    return g_query_adapter(&query) >= 0;
-}
-
 static BOOL resolve_adapter_icd_path(D3DKMT_HANDLE adapter, wchar_t *path, size_t capacity)
 {
     D3DKMT_OPENGLINFO info = {0};
@@ -68,7 +41,7 @@ static BOOL resolve_adapter_icd_path(D3DKMT_HANDLE adapter, wchar_t *path, size_
     wchar_t directory[MAX_PATH];
     DWORD attributes;
 
-    if (!query_adapter(adapter, KMTQAITYPE_UMOPENGLINFO, &info, sizeof(info)))
+    if (!nvidia_query_adapter(&g_adapter, adapter, KMTQAITYPE_UMOPENGLINFO, &info, sizeof(info)))
         return FALSE;
     info.UmdOpenGlIcdFileName[MAX_PATH - 1] = L'\0';
     source = info.UmdOpenGlIcdFileName;
@@ -128,47 +101,17 @@ static BOOL find_cuda_luid(const D3DKMT_ADAPTERADDRESS *address, LUID *luid)
 {
     HMODULE cuda = LoadLibraryExW(L"nvcuda.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     CudaInitFn init;
-    CudaDeviceCountFn get_count;
-    CudaDeviceGetFn get_device;
-    CudaDevicePciFn get_pci;
-    CudaDeviceLuidFn get_luid;
-    LUID selected = {0};
-    int count, matches = 0;
+    NvidiaCudaApi api;
 
     if (!cuda) return FALSE;
-    init = (CudaInitFn)GetProcAddress(cuda, "cuInit");
-    get_count = (CudaDeviceCountFn)GetProcAddress(cuda, "cuDeviceGetCount");
-    get_device = (CudaDeviceGetFn)GetProcAddress(cuda, "cuDeviceGet");
-    get_pci = (CudaDevicePciFn)GetProcAddress(cuda, "cuDeviceGetPCIBusId");
-    get_luid = (CudaDeviceLuidFn)GetProcAddress(cuda, "cuDeviceGetLuid");
-    if (!init || !get_count || !get_device || !get_pci || !get_luid ||
-        init(0) != 0 || get_count(&count) != 0 || count <= 0)
-        goto failed;
-
-    for (int i = 0; i < count; ++i) {
-        char pci[64] = {0}, trailing;
-        unsigned domain, bus, device, function, node_mask = 0;
-        int cuda_device;
-
-        if (get_device(&cuda_device, i) != 0 ||
-            get_pci(pci, (int)sizeof(pci), cuda_device) != 0)
-            goto failed;
-        pci[sizeof(pci) - 1] = '\0';
-        if (sscanf_s(pci, "%x:%x:%x.%x%c", &domain, &bus, &device, &function,
-                     &trailing, 1u) != 4)
-            goto failed;
-        if (bus != address->BusNumber || device != address->DeviceNumber ||
-            function != address->FunctionNumber)
-            continue;
-        if (++matches != 1 || get_luid((char *)&selected, &node_mask, cuda_device) != 0 ||
-            node_mask != 1 || (!selected.LowPart && !selected.HighPart))
-            goto failed;
+    if (GetProcAddress(cuda, "appsandbox_cuda")) {
+        FreeLibrary(cuda);
+        cuda = LoadLibraryExW(L"appsandbox-nvcuda.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!cuda) return FALSE;
     }
-    if (matches != 1) goto failed;
-    *luid = selected;
-    return TRUE;
-
-failed:
+    init = (CudaInitFn)GetProcAddress(cuda, "cuInit");
+    if (init && nvidia_cuda_api_load(cuda, &api) && init(0) == 0 &&
+        nvidia_cuda_host_luid(&api, address, luid)) return TRUE;
     FreeLibrary(cuda);
     return FALSE;
 }
@@ -177,11 +120,11 @@ static BOOL select_nvidia_adapter(void)
 {
     D3DKMT_ENUMADAPTERS2 enumeration = {0};
     D3DKMT_ADAPTERINFO *adapters;
-    NvidiaAdapter selected = {0};
+    NvidiaAdapterIdentity selected = {0};
     ULONG capacity, best_sources = 0;
     BOOL found = FALSE;
 
-    if (g_enum_adapters(&enumeration) < 0 || !enumeration.NumAdapters)
+    if (g_adapter.enumerate(&enumeration) < 0 || !enumeration.NumAdapters)
         return FALSE;
     capacity = enumeration.NumAdapters;
     adapters = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
@@ -193,22 +136,13 @@ static BOOL select_nvidia_adapter(void)
         return FALSE;
     }
     enumeration.pAdapters = adapters;
-    if (g_enum_adapters(&enumeration) >= 0 && enumeration.NumAdapters <= capacity) {
+    if (g_adapter.enumerate(&enumeration) >= 0 && enumeration.NumAdapters <= capacity) {
         for (ULONG i = 0; i < enumeration.NumAdapters; ++i) {
-            D3DKMT_ADAPTERTYPE type = {0};
-            D3DKMT_QUERY_DEVICE_IDS ids = {0};
             wchar_t path[MAX_PATH];
 
-            if (!query_adapter(adapters[i].hAdapter, KMTQAITYPE_ADAPTERTYPE_RENDER,
-                               &type, sizeof(type)) || !type.Paravirtualized ||
-                !query_adapter(adapters[i].hAdapter, KMTQAITYPE_PHYSICALADAPTERDEVICEIDS,
-                               &ids, sizeof(ids)) || ids.DeviceIds.VendorID != 0x10de)
+            if (!nvidia_query_adapter_identity(&g_adapter, adapters[i].hAdapter,
+                                               adapters[i].AdapterLuid, &g_adapters[g_adapter_count]))
                 continue;
-            g_adapters[g_adapter_count].luid = adapters[i].AdapterLuid;
-            g_adapters[g_adapter_count].ids = ids.DeviceIds;
-            g_adapters[g_adapter_count].has_address = query_adapter(adapters[i].hAdapter,
-                KMTQAITYPE_ADAPTERADDRESS_RENDER, &g_adapters[g_adapter_count].address,
-                sizeof(g_adapters[g_adapter_count].address));
             ++g_adapter_count;
             if ((found && adapters[i].NumOfSources <= best_sources) ||
                 !resolve_adapter_icd_path(adapters[i].hAdapter, path, MAX_PATH))
@@ -223,7 +157,7 @@ static BOOL select_nvidia_adapter(void)
     for (ULONG i = 0; i < capacity; ++i) {
         if (adapters[i].hAdapter) {
             D3DKMT_CLOSEADAPTER close = {adapters[i].hAdapter};
-            g_close_adapter(&close);
+            g_adapter.close(&close);
         }
     }
     HeapFree(GetProcessHeap(), 0, adapters);
@@ -330,15 +264,15 @@ static NTSTATUS APIENTRY open_adapter_from_hdc_hook(D3DKMT_OPENADAPTERFROMHDC *a
         if (!same_luid(adapter->AdapterLuid, g_luid)) {
             D3DKMT_OPENADAPTERFROMLUID replacement = {0};
             replacement.AdapterLuid = g_luid;
-            if (g_open_luid(&replacement) >= 0) {
+            if (g_adapter.open(&replacement) >= 0) {
                 D3DKMT_CLOSEADAPTER close = {adapter->hAdapter};
-                if (g_close_adapter(&close) >= 0) {
+                if (g_adapter.close(&close) >= 0) {
                     adapter->hAdapter = replacement.hAdapter;
                     adapter->AdapterLuid = replacement.AdapterLuid;
                     adapter->VidPnSourceId = 0;
                 } else {
                     close.hAdapter = replacement.hAdapter;
-                    g_close_adapter(&close);
+                    g_adapter.close(&close);
                 }
             }
         }
@@ -431,14 +365,10 @@ static BOOL CALLBACK initialize_adapter_hooks(PINIT_ONCE once, PVOID parameter, 
     (void)context;
 
     user32 = LoadLibraryExW(L"user32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    gdi32 = LoadLibraryExW(L"gdi32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    gdi32 = nvidia_adapter_api_load(&g_adapter) ? g_adapter.module : NULL;
     if (!user32 || !gdi32) goto done;
     if (GetModuleHandleW(NVIDIA_ICD_NAME_W)) goto done;
-    g_enum_adapters = (PFND3DKMT_ENUMADAPTERS2)GetProcAddress(gdi32, "D3DKMTEnumAdapters2");
-    g_query_adapter = (PFND3DKMT_QUERYADAPTERINFO)GetProcAddress(gdi32, "D3DKMTQueryAdapterInfo");
-    g_open_luid = (PFND3DKMT_OPENADAPTERFROMLUID)GetProcAddress(gdi32, "D3DKMTOpenAdapterFromLuid");
-    g_close_adapter = (PFND3DKMT_CLOSEADAPTER)GetProcAddress(gdi32, "D3DKMTCloseAdapter");
-    if (g_enum_adapters && g_query_adapter && g_open_luid && g_close_adapter) {
+    if (g_adapter.enumerate) {
         void *volatile *slot = find_win32u_import_slot(user32, "NtUserEnumDisplayDevices");
         if (slot) g_enum_displays = (EnumDisplayDevicesFn)*slot;
         if (g_enum_displays && select_nvidia_adapter() && !GetModuleHandleW(NVIDIA_ICD_NAME_W) &&

@@ -292,21 +292,25 @@ static BOOL grant_system_file_control(const wchar_t *path)
 }
 
 #if defined(_M_X64)
-static BOOL validate_dll_export(const wchar_t *path, WORD machine, const char *required_export)
+static BOOL install_system_file(const wchar_t *source, const wchar_t *runtime)
 {
-    HMODULE module = LoadLibraryExW(path, NULL, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    return files_equal(source, runtime) ||
+        ((GetFileAttributesW(runtime) == INVALID_FILE_ATTRIBUTES || grant_system_file_control(runtime)) &&
+         replace_file(source, runtime));
+}
+
+static BOOL dll_image_exports(HMODULE module, WORD machine, BYTE **image,
+                              DWORD *image_size, IMAGE_EXPORT_DIRECTORY **exports)
+{
     BYTE *base;
     IMAGE_NT_HEADERS64 *nt;
     IMAGE_DATA_DIRECTORY directory;
-    IMAGE_EXPORT_DIRECTORY *exports;
-    DWORD *names, i, size;
-    size_t export_length = required_export ? strlen(required_export) + 1 : 0;
-    BOOL found = FALSE;
+    DWORD size;
 
     if (!module) return FALSE;
     base = (BYTE *)((ULONG_PTR)module & ~(ULONG_PTR)3);
     nt = (IMAGE_NT_HEADERS64 *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
-    if (nt->FileHeader.Machine != machine) goto done;
+    if (nt->FileHeader.Machine != machine) return FALSE;
     if (machine == IMAGE_FILE_MACHINE_AMD64 &&
         nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
         size = nt->OptionalHeader.SizeOfImage;
@@ -316,24 +320,76 @@ static BOOL validate_dll_export(const wchar_t *path, WORD machine, const char *r
         IMAGE_NT_HEADERS32 *nt32 = (IMAGE_NT_HEADERS32 *)nt;
         size = nt32->OptionalHeader.SizeOfImage;
         directory = nt32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    } else goto done;
-    if (!required_export) { found = TRUE; goto done; }
-    if (!directory.VirtualAddress || size < sizeof(*exports) ||
-        directory.VirtualAddress > size - sizeof(*exports)) goto done;
-    exports = (IMAGE_EXPORT_DIRECTORY *)(base + directory.VirtualAddress);
-    if (exports->NumberOfNames > size / sizeof(DWORD) ||
-        exports->AddressOfNames > size - exports->NumberOfNames * sizeof(DWORD)) goto done;
+    } else return FALSE;
+    *image = base;
+    *image_size = size;
+    if (!exports) return TRUE;
+    if (!directory.VirtualAddress || size < sizeof(**exports) ||
+        directory.VirtualAddress > size - sizeof(**exports)) return FALSE;
+    *exports = (IMAGE_EXPORT_DIRECTORY *)(base + directory.VirtualAddress);
+    return (*exports)->NumberOfNames <= size / sizeof(DWORD) &&
+        (*exports)->AddressOfNames <= size - (*exports)->NumberOfNames * sizeof(DWORD);
+}
+
+static BOOL dll_image_has_export(BYTE *base, DWORD size, IMAGE_EXPORT_DIRECTORY *exports,
+                                 const char *required_export)
+{
+    DWORD *names, i;
+    size_t export_length = strlen(required_export) + 1;
+
     names = (DWORD *)(base + exports->AddressOfNames);
     for (i = 0; i < exports->NumberOfNames; i++) {
         if (export_length <= size && names[i] <= size - export_length &&
-            !memcmp(base + names[i], required_export, export_length)) {
-            found = TRUE;
-            break;
-        }
+            !memcmp(base + names[i], required_export, export_length)) return TRUE;
     }
-done:
+    return FALSE;
+}
+
+static BOOL validate_dll_export(const wchar_t *path, WORD machine, const char *required_export)
+{
+    HMODULE module = LoadLibraryExW(path, NULL, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    BYTE *base;
+    DWORD size;
+    IMAGE_EXPORT_DIRECTORY *exports = NULL;
+    BOOL found;
+
+    if (!module) return FALSE;
+    found = dll_image_exports(module, machine, &base, &size, required_export ? &exports : NULL);
+    if (found && required_export) found = dll_image_has_export(base, size, exports, required_export);
     FreeLibrary(module);
     return found;
+}
+
+static BOOL validate_nvidia_opencl_dll(const wchar_t *path, BOOL shim)
+{
+    return validate_dll_export(path, IMAGE_FILE_MACHINE_AMD64, "clGetExtensionFunctionAddress") &&
+        validate_dll_export(path, IMAGE_FILE_MACHINE_AMD64, "clGetPlatformInfo") &&
+        validate_dll_export(path, IMAGE_FILE_MACHINE_AMD64, "appsandbox_opencl") == shim;
+}
+
+static BOOL dll_exports_covered(const wchar_t *source, const wchar_t *replacement, WORD machine)
+{
+    HMODULE original = LoadLibraryExW(source, NULL, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    HMODULE proxy = LoadLibraryExW(replacement, NULL, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    BYTE *base, *replacement_base;
+    DWORD size, replacement_size, *names, i;
+    IMAGE_EXPORT_DIRECTORY *exports, *replacement_exports;
+    BOOL result = FALSE;
+
+    if (!dll_image_exports(original, machine, &base, &size, &exports) ||
+        !dll_image_exports(proxy, machine, &replacement_base, &replacement_size,
+                           &replacement_exports)) goto done;
+    names = (DWORD *)(base + exports->AddressOfNames);
+    for (i = 0; i < exports->NumberOfNames; i++) {
+        if (names[i] >= size || !memchr(base + names[i], 0, size - names[i]) ||
+            !dll_image_has_export(replacement_base, replacement_size, replacement_exports,
+                                  (char *)base + names[i])) goto done;
+    }
+    result = TRUE;
+done:
+    if (proxy) FreeLibrary(proxy);
+    if (original) FreeLibrary(original);
+    return result;
 }
 
 static BOOL validate_opengl_dll(const wchar_t *path, WORD machine, BOOL native)
@@ -571,28 +627,105 @@ static BOOL nvidia_ngx_junction(const wchar_t *sys, const wchar_t *package)
 }
 
 static BOOL provision_nvapi(const wchar_t *native_dir, const wchar_t *sys,
-                            wchar_t packages[32][MAX_PATH], UINT count)
+                            wchar_t sources[32][MAX_PATH], UINT count)
 {
-    wchar_t payload[MAX_PATH], original[MAX_PATH], other[MAX_PATH], backup[MAX_PATH], runtime[MAX_PATH];
+    wchar_t payload[MAX_PATH], backup[MAX_PATH], runtime[MAX_PATH];
     UINT i;
 
     if (!count || swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-dlss-shim.dll", native_dir) < 0 ||
-        swprintf_s(original, MAX_PATH, L"%s\\nvapi64.dll", packages[0]) < 0 ||
         swprintf_s(runtime, MAX_PATH, L"%s\\nvapi64.dll", sys) < 0 ||
         swprintf_s(backup, MAX_PATH, L"%s\\appsandbox-nvapi64.dll", sys) < 0)
         return FALSE;
     if (!validate_dll_export(payload, IMAGE_FILE_MACHINE_AMD64, "appsandbox_nvapi") ||
         !validate_dll_export(payload, IMAGE_FILE_MACHINE_AMD64, "nvapi_QueryInterface") ||
-        !validate_dll_export(original, IMAGE_FILE_MACHINE_AMD64, "nvapi_QueryInterface") ||
-        validate_dll_export(original, IMAGE_FILE_MACHINE_AMD64, "appsandbox_nvapi")) return FALSE;
-    for (i = 1; i < count; i++) {
-        if (swprintf_s(other, MAX_PATH, L"%s\\nvapi64.dll", packages[i]) < 0 ||
-            !files_equal(original, other)) return FALSE;
+        !validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, "nvapi_QueryInterface") ||
+        validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, "appsandbox_nvapi")) return FALSE;
+    for (i = 1; i < count; i++)
+        if (!files_equal(sources[0], sources[i])) return FALSE;
+    return replace_file(sources[0], backup) && install_system_file(payload, runtime);
+}
+
+static BOOL provision_nvidia_library(const wchar_t *sys, const wchar_t *filename,
+                                    const char *required_export)
+{
+    wchar_t sources[32][MAX_PATH], runtime[MAX_PATH];
+    UINT count = find_nvidia_driver_files(sources, sys, filename), i;
+
+    if (!count) return TRUE;
+    if (!validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, required_export) ||
+        swprintf_s(runtime, MAX_PATH, L"%s\\%s", sys, filename) < 0) return FALSE;
+    for (i = 1; i < count; i++)
+        if (!files_equal(sources[0], sources[i])) return FALSE;
+    return install_system_file(sources[0], runtime);
+}
+
+static BOOL provision_cuda(const wchar_t *native_dir, const wchar_t *sys)
+{
+    wchar_t sources[32][MAX_PATH], payload[MAX_PATH], runtime[MAX_PATH], backup[MAX_PATH];
+    UINT count, i;
+
+    if (!native_dir || !native_dir[0]) return TRUE;
+    if (swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-cuda-shim.dll", native_dir) < 0)
+        return FALSE;
+    if (GetFileAttributesW(payload) == INVALID_FILE_ATTRIBUTES) return TRUE;
+    count = find_nvidia_driver_files(sources, sys, L"nvcuda_loader64.dll");
+    if (!count) return TRUE;
+    if (!validate_dll_export(payload, IMAGE_FILE_MACHINE_AMD64, "appsandbox_cuda") ||
+        !validate_dll_export(payload, IMAGE_FILE_MACHINE_AMD64, "cuInit") ||
+        !validate_dll_export(payload, IMAGE_FILE_MACHINE_AMD64, "cuGetProcAddress") ||
+        !validate_dll_export(payload, IMAGE_FILE_MACHINE_AMD64, "cuDeviceGetLuid") ||
+        !validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, "cuInit") ||
+        !validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, "cuGetProcAddress") ||
+        !validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, "cuDeviceGetLuid") ||
+        validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, "appsandbox_cuda") ||
+        swprintf_s(runtime, MAX_PATH, L"%s\\nvcuda.dll", sys) < 0 ||
+        swprintf_s(backup, MAX_PATH, L"%s\\appsandbox-nvcuda.dll", sys) < 0) return FALSE;
+    for (i = 1; i < count; i++)
+        if (!files_equal(sources[0], sources[i])) return FALSE;
+    if (!dll_exports_covered(sources[0], payload, IMAGE_FILE_MACHINE_AMD64)) {
+        if (validate_dll_export(runtime, IMAGE_FILE_MACHINE_AMD64, "appsandbox_cuda"))
+            install_system_file(sources[0], runtime);
+        return FALSE;
     }
-    if (!replace_file(original, backup)) return FALSE;
-    return files_equal(payload, runtime) ||
-        ((GetFileAttributesW(runtime) == INVALID_FILE_ATTRIBUTES || grant_system_file_control(runtime)) &&
-         replace_file(payload, runtime));
+    return replace_file(sources[0], backup) && install_system_file(payload, runtime);
+}
+
+static BOOL provision_nvidia_opencl(const wchar_t *native_dir, const wchar_t *sys)
+{
+    wchar_t runtimes[32][MAX_PATH], payload[MAX_PATH], backup[MAX_PATH], *slash;
+    UINT count, i;
+    BOOL result = TRUE;
+
+    if (!native_dir || !native_dir[0]) return TRUE;
+    if (swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-opencl-shim.dll", native_dir) < 0)
+        return FALSE;
+    if (GetFileAttributesW(payload) == INVALID_FILE_ATTRIBUTES) return TRUE;
+    count = find_nvidia_driver_files(runtimes, sys, L"nvopencl64.dll");
+    if (!count) return TRUE;
+    if (!validate_nvidia_opencl_dll(payload, TRUE)) return FALSE;
+    for (i = 0; i < count; i++) {
+        const wchar_t *original;
+        BOOL installed = validate_dll_export(runtimes[i], IMAGE_FILE_MACHINE_AMD64,
+                                             "appsandbox_opencl");
+        if (wcscpy_s(backup, MAX_PATH, runtimes[i]) || !(slash = wcsrchr(backup, L'\\')))
+            return FALSE;
+        *slash = 0;
+        if (wcscat_s(backup, MAX_PATH, L"\\appsandbox-nvopencl64.dll")) return FALSE;
+        original = installed ? backup : runtimes[i];
+        if (!validate_nvidia_opencl_dll(original, FALSE)) {
+            result = FALSE;
+            continue;
+        }
+        if (!dll_exports_covered(original, payload, IMAGE_FILE_MACHINE_AMD64)) {
+            if (installed) install_system_file(backup, runtimes[i]);
+            result = FALSE;
+            continue;
+        }
+        if ((!installed && !replace_file(runtimes[i], backup)) ||
+            !install_system_file(payload, runtimes[i]))
+            result = FALSE;
+    }
+    return result;
 }
 
 static const char *json_skip_whitespace(const char *p)
@@ -939,29 +1072,63 @@ BOOL gl_vk_provision_runtime(const wchar_t *dir, const wchar_t *native_dir,
 #endif
 }
 
-BOOL nvidia_dlss_provision(const wchar_t *native_dir)
+BOOL nvidia_runtime_provision(const wchar_t *native_dir)
 {
 #if defined(_M_X64)
     wchar_t sys[MAX_PATH], payload[MAX_PATH], packages[32][MAX_PATH];
     UINT count, i, length;
+    BOOL result = TRUE;
 
-    if (!native_dir || !native_dir[0]) return TRUE;
-    if (swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-dlss-shim.dll", native_dir) < 0)
-        return FALSE;
-    if (GetFileAttributesW(payload) == INVALID_FILE_ATTRIBUTES) return TRUE;
     length = GetSystemDirectoryW(sys, MAX_PATH);
     if (!length || length >= MAX_PATH) return FALSE;
+    if (!provision_nvidia_library(sys, L"nvofapi64.dll", "NvOFAPICreateInstanceCuda")) result = FALSE;
+    if (!provision_nvidia_library(sys, L"nvoptix.dll", "optixQueryFunctionTable")) result = FALSE;
+    if (!provision_cuda(native_dir, sys)) result = FALSE;
+    if (!provision_nvidia_opencl(native_dir, sys)) result = FALSE;
+    if (!native_dir || !native_dir[0]) return result;
+    if (swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-dlss-shim.dll", native_dir) < 0)
+        return FALSE;
+    if (GetFileAttributesW(payload) == INVALID_FILE_ATTRIBUTES) return result;
+    count = find_nvidia_driver_files(packages, sys, L"nvapi64.dll");
+    if (count && !provision_nvapi(native_dir, sys, packages, count)) result = FALSE;
     count = find_nvidia_driver_files(packages, sys, L"_nvngx.dll");
-    if (!count) return TRUE;
     for (i = 0; i < count; i++) {
         wchar_t *slash = wcsrchr(packages[i], L'\\');
         if (!slash) return FALSE;
         *slash = 0;
-        if (!nvidia_ngx_junction(sys, packages[i])) return FALSE;
+        if (!nvidia_ngx_junction(sys, packages[i])) result = FALSE;
     }
-    return provision_nvapi(native_dir, sys, packages, count);
+    return result;
 #else
     (void)native_dir;
     return TRUE;
+#endif
+}
+
+BOOL nvidia_opencl_copy_target(const wchar_t *path, wchar_t target[MAX_PATH])
+{
+    target[0] = 0;
+#if defined(_M_X64)
+    {
+        const wchar_t *slash = wcsrchr(path, L'\\');
+        if (!slash || _wcsicmp(slash + 1, L"nvopencl64.dll") ||
+            !validate_dll_export(path, IMAGE_FILE_MACHINE_AMD64, "appsandbox_opencl")) return TRUE;
+        if (wcsncpy_s(target, MAX_PATH, path, slash + 1 - path) ||
+            wcscat_s(target, MAX_PATH, L"appsandbox-nvopencl64.dll")) return FALSE;
+    }
+#else
+    (void)path;
+#endif
+    return TRUE;
+}
+
+BOOL nvidia_opencl_commit_copy(const wchar_t *source, const wchar_t *target)
+{
+#if defined(_M_X64)
+    return validate_nvidia_opencl_dll(source, FALSE) && replace_file(source, target);
+#else
+    (void)source;
+    (void)target;
+    return FALSE;
 #endif
 }

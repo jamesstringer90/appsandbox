@@ -1,0 +1,10 @@
+LIBRARY appsandbox-nvidia-opencl-shim
+EXPORTS
+    appsandbox_opencl
+    NVAON_SharedMemory_Destroy=appsandbox-nvopencl64.NVAON_SharedMemory_Destroy
+    NVAON_SharedMemory_ImportReadOnly=appsandbox-nvopencl64.NVAON_SharedMemory_ImportReadOnly
+    clGetExportTable=appsandbox-nvopencl64.clGetExportTable
+    clGetExtensionFunctionAddress
+    clGetPlatformInfo
+    clIcdGetPlatformIDsKHR
+    cuGetExportTable=appsandbox-nvopencl64.cuGetExportTable

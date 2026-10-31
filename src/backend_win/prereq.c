@@ -20,7 +20,7 @@ BOOL prereq_is_feature_enabled(const wchar_t *feature_name)
     DWORD bytes_read = 0;
 
     _snwprintf_s(cmd, 512, _TRUNCATE,
-        L"C:\\Windows\\System32\\dism.exe /online /Get-FeatureInfo /FeatureName:%ls",
+        L"C:\\Windows\\System32\\dism.exe /English /online /Get-FeatureInfo /FeatureName:%ls",
         feature_name);
 
     ZeroMemory(&sa, sizeof(sa));

@@ -145,7 +145,12 @@
         /* Leave unrelated files in the VM's disk directory. */
         rmdir(diskDir.fileSystemRepresentation);
     }
-    return [[NSFileManager defaultManager] removeItemAtURL:dir error:error];
+    NSError *removeError = nil;
+    if ([[NSFileManager defaultManager] removeItemAtURL:dir error:&removeError]) return YES;
+    if ([removeError.domain isEqualToString:NSCocoaErrorDomain] &&
+        removeError.code == NSFileNoSuchFileError) return YES;
+    if (error) *error = removeError;
+    return NO;
 }
 
 @end

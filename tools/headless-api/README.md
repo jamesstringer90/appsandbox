@@ -131,7 +131,7 @@ clear message** and a non-zero exit — it never half-starts:
    ```python
    import asb
    c = asb.connect()
-   print(c.version())   # {'product': 'AppSandbox', 'version': '0.1.8', ...}
+   print(c.version())   # {'product': 'AppSandbox', 'version': '0.1.9', ...}
    ```
 
 `asb.py` has no third-party dependencies; copy it next to your script, or add

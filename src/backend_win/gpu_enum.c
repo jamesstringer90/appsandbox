@@ -729,7 +729,9 @@ BOOL gpu_append_nvidia_graphics_shim_share(const GpuList *gpu_list, GpuDriverSha
 #if defined(_M_X64)
     static const wchar_t *const additional[] = {
         L"appsandbox-nvidia-vk-gl-shim32.dll",
-        L"appsandbox-nvidia-dlss-shim.dll"
+        L"appsandbox-nvidia-dlss-shim.dll",
+        L"appsandbox-nvidia-cuda-shim.dll",
+        L"appsandbox-nvidia-opencl-shim.dll"
     };
     wchar_t exe[MAX_PATH], path[MAX_PATH], file[MAX_PATH], *slash;
     GpuDriverShare *share;

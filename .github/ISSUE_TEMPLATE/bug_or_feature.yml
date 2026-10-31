@@ -1,0 +1,29 @@
+name: Bug report or feature request
+description: Share a problem or idea, what you tried, and what you learned.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Before opening an issue
+
+        Please try fixing the bug or adding the feature with an AI coding tool. I personally use Codex, but you can use whatever you want. With the help of these tools, I'm sure you can do it yourself, even if you're new to programming! App Sandbox's own code is [MIT-licensed](https://github.com/jamesstringer90/appsandbox/blob/main/LICENSE), so you're welcome to make it your own.
+
+        Try this prompt:
+
+        > Help me fix [problem] or add [feature] in App Sandbox: https://github.com/jamesstringer90/appsandbox. I'm new to programming. Walk me through getting my own copy, making the change, and running it to check that it works. For regular app changes, reuse the released drivers; don't rebuild them or install the WDK. Help me share my changes in a pull request once we have confirmed they work.
+
+        Whether you use AI or your own programming skills, issues with debugging details, test results, or suggested fixes are much more helpful than reports with no investigation. I'm more likely to prioritize that work, even if you haven't found a complete fix. I guarantee I will not call it AI slop!!
+
+        A **pull request (PR)** shows me exactly what you changed to fix the bug or add the feature. Include how you tested it.
+
+        [PRs are considered suggestions](https://github.com/jamesstringer90/appsandbox/blob/main/CONTRIBUTING.md) so please submit them with that expectation. I will look at them to understand what you're trying to do, and I'll credit work that helps shape a change.
+
+        Thanks for giving it a go!
+
+  - type: textarea
+    id: issue
+    attributes:
+      label: Your issue
+      description: Describe the problem or feature, what you tried, and any results or PR links.
+    validations:
+      required: true

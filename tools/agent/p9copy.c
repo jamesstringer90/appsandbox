@@ -568,9 +568,15 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
     BOOL ok = TRUE;
     BOOL created;
     const char *names[1];
+    wchar_t target[MAX_PATH] = { 0 }, temporary[MAX_PATH] = { 0 };
 
-    if (skip_excluded_file(s, name) || skip_preserved_file(s, name, local_path))
-        return TRUE;
+    if (skip_excluded_file(s, name)) return TRUE;
+    if (s->options.resolve_target && !s->options.resolve_target(local_path, target)) return FALSE;
+    if (target[0]) {
+        if (!s->options.commit_file) return FALSE;
+        local_path = target;
+    }
+    if (skip_preserved_file(s, name, local_path)) return TRUE;
 
     /* Check if file exists and same size — skip if so */
     {
@@ -596,13 +602,26 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
     if (iounit == 0 || iounit > s->msize - 24)
         iounit = s->msize - 24;
 
-    hfile = CreateFileW(local_path, GENERIC_WRITE, 0, NULL,
-                        s->options.keep_existing ? CREATE_NEW : CREATE_ALWAYS,
+    if (target[0]) {
+        wchar_t folder[MAX_PATH], *slash;
+        if (wcscpy_s(folder, MAX_PATH, local_path) || !(slash = wcsrchr(folder, L'\\'))) {
+            p9_clunk(s, fid);
+            return FALSE;
+        }
+        *slash = 0;
+        if (!GetTempFileNameW(folder, L"asb", 0, temporary)) {
+            p9_clunk(s, fid);
+            return FALSE;
+        }
+    }
+    hfile = CreateFileW(temporary[0] ? temporary : local_path, GENERIC_WRITE, 0, NULL,
+                        s->options.keep_existing && !temporary[0] ? CREATE_NEW : CREATE_ALWAYS,
                         FILE_ATTRIBUTE_NORMAL, NULL);
     if (hfile == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
         p9_clunk(s, fid);
-        if (s->options.keep_existing &&
+        if (temporary[0]) DeleteFileW(temporary);
+        if (s->options.keep_existing && !temporary[0] &&
             (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS)) {
             P9LOG("9P skip (destination created during copy): %s", name);
             return TRUE;
@@ -641,7 +660,10 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
     CloseHandle(hfile);
     p9_clunk(s, fid);
 
-    if (!ok && created && !DeleteFileW(local_path))
+    if (temporary[0]) {
+        if (ok) ok = s->options.commit_file(temporary, local_path);
+        DeleteFileW(temporary);
+    } else if (!ok && created && !DeleteFileW(local_path))
         P9LOG("9P cannot remove incomplete file: %ls (error %lu)",
               local_path, GetLastError());
 
