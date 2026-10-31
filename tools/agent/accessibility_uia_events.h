@@ -5,8 +5,6 @@
 typedef struct IUIAutomation IUIAutomation;
 typedef struct IUIAutomationElement IUIAutomationElement;
 #include <stdint.h>
-/* Create/observe/reset/destroy on the same collector MTA thread.
- * Generation/time reads are thread safe while the owner remains alive. */
 typedef struct AccessibilityUiaEvents AccessibilityUiaEvents;
 HRESULT accessibility_uia_events_create(IUIAutomation *, AccessibilityUiaEvents **);
 void accessibility_uia_events_destroy(AccessibilityUiaEvents *);

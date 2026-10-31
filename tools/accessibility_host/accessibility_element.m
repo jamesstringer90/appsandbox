@@ -2,15 +2,13 @@
 #import "../../src/backend_mac/vm_accessibility_snapshot.h"
 #import "../transport/accessibility_attributes_mac.h"
 #import "../../tools/transport/accessibility_value_mac.h"
-#import <os/log.h>
 
-// String-based AX dispatch is deliberate: guest apps can advertise attributes
-// and actions that do not have corresponding NSAccessibility protocol methods.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-implementations"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 @implementation VmAccessibilityElement
+- (NSDictionary *)record { return [self.owner recordForElement:self]; }
 - (void)retire {
     if (_retired) return;
     _retired = YES;
@@ -24,7 +22,6 @@
 - (BOOL)accessibilityNotifiesWhenDestroyed { return YES; }
 - (NSString *)accessibilityRole {
     NSString *role = self.record[@"role"];
-    // Source windows and sheets are embedded content; the viewer owns the host window.
     if (self.container || [role isEqual:@"AXWindow"] || [role isEqual:@"AXSheet"] ||
         [role isEqual:@"AXApplication"]) return NSAccessibilityGroupRole;
     return role ?: NSAccessibilityStaticTextRole;
@@ -54,17 +51,6 @@
     return [self.owner childrenForElement:self];
 }
 - (NSRect)accessibilityFrame { return [self.owner frameForElement:self]; }
-- (NSRect)accessibilityFrameInParentSpace {
-    NSRect frame = self.accessibilityFrame;
-    id parent = self.accessibilityParent;
-    if ([parent respondsToSelector:@selector(accessibilityFrame)]) {
-        NSRect parentFrame = [parent accessibilityFrame];
-        frame.origin.x -= parentFrame.origin.x;
-        frame.origin.y -= parentFrame.origin.y;
-    }
-    return frame;
-}
-- (BOOL)hasVisibleGuestContent { return !NSIsEmptyRect(self.accessibilityFrame); }
 - (id)accessibilityFocusedUIElement { return [self.owner focusedGuestElement]; }
 - (id)hitTestGuest:(NSPoint)point {
     if (!self.isAccessibilityElement) return nil;
@@ -175,7 +161,8 @@
     return self.record[@"actionDescriptions"][action] ?: NSAccessibilityActionDescription(action);
 }
 - (void)accessibilityPerformAction:(NSString *)action {
-    if (![[self accessibilityActionNames] containsObject:action] || ![self.owner performAction:action value:nil element:self])
+    if (![[self accessibilityActionNames] containsObject:action] ||
+        ![[self.owner request:@{@"action": action} element:self][@"ok"] boolValue])
         NSAccessibilityRaiseBadArgumentException(self, action, nil);
 }
 - (NSArray *)accessibilityParameterizedAttributeNames {
@@ -186,9 +173,6 @@
     BOOL inputGeometry = ![attribute isEqual:@"AXScreenPointForLayoutPoint"] && ![attribute isEqual:@"AXScreenSizeForLayoutSize"];
     BOOL outputGeometry = ![attribute isEqual:@"AXLayoutPointForScreenPoint"] && ![attribute isEqual:@"AXLayoutSizeForScreenSize"];
     id wire = [self encode:parameter geometry:inputGeometry];
-    if (getenv("ASB_AX_TRACE_REQUESTS"))
-        os_log(OS_LOG_DEFAULT, "[AX parameter] node=%{public}@ attribute=%{public}@ range=%{public}@", self.nodeID, attribute,
-            [wire isKindOfClass:NSDictionary.class] && [wire[@"$ax"] isEqual:@"range"] ? wire[@"value"] : @"non-range");
     NSDictionary *response = wire ? [self.owner request:@{@"action": @"getParameterizedAttribute", @"attribute": attribute, @"value": wire} element:self] : nil;
     id result = [response[@"ok"] boolValue] ? [self decode:response[@"value"] geometry:outputGeometry] : nil;
     return result == NSNull.null ? nil : result;
@@ -200,9 +184,6 @@
 - (NSArray *)accessibilityArrayAttributeValues:(NSString *)attribute index:(NSUInteger)index maxCount:(NSUInteger)maximum {
     id value = [self accessibilityAttributeValue:attribute];
     if (![value isKindOfClass:NSArray.class]) return nil;
-    if (getenv("ASB_AX_TRACE_REQUESTS"))
-        os_log(OS_LOG_DEFAULT, "[AX array] node=%{public}@ attribute=%{public}@ index=%lu requested=%lu total=%lu", self.nodeID, attribute,
-            (unsigned long)index, (unsigned long)maximum, (unsigned long)[value count]);
     if (index >= [value count]) return @[];
     return [value subarrayWithRange:NSMakeRange(index, MIN(maximum, [value count] - index))];
 }

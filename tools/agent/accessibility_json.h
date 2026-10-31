@@ -11,9 +11,6 @@ typedef enum AccessibilityJsonType {
     AX_JSON_ARRAY, AX_JSON_OBJECT
 } AccessibilityJsonType;
 
-/* Constructors return an owned reference. Getters return borrowed values.
- * Set/append consume their value even on failure. Retain explicitly when
- * sharing a value with another container or the last published snapshot. */
 AccessibilityJson *ax_json_null(void);
 AccessibilityJson *ax_json_boolean(int value);
 AccessibilityJson *ax_json_number(double value);
@@ -38,8 +35,6 @@ double ax_json_double(const AccessibilityJson *value, double fallback);
 int ax_json_bool(const AccessibilityJson *value, int fallback);
 int ax_json_valid(const AccessibilityJson *value);
 
-/* Uses Windows' JSON parser/serializer through the C ABI. UTF-8 buffers use
- * malloc/free. A failed allocation or invalid subtree cannot be serialized. */
 int ax_json_initialize(void);
 void ax_json_uninitialize(void);
 AccessibilityJson *ax_json_parse(const char *utf8, size_t length);

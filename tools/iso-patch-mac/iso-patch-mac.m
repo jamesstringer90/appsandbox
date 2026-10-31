@@ -1566,10 +1566,16 @@ static int cmd_build_windows(int argc, char **argv) {
     NSString *binDir = [signedDir stringByAppendingPathComponent:@"resources"];
     NSString *drvDir = [signedDir stringByAppendingPathComponent:@"drivers"];
     NSString *devconPath = [drvDir stringByAppendingPathComponent:@"devcon.exe"];
-    if (![fm fileExistsAtPath:[binDir stringByAppendingPathComponent:@"appsandbox-agent.exe"]]) {
-        [fm removeItemAtPath:tmp error:nil];
-        emit_error(@"build-windows: signed payload zip did not yield resources/appsandbox-agent.exe");
-        return 3;
+    NSArray<NSString *> *guestBinaries = @[@"appsandbox-agent.exe", @"appsandbox-input.exe",
+        @"appsandbox-displays.exe", @"appsandbox-clipboard.exe", @"appsandbox-clipboard-reader.exe",
+        @"appsandbox-audio.exe", @"appsandbox-accessibility.exe"];
+    for (NSString *name in guestBinaries) {
+        if (![fm fileExistsAtPath:[binDir stringByAppendingPathComponent:name]]) {
+            [fm removeItemAtPath:tmp error:nil];
+            emit_error([NSString stringWithFormat:
+                @"build-windows: signed Windows payload is missing resources/%@; a matching Windows release containing all guest helpers is required", name]);
+            return 3;
+        }
     }
     emit_log(@"using downloaded signed guest payload");
 
@@ -1680,14 +1686,9 @@ static int cmd_build_windows(int argc, char **argv) {
     n += bw_manifest_add(mf, unattend,      "\\Windows\\Panther\\unattend.xml");
     n += bw_manifest_add(mf, setupCmd,      "\\Windows\\AppSandbox\\setup.cmd");
     n += bw_manifest_add(mf, setupComplete, "\\Windows\\Setup\\Scripts\\SetupComplete.cmd");
-    /* agent + channel helper EXEs (existence-gated -- mirrors generate_vhdx_manifest's bin set;
-     * appsandbox-displays.exe is staged when present in the payload). */
-    const char *bins[] = { "appsandbox-agent.exe", "appsandbox-input.exe", "appsandbox-displays.exe",
-                           "appsandbox-clipboard.exe", "appsandbox-clipboard-reader.exe",
-                           "appsandbox-audio.exe", "appsandbox-accessibility.exe" };
-    for (size_t i = 0; i < sizeof(bins)/sizeof(bins[0]); i++) {
-        NSString *src = [binDir stringByAppendingPathComponent:@(bins[i])];
-        n += bw_manifest_add(mf, src, [NSString stringWithFormat:@"\\Windows\\AppSandbox\\%s", bins[i]].UTF8String);
+    for (NSString *name in guestBinaries) {
+        NSString *src = [binDir stringByAppendingPathComponent:name];
+        n += bw_manifest_add(mf, src, [NSString stringWithFormat:@"\\Windows\\AppSandbox\\%@", name].UTF8String);
     }
     /* Our signed drivers (VDD + VAD + ivshmem SHM) + their certs, from the signed payload. Existence-gated. */
     const char *drv[] = { "AppSandboxVDD.inf", "AppSandboxVDD.dll", "AppSandboxVDD.cat", "AppSandboxVDD.cer",

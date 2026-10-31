@@ -4,9 +4,7 @@
 #import "../../tools/transport/accessibility_protocol.h"
 #import "../../tools/transport/asb_transport.h"
 #include <unistd.h>
-#include <fcntl.h>
 
-@class VmAccessibilityDisplayObserver;
 @interface VmAccessibilityMac () <VZVirtioSocketListenerDelegate>
 - (void)connectTransport;
 - (void)displayChanged:(VZGraphicsDisplay *)display available:(BOOL)available;
@@ -33,12 +31,9 @@
     BOOL _started;
     BOOL _connecting;
     NSUInteger _generation;
-    int _configuredFD;
 }
 - (instancetype)initWithView:(NSView *)view vmName:(NSString *)name {
     if ((self = [super init])) {
-        _view = view;
-        _configuredFD = -1;
         _session = [[VmAccessibilitySession alloc] initWithView:view name:name];
     }
     return self;
@@ -46,7 +41,6 @@
 - (void)dealloc {
     [_connectTimer invalidate];
     [_session stop];
-    if (_configuredFD >= 0) close(_configuredFD);
     _displayObserver.owner = nil;
     if (_displayObserver) [_graphicsDisplay removeObserver:_displayObserver];
     if (_listener) [_socketDevice removeSocketListenerForPort:ASB_AX_PORT];
@@ -64,25 +58,11 @@
     _virtualMachine = nil;
     _transport = transport;
 }
-- (BOOL)configureWithFileDescriptor:(int)fileDescriptor {
-    [self stopAccessibility];
-    _socketDevice = nil;
-    _virtualMachine = nil;
-    _transport = nil;
-    _configuredFD = dup(fileDescriptor);
-    if (_configuredFD >= 0) fcntl(_configuredFD, F_SETFD, FD_CLOEXEC);
-    return _configuredFD >= 0;
-}
 - (void)startAccessibility {
-    if (_started || (!_socketDevice && !_transport && _configuredFD < 0)) return;
+    if (_started || (!_socketDevice && !_transport)) return;
     _started = YES;
     _generation++;
     [_session start];
-    if (_configuredFD >= 0) {
-        [_session attachFileDescriptor:_configuredFD];
-        close(_configuredFD);
-        _configuredFD = -1;
-    }
     if (_socketDevice) {
         _listener = [VZVirtioSocketListener new];
         _listener.delegate = self;
@@ -109,8 +89,6 @@
     [_connectTimer invalidate];
     _connectTimer = nil;
     [_session stop];
-    if (_configuredFD >= 0) close(_configuredFD);
-    _configuredFD = -1;
     if (_listener) [_socketDevice removeSocketListenerForPort:ASB_AX_PORT];
     _listener.delegate = nil;
     _listener = nil;
@@ -152,11 +130,9 @@
     [_session setDisplayPixels:display.sizeInPixels available:available];
 }
 - (void)updateDisplayPixels:(NSSize)pixels { [_session setDisplayPixels:pixels available:YES]; }
-- (void)noteGuestInput { [_session noteInput]; }
 - (void)observeWindow { [_session observeWindow]; }
 - (void)geometryDidChange { [_session geometryDidChange]; }
 - (BOOL)hasAccessibilityContent { return _session.hasAccessibilityContent; }
-- (NSDictionary *)snapshotStatistics { return _session.snapshotStatistics; }
 - (NSString *)accessibilityLabel { return _session.accessibilityLabel; }
 - (NSArray *)accessibilityChildren { return _session.accessibilityChildren; }
 - (id)accessibilityFocusedUIElement { return _session.accessibilityFocusedUIElement; }

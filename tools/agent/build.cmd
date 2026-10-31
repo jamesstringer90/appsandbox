@@ -1,11 +1,9 @@
 @echo off
-REM Build appsandbox-agent.exe (guest-side agent)
-REM Run from VS Developer Command Prompt or after calling vcvarsall.bat
+setlocal
+set "ASB_PLATFORM=%~1"
+if not defined ASB_PLATFORM set "ASB_PLATFORM=x64"
+set "ASB_CONFIGURATION=%~2"
+if not defined ASB_CONFIGURATION set "ASB_CONFIGURATION=Release"
 
-cl /nologo /O2 /W3 /Fe:..\..\release\resources\appsandbox-agent.exe agent.c ws2_32.lib advapi32.lib
-if %ERRORLEVEL% EQU 0 (
-    echo Built: release\resources\appsandbox-agent.exe
-) else (
-    echo Build failed.
-    exit /b 1
-)
+msbuild "%~dp0..\..\AppSandbox.sln" /t:agent;appsandbox-input;appsandbox-displays;appsandbox-clipboard;appsandbox-clipboard-reader;appsandbox-audio;appsandbox-accessibility /p:Configuration=%ASB_CONFIGURATION% /p:Platform=%ASB_PLATFORM% /m /nologo
+exit /b %ERRORLEVEL%

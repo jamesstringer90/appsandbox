@@ -1,4 +1,3 @@
-/* Guest socket I/O; delegate callbacks run on the main queue. */
 #import "../../tools/transport/accessibility_wire_mac.h"
 
 @class VmAccessibilityConnection;

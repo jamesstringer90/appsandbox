@@ -1,11 +1,9 @@
-/* Main-thread viewer state, refresh scheduling, and action forwarding. */
 #import <Cocoa/Cocoa.h>
 
 @interface VmAccessibilitySession : NSObject
 @property(nonatomic, weak, readonly) NSView *view;
 @property(nonatomic, readonly) BOOL connected;
 @property(nonatomic, readonly) BOOL hasAccessibilityContent;
-@property(nonatomic, readonly) NSDictionary *snapshotStatistics;
 - (instancetype)initWithView:(NSView *)view name:(NSString *)name;
 - (void)start;
 - (void)stop;

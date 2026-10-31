@@ -1,7 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
 #include "accessibility_uia_events.h"
-/* SDK module constants have external linkage in C. accessibility_uia.c
- * includes their definitions once; this TU imports only the values it uses. */
 #define __UIA_PatternIds_MODULE_DEFINED__
 #define __UIA_EventIds_MODULE_DEFINED__
 #define __UIA_PropertyIds_MODULE_DEFINED__
@@ -13,8 +11,6 @@
 #define __UIA_HeadingLevelIds_MODULE_DEFINED__
 #define __UIA_ChangeIds_MODULE_DEFINED__
 #define __UIA_MetadataIds_MODULE_DEFINED__
-/* UIAutomationCoreApi.h defines this one outside the module guards. It is
- * unused here; give this TU's SDK definition a private namespace. */
 #define UIA_ScrollPatternNoScroll asb_events_sdk_scroll_no_scroll
 #include <UIAutomationClient.h>
 #undef UIA_ScrollPatternNoScroll
@@ -98,8 +94,6 @@ static HRESULT sink_query(Sink *s, REFIID iid, void **out) {
     sink_addref(s);
     return S_OK;
 }
-/* UIA can retain callbacks after unsubscription. Each sink owns the shared
- * counters and has its own disable gate, never a pointer to the collector. */
 static void signal_change(Sink *s) {
     LONG64 now, previous;
     if (!InterlockedCompareExchange(&s->enabled, 0, 0)) return;
@@ -133,7 +127,6 @@ static HRESULT STDMETHODCALLTYPE structure_handle(IUIAutomationStructureChangedE
 static HRESULT STDMETHODCALLTYPE focus_handle(IUIAutomationFocusChangedEventHandler *p, IUIAutomationElement *sender) {
     Sink *s = SINK_FROM(p, focus);
     int process = 0;
-    /* Only registration-cached PID: never read live properties or walk trees. */
     if (InterlockedCompareExchange(&s->enabled, 0, 0) && sender &&
         SUCCEEDED(sender->lpVtbl->get_CachedProcessId(sender, &process)) && process == s->process)
         signal_change(s);
@@ -223,7 +216,6 @@ HRESULT accessibility_uia_events_observe(AccessibilityUiaEvents *e, IUIAutomatio
     e->root = root; root->lpVtbl->AddRef(root);
     CHECK(sink_create(e->changes, process, &e->sink));
     CHECK(e->automation6->lpVtbl->CreateEventHandlerGroup(e->automation6, &e->group));
-    /* Semantic changes only; omit continuously changing geometry. */
     CHECK(e->group->lpVtbl->AddPropertyChangedEventHandler(e->group, TreeScope_Subtree, NULL,
         &e->sink->property, properties, (int)ARRAYSIZE(properties)));
     CHECK(e->group->lpVtbl->AddStructureChangedEventHandler(e->group, TreeScope_Subtree, NULL, &e->sink->structure));

@@ -95,12 +95,6 @@ typedef void (^IsoPatchCompletion)(NSError * _Nullable error);
  * ensure_ssh_msi_cached). Returns the cached path, or nil on failure. Blocking; call off-main. */
 + (nullable NSString *)ensureOpenSSHMsiCached;
 
-/* Ensure the SIGNED Windows guest payload zip (EV-signed agent EXEs + attestation-signed drivers,
- * incl. the ivshmem AppSandboxSHM) is cached locally. Mirrors ensureOpenSSHMsiCached: downloads the
- * release zip on first use (single atomic write; the version is pinned in the filename so a newer
- * release auto-invalidates) and returns the cached zip PATH. build-windows extracts the needed
- * members into its own per-build temp dir. Returns nil on failure (the caller must abort the build;
- * there is no bundled fallback). Blocking; call off-main. */
 + (nullable NSString *)ensureSignedWinPayloadZipCached;
 
 /* Ensure the vendored NetKVM (virtio-net) zip is cached locally. Mirrors ensureSignedWinPayloadZipCached:

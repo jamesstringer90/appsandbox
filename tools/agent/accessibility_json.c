@@ -10,7 +10,6 @@
 #include "accessibility_json.h"
 #include "../transport/accessibility_protocol.h"
 
-/* ABI IIDs from SDK windows.data.json.h; C declarations have no uuid.lib definitions. */
 static const IID iid_json_statics = {0x5f6b544a,0x2f53,0x48e1,{0x91,0xa3,0xf7,0x8b,0x50,0xa6,0x34,0x5c}};
 static const IID iid_json_map = {0xc9d9a725,0x786b,0x5113,{0xb4,0xb7,0x9b,0x61,0x76,0x4c,0x22,0x0b}};
 static const IID iid_json_vector = {0xd44662bc,0xdce3,0x59a8,{0x92,0x72,0x4b,0x21,0x0f,0x33,0x90,0x8b}};
@@ -34,7 +33,6 @@ struct AccessibilityJson {
     wchar_t *text;
     struct JsonEntry { wchar_t *key; AccessibilityJson *value; } *entries;
 };
-/* Collector-owned MTA state; initialize/uninitialize on that same thread. */
 static __declspec(thread) NativeStatics *statics;
 static __declspec(thread) int ro_initialized;
 #define RELEASE(p) do { if (p) (p)->lpVtbl->Release(p); } while (0)
@@ -242,8 +240,6 @@ done:
     WindowsDeleteString(text); RELEASE(child); RELEASE(array); RELEASE(array_value); RELEASE(object_value); RELEASE(object); return n;
 #undef TRY
 }
-/* Structural preflight bounds native parser recursion, not JSON syntax parsing.
- * The platform parser remains authoritative for escapes/tokens/grammar. */
 static int bounded_depth(const char *s, size_t length) {
     size_t i; unsigned depth = 0; int quoted = 0, escaped = 0;
     for (i = 0; i < length; ++i) {

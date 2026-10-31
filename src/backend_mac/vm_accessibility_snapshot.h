@@ -1,4 +1,3 @@
-/* Validated guest snapshots and display-coordinate conversion. */
 #import <Cocoa/Cocoa.h>
 #include <math.h>
 
@@ -38,8 +37,6 @@ static inline BOOL VmAccessibilityIsSessionIdentifier(id value) {
 @property (copy) NSArray<NSString *> *roots;
 @property (copy) NSString *focused;
 @property BOOL truncated;
-@property NSTimeInterval receivedAt;
-@property NSTimeInterval captureDuration;
 @property uint64_t refreshGeneration;
 @end
 

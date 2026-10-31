@@ -120,6 +120,12 @@ step "Building $SCHEME ($CONFIGURATION)"
 xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration "$CONFIGURATION" clean >/dev/null
 xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration "$CONFIGURATION" build >/dev/null
 [[ -d "$APP_PATH" ]] || die "build produced no app at $APP_PATH"
+for helper in \
+    Contents/Resources/agent_mac/AppSandboxAccessibility.app/Contents/MacOS/AppSandboxAccessibility \
+    Contents/Resources/agent_mac/com.appsandbox.accessibility.plist \
+    Contents/Helpers/AppSandboxAccessibilityHost.app/Contents/MacOS/AppSandboxAccessibilityHost; do
+    [[ -f "$APP_PATH/$helper" ]] || die "missing accessibility payload: $helper"
+done
 
 # --- 1b. sign the embedded QEMU (Resources/ Mach-O that Xcode does not sign) ---
 # qemu + its dylibs live under Contents/Resources/qemu — not an Xcode code location, so the build

@@ -8,9 +8,6 @@
 #include <float.h>
 
 @interface VmAccessibilitySession () <VmAccessibilityConnectionDelegate, VmAccessibilityPresenterDelegate>
-- (void)receiveState:(id)state connection:(VmAccessibilityConnection *)connection;
-- (void)connectionEnded:(VmAccessibilityConnection *)connection;
-- (void)receiveRemoteMessage:(NSDictionary *)message presenter:(VmAccessibilityPresenter *)presenter;
 - (void)publishSnapshot:(BOOL)includeSnapshot;
 - (void)markSnapshotPending;
 - (void)scheduleCapture;
@@ -24,14 +21,6 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
     CGEventSetIntegerValueField(raw, kCGEventTargetUnixProcessID, getpid());
     NSEvent *event = [NSEvent eventWithCGEvent:raw];
     if (!event || !VmAccessibilityIsInputEvent(event)) { CFRelease(raw); return nil; }
-    if (getenv("ASB_AX_TRACE_INPUT")) {
-        CGPoint point = CGEventGetLocation(raw);
-        NSLog(@"[AX input] type=%ld eventWindow=%ld targetWindow=%ld pointerWindow=%lld flags=%llu point=(%.1f,%.1f) delta=(%.1f,%.1f) key=%lld",
-            (long)event.type, (long)event.windowNumber, (long)window.windowNumber,
-            CGEventGetIntegerValueField(raw, kCGMouseEventWindowUnderMousePointer), (unsigned long long)event.modifierFlags,
-            point.x, point.y, CGEventGetDoubleValueField(raw, kCGScrollWheelEventDeltaAxis1),
-            CGEventGetDoubleValueField(raw, kCGScrollWheelEventDeltaAxis2), CGEventGetIntegerValueField(raw, kCGKeyboardEventKeycode));
-    }
     BOOL keyboard = event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp || event.type == NSEventTypeFlagsChanged;
     if (keyboard) {
         BOOL flags = event.type == NSEventTypeFlagsChanged;
@@ -95,11 +84,6 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
 }
 - (BOOL)connected { return _connection != nil; }
 - (BOOL)hasAccessibilityContent { return _started && _presenter.root != nil; }
-- (NSDictionary *)snapshotStatistics {
-    return @{@"ready": @(_snapshot && !_pending), @"nodes": @(_snapshot.nodes.count),
-        @"revision": @(_snapshot.revision), @"captureMs": @(_snapshot.captureDuration * 1000),
-        @"generation": @(_requestedRefresh), @"status": _status ?: @""};
-}
 - (void)dealloc {
     [_connection stop];
     [_presenter stop];
@@ -260,7 +244,6 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
         NSData *data = [[NSData alloc] initWithBase64EncodedString:message[@"event"] options:0];
         CGEventRef raw = data.length ? CGEventCreateFromData(NULL, (__bridge CFDataRef)data) : NULL;
         NSEvent *event = raw ? VmAccessibilityEventForWindow(raw, self.view.window) : nil;
-        if (getenv("ASB_AX_TRACE_INPUT")) NSLog(@"[AX input route] accepted=%d", event != nil);
         if (raw) CFRelease(raw);
         if (!event) return;
         [self.view.window makeFirstResponder:self.view];
@@ -287,8 +270,6 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
             return;
         }
         BOOL mutation = !query || AsbAXParameterizedAttributeMutates(attribute);
-        // Semantic actions have an explicit completion; only physical input
-        // and display changes need the input settle interval.
         if (mutation) { _pendingActions++; [self markSnapshotPending]; }
         VmAccessibilityConnection *connection = _connection;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -329,15 +310,6 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
         NSEventMaskOtherMouseDragged | NSEventMaskScrollWheel handler:^NSEvent *(NSEvent *event) {
         VmAccessibilitySession *session = weakSelf;
         BOOL keyboard = event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp || event.type == NSEventTypeFlagsChanged;
-        if (session && getenv("ASB_AX_TRACE_INPUT")) {
-            NSLog(@"[AX window input] type=%ld window=%ld targetWindow=%ld flags=%llu point=(%.1f,%.1f)",
-                (long)event.type, (long)event.windowNumber, (long)session.view.window.windowNumber,
-                (unsigned long long)event.modifierFlags, event.locationInWindow.x, event.locationInWindow.y);
-            if (event.type == NSEventTypeScrollWheel)
-                NSLog(@"[AX window wheel] delta=(%.2f,%.2f) precise=%d phase=%llu momentum=%llu",
-                    event.scrollingDeltaX, event.scrollingDeltaY, event.hasPreciseScrollingDeltas,
-                    (unsigned long long)event.phase, (unsigned long long)event.momentumPhase);
-        }
         if (session && (event.window == session.view.window || (keyboard && !event.window && NSApp.keyWindow == session.view.window))) [session noteInput];
         return event;
     }];
@@ -350,9 +322,6 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
                 [weakSelf geometryDidChange];
             }]];
     }
-    // A remote AX token created while the console is locked can resolve to the
-    // application instead of its window. Refresh the attachment when the viewer
-    // becomes active again; geometry updates alone retain that unusable token.
     [_windowObservers addObject:[NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidBecomeActiveNotification
         object:NSApp queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) {
             (void)notification;

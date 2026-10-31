@@ -126,9 +126,6 @@
                     NSString *requestID = message[@"requestId"], *session = message[@"session"];
                     if (!VmAccessibilityIsIdentifier(requestID) || !VmAccessibilityIsSessionIdentifier(session) ||
                         !VmAccessibilityIsInteger(message[@"version"], ASB_AX_VERSION, ASB_AX_VERSION)) break;
-                    // The guest asks only when it can begin this request. Recheck
-                    // the caller's original deadline on the writer queue, so time
-                    // spent waiting in either process never renews the budget.
                     dispatch_async(self->_writer, ^{
                         [self->_lock lock];
                         VmAccessibilityGuestRequest *request = self->_requests[requestID];
@@ -209,7 +206,6 @@
     }
     if (request.deadline <= now) return nil;
     request.session = message[@"session"];
-    // Host processes share system uptime. Never send that clock to the VM.
     [outgoing removeObjectForKey:@"hostDeadline"];
     [_lock lock];
     if (_stopped || _requests.count >= ASB_AX_MAX_PENDING_REQUESTS) { [_lock unlock]; return nil; }

@@ -78,7 +78,6 @@ VmAccessibilitySnapshot *VmAccessibilityParseSnapshot(NSDictionary *message) {
         ![display isKindOfClass:NSDictionary.class] || ![input isKindOfClass:NSArray.class] ||
         input.count > ASB_AX_MAX_NODES || ![roots isKindOfClass:NSArray.class] || roots.count > input.count ||
         (message[@"truncated"] && !VmAccessibilityIsInteger(message[@"truncated"], 0, 1)) ||
-        (message[@"captureMs"] && !VmAccessibilityIsNumber(message[@"captureMs"], 0, DBL_MAX)) ||
         (message[@"refreshGeneration"] && !VmAccessibilityIsInteger(message[@"refreshGeneration"], 0, 9007199254740991.0))) return nil;
     for (NSString *key in @[@"x", @"y"]) if (!VmAccessibilityIsNumber(display[key], -100000000, 100000000)) return nil;
     for (NSString *key in @[@"width", @"height"]) if (!VmAccessibilityIsNumber(display[key], 1, 1000000)) return nil;
@@ -163,8 +162,6 @@ VmAccessibilitySnapshot *VmAccessibilityParseSnapshot(NSDictionary *message) {
     snapshot.roots = displayRoots;
     snapshot.focused = focused;
     snapshot.truncated = [message[@"truncated"] boolValue];
-    snapshot.receivedAt = VmAccessibilityNow();
-    snapshot.captureDuration = [message[@"captureMs"] doubleValue] / 1000.0;
     snapshot.refreshGeneration = [message[@"refreshGeneration"] unsignedLongLongValue];
     return snapshot;
 }
@@ -195,8 +192,6 @@ NSValue *VmAccessibilityTransformGeometry(NSValue *value, VmAccessibilitySnapsho
 BOOL VmAccessibilityDisplayPixelsCompatible(NSSize output, NSSize rendered) {
     if (output.width <= 0 || output.height <= 0) return YES;
     if (rendered.width <= 0 || rendered.height <= 0) return NO;
-    // macOS can render a scaled display above its output resolution. Geometry
-    // depends on the aspect ratio, allowing for one pixel of rounding.
     CGFloat scale = MIN(output.width / rendered.width, output.height / rendered.height);
     return fabs(output.width - rendered.width * scale) <= 1 &&
         fabs(output.height - rendered.height * scale) <= 1;

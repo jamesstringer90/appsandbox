@@ -82,25 +82,25 @@
 		4015000000000000000000BB /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3007000000000000000000AA /* AudioToolbox.framework */; };
 		/* Framework target — Headers (public) */
 		6012000000000000000000BB /* asb_types.h in Headers */ = {isa = PBXBuildFile; fileRef = 1018000000000000000000AA /* asb_types.h */; settings = {ATTRIBUTES = (Public, ); }; };
-		20A1000000000000000000AF /* appsandbox-accessibility.m in Sources */ = {isa = PBXBuildFile; fileRef = 10A1000000000000000000AF /* appsandbox-accessibility.m */; };
-		20A2000000000000000000AF /* vm_accessibility_mac.m in Sources */ = {isa = PBXBuildFile; fileRef = 10A4000000000000000000AF /* vm_accessibility_mac.m */; };
-		40A1000000000000000000AF /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3006000000000000000000AA; };
-		40A2000000000000000000AF /* AppKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 30A1000000000000000000AF /* AppKit.framework */; };
-		40A3000000000000000000AF /* ApplicationServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 30A2000000000000000000AF /* ApplicationServices.framework */; };
-		60A1000000000000000000AF /* AppSandboxAccessibility.app in Embed agent_mac */ = {isa = PBXBuildFile; fileRef = C0A1000000000000000000AF /* AppSandboxAccessibility.app */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
-		60A2000000000000000000AF /* com.appsandbox.accessibility.plist in Embed agent_mac */ = {isa = PBXBuildFile; fileRef = 10A3000000000000000000AF /* com.appsandbox.accessibility.plist */; };
-		ACCE551B0000000000000003 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = ACCE551B0000000000000001 /* main.m */; };
-		ACCE551B0000000000000004 /* AppKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 30A1000000000000000000AF /* AppKit.framework */; };
-		ACCE551B0000000000000005 /* AppSandboxAccessibilityHost.app in Embed Accessibility Host */ = {isa = PBXBuildFile; fileRef = ACCE551B0000000000000002 /* AppSandboxAccessibilityHost.app */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
-		ACCE552C0000000000000001 /* vm_accessibility_session.m in Sources */ = {isa = PBXBuildFile; fileRef = ACCE552C0000000000000011 /* vm_accessibility_session.m */; };
-		ACCE553D0000000000000004 /* vm_accessibility_connection.m in Sources */ = {isa = PBXBuildFile; fileRef = ACCE553D0000000000000003 /* vm_accessibility_connection.m */; };
-		ACCE553D0000000000000007 /* vm_accessibility_presenter.m in Sources */ = {isa = PBXBuildFile; fileRef = ACCE553D0000000000000006 /* vm_accessibility_presenter.m */; };
-		ACCE553D000000000000000A /* vz_accessibility_view.m in Sources */ = {isa = PBXBuildFile; fileRef = ACCE553D0000000000000009 /* vz_accessibility_view.m */; };
-		ACCE553D000000000000000D /* vm_accessibility_snapshot.m in Sources */ = {isa = PBXBuildFile; fileRef = ACCE553D000000000000000C /* vm_accessibility_snapshot.m */; };
-		ACCE553D000000000000000E /* vm_accessibility_snapshot.m in Sources */ = {isa = PBXBuildFile; fileRef = ACCE553D000000000000000C /* vm_accessibility_snapshot.m */; };
-		ACCE553D0000000000000014 /* accessibility_element.m in Sources */ = {isa = PBXBuildFile; fileRef = ACCE553D0000000000000013 /* accessibility_element.m */; };
-		ACCE553D0000000000000019 /* ApplicationServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 30A2000000000000000000AF /* ApplicationServices.framework */; };
-		ACCE553D000000000000001A /* ApplicationServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 30A2000000000000000000AF /* ApplicationServices.framework */; };
+		20A1000000000000000000AF = {isa = PBXBuildFile; fileRef = 10A1000000000000000000AF; };
+		20A2000000000000000000AF = {isa = PBXBuildFile; fileRef = 10A4000000000000000000AF; };
+		40A1000000000000000000AF = {isa = PBXBuildFile; fileRef = 3006000000000000000000AA; };
+		40A2000000000000000000AF = {isa = PBXBuildFile; fileRef = 30A1000000000000000000AF; };
+		40A3000000000000000000AF = {isa = PBXBuildFile; fileRef = 30A2000000000000000000AF; };
+		60A1000000000000000000AF = {isa = PBXBuildFile; fileRef = C0A1000000000000000000AF; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		60A2000000000000000000AF = {isa = PBXBuildFile; fileRef = 10A3000000000000000000AF; };
+		ACCE551B0000000000000003 = {isa = PBXBuildFile; fileRef = ACCE551B0000000000000001; };
+		ACCE551B0000000000000004 = {isa = PBXBuildFile; fileRef = 30A1000000000000000000AF; };
+		ACCE551B0000000000000005 = {isa = PBXBuildFile; fileRef = ACCE551B0000000000000002; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		ACCE552C0000000000000001 = {isa = PBXBuildFile; fileRef = ACCE552C0000000000000011; };
+		ACCE553D0000000000000004 = {isa = PBXBuildFile; fileRef = ACCE553D0000000000000003; };
+		ACCE553D0000000000000007 = {isa = PBXBuildFile; fileRef = ACCE553D0000000000000006; };
+		ACCE553D000000000000000A = {isa = PBXBuildFile; fileRef = ACCE553D0000000000000009; };
+		ACCE553D000000000000000D = {isa = PBXBuildFile; fileRef = ACCE553D000000000000000C; };
+		ACCE553D000000000000000E = {isa = PBXBuildFile; fileRef = ACCE553D000000000000000C; };
+		ACCE553D0000000000000014 = {isa = PBXBuildFile; fileRef = ACCE553D0000000000000013; };
+		ACCE553D0000000000000019 = {isa = PBXBuildFile; fileRef = 30A2000000000000000000AF; };
+		ACCE553D000000000000001A = {isa = PBXBuildFile; fileRef = 30A2000000000000000000AF; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -132,14 +132,14 @@
 			remoteGlobalIDString = 8040000000000000000000EE;
 			remoteInfo = "appsandbox-clipboard";
 		};
-		D0A1000000000000000000AF /* PBXContainerItemProxy */ = {
+		D0A1000000000000000000AF = {
 			isa = PBXContainerItemProxy;
 			containerPortal = B001000000000000000000AA;
 			proxyType = 1;
-			remoteGlobalIDString = 80A1000000000000000000AF /* AppSandboxAccessibility */;
+			remoteGlobalIDString = 80A1000000000000000000AF;
 			remoteInfo = AppSandboxAccessibility;
 		};
-		ACCE551B0000000000000006 /* PBXContainerItemProxy */ = {isa = PBXContainerItemProxy; containerPortal = B001000000000000000000AA; proxyType = 1; remoteGlobalIDString = ACCE551B000000000000000A /* AppSandboxAccessibilityHost */; remoteInfo = AppSandboxAccessibilityHost; };
+		ACCE551B0000000000000006 = {isa = PBXContainerItemProxy; containerPortal = B001000000000000000000AA; proxyType = 1; remoteGlobalIDString = ACCE551B000000000000000A; remoteInfo = AppSandboxAccessibilityHost; };
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -177,13 +177,13 @@
 				6033000000000000000000DD /* firstboot.sh in Embed agent_mac */,
 				6034000000000000000000DD /* appsandbox-clipboard in Embed agent_mac */,
 				6035000000000000000000DD /* com.appsandbox.clipboard.plist in Embed agent_mac */,
-				60A1000000000000000000AF /* AppSandboxAccessibility.app in Embed agent_mac */,
-				60A2000000000000000000AF /* com.appsandbox.accessibility.plist in Embed agent_mac */,
+				60A1000000000000000000AF,
+				60A2000000000000000000AF,
 			);
 			name = "Embed agent_mac";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		ACCE551B0000000000000007 /* Embed Accessibility Host */ = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = Contents/Helpers; dstSubfolderSpec = 1; files = (ACCE551B0000000000000005 /* AppSandboxAccessibilityHost.app in Embed Accessibility Host */, ); name = "Embed Accessibility Host"; runOnlyForDeploymentPostprocessing = 0; };
+		ACCE551B0000000000000007 = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = Contents/Helpers; dstSubfolderSpec = 1; files = (ACCE551B0000000000000005, ); name = "Embed Accessibility Host"; runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
@@ -268,34 +268,34 @@
 		5004000000000000000000AA /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		C001000000000000000000AA /* AppSandbox.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppSandbox.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C002000000000000000000BB /* AppSandboxCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = AppSandboxCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
-		10A1000000000000000000AF /* appsandbox-accessibility.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "appsandbox-accessibility.m"; sourceTree = "<group>"; };
-		10A2000000000000000000AF /* AppSandboxAccessibility-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "AppSandboxAccessibility-Info.plist"; sourceTree = "<group>"; };
-		10A3000000000000000000AF /* com.appsandbox.accessibility.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = com.appsandbox.accessibility.plist; sourceTree = "<group>"; };
-		10A4000000000000000000AF /* vm_accessibility_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_accessibility_mac.m; sourceTree = "<group>"; };
-		10A5000000000000000000AF /* vm_accessibility_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_mac.h; sourceTree = "<group>"; };
-		30A1000000000000000000AF /* AppKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppKit.framework; path = System/Library/Frameworks/AppKit.framework; sourceTree = SDKROOT; };
-		30A2000000000000000000AF /* ApplicationServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ApplicationServices.framework; path = System/Library/Frameworks/ApplicationServices.framework; sourceTree = SDKROOT; };
-		C0A1000000000000000000AF /* AppSandboxAccessibility.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppSandboxAccessibility.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		ACCE551B0000000000000001 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = tools/accessibility_host/main.m; sourceTree = SOURCE_ROOT; };
-		ACCE551B0000000000000002 /* AppSandboxAccessibilityHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppSandboxAccessibilityHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		ACCE552C0000000000000011 /* vm_accessibility_session.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = src/backend_mac/vm_accessibility_session.m; sourceTree = SOURCE_ROOT; };
-		ACCE553D0000000000000003 /* vm_accessibility_connection.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_accessibility_connection.m; sourceTree = "<group>"; };
-		ACCE553D0000000000000005 /* vm_accessibility_connection.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_connection.h; sourceTree = "<group>"; };
-		ACCE553D0000000000000006 /* vm_accessibility_presenter.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_accessibility_presenter.m; sourceTree = "<group>"; };
-		ACCE553D0000000000000008 /* vm_accessibility_presenter.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_presenter.h; sourceTree = "<group>"; };
-		ACCE553D0000000000000009 /* vz_accessibility_view.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_accessibility_view.m; sourceTree = "<group>"; };
-		ACCE553D000000000000000B /* vz_accessibility_view.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_accessibility_view.h; sourceTree = "<group>"; };
-		ACCE553D000000000000000C /* vm_accessibility_snapshot.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_accessibility_snapshot.m; sourceTree = "<group>"; };
-		ACCE553D000000000000000F /* vm_accessibility_snapshot.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_snapshot.h; sourceTree = "<group>"; };
-		ACCE553D0000000000000010 /* vm_accessibility_session.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_session.h; sourceTree = "<group>"; };
-		ACCE553D0000000000000011 /* vm_accessibility_appkit.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_appkit.h; sourceTree = "<group>"; };
-		ACCE553D0000000000000012 /* keyboard_modifiers_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = keyboard_modifiers_mac.h; sourceTree = "<group>"; };
-		ACCE553D0000000000000013 /* accessibility_element.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = accessibility_element.m; sourceTree = "<group>"; };
-		ACCE553D0000000000000015 /* accessibility_element.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_element.h; sourceTree = "<group>"; };
-		ACCE553D0000000000000016 /* accessibility_protocol.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_protocol.h; sourceTree = "<group>"; };
-		ACCE553D0000000000000017 /* accessibility_wire_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_wire_mac.h; sourceTree = "<group>"; };
-		ACCE553D0000000000000018 /* accessibility_value_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_value_mac.h; sourceTree = "<group>"; };
-		ACCE553D000000000000001B /* accessibility_attributes_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_attributes_mac.h; sourceTree = "<group>"; };
+		10A1000000000000000000AF = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "appsandbox-accessibility.m"; sourceTree = "<group>"; };
+		10A2000000000000000000AF = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "AppSandboxAccessibility-Info.plist"; sourceTree = "<group>"; };
+		10A3000000000000000000AF = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = com.appsandbox.accessibility.plist; sourceTree = "<group>"; };
+		10A4000000000000000000AF = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_accessibility_mac.m; sourceTree = "<group>"; };
+		10A5000000000000000000AF = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_mac.h; sourceTree = "<group>"; };
+		30A1000000000000000000AF = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppKit.framework; path = System/Library/Frameworks/AppKit.framework; sourceTree = SDKROOT; };
+		30A2000000000000000000AF = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ApplicationServices.framework; path = System/Library/Frameworks/ApplicationServices.framework; sourceTree = SDKROOT; };
+		C0A1000000000000000000AF = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppSandboxAccessibility.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		ACCE551B0000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = tools/accessibility_host/main.m; sourceTree = SOURCE_ROOT; };
+		ACCE551B0000000000000002 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppSandboxAccessibilityHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		ACCE552C0000000000000011 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = src/backend_mac/vm_accessibility_session.m; sourceTree = SOURCE_ROOT; };
+		ACCE553D0000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_accessibility_connection.m; sourceTree = "<group>"; };
+		ACCE553D0000000000000005 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_connection.h; sourceTree = "<group>"; };
+		ACCE553D0000000000000006 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_accessibility_presenter.m; sourceTree = "<group>"; };
+		ACCE553D0000000000000008 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_presenter.h; sourceTree = "<group>"; };
+		ACCE553D0000000000000009 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vz_accessibility_view.m; sourceTree = "<group>"; };
+		ACCE553D000000000000000B = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vz_accessibility_view.h; sourceTree = "<group>"; };
+		ACCE553D000000000000000C = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_accessibility_snapshot.m; sourceTree = "<group>"; };
+		ACCE553D000000000000000F = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_snapshot.h; sourceTree = "<group>"; };
+		ACCE553D0000000000000010 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_session.h; sourceTree = "<group>"; };
+		ACCE553D0000000000000011 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_appkit.h; sourceTree = "<group>"; };
+		ACCE553D0000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = keyboard_modifiers_mac.h; sourceTree = "<group>"; };
+		ACCE553D0000000000000013 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = accessibility_element.m; sourceTree = "<group>"; };
+		ACCE553D0000000000000015 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_element.h; sourceTree = "<group>"; };
+		ACCE553D0000000000000016 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_protocol.h; sourceTree = "<group>"; };
+		ACCE553D0000000000000017 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_wire_mac.h; sourceTree = "<group>"; };
+		ACCE553D0000000000000018 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_value_mac.h; sourceTree = "<group>"; };
+		ACCE553D000000000000001B = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_attributes_mac.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -320,7 +320,7 @@
 				4013000000000000000000BB /* Metal.framework in Frameworks */,
 				4014000000000000000000BB /* Security.framework in Frameworks */,
 				4015000000000000000000BB /* AudioToolbox.framework in Frameworks */,
-				ACCE553D0000000000000019 /* ApplicationServices.framework in Frameworks */,
+				ACCE553D0000000000000019,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -350,19 +350,19 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		A0A2000000000000000000AF /* Frameworks */ = {
+		A0A2000000000000000000AF = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				40A1000000000000000000AF /* Foundation.framework in Frameworks */,
-				40A2000000000000000000AF /* AppKit.framework in Frameworks */,
-				40A3000000000000000000AF /* ApplicationServices.framework in Frameworks */,
+				40A1000000000000000000AF,
+				40A2000000000000000000AF,
+				40A3000000000000000000AF,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		ACCE551B0000000000000009 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (
-				ACCE551B0000000000000004 /* AppKit.framework in Frameworks */,
-				ACCE553D000000000000001A /* ApplicationServices.framework in Frameworks */,
+		ACCE551B0000000000000009 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (
+				ACCE551B0000000000000004,
+				ACCE553D000000000000001A,
 			); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 
@@ -376,8 +376,8 @@
 				5003000000000000000000AA /* web */,
 				7008000000000000000000AA /* Frameworks */,
 				7009000000000000000000AA /* Products */,
-				ACCE553D0000000000000001 /* accessibility_host */,
-				ACCE553D0000000000000002 /* transport */,
+				ACCE553D0000000000000001,
+				ACCE553D0000000000000002,
 			);
 			sourceTree = "<group>";
 		};
@@ -430,9 +430,9 @@
 				1033000000000000000000DD /* firstboot.sh */,
 				1034000000000000000000DD /* com.appsandbox.clipboard.plist */,
 				1040000000000000000000EE /* appsandbox-clipboard.m */,
-				10A1000000000000000000AF /* appsandbox-accessibility.m */,
-				10A2000000000000000000AF /* AppSandboxAccessibility-Info.plist */,
-				10A3000000000000000000AF /* com.appsandbox.accessibility.plist */,
+				10A1000000000000000000AF,
+				10A2000000000000000000AF,
+				10A3000000000000000000AF,
 			);
 			name = agent_mac;
 			path = tools/agent_mac;
@@ -504,26 +504,26 @@
 				1020000000000000000000AA /* vm_ssh_proxy_mac.m */,
 				1021000000000000000000AA /* vm_clipboard_mac.h */,
 				1022000000000000000000AA /* vm_clipboard_mac.m */,
-				10A4000000000000000000AF /* vm_accessibility_mac.m */,
-				10A5000000000000000000AF /* vm_accessibility_mac.h */,
+				10A4000000000000000000AF,
+				10A5000000000000000000AF,
 				1061000000000000000000AA /* asb_ivshmem_transport.h */,
 				1060000000000000000000AA /* asb_ivshmem_transport.m */,
 				1063000000000000000000AA /* qemu_vm.h */,
 				1062000000000000000000AA /* qemu_vm.m */,
 				1065000000000000000000AA /* idd_display.h */,
 				1064000000000000000000AA /* idd_display.m */,
-				ACCE553D0000000000000003 /* vm_accessibility_connection.m */,
-				ACCE553D0000000000000005 /* vm_accessibility_connection.h */,
-				ACCE553D0000000000000006 /* vm_accessibility_presenter.m */,
-				ACCE553D0000000000000008 /* vm_accessibility_presenter.h */,
-				ACCE553D0000000000000009 /* vz_accessibility_view.m */,
-				ACCE553D000000000000000B /* vz_accessibility_view.h */,
-				ACCE553D000000000000000C /* vm_accessibility_snapshot.m */,
-				ACCE553D000000000000000F /* vm_accessibility_snapshot.h */,
-				ACCE553D0000000000000010 /* vm_accessibility_session.h */,
-				ACCE553D0000000000000011 /* vm_accessibility_appkit.h */,
-				ACCE553D0000000000000012 /* keyboard_modifiers_mac.h */,
-				ACCE552C0000000000000011 /* vm_accessibility_session.m */,
+				ACCE553D0000000000000003,
+				ACCE553D0000000000000005,
+				ACCE553D0000000000000006,
+				ACCE553D0000000000000008,
+				ACCE553D0000000000000009,
+				ACCE553D000000000000000B,
+				ACCE553D000000000000000C,
+				ACCE553D000000000000000F,
+				ACCE553D0000000000000010,
+				ACCE553D0000000000000011,
+				ACCE553D0000000000000012,
+				ACCE552C0000000000000011,
 			);
 			name = backend_mac;
 			path = src/backend_mac;
@@ -540,8 +540,8 @@
 				3005000000000000000000AA /* Security.framework */,
 				3006000000000000000000AA /* Foundation.framework */,
 				3007000000000000000000AA /* AudioToolbox.framework */,
-				30A1000000000000000000AF /* AppKit.framework */,
-				30A2000000000000000000AF /* ApplicationServices.framework */,
+				30A1000000000000000000AF,
+				30A2000000000000000000AF,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -554,30 +554,30 @@
 				C020000000000000000000CC /* iso-patch-mac */,
 				C030000000000000000000DD /* appsandbox-agent */,
 				C040000000000000000000EE /* appsandbox-clipboard */,
-				C0A1000000000000000000AF /* AppSandboxAccessibility.app */,
-				ACCE551B0000000000000002 /* AppSandboxAccessibilityHost.app */,
+				C0A1000000000000000000AF,
+				ACCE551B0000000000000002,
 			);
 			name = Products;
 			sourceTree = "<group>";
 		};
-		ACCE553D0000000000000001 /* accessibility_host */ = {
+		ACCE553D0000000000000001 = {
 			isa = PBXGroup;
 			children = (
-				ACCE551B0000000000000001 /* main.m */,
-				ACCE553D0000000000000013 /* accessibility_element.m */,
-				ACCE553D0000000000000015 /* accessibility_element.h */,
+				ACCE551B0000000000000001,
+				ACCE553D0000000000000013,
+				ACCE553D0000000000000015,
 			);
 			name = accessibility_host;
 			path = tools/accessibility_host;
 			sourceTree = SOURCE_ROOT;
 		};
-		ACCE553D0000000000000002 /* transport */ = {
+		ACCE553D0000000000000002 = {
 			isa = PBXGroup;
 			children = (
-				ACCE553D0000000000000016 /* accessibility_protocol.h */,
-				ACCE553D0000000000000017 /* accessibility_wire_mac.h */,
-				ACCE553D0000000000000018 /* accessibility_value_mac.h */,
-				ACCE553D000000000000001B /* accessibility_attributes_mac.h */,
+				ACCE553D0000000000000016,
+				ACCE553D0000000000000017,
+				ACCE553D0000000000000018,
+				ACCE553D000000000000001B,
 			);
 			name = transport;
 			path = tools/transport;
@@ -608,7 +608,7 @@
 				A004000000000000000000BB /* Embed Frameworks */,
 				A022000000000000000000CC /* Embed iso-patch-mac */,
 				A032000000000000000000DD /* Embed agent_mac */,
-				ACCE551B0000000000000007 /* Embed Accessibility Host */,
+				ACCE551B0000000000000007,
 				A014000000000000000000CC /* Embed QEMU */,
 				A008000000000000000000AA /* Stamp version */,
 			);
@@ -619,8 +619,8 @@
 				E020000000000000000000CC /* PBXTargetDependency */,
 				E030000000000000000000DD /* PBXTargetDependency */,
 				E040000000000000000000EE /* PBXTargetDependency */,
-				E0A1000000000000000000AF /* PBXTargetDependency */,
-				ACCE551B000000000000000C /* PBXTargetDependency */,
+				E0A1000000000000000000AF,
+				ACCE551B000000000000000C,
 			);
 			name = AppSandbox;
 			productName = AppSandbox;
@@ -693,12 +693,12 @@
 			productReference = C002000000000000000000BB /* AppSandboxCore.framework */;
 			productType = "com.apple.product-type.framework";
 		};
-		80A1000000000000000000AF /* AppSandboxAccessibility */ = {
+		80A1000000000000000000AF = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 80A2000000000000000000AF /* Build configuration list for AppSandboxAccessibility */;
+			buildConfigurationList = 80A2000000000000000000AF;
 			buildPhases = (
-				A0A1000000000000000000AF /* Sources */,
-				A0A2000000000000000000AF /* Frameworks */,
+				A0A1000000000000000000AF,
+				A0A2000000000000000000AF,
 			);
 			buildRules = (
 			);
@@ -706,10 +706,10 @@
 			);
 			name = AppSandboxAccessibility;
 			productName = AppSandboxAccessibility;
-			productReference = C0A1000000000000000000AF /* AppSandboxAccessibility.app */;
+			productReference = C0A1000000000000000000AF;
 			productType = "com.apple.product-type.application";
 		};
-		ACCE551B000000000000000A /* AppSandboxAccessibilityHost */ = {isa = PBXNativeTarget; buildConfigurationList = ACCE551B000000000000000B /* Build configuration list for AppSandboxAccessibilityHost */; buildPhases = (ACCE551B0000000000000008 /* Sources */, ACCE551B0000000000000009 /* Frameworks */, ); buildRules = (); dependencies = (); name = AppSandboxAccessibilityHost; productName = AppSandboxAccessibilityHost; productReference = ACCE551B0000000000000002 /* AppSandboxAccessibilityHost.app */; productType = "com.apple.product-type.application"; };
+		ACCE551B000000000000000A = {isa = PBXNativeTarget; buildConfigurationList = ACCE551B000000000000000B; buildPhases = (ACCE551B0000000000000008, ACCE551B0000000000000009, ); buildRules = (); dependencies = (); name = AppSandboxAccessibilityHost; productName = AppSandboxAccessibilityHost; productReference = ACCE551B0000000000000002; productType = "com.apple.product-type.application"; };
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -734,7 +734,7 @@
 					8040000000000000000000EE = {
 						CreatedOnToolsVersion = 15.0;
 					};
-					80A1000000000000000000AF /* AppSandboxAccessibility */ = {
+					80A1000000000000000000AF = {
 						CreatedOnToolsVersion = 26.0;
 					};
 				};
@@ -752,13 +752,13 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				ACCE551B000000000000000A /* AppSandboxAccessibilityHost */,
+				ACCE551B000000000000000A,
 				8003000000000000000000AA /* AppSandbox */,
 				8010000000000000000000BB /* AppSandboxCore */,
 				8020000000000000000000CC /* iso-patch-mac */,
 				8030000000000000000000DD /* appsandbox-agent */,
 				8040000000000000000000EE /* appsandbox-clipboard */,
-				80A1000000000000000000AF /* AppSandboxAccessibility */,
+				80A1000000000000000000AF,
 			);
 		};
 /* End PBXProject section */
@@ -872,15 +872,15 @@
 				20E2000000000000000000D2 /* mac_account_hash.m in Sources */,
 				2031000000000000000000BB /* vm_ssh_proxy_mac.m in Sources */,
 				2032000000000000000000BB /* vm_clipboard_mac.m in Sources */,
-				20A2000000000000000000AF /* vm_accessibility_mac.m in Sources */,
-				ACCE552C0000000000000001 /* vm_accessibility_session.m in Sources */,
+				20A2000000000000000000AF,
+				ACCE552C0000000000000001,
 				2060000000000000000000BB /* asb_ivshmem_transport.m in Sources */,
 				2061000000000000000000BB /* qemu_vm.m in Sources */,
 				2064000000000000000000BB /* idd_display.m in Sources */,
-				ACCE553D0000000000000004 /* vm_accessibility_connection.m in Sources */,
-				ACCE553D0000000000000007 /* vm_accessibility_presenter.m in Sources */,
-				ACCE553D000000000000000A /* vz_accessibility_view.m in Sources */,
-				ACCE553D000000000000000D /* vm_accessibility_snapshot.m in Sources */,
+				ACCE553D0000000000000004,
+				ACCE553D0000000000000007,
+				ACCE553D000000000000000A,
+				ACCE553D000000000000000D,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -923,18 +923,18 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		A0A1000000000000000000AF /* Sources */ = {
+		A0A1000000000000000000AF = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				20A1000000000000000000AF /* appsandbox-accessibility.m in Sources */,
+				20A1000000000000000000AF,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		ACCE551B0000000000000008 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (
-				ACCE551B0000000000000003 /* main.m in Sources */,
-				ACCE553D000000000000000E /* vm_accessibility_snapshot.m in Sources */,
-				ACCE553D0000000000000014 /* accessibility_element.m in Sources */,
+		ACCE551B0000000000000008 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (
+				ACCE551B0000000000000003,
+				ACCE553D000000000000000E,
+				ACCE553D0000000000000014,
 			); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
@@ -959,12 +959,12 @@
 			target = 8040000000000000000000EE /* appsandbox-clipboard */;
 			targetProxy = D040000000000000000000EE /* PBXContainerItemProxy */;
 		};
-		E0A1000000000000000000AF /* PBXTargetDependency */ = {
+		E0A1000000000000000000AF = {
 			isa = PBXTargetDependency;
-			target = 80A1000000000000000000AF /* AppSandboxAccessibility */;
-			targetProxy = D0A1000000000000000000AF /* PBXContainerItemProxy */;
+			target = 80A1000000000000000000AF;
+			targetProxy = D0A1000000000000000000AF;
 		};
-		ACCE551B000000000000000C /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = ACCE551B000000000000000A /* AppSandboxAccessibilityHost */; targetProxy = ACCE551B0000000000000006 /* PBXContainerItemProxy */; };
+		ACCE551B000000000000000C = {isa = PBXTargetDependency; target = ACCE551B000000000000000A; targetProxy = ACCE551B0000000000000006; };
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
@@ -1275,7 +1275,7 @@
 			};
 			name = Release;
 		};
-		90A1000000000000000000AF /* Debug */ = {
+		90A1000000000000000000AF = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = B0B0000000000000000000FF;
 			buildSettings = {
@@ -1292,7 +1292,7 @@
 			};
 			name = Debug;
 		};
-		90A2000000000000000000AF /* Release */ = {
+		90A2000000000000000000AF = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = B0B0000000000000000000FF;
 			buildSettings = {
@@ -1309,7 +1309,7 @@
 			};
 			name = Release;
 		};
-		ACCE551B000000000000000D /* Debug */ = {
+		ACCE551B000000000000000D = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = B0B0000000000000000000FF;
 			buildSettings = {
@@ -1328,7 +1328,7 @@
 			};
 			name = Debug;
 		};
-		ACCE551B000000000000000E /* Release */ = {
+		ACCE551B000000000000000E = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = B0B0000000000000000000FF;
 			buildSettings = {
@@ -1404,16 +1404,16 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		80A2000000000000000000AF /* Build configuration list for AppSandboxAccessibility */ = {
+		80A2000000000000000000AF = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				90A1000000000000000000AF /* Debug */,
-				90A2000000000000000000AF /* Release */,
+				90A1000000000000000000AF,
+				90A2000000000000000000AF,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		ACCE551B000000000000000B /* Build configuration list for AppSandboxAccessibilityHost */ = {isa = XCConfigurationList; buildConfigurations = (ACCE551B000000000000000D /* Debug */, ACCE551B000000000000000E /* Release */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		ACCE551B000000000000000B = {isa = XCConfigurationList; buildConfigurations = (ACCE551B000000000000000D, ACCE551B000000000000000E, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 /* End XCConfigurationList section */
 	};
 	rootObject = B001000000000000000000AA /* Project object */;

@@ -1,4 +1,3 @@
-/* Host AX helper lifecycle and local IPC, owned by one viewer session. */
 #import "vm_accessibility_appkit.h"
 
 @class VmAccessibilityPresenter;

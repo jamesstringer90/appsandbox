@@ -1,5 +1,3 @@
-/* Private AppKit interfaces that attach the helper's AX subtree to the viewer.
- * Keep these declarations out of portable protocol and guest code. */
 #import <Cocoa/Cocoa.h>
 
 @interface NSAccessibilityRemoteUIElement : NSObject

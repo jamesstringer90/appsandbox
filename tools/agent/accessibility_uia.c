@@ -139,8 +139,6 @@ static Json *cached_json_string(AccessibilityUia *uia, IUIAutomationElement *ele
     SysFreeString(text);
     return result;
 }
-/* Match AsbAXIsMaskedValue in the Mac collector and host. Empty native
- * values are safe too; they do not reveal a password's length. */
 static int is_masked_value(BSTR value) {
     size_t length = SysStringLen(value), i;
     if (length > ASB_AX_MAX_STRING) return 0;
@@ -156,8 +154,6 @@ static int check_work(AccessibilityUia *uia) {
     if (uia->work->deadline && GetTickCount64() >= uia->work->deadline) uia->work->error = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
     return SUCCEEDED(uia->work->error);
 }
-/* Like the Mac collector, service requests between nodes. No borrowed
- * property, text range, or record contents may span this checkpoint. */
 static int continue_capture(AccessibilityUia *uia) {
     if (!check_work(uia)) return 0;
     if (uia->work->continuation && !uia->work->continuation(uia->work->continuation_context) && check_work(uia))
@@ -168,8 +164,6 @@ static int prepare(AccessibilityUia *uia, uint64_t deadline) {
     uint64_t now = GetTickCount64(), remaining;
     if (now >= deadline) return 0;
     remaining = deadline - now;
-    /* Some short budgets are rejected by UIA. Do not run with a previous,
-     * longer timeout when the requested deadline cannot be applied. */
     if (uia->timeouts && FAILED(IUIAutomation2_put_TransactionTimeout(uia->timeouts, (DWORD)(remaining < 1000 ? remaining : 1000)))) return 0;
     return GetTickCount64() < deadline;
 }
@@ -211,9 +205,6 @@ static UiaRecord *find_element(AccessibilityUia *uia, IUIAutomationElement *elem
     UiaRecord *record = identity ? find_identity(uia, identity, hash) : NULL;
     DWORD pid = (DWORD)cached_int(element, UIA_ProcessIdPropertyId, 0);
     if (record) return record;
-    /* Some native elements omit RuntimeId but still support UIA equality.
-     * As with CFEqual on Mac, native equality is the identity authority;
-     * labels, positions and child order cannot identify an element. */
     record = identity ? uia->identities[0] : uia->records;
     for (; record; record = identity ? record->identity_next : record->next) {
         BOOL equal = FALSE;
@@ -256,8 +247,6 @@ static UiaRecord *remember(AccessibilityUia *uia, IUIAutomationElement *element,
     record = check_work(uia) ? find_element(uia, updated, identity, hash) : NULL;
     if (!check_work(uia)) { SysFreeString(identity); RELEASE(updated); return NULL; }
     if (record) {
-        /* A later wrapper may supply a RuntimeId for an element first seen
-         * without one. Promote that same record instead of splitting aliases. */
         if (identity && !record->identity) {
             UiaRecord **bucket = &uia->identities[0];
             while (*bucket != record) bucket = &(*bucket)->identity_next;
@@ -268,7 +257,6 @@ static UiaRecord *remember(AccessibilityUia *uia, IUIAutomationElement *element,
             uia->identities[hash % RECORD_BUCKETS] = record;
         }
         SysFreeString(identity);
-        /* A query must not replace the native cache being read by a capture. */
         if (uia->work->capturing) { RELEASE(record->element); record->element = updated; }
         else RELEASE(updated);
         return record;
@@ -299,8 +287,6 @@ static Json *reference(AccessibilityUia *uia, IUIAutomationElement *element) {
     identity = identity_string(uia, element, &hash);
     if (!identity && SUCCEEDED(uia->work->error)) {
         IUIAutomationElement *identity_element = NULL;
-        /* Relationship targets often omit cached identity properties. Resolve
-         * their IDs without refetching every property of an existing node. */
         if (SUCCEEDED(IUIAutomationElement_BuildUpdatedCache(element, uia->identity_cache, &identity_element)) && identity_element)
             identity = identity_string(uia, identity_element, &hash);
         RELEASE(identity_element);
@@ -469,8 +455,6 @@ HRESULT accessibility_uia_create(AccessibilityUia **result) {
     TRY(IUIAutomationCacheRequest_put_AutomationElementMode(uia->identity_cache, AutomationElementMode_None));
     TRY(IUIAutomationCacheRequest_AddProperty(uia->identity_cache, UIA_RuntimeIdPropertyId));
     TRY(IUIAutomationCacheRequest_AddProperty(uia->identity_cache, UIA_ProcessIdPropertyId));
-    /* Fetch child identities together, then read each node's properties in
-     * its own transaction, matching the Mac traversal's request granularity. */
     TRY(IUIAutomationCacheRequest_Clone(uia->identity_cache, &uia->children_cache));
     TRY(IUIAutomationCacheRequest_put_TreeScope(uia->children_cache, TreeScope_Children));
     TRY(IUIAutomationCacheRequest_put_AutomationElementMode(uia->children_cache, AutomationElementMode_Full));
@@ -761,8 +745,6 @@ static void add_structural_relations(AccessibilityUia *uia, Json *node, int capt
 }
 static IUIAutomationTextRange *text_prefix(IUIAutomationTextRange *document, size_t offset, uint64_t deadline) {
     int low = 0, high = (int)offset;
-    /* Native character units may group UTF-16 units. Find an exact prefix
-     * length rather than treating surrogate pairs or CRLF as single units. */
     while (low <= high && GetTickCount64() < deadline) {
         int units = low + (high - low) / 2, moved = 0;
         IUIAutomationTextRange *range = NULL;
@@ -953,8 +935,6 @@ static HRESULT set_selection(AccessibilityUia *uia, UiaRecord *container, const 
         TRY(IUIAutomationElement_get_CurrentIsEnabled(record->element, &enabled));
         if (!enabled) { hr = UIA_E_ELEMENTNOTENABLED; goto done; }
     }
-    /* Validate every target before mutation. UIA provides no atomic setter;
-     * preserve failures even if earlier individual changes succeeded. */
     if (!count) {
         TRY(IUIAutomationSelectionPattern_GetCurrentSelection(pattern, &selected));
         if (!selected) { hr = S_OK; goto done; }
@@ -1029,7 +1009,6 @@ static HRESULT set_attribute(AccessibilityUia *uia, UiaRecord *record, const wch
     }
     PATTERN(element, IUIAutomationValuePattern, UIA_ValuePatternId, &text);
     if (text) {
-        /* UIA consumes a null-terminated string, unlike the JSON wire value. */
         if (ax_json_type(value) != AX_JSON_STRING || ax_json_length(value) > ASB_AX_MAX_STRING ||
             wmemchr(ax_json_text(value), 0, ax_json_length(value))) { hr = E_INVALIDARG; goto done; }
         TRY(IUIAutomationValuePattern_get_CurrentIsReadOnly(text, &read_only));
@@ -1179,7 +1158,6 @@ HRESULT accessibility_uia_capture(AccessibilityUia *uia, uint64_t deadline, Acce
     uia->work->continuation = continuation; uia->work->continuation_context = context;
     uia->work->deadline = deadline; uia->work->error = S_OK;
     uia->work->truncated = 0;
-    /* A preceding action can leave a smaller transaction timeout behind. */
     if (uia->timeouts && FAILED(uia->work->error = IUIAutomation2_put_TransactionTimeout(uia->timeouts, 1000))) goto done;
     if (!accessibility_uia_active(uia) || !(window = GetForegroundWindow())) {
         uia->work->error = HRESULT_FROM_WIN32(ERROR_CANCELLED); goto done;
@@ -1225,8 +1203,6 @@ HRESULT accessibility_uia_capture(AccessibilityUia *uia, uint64_t deadline, Acce
         captured[count++] = record;
         ax_json_append(output, ax_json_retain(record->captured_metadata));
         if (item.depth >= 127) { uia->work->truncated = 1; continue; }
-        /* A failed provider read is an incomplete attempt, not a smaller tree.
-         * Keep the previous records until a complete retry is published. */
         if (FAILED(uia->work->error = IUIAutomationElement_BuildUpdatedCache(record->element, uia->children_cache, &expanded)) || !expanded) goto done;
         if (FAILED(uia->work->error = IUIAutomationElement_GetCachedChildren(expanded, &children))) goto done;
         if (children) {
@@ -1246,7 +1222,6 @@ HRESULT accessibility_uia_capture(AccessibilityUia *uia, uint64_t deadline, Acce
         RELEASE(children); RELEASE(expanded);
     }
     if (queued) uia->work->truncated = 1;
-    /* Resolve references after traversal, when structural nodes are cached. */
     for (i = 0; i < count; ++i) {
         if (!continue_capture(uia)) goto done;
         add_relations(uia, captured[i], named(captured[i]->captured_metadata, L"attributes"));
@@ -1325,8 +1300,6 @@ static Json *query_metadata(AccessibilityUia *uia, UiaRecord *record, BSTR *text
     Json *result = NULL;
     int count = 0, i;
     *text = NULL; *complete_text = 0;
-    /* Request metadata and text are scratch values, as on Mac. In particular,
-     * a read during traversal must not overwrite its staged text baseline. */
     if (FAILED(uia->work->error = IUIAutomationElement_BuildUpdatedCache(record->element, uia->cache, &scratch.element)) ||
         !scratch.element) goto done;
     memcpy(scratch.id, record->id, sizeof(scratch.id));
@@ -1474,8 +1447,6 @@ done:
     ax_json_set(response, L"mutation", ax_json_boolean(mutation));
     if (result) ax_json_set(response, L"value", result);
     uia->work = previous;
-    /* Requests share the same UIA client on the serial worker. Restore its
-     * timeout before resuming the capture, without extending that deadline. */
     if (previous && SUCCEEDED(previous->error) && !prepare(uia, previous->deadline))
         previous->error = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
     return response;

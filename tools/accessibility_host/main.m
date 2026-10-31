@@ -1,12 +1,8 @@
-/* AppKit AX provider process. UI state arrives on the main thread;
- * native AX callbacks run on the secondary AX thread. */
 #import "accessibility_element.h"
 #import "../../src/backend_mac/vm_accessibility_appkit.h"
 #import "../../src/backend_mac/vm_accessibility_snapshot.h"
 #import "../../tools/transport/accessibility_value_mac.h"
-#import <os/log.h>
 #include <sys/socket.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <dlfcn.h>
 
@@ -21,8 +17,8 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
 @implementation VmAccessibilityClientRequest
 @end
 
-@class VmAccessibilityProvider;
 @interface VmAccessibilityRemoteElement : VmAccessibilityElement
+@property (readonly) NSRect accessibilityFrameInParentSpace;
 @end
 
 @interface VmAccessibilityProvider : NSObject <VmAccessibilityElementOwner>
@@ -31,7 +27,6 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
 - (instancetype)initWithFileDescriptor:(int)fd;
 - (void)begin;
 - (NSDictionary *)stateWaiting:(BOOL)wait;
-- (NSDictionary *)recordForElement:(VmAccessibilityElement *)element;
 - (id)hitTest:(NSPoint)point;
 @end
 
@@ -51,7 +46,6 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
 
 @implementation VmAccessibilityRemoteElement
 - (pid_t)accessibilityPresenterProcessIdentifier { return getppid(); }
-- (NSDictionary *)record { return [(VmAccessibilityProvider *)self.owner recordForElement:self]; }
 - (id)hitTestGuest:(NSPoint)point {
     VmAccessibilityProvider *server = (VmAccessibilityProvider *)self.owner;
     return [[server stateWaiting:NO][@"navigationQueries"] boolValue] ? [server hitTest:point] : [super hitTestGuest:point];
@@ -163,16 +157,10 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
         snapshot = previous[@"snapshot"];
         [elements addEntriesFromDictionary:previous[@"elements"] ?: @{}];
     }
-    // AX callbacks can create auxiliary proxies on the secondary AX thread.
-    // Promote/reuse those proxies and publish the new session atomically.
-    // Keep previous dictionaries alive until after unlocking: destruction
-    // notifications may re-enter the provider.
     [_condition lock];
     if (mirroring && message[@"snapshot"]) {
         [_auxiliaryRecords removeAllObjects];
         if (![snapshot.session isEqual:[previous[@"snapshot"] session]]) {
-            // Release retired proxies after unlocking: destruction notifications
-            // may ask the provider for its current accessibility state.
             previousAuxiliaryElements = [_auxiliaryElements copy];
             [_auxiliaryElements removeAllObjects];
         }
@@ -207,8 +195,6 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
     for (VmAccessibilityElement *element in previousAuxiliaryElements.allValues)
         if (elements[element.nodeID] != element) [element retire];
     if (mirroring && message[@"snapshot"]) {
-        // Node identifiers restart when the guest collector reconnects. Compare
-        // proxy identity, including the cached tree held through a disconnect.
         for (NSString *identifier in previousElements) {
             if (previousElements[identifier] != elements[identifier]) {
                 [previousElements[identifier] retire];
@@ -236,9 +222,6 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
 }
 - (NSDictionary *)stateWaiting:(BOOL)wait {
     [_condition lock];
-    // Tree reads must finish before an AX client's messaging timeout. A full
-    // guest traversal can take seconds; expose the busy element while it runs.
-    // Native action requests retain their separate request timeout.
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.2];
     while (wait && !NSThread.isMainThread && [_state[@"pending"] boolValue])
         if (![_condition waitUntilDate:deadline]) break;
@@ -321,12 +304,7 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
     if (!raw || snapshot.pixels.width <= 0 || snapshot.pixels.height <= 0) return NSZeroRect;
     NSRect guest = NSMakeRect([raw[0] doubleValue], [raw[1] doubleValue], [raw[2] doubleValue], [raw[3] doubleValue]);
     if (NSIsEmptyRect(guest)) return NSZeroRect;
-    CGFloat scale = MIN(frame.size.width / snapshot.pixels.width, frame.size.height / snapshot.pixels.height);
-    NSSize size = NSMakeSize(snapshot.pixels.width * scale, snapshot.pixels.height * scale);
-    CGFloat sx = size.width / snapshot.display.size.width, sy = size.height / snapshot.display.size.height;
-    return NSMakeRect(frame.origin.x + (frame.size.width - size.width) / 2 + (NSMinX(guest) - NSMinX(snapshot.display)) * sx,
-        frame.origin.y + (frame.size.height - size.height) / 2 + (NSMaxY(snapshot.display) - NSMaxY(guest)) * sy,
-        guest.size.width * sx, guest.size.height * sy);
+    return [VmAccessibilityTransformGeometry([NSValue valueWithRect:guest], snapshot, frame, NO) rectValue];
 }
 - (id)focusedGuestElement {
     NSDictionary *state = [self stateWaiting:NO];
@@ -373,18 +351,10 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
     NSDictionary *state = [self stateWaiting:NO];
     return VmAccessibilityTransformGeometry(value, state[@"snapshot"], [state[@"frame"] rectValue], toGuest);
 }
-- (BOOL)performAction:(NSString *)action value:(id)value element:(VmAccessibilityElement *)element {
-    NSMutableDictionary *message = [@{@"action": action} mutableCopy];
-    if (value) message[@"value"] = value;
-    return [[self request:message element:element][@"ok"] boolValue];
-}
 - (NSDictionary *)request:(NSDictionary *)operation element:(VmAccessibilityElement *)element {
     if (NSThread.isMainThread || ![self isCurrentElement:element] || element.container || element.status) return nil;
     NSTimeInterval deadline = VmAccessibilityNow() + ASB_AX_REQUEST_TIMEOUT_MS / 1000.0;
     NSString *requestID = NSUUID.UUID.UUIDString;
-    if (getenv("ASB_AX_TRACE_REQUESTS"))
-        os_log(OS_LOG_DEFAULT, "[AX request] id=%{public}@ node=%{public}@ action=%{public}@ attribute=%{public}@", requestID, element.nodeID,
-            operation[@"action"], operation[@"attribute"] ?: @"");
     VmAccessibilityClientRequest *request = [VmAccessibilityClientRequest new];
     request.signal = dispatch_semaphore_create(0);
     NSMutableDictionary *message = [operation mutableCopy];
@@ -402,8 +372,6 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
     [_requests removeObjectForKey:requestID];
     NSDictionary *response = request.response;
     [_condition unlock];
-    if (getenv("ASB_AX_TRACE_REQUESTS"))
-        os_log(OS_LOG_DEFAULT, "[AX reply] id=%{public}@ ok=%d error=%{public}@", requestID, [response[@"ok"] boolValue], response[@"error"] ?: @"timeout");
     return response;
 }
 @end

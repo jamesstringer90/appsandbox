@@ -6,16 +6,6 @@
     VmAccessibilityMac *_accessibilityBridge;
     NSEventModifierFlags _keyboardModifierFlags;
 }
-- (void)scrollWheel:(NSEvent *)event {
-    if (getenv("ASB_AX_TRACE_INPUT")) {
-        NSPoint local = [self convertPoint:event.locationInWindow fromView:nil];
-        NSLog(@"[AX VM wheel] window=%ld delta=(%.2f,%.2f) precise=%d phase=%llu momentum=%llu point=(%.1f,%.1f)",
-            (long)event.windowNumber, event.scrollingDeltaX, event.scrollingDeltaY,
-            event.hasPreciseScrollingDeltas, (unsigned long long)event.phase,
-            (unsigned long long)event.momentumPhase, local.x, local.y);
-    }
-    [super scrollWheel:event];
-}
 - (void)flagsChanged:(NSEvent *)event {
     for (NSEvent *transition in AsbKeyboardModifierEvents(event, &_keyboardModifierFlags))
         [super flagsChanged:transition];

@@ -1531,9 +1531,6 @@ void asb_mac_close_display(const char *name) {
     int idx = vm_index_of(name);
     if (idx < 0 || !g_display_refs[idx]) return;
     VzDisplayWindow *display = g_display_refs[idx];
-    /* Keep the controller retained until its window delegate finishes closing
-       the accessibility, audio, and clipboard connections. ARC can release a
-       local reference after fetching display.window, before sending close. */
     [display.window close];
     g_display_refs[idx] = nil;
     g_vms[idx].display  = nil;

@@ -6,7 +6,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-/* UIA error from winerror.h; avoid UIAutomationClient.h's C module definitions. */
 #ifndef UIA_E_ELEMENTNOTAVAILABLE
 #define UIA_E_ELEMENTNOTAVAILABLE ((HRESULT)0x80040201L)
 #endif
@@ -92,7 +91,6 @@ static int status_message(AccessibilitySession *s, const wchar_t *status, int in
     ax_json_set(message, L"invalidated", ax_json_boolean(invalidated));
     result = write_message(s->connection, message); ax_json_release(message); return result;
 }
-/* Consumes result. Request remains borrowed throughout execution. */
 static int reply(AccessibilitySession *s, const AccessibilityJson *request, AccessibilityJson *result) {
     int sent;
     ax_json_set(result, L"type", ax_json_string(L"actionResult"));
@@ -102,8 +100,6 @@ static int reply(AccessibilitySession *s, const AccessibilityJson *request, Acce
     if (ax_json_bool(ax_json_get(result, L"mutation"), 0)) {
         ++s->work_generation;
         s->capture_failures = 0;
-        /* The host follows a mutation with an explicit refresh. Match Mac:
-         * do not race that refresh with an extra speculative capture. */
         s->capture_requested = 0; s->background_capture_requested = 0;
     }
     ax_json_remove(result, L"mutation");
@@ -172,7 +168,6 @@ static int handle(AccessibilitySession *s, const AccessibilityJson *message) {
             if (ax_json_equal_text(ax_json_get(s->pending[i].message, L"requestId"), ax_json_text(request))) break;
         if (i == s->pending_count) return 1;
         pending = take_pending(s, i);
-        /* Charge confirmation round trip to original budget, including suspension. */
         sent = execute(s, pending.message, pending.prepared_at + (uint64_t)number);
         ax_json_release(pending.message); return sent;
     }
@@ -202,8 +197,6 @@ static void observe_changes(AccessibilitySession *s) {
         uint64_t next = accessibility_uia_last_change_time(s->uia) + 100;
         s->observed_change = change;
         if (next < s->background_capture_after) next = s->background_capture_after;
-        /* As on Mac, semantic notifications during capture queue background
-         * work without cancelling it or delaying an explicit refresh. */
         if (!s->capture_requested) {
             if (!s->capturing) ++s->work_generation;
             s->capture_requested = 1; s->background_capture_requested = 1; s->capture_after = next;
@@ -223,8 +216,6 @@ static int capture_continue(void *context) {
         c->connected = status_message(s, L"updating", 0);
         c->tick = GetTickCount64() + 500;
     }
-    /* Match the Mac collector's serial request pump. Reading the tree must
-     * not repeatedly throw away a capture that is still in progress. */
     for (count = 0; c->connected && count < ASB_AX_MAX_PENDING_REQUESTS; ++count) {
         AccessibilityJson *message;
         int ready = asb_poll(s->connection, 0);
@@ -233,7 +224,6 @@ static int capture_continue(void *context) {
         message = read_message(s->connection);
         if (!message) { c->connected = 0; break; }
         if (ax_json_equal_text(ax_json_get(message, L"type"), L"subscribe")) {
-            /* Reset frees records, so process it only after traversal unwinds. */
             s->deferred_message = message; return 0;
         }
         c->connected = handle(s, message); ax_json_release(message);
@@ -295,7 +285,6 @@ static void run_session(AccessibilityUia *uia, AsbConn *connection) {
                     ax_json_set(snapshot, L"session", ax_json_string(s.session));
                     ax_json_set(snapshot, L"revision", ax_json_number((double)++s.revision));
                     ax_json_set(snapshot, L"refreshGeneration", ax_json_number((double)s.refresh_generation));
-                    ax_json_set(snapshot, L"captureMs", ax_json_number((double)(GetTickCount64() - context.started)));
                     ready = write_message(connection, snapshot); ax_json_release(snapshot); if (!ready) break;
                     s.capture_failures = 0;
                 } else if (!accessibility_uia_active(uia) || GetForegroundWindow() != foreground) {
@@ -304,8 +293,6 @@ static void run_session(AccessibilityUia *uia, AsbConn *connection) {
                 } else {
                     if (!status_message(&s, L"captureFailed", 0)) break;
                     if (s.capture_failures < 3) ++s.capture_failures;
-                    /* Match the Mac collector: retry transient failures twice,
-                     * then wait for new input or a semantic change. */
                     if (capture_result != HRESULT_FROM_WIN32(ERROR_MORE_DATA) && s.capture_failures <= 2) {
                         s.capture_requested = 1; s.background_capture_requested = 0;
                         s.capture_after = GetTickCount64() + 500 * s.capture_failures;

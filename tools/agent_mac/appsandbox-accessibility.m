@@ -1,11 +1,7 @@
-/* Guest AX collection and native actions. Main thread owns AppKit/observers;
- * the serial worker owns the socket, records, and capture scheduler. */
-
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import "../transport/accessibility_attributes_mac.h"
 #import "../transport/accessibility_value_mac.h"
-#import <os/log.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -100,8 +96,6 @@ static NSArray *GuestAccessibilityReadSupportedAttributes(AXUIElementRef element
         if ([supported containsObject:name]) [requested addObject:name];
     NSArray *values = GuestAccessibilityReadAttributes(element, requested, outError);
     if (!values || values.count != requested.count) return nil;
-    // Preserve the fixed indexes used to decode the node's core fields without
-    // probing attributes that this native element never advertised.
     NSMutableArray *expanded = [NSMutableArray arrayWithCapacity:attributes.count];
     NSUInteger index = 0;
     for (NSString *name in attributes)
@@ -186,16 +180,12 @@ static NSDictionary *GuestAccessibilityCaptureContext(void) {
 @property(nonatomic, readonly) AXUIElementRef element;
 @property(nonatomic, copy) NSString *identifier;
 @property(nonatomic, copy) NSArray<NSString *> *actions;
-@property(nonatomic, strong) NSNumber *writableValue;
-@property(nonatomic, strong) NSNumber *writableFocused;
-@property(nonatomic, strong) NSNumber *writableSelectedTextRange;
 @property(nonatomic) uint64_t seenRevision;
 @property(nonatomic) double attributeReadStartedAt;
 @property(nonatomic) double lastSeenAt;
 @property(nonatomic) pid_t applicationPID;
 @property(nonatomic) BOOL secure;
 @property(nonatomic) BOOL secureSticky;
-@property(nonatomic) double actionsRefreshAt;
 @property(nonatomic, copy) NSArray *attributeNames;
 @property(nonatomic, copy) NSArray *parameterizedNames;
 @property(nonatomic, copy) NSArray *writableAttributes;
@@ -226,9 +216,6 @@ static NSDictionary *GuestAccessibilityCaptureContext(void) {
 
 @interface GuestAccessibilityCollector : NSObject
 @property(nonatomic) int socket;
-@property(nonatomic) int localDescriptor;
-@property(nonatomic) pid_t sourcePID;
-@property(nonatomic) BOOL localConnection;
 @property(nonatomic) BOOL subscribed;
 @property(nonatomic) BOOL permissionRequested;
 @property(nonatomic) double nextSnapshot;
@@ -288,7 +275,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
 - (instancetype)init {
     if ((self = [super init])) {
         _socket = -1;
-        _localDescriptor = -1;
         _buckets = NSMutableDictionary.dictionary;
         _records = NSMutableDictionary.dictionary;
         _pendingActions = NSMutableDictionary.dictionary;
@@ -313,7 +299,7 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
 }
 
 - (void)observeSystemInput {
-    if (self.localConnection || !AXIsProcessTrusted()) return;
+    if (!AXIsProcessTrusted()) return;
     __weak GuestAccessibilityCollector *weakSelf = self;
     if (!_inputMonitor) _inputMonitor = [NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp |
         NSEventMaskFlagsChanged | NSEventMaskLeftMouseDown | NSEventMaskLeftMouseUp |
@@ -343,9 +329,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
 }
 
 - (void)processAccessibilityValueChanges {
-    // A read can generate notifications for elements visited later in the same
-    // traversal. A successfully published snapshot already covers those changes.
-    // Keep later, unknown, and unsuccessfully captured changes on the refresh path.
     if (self.captureDeadline > 0) return;
     NSArray<NSDictionary *> *changes;
     BOOL overflow;
@@ -379,9 +362,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
 }
 
 - (void)processDestroyedAccessibilityElements {
-    // Reading dynamic menus can destroy their previous AX objects. Wait until
-    // traversal finishes so those replaced objects cannot start a capture loop.
-    // Records belong to this worker; the observer only queues retained elements.
     if (self.captureDeadline > 0) return;
     NSArray *destroyed;
     BOOL overflow;
@@ -461,13 +441,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
 
 - (NSDictionary *)context {
     NSDictionary *context = GuestAccessibilityCaptureContext();
-    if (self.sourcePID > 0) {
-        NSMutableDictionary *resolved = [context mutableCopy];
-        NSRunningApplication *application = [NSRunningApplication runningApplicationWithProcessIdentifier:self.sourcePID];
-        resolved[@"app"] = @{@"pid": @(application.processIdentifier),
-            @"bundleId": application.bundleIdentifier ?: @"", @"name": application.localizedName ?: @""};
-        context = resolved;
-    }
     if ([context[@"trusted"] boolValue]) {
         pid_t pid = [context[@"app"][@"pid"] intValue];
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -489,19 +462,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
 }
 
 - (int)connect {
-    if (self.localConnection) {
-        int fd = self.localDescriptor;
-        self.localDescriptor = -1;
-        if (fd >= 0) {
-            fcntl(fd, F_SETFD, FD_CLOEXEC);
-            int one = 1;
-            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-            struct timeval timeout = {.tv_sec = 1};
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-        }
-        return fd;
-    }
     int fd = socket(AF_VSOCK, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     fcntl(fd, F_SETFD, FD_CLOEXEC);
@@ -589,7 +549,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
 
 - (void)updateCapabilities:(GuestAccessibilityRecord *)record deadline:(double)deadline {
     if (GuestAccessibilityMonotonicTime() >= deadline) { record.capabilityError = kAXErrorCannotComplete; return; }
-    if (GuestAccessibilityMonotonicTime() < record.actionsRefreshAt) return;
     CFArrayRef actions = NULL, attributes = NULL, parameters = NULL;
     AXError actionError = AXUIElementCopyActionNames(record.element, &actions);
     AXError attributeError = AXUIElementCopyAttributeNames(record.element, &attributes);
@@ -634,9 +593,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
         }
         record.settable = known;
         record.writableAttributes = writable;
-        record.writableValue = @([writable containsObject:@"AXValue"]);
-        record.writableFocused = @([writable containsObject:@"AXFocused"]);
-        record.writableSelectedTextRange = @([writable containsObject:@"AXSelectedTextRange"]);
     }
     NSMutableDictionary *descriptions = NSMutableDictionary.dictionary;
     for (NSString *action in record.actions) {
@@ -646,7 +602,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
         else if (description) CFRelease(description);
     }
     record.actionDescriptions = descriptions;
-    record.actionsRefreshAt = GuestAccessibilityMonotonicTime() + 3.0;
 }
 
 - (id)encodeValue:(id)value applicationPID:(pid_t)pid {
@@ -667,7 +622,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
 }
 
 - (NSDictionary *)metadataForRecord:(GuestAccessibilityRecord *)record {
-    record.actionsRefreshAt = 0;
     [self updateCapabilities:record deadline:GuestAccessibilityMonotonicTime() + ASB_AX_REQUEST_TIMEOUT_MS / 1000.0];
     if (record.capabilityError != kAXErrorSuccess || !record.attributeNames) return nil;
     NSArray *capturedNames = AsbAXCaptureAttributeNames(record.attributeNames);
@@ -747,8 +701,7 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
 
 - (NSDictionary *)snapshot:(NSDictionary *)context {
     [self expireRecords];
-    double started = GuestAccessibilityMonotonicTime();
-    self.nextHeartbeat = started + 0.5;
+    self.nextHeartbeat = GuestAccessibilityMonotonicTime() + 0.5;
     pid_t pid = [context[@"app"][@"pid"] intValue];
     AXUIElementRef application = AXUIElementCreateApplication(pid);
     AXUIElementSetMessagingTimeout(application, 1.0f);
@@ -795,7 +748,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
         @autoreleasepool {
             GuestAccessibilityRecord *record = queue[cursor];
             AXUIElementSetMessagingTimeout(record.element, 1.0f);
-            record.actionsRefreshAt = 0;
             [self updateCapabilities:record deadline:self.captureDeadline > 0 ? self.captureDeadline : GuestAccessibilityMonotonicTime() + ASB_AX_CAPTURE_TIMEOUT_MS / 1000.0];
             if (record.capabilityError == kAXErrorInvalidUIElement) continue;
             if (record.capabilityError != kAXErrorSuccess) return nil;
@@ -848,17 +800,12 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
             record.attributeReadStartedAt = attributeErrors.count ? 0 : attributeReadStartedAt;
             NSMutableDictionary *node = [@{@"id": record.identifier, @"role": role,
                 @"enabled": @YES, @"focused": @NO, @"secure": @(record.secure),
-                @"frame": @[@0, @0, @0, @0], @"actions": record.actions ?: @[],
-                @"writableValue": record.writableValue ?: @NO,
-                @"writableFocused": record.writableFocused ?: @NO,
-                @"writableSelectedTextRange": record.secure ? @NO : (record.writableSelectedTextRange ?: @NO)} mutableCopy];
+                @"frame": @[@0, @0, @0, @0]} mutableCopy];
             if (attributeErrors.count) node[@"attributeErrors"] = attributeErrors;
             if (parents[record.identifier]) node[@"parent"] = parents[record.identifier];
             if (subrole) node[@"subrole"] = subrole;
             NSString *title = [record.attributeNames containsObject:@"AXTitle"] ? GuestAccessibilityString(GuestAccessibilityValueWithoutError(values[2])) : nil;
             NSString *label = [record.attributeNames containsObject:@"AXDescription"] ? GuestAccessibilityString(GuestAccessibilityValueWithoutError(values[3])) : nil;
-            if (title) node[@"title"] = title;
-            if (label) node[@"label"] = label;
             id value = GuestAccessibilityValueWithoutError(values[4]);
             if (!record.secure) {
                 if ([value isKindOfClass:NSString.class]) node[@"value"] = GuestAccessibilityString(value);
@@ -902,17 +849,10 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
                 depths[next.identifier] = @([depths[record.identifier] unsignedIntegerValue] + 1);
                 [children addObject:next.identifier];
             }
-            // Dynamic tables can replace their row/cell objects while we read
-            // sibling rows. Read each subtree while its child references are
-            // fresh, preserving the application's child order in the snapshot.
             NSMutableSet<NSString *> *visibleIdentifiers = NSMutableSet.set;
             for (NSString *name in @[@"AXVisibleChildren", @"AXVisibleRows"]) {
-                NSUInteger index = [attributes indexOfObject:name];
-                id visible = index != NSNotFound ? values[index] : nil;
-                if (!visible) {
-                    index = [remaining indexOfObject:name];
-                    if (index != NSNotFound && index < extraValues.count) visible = extraValues[index];
-                }
+                NSUInteger index = [remaining indexOfObject:name];
+                id visible = index != NSNotFound && index < extraValues.count ? extraValues[index] : nil;
                 for (id child in GuestAccessibilityElementArray(visible)) {
                     if (CFGetTypeID((__bridge CFTypeRef)child) != AXUIElementGetTypeID()) continue;
                     [visibleIdentifiers addObject:[self record:(__bridge AXUIElementRef)child applicationPID:pid].identifier];
@@ -950,9 +890,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
                 if (encoded) nativeValues[name] = encoded;
             }
             node[@"attributes"] = nativeValues;
-            // SwiftUI can expose a control's readable name only as an attributed
-            // string. Keep that original attribute and also supply its plain text
-            // to clients that read the standard title/description attributes.
             NSDictionary *attributedTitle = nativeValues[@"AXAttributedTitle"];
             if (!title.length && [attributedTitle isKindOfClass:NSDictionary.class] &&
                 [attributedTitle[@"$ax"] isEqual:@"attributed"])
@@ -978,14 +915,14 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
         node[@"settable"] = record.settable ?: @{};
         node[@"actionDescriptions"] = record.actionDescriptions ?: @{};
         if (record.actionNamesError != kAXErrorSuccess) node[@"actionNamesError"] = @(record.actionNamesError);
-        node[@"writableValue"] = record.writableValue ?: @NO;
-        node[@"writableFocused"] = record.writableFocused ?: @NO;
-        node[@"writableSelectedTextRange"] = record.secure ? @NO : (record.writableSelectedTextRange ?: @NO);
+        node[@"writableValue"] = @([record.writableAttributes containsObject:@"AXValue"]);
+        node[@"writableFocused"] = @([record.writableAttributes containsObject:@"AXFocused"]);
+        node[@"writableSelectedTextRange"] = @(!record.secure && [record.writableAttributes containsObject:@"AXSelectedTextRange"]);
     }
     NSMutableDictionary *snapshot = [@{@"type": @"snapshot", @"version": @(ASB_AX_VERSION),
         @"session": self.session, @"revision": @(self.revision), @"app": context[@"app"],
         @"display": context[@"display"], @"roots": roots, @"nodes": nodes, @"truncated": @(truncated),
-        @"refreshGeneration": @(self.refreshGeneration), @"captureMs": @((GuestAccessibilityMonotonicTime() - started) * 1000)} mutableCopy];
+        @"refreshGeneration": @(self.refreshGeneration)} mutableCopy];
     for (;;) {
         NSMutableSet *emitted = NSMutableSet.set;
         for (NSDictionary *node in nodes) [emitted addObject:node[@"id"]];
@@ -1014,9 +951,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
 }
 
 - (BOOL)rejectAction:(NSDictionary *)message error:(AXError)error {
-    if (getenv("ASB_AX_TRACE_REQUESTS"))
-        os_log(OS_LOG_DEFAULT, "[AX rejected] id=%{public}@ node=%{public}@ action=%{public}@ attribute=%{public}@ error=%d", message[@"requestId"],
-            message[@"nodeId"], message[@"action"], message[@"attribute"] ?: @"", error);
     return [self send:@{@"type": @"actionResult", @"version": @(ASB_AX_VERSION),
         @"session": self.session, @"requestId": message[@"requestId"], @"ok": @NO, @"error": @(error)}];
 }
@@ -1043,9 +977,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
     pending.message = message;
     pending.preparedAt = GuestAccessibilityMonotonicTime();
     self.pendingActions[request] = pending;
-    if (getenv("ASB_AX_TRACE_REQUESTS"))
-        os_log(OS_LOG_DEFAULT, "[AX ready] id=%{public}@ node=%{public}@ action=%{public}@ attribute=%{public}@", request, message[@"nodeId"],
-            message[@"action"], message[@"attribute"] ?: @"");
     return [self send:@{@"type": @"actionReady", @"version": @(ASB_AX_VERSION),
         @"session": self.session, @"requestId": request}];
 }
@@ -1057,15 +988,9 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
         ![message[@"session"] isEqual:self.session] || ![budget isKindOfClass:NSNumber.class] ||
         !isfinite([budget doubleValue]) || [budget doubleValue] < 0 || [budget doubleValue] > ASB_AX_REQUEST_TIMEOUT_MS) return NO;
     GuestAccessibilityPendingAction *pending = self.pendingActions[request];
-    if (!pending) return YES; // A delayed commit may follow local expiry.
+    if (!pending) return YES;
     [self.pendingActions removeObjectForKey:request];
-    // Start the returned budget at the time we asked the host, not at receipt.
-    // This conservatively charges the entire round trip to the request and
-    // needs no agreement between host and guest wall clocks or uptimes.
     double deadline = pending.preparedAt + [budget doubleValue] / 1000.0;
-    if (getenv("ASB_AX_TRACE_REQUESTS"))
-        os_log(OS_LOG_DEFAULT, "[AX commit] id=%{public}@ budgetMs=%.1f remainingMs=%.1f", request, [budget doubleValue],
-            (deadline - GuestAccessibilityMonotonicTime()) * 1000);
     return [self handleAction:pending.message deadline:deadline];
 }
 
@@ -1101,7 +1026,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
         if ([action isEqual:@"setSelectedTextRange"]) { action = @"setAttribute"; attribute = @"AXSelectedTextRange";
             encoded = @{@"$ax": @"range", @"value": encoded ?: NSNull.null}; }
         if ([action isEqual:@"hitTest"]) {
-            mutation = NO;
             id value = [self decodeValue:encoded applicationPID:record.applicationPID];
             CGPoint point;
             if (value && CFGetTypeID((__bridge CFTypeRef)value) == AXValueGetTypeID() &&
@@ -1116,7 +1040,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
                 if (hit) CFRelease(hit);
             }
         } else if ([action isEqual:@"getFrame"]) {
-            mutation = NO;
             CFArrayRef values = NULL;
             error = AXUIElementCopyMultipleAttributeValues(record.element,
                 (__bridge CFArrayRef)@[@"AXPosition", @"AXSize"], kAXCopyMultipleAttributeOptionStopOnError, &values);
@@ -1133,11 +1056,9 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
             }
             if (values) CFRelease(values);
         } else if ([action isEqual:@"getMetadata"]) {
-            mutation = NO;
             metadata = [self metadataForRecord:record];
             error = metadata ? kAXErrorSuccess : kAXErrorCannotComplete;
         } else if ([action isEqual:@"isAttributeSettable"] && [attribute isKindOfClass:NSString.class] && attribute.length <= 256) {
-            mutation = NO;
             Boolean settable = false;
             error = AXUIElementIsAttributeSettable(record.element, (__bridge CFStringRef)attribute, &settable);
             if (error == kAXErrorSuccess) result = @(settable);
@@ -1193,15 +1114,11 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
         self.captureFailures = 0;
         self.captureRequested = NO;
         self.nextSnapshot = INFINITY;
-        record.actionsRefreshAt = 0;
     }
     NSMutableDictionary *reply = [@{@"type": @"actionResult", @"version": @(ASB_AX_VERSION),
         @"session": self.session, @"requestId": request, @"ok": @(error == kAXErrorSuccess), @"error": @(error)} mutableCopy];
     if (result) reply[@"value"] = result;
     if (metadata) reply[@"record"] = metadata;
-    if (getenv("ASB_AX_TRACE_REQUESTS"))
-        os_log(OS_LOG_DEFAULT, "[AX executed] id=%{public}@ node=%{public}@ action=%{public}@ attribute=%{public}@ mutation=%d error=%d", request,
-            identifier, action, message[@"attribute"] ?: @"", mutation, error);
     return [self send:reply];
 }
 
@@ -1270,7 +1187,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
             }
             self.socket = [self connect];
             if (self.socket < 0) {
-                if (self.localConnection) break;
                 for (int i = 0; i < 20 && !g_stop; i++) usleep(100000);
                 continue;
             }
@@ -1345,9 +1261,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
                                     connected = complete ? [self send:snapshot] : [self sendStatus:@"captureFailed"];
                                     if (complete) {
                                         self.captureFailures = 0;
-                                        // Keep every transmitted reference alive until its replacement
-                                        // is published, including references outside AXChildren. An
-                                        // interrupted or slow capture must not expire the visible tree.
                                         if (connected) {
                                             self.publishedRecords = self.capturingRecords;
                                             self.publishedRevision = self.revision;
@@ -1356,8 +1269,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
                                     else if (connected && ++self.captureFailures <= 2 && ![snapshot[@"truncated"] boolValue] &&
                                              [after[@"active"] boolValue] && [after[@"trusted"] boolValue] &&
                                              [after[@"app"][@"pid"] isEqual:context[@"app"][@"pid"]]) {
-                                        // A temporary AX timeout must not leave the viewer empty
-                                        // until the next input. Retry twice, then await a new change.
                                         self.captureRequested = YES;
                                         self.backgroundCaptureRequested = NO;
                                         self.nextSnapshot = GuestAccessibilityMonotonicTime() + 0.5 * self.captureFailures;
@@ -1368,9 +1279,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
                         self.captureDeadline = 0;
                         self.capturingRecords = nil;
                         [self expireRecords];
-                        // Continuous value notifications must leave idle time
-                        // between full traversals.
-                        // Input and explicit refreshes bypass this background budget.
                         double finished = GuestAccessibilityMonotonicTime();
                         self.backgroundCaptureAfter = finished + MAX(1.0, 3 * (finished - captureStarted));
                         if (self.captureRequested && self.backgroundCaptureRequested)
@@ -1391,7 +1299,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
             close(self.socket);
             self.socket = -1;
             [self prune:NSSet.set];
-            if (self.localConnection) break;
             for (int i = 0; i < 20 && !g_stop; i++) usleep(100000);
         }
     }
@@ -1400,7 +1307,7 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
 
 @end
 
-int main(int argc, const char *argv[]) {
+int main(void) {
     @autoreleasepool {
         signal(SIGPIPE, SIG_IGN);
         signal(SIGTERM, GuestAccessibilityStopSignal);
@@ -1408,18 +1315,6 @@ int main(int argc, const char *argv[]) {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
         GuestAccessibilityCollector *exporter = [GuestAccessibilityCollector new];
-        if (argc == 3 && strcmp(argv[1], "--local-pid") == 0) {
-            char *end = NULL;
-            long pid = strtol(argv[2], &end, 10);
-            int type = 0;
-            socklen_t size = sizeof(type);
-            if (!end || *end || pid <= 0 || pid > INT_MAX ||
-                getsockopt(STDIN_FILENO, SOL_SOCKET, SO_TYPE, &type, &size) || type != SOCK_STREAM) return 2;
-            exporter.sourcePID = (pid_t)pid;
-            exporter.localDescriptor = dup(STDIN_FILENO);
-            if (exporter.localDescriptor < 0) return 2;
-            exporter.localConnection = YES;
-        } else if (argc != 1) return 2;
         [exporter observeSystemInput];
         dispatch_queue_t queue = dispatch_queue_create("com.appsandbox.accessibility", DISPATCH_QUEUE_SERIAL);
         dispatch_async(queue, ^{ [exporter run]; });
