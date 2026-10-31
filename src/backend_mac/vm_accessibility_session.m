@@ -12,6 +12,7 @@
 - (void)connectionEnded:(VmAccessibilityConnection *)connection;
 - (void)receiveRemoteMessage:(NSDictionary *)message presenter:(VmAccessibilityPresenter *)presenter;
 - (void)publishSnapshot:(BOOL)includeSnapshot;
+- (void)markSnapshotPending;
 - (void)scheduleCapture;
 - (void)attachWindow;
 @end
@@ -209,12 +210,15 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
 - (void)noteInput {
     if (!_started || !_connection) return;
     _lastInput = VmAccessibilityNow();
+    [self markSnapshotPending];
+    [self scheduleCapture];
+}
+- (void)markSnapshotPending {
     _epoch++;
     _pending = YES;
     _status = @"Guest accessibility is updating.";
     if (_connection.supportsRefresh) _requestedRefresh++;
     [self publishSnapshot:NO];
-    [self scheduleCapture];
 }
 - (void)scheduleCapture {
     if (_refreshScheduled || !_connection.supportsRefresh || _pendingActions) return;
@@ -283,14 +287,15 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
             return;
         }
         BOOL mutation = !query || AsbAXParameterizedAttributeMutates(attribute);
-        if (mutation) { _pendingActions++; [self noteInput]; }
+        // Semantic actions have an explicit completion; only physical input
+        // and display changes need the input settle interval.
+        if (mutation) { _pendingActions++; [self markSnapshotPending]; }
         VmAccessibilityConnection *connection = _connection;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             NSDictionary *response = [connection request:message];
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (self->_connection == connection && mutation) {
                     if (self->_pendingActions) self->_pendingActions--;
-                    self->_lastInput = VmAccessibilityNow();
                     [self scheduleCapture];
                     [self.view.window makeFirstResponder:self.view];
                 }
