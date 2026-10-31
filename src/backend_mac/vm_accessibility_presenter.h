@@ -2,8 +2,8 @@
 
 @class VmAccessibilityPresenter;
 @protocol VmAccessibilityPresenterDelegate <NSObject>
-@property(nonatomic, weak, readonly) NSView *view;
 - (void)receiveRemoteMessage:(NSDictionary *)message presenter:(VmAccessibilityPresenter *)presenter;
+- (void)presenterEnded:(VmAccessibilityPresenter *)presenter;
 @end
 
 @interface VmAccessibilityPresenter : NSObject

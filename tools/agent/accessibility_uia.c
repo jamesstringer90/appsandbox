@@ -1338,7 +1338,7 @@ done:
     return result;
 }
 Json *accessibility_uia_request(AccessibilityUia *uia, const Json *message, uint64_t deadline) {
-    Json *response = ax_json_object(), *result = NULL, *owned_value = NULL, *fresh = NULL;
+    Json *response = ax_json_object(), *result = NULL, *fresh = NULL;
     const Json *value = named(message, L"value");
     const wchar_t *action = named_text(message, L"action"), *attribute = named_text(message, L"attribute");
     UiaRecord *record = find_record(uia, named_text(message, L"nodeId"));
@@ -1358,12 +1358,6 @@ Json *accessibility_uia_request(AccessibilityUia *uia, const Json *message, uint
     if (FAILED(hr) || (DWORD)pid != record->pid) { hr = UIA_E_ELEMENTNOTAVAILABLE; goto done; }
     TRY(IUIAutomationElement_get_CurrentIsPassword(record->element, &secure));
     record->secure = secure != FALSE;
-    if (text_equal(action, L"setValue")) { action = L"setAttribute"; attribute = L"AXValue"; }
-    if (text_equal(action, L"setFocused")) { action = L"setAttribute"; attribute = L"AXFocused"; }
-    if (text_equal(action, L"setSelectedTextRange")) {
-        action = L"setAttribute"; attribute = L"AXSelectedTextRange";
-        owned_value = typed(L"range", ax_json_retain((Json *)value)); value = owned_value;
-    }
     if (text_equal(action, L"getFrame")) {
         RECT bounds = {0};
         requires_value = 1;
@@ -1437,7 +1431,7 @@ Json *accessibility_uia_request(AccessibilityUia *uia, const Json *message, uint
         mutation = 1; hr = perform(uia, record, action, deadline);
     }
 done:
-    RELEASE(grid); RELEASE(element); ax_json_release(fresh); ax_json_release(owned_value);
+    RELEASE(grid); RELEASE(element); ax_json_release(fresh);
     SysFreeString(fresh_text);
     if (FAILED(uia->work->error)) hr = uia->work->error;
     if (SUCCEEDED(hr) && requires_value && !ax_json_valid(result)) hr = E_OUTOFMEMORY;

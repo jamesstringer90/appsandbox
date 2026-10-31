@@ -152,13 +152,14 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
     VmAccessibilitySnapshot *snapshot = message[@"snapshot"] ? VmAccessibilityParseSnapshot(message[@"snapshot"]) :
         ([message[@"mirroring"] boolValue] || [message[@"pending"] boolValue] ? previous[@"snapshot"] : nil);
     BOOL mirroring = [message[@"mirroring"] boolValue] && snapshot != nil;
-    NSMutableDictionary *elements = [NSMutableDictionary dictionary];
+    NSDictionary *elements = @{};
     if (!mirroring && [message[@"pending"] boolValue]) {
         snapshot = previous[@"snapshot"];
-        [elements addEntriesFromDictionary:previous[@"elements"] ?: @{}];
+        elements = previous[@"elements"] ?: @{};
     }
     [_condition lock];
     if (mirroring && message[@"snapshot"]) {
+        NSMutableDictionary *updatedElements = [NSMutableDictionary dictionary];
         [_auxiliaryRecords removeAllObjects];
         if (![snapshot.session isEqual:[previous[@"snapshot"] session]]) {
             previousAuxiliaryElements = [_auxiliaryElements copy];
@@ -173,10 +174,11 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
                 element.nodeID = nodeID;
                 element.session = snapshot.session;
             }
-            elements[nodeID] = element;
+            updatedElements[nodeID] = element;
         }
+        elements = updatedElements;
         _elements = elements;
-    } else if (mirroring) [elements addEntriesFromDictionary:previous[@"elements"] ?: @{}];
+    } else if (mirroring) elements = previous[@"elements"] ?: @{};
     NSString *name = [snapshot.app[@"name"] length] ? snapshot.app[@"name"] : snapshot.app[@"bundleId"];
     NSMutableDictionary *state = [@{ @"mirroring": @(mirroring), @"pending": message[@"pending"] ?: @NO,
         @"navigationQueries": message[@"navigationQueries"] ?: @NO,
@@ -202,7 +204,7 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
             }
         }
     }
-    if (mirroring) {
+    if (mirroring && message[@"snapshot"]) {
         for (NSString *identifier in snapshot.nodes) {
             NSDictionary *old = newSession ? nil : oldSnapshot.nodes[identifier], *current = snapshot.nodes[identifier];
             if (![old[@"children"] isEqual:current[@"children"]] ||

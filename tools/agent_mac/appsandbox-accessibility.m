@@ -1021,10 +1021,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
     else if ([action isKindOfClass:NSString.class]) {
         NSString *attribute = message[@"attribute"];
         id encoded = message[@"value"];
-        if ([action isEqual:@"setValue"]) { action = @"setAttribute"; attribute = @"AXValue"; }
-        if ([action isEqual:@"setFocused"]) { action = @"setAttribute"; attribute = @"AXFocused"; }
-        if ([action isEqual:@"setSelectedTextRange"]) { action = @"setAttribute"; attribute = @"AXSelectedTextRange";
-            encoded = @{@"$ax": @"range", @"value": encoded ?: NSNull.null}; }
         if ([action isEqual:@"hitTest"]) {
             id value = [self decodeValue:encoded applicationPID:record.applicationPID];
             CGPoint point;

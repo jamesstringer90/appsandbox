@@ -94,14 +94,13 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
 - (void)start {
     if (_started) return;
     _started = YES;
-    _presenter = [VmAccessibilityPresenter new];
-    _presenter.delegate = self;
-    [_presenter start];
+    [self startPresenter];
     [self observeWindow];
     __weak VmAccessibilitySession *weakSelf = self;
     _watchdog = [NSTimer timerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) {
         VmAccessibilitySession *session = weakSelf;
         if (!session) { [timer invalidate]; return; }
+        [session startPresenter];
         if (session->_connection && VmAccessibilityNow() - session->_connection.lastActivity > 10) {
             VmAccessibilityConnection *connection = session->_connection;
             [connection stop];
@@ -109,6 +108,18 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
         }
     }];
     [NSRunLoop.mainRunLoop addTimer:_watchdog forMode:NSRunLoopCommonModes];
+}
+- (void)startPresenter {
+    if (!_started || _presenter) return;
+    _presenter = [VmAccessibilityPresenter new];
+    _presenter.delegate = self;
+    [_presenter start];
+}
+- (void)presenterEnded:(VmAccessibilityPresenter *)presenter {
+    if (!_started || presenter != _presenter) return;
+    _presenter = nil;
+    NSView *view = self.view;
+    if (view) NSAccessibilityPostNotification(view, NSAccessibilityLayoutChangedNotification);
 }
 - (void)stop {
     _started = NO;
@@ -334,6 +345,7 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
 - (void)geometryDidChange { [self publishSnapshot:NO]; }
 - (void)setDisplayPixels:(NSSize)pixels available:(BOOL)available {
     BOOL changed = !NSEqualSizes(pixels, _displayPixels);
+    if (!changed && available == _displayAvailable) return;
     _displayPixels = pixels;
     _displayAvailable = available;
     if (changed && available) [self noteInput];

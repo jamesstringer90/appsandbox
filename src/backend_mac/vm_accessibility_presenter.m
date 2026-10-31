@@ -25,9 +25,9 @@
 - (NSAccessibilityRemoteUIElement *)root { return _root; }
 - (void)dealloc { if (_fd >= 0) close(_fd); }
 - (void)start {
-    if (!NSClassFromString(@"NSAccessibilityRemoteUIElement")) return;
+    if (!NSClassFromString(@"NSAccessibilityRemoteUIElement")) { [self fail]; return; }
     int sockets[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) return;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) { [self fail]; return; }
     _fd = sockets[0];
     fcntl(_fd, F_SETFD, FD_CLOEXEC);
     int one = 1;
@@ -42,7 +42,7 @@
     _task.standardError = NSFileHandle.fileHandleWithNullDevice;
     BOOL launched = [_task launchAndReturnError:nil];
     [input closeFile];
-    if (!launched) { [self stop]; return; }
+    if (!launched) { [self fail]; return; }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         for (;;) {
             @autoreleasepool {
@@ -61,11 +61,7 @@
                 });
             }
         }
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self stop];
-            NSView *view = self.delegate.view;
-            if (view) NSAccessibilityPostNotification(view, NSAccessibilityLayoutChangedNotification);
-        });
+        dispatch_async(dispatch_get_main_queue(), ^{ [self fail]; });
     });
 }
 - (void)send:(NSDictionary *)message {
@@ -74,8 +70,13 @@
         BOOL stopped = self->_stopped;
         [self->_lock unlock];
         if (!stopped && !AsbAXWriteMessage(self->_fd, message))
-            dispatch_async(dispatch_get_main_queue(), ^{ [self stop]; });
+            dispatch_async(dispatch_get_main_queue(), ^{ [self fail]; });
     });
+}
+- (void)fail {
+    if (_stopped) return;
+    [self stop];
+    [self.delegate presenterEnded:self];
 }
 - (void)stop {
     [_lock lock];
