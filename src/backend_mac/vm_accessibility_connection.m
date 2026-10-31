@@ -1,5 +1,6 @@
 #import "vm_accessibility_connection.h"
 #import "vm_accessibility_snapshot.h"
+#import "vm_accessibility_uia.h"
 #include <sys/socket.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -27,6 +28,8 @@
     BOOL _supportsRefresh;
     BOOL _supportsNavigationQueries;
     BOOL _supportsActionConfirmation;
+    NSString *_accessibilityAPI;
+    VmAccessibilityUia *_uia;
 }
 
 - (instancetype)initWithFileDescriptor:(int)fd {
@@ -148,11 +151,16 @@
                     [self->_lock unlock];
                     if (request) dispatch_semaphore_signal(request.signal);
                 } else if ([type isEqual:@"snapshot"]) {
-                    VmAccessibilitySnapshot *snapshot = VmAccessibilityParseSnapshot(message);
+                    [self->_lock lock];
+                    VmAccessibilityUia *uia = self->_uia;
+                    [self->_lock unlock];
+                    VmAccessibilitySnapshot *snapshot = uia ? [uia snapshot:message] : VmAccessibilityParseSnapshot(message);
                     if (!snapshot) break;
                     [self offerState:snapshot];
                 } else if ([type isEqual:@"status"]) {
+                    NSString *api = message[@"accessibilityAPI"] ?: @"ax";
                     if (!VmAccessibilityIsInteger(message[@"version"], ASB_AX_VERSION, ASB_AX_VERSION) ||
+                        ![@[@"ax", @"uia"] containsObject:api] ||
                         !VmAccessibilityIsSessionIdentifier(message[@"session"]) || !VmAccessibilityIsString(message[@"status"], 64) ||
                         (message[@"refreshSupported"] && !VmAccessibilityIsInteger(message[@"refreshSupported"], 0, 1)) ||
                         (message[@"navigationQueriesSupported"] && !VmAccessibilityIsInteger(message[@"navigationQueriesSupported"], 0, 1)) ||
@@ -160,10 +168,16 @@
                         (message[@"invalidated"] && !VmAccessibilityIsInteger(message[@"invalidated"], 0, 1)) ||
                         ![@[@"permissionRequired", @"ready", @"inactive", @"updating", @"unavailable", @"captureFailed"] containsObject:message[@"status"]]) break;
                     [self->_lock lock];
+                    BOOL sameAPI = !self->_accessibilityAPI || [self->_accessibilityAPI isEqual:api];
+                    if (!self->_accessibilityAPI) {
+                        self->_accessibilityAPI = api;
+                        if ([api isEqual:@"uia"]) self->_uia = VmAccessibilityUia.new;
+                    }
                     self->_supportsRefresh = [message[@"refreshSupported"] boolValue];
                     self->_supportsNavigationQueries = [message[@"navigationQueriesSupported"] boolValue];
                     self->_supportsActionConfirmation = [message[@"actionConfirmationSupported"] boolValue];
                     [self->_lock unlock];
+                    if (!sameAPI) break;
                     [self offerState:message];
                 } else break;
             }
@@ -193,6 +207,21 @@
 }
 
 - (NSDictionary *)request:(NSDictionary *)message {
+    [_lock lock];
+    VmAccessibilityUia *uia = _uia;
+    [_lock unlock];
+    if (!uia) return [self requestNative:message];
+    NSTimeInterval deadline = VmAccessibilityNow() + ASB_AX_REQUEST_TIMEOUT_MS / 1000.0;
+    if (message[@"hostDeadline"]) {
+        if (!VmAccessibilityIsNumber(message[@"hostDeadline"], 0, DBL_MAX)) return nil;
+        deadline = MIN(deadline, [message[@"hostDeadline"] doubleValue]);
+    }
+    NSMutableDictionary *bounded = [message mutableCopy];
+    bounded[@"hostDeadline"] = @(deadline);
+    return [uia request:bounded send:^NSDictionary *(NSDictionary *request) { return [self requestNative:request]; }];
+}
+
+- (NSDictionary *)requestNative:(NSDictionary *)message {
     NSString *requestID = NSUUID.UUID.UUIDString;
     NSMutableDictionary *outgoing = [message mutableCopy];
     outgoing[@"requestId"] = requestID;

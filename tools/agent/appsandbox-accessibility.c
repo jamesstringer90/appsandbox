@@ -85,6 +85,7 @@ static AccessibilityJson *message_base(AccessibilitySession *s, const wchar_t *t
 static int status_message(AccessibilitySession *s, const wchar_t *status, int invalidated) {
     AccessibilityJson *message = message_base(s, L"status"); int result;
     ax_json_set(message, L"status", ax_json_string(status));
+    ax_json_set(message, L"accessibilityAPI", ax_json_string(L"uia"));
     ax_json_set(message, L"refreshSupported", ax_json_boolean(1));
     ax_json_set(message, L"navigationQueriesSupported", ax_json_boolean(1));
     ax_json_set(message, L"actionConfirmationSupported", ax_json_boolean(1));

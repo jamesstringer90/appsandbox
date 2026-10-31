@@ -101,6 +101,7 @@
 		ACCE553D0000000000000014 = {isa = PBXBuildFile; fileRef = ACCE553D0000000000000013; };
 		ACCE553D0000000000000019 = {isa = PBXBuildFile; fileRef = 30A2000000000000000000AF; };
 		ACCE553D000000000000001A = {isa = PBXBuildFile; fileRef = 30A2000000000000000000AF; };
+		ACCE553D000000000000001E = {isa = PBXBuildFile; fileRef = ACCE553D000000000000001C; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -296,6 +297,8 @@
 		ACCE553D0000000000000017 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_wire_mac.h; sourceTree = "<group>"; };
 		ACCE553D0000000000000018 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_value_mac.h; sourceTree = "<group>"; };
 		ACCE553D000000000000001B = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accessibility_attributes_mac.h; sourceTree = "<group>"; };
+		ACCE553D000000000000001C = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = vm_accessibility_uia.m; sourceTree = "<group>"; };
+		ACCE553D000000000000001D = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_accessibility_uia.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -514,6 +517,8 @@
 				1064000000000000000000AA /* idd_display.m */,
 				ACCE553D0000000000000003,
 				ACCE553D0000000000000005,
+				ACCE553D000000000000001C,
+				ACCE553D000000000000001D,
 				ACCE553D0000000000000006,
 				ACCE553D0000000000000008,
 				ACCE553D0000000000000009,
@@ -878,6 +883,7 @@
 				2061000000000000000000BB /* qemu_vm.m in Sources */,
 				2064000000000000000000BB /* idd_display.m in Sources */,
 				ACCE553D0000000000000004,
+				ACCE553D000000000000001E,
 				ACCE553D0000000000000007,
 				ACCE553D000000000000000A,
 				ACCE553D000000000000000D,

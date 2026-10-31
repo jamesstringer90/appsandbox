@@ -28,7 +28,7 @@ typedef struct UiaRecord {
     IUIAutomationElement *element;
     BSTR identity, text, captured_text;
     wchar_t id[32];
-    uint64_t number, identity_hash, capture, reference, selection_mark;
+    uint64_t number, identity_hash, capture, reference;
     DWORD pid;
     int secure, complete_text, captured_complete_text;
     Json *metadata, *captured_metadata;
@@ -52,7 +52,7 @@ struct AccessibilityUia {
     AccessibilityUiaEvents *events;
     UiaRecord *records, **identities, **ids;
     size_t record_count;
-    uint64_t next_id, capture, selection_generation;
+    uint64_t next_id, capture;
     HWND foreground, event_foreground;
     DWORD session_id;
     UiaWork *work;
@@ -60,11 +60,10 @@ struct AccessibilityUia {
 
 static int text_equal(const wchar_t *a, const wchar_t *b) { return wcscmp(a, b) == 0; }
 static Json *named(const Json *value, const wchar_t *key) { return ax_json_get(value, key); }
-static int named_equal(const Json *value, const wchar_t *key, const wchar_t *text) { return ax_json_equal_text(named(value, key), text); }
 static const wchar_t *named_text(const Json *value, const wchar_t *key) { return ax_json_text(named(value, key)); }
 static Json *typed(const wchar_t *type, Json *value) {
     Json *result = ax_json_object();
-    ax_json_set(result, L"$ax", ax_json_string(type));
+    ax_json_set(result, L"$uia", ax_json_string(type));
     ax_json_set(result, L"value", value);
     return result;
 }
@@ -78,14 +77,9 @@ static Json *pair(double first, double second) {
     double values[] = {first, second};
     return numbers(values, 2);
 }
-static Json *range_value(size_t location, size_t length) { return typed(L"range", pair((double)location, (double)length)); }
-static Json *double_value(double value) { return typed(L"double", ax_json_number(value)); }
+static Json *range_value(size_t location, size_t length) { return pair((double)location, (double)length); }
 static Json *element_reference(const UiaRecord *record) { return typed(L"element", ax_json_string(record->id)); }
-static int has_string(const Json *array, const wchar_t *text) {
-    size_t i;
-    for (i = 0; i < ax_json_count(array); ++i) if (ax_json_equal_text(ax_json_at(array, i), text)) return 1;
-    return 0;
-}
+
 static int cached_int(IUIAutomationElement *element, PROPERTYID property, int fallback) {
     VARIANT value;
     int result = fallback;
@@ -97,34 +91,13 @@ static int cached_int(IUIAutomationElement *element, PROPERTYID property, int fa
     VariantClear(&value);
     return result;
 }
-static int cached_number(IUIAutomationElement *element, PROPERTYID property, double *result) {
-    VARIANT value;
-    int ok = 0;
-    VariantInit(&value);
-    if (SUCCEEDED(IUIAutomationElement_GetCachedPropertyValue(element, property, &value))) {
-        if (value.vt == VT_R8) { *result = value.dblVal; ok = isfinite(*result); }
-        else if (value.vt == VT_I4) { *result = value.lVal; ok = 1; }
-    }
-    VariantClear(&value);
-    return ok;
-}
+
 static size_t limited_length(const wchar_t *text, size_t length, size_t limit) {
     if (length > limit) {
         length = limit;
         if (length && text[length - 1] >= 0xd800 && text[length - 1] <= 0xdbff) --length;
     }
     return length;
-}
-static BSTR cached_string(AccessibilityUia *uia, IUIAutomationElement *element, PROPERTYID property) {
-    VARIANT value;
-    BSTR result = NULL;
-    VariantInit(&value);
-    if (SUCCEEDED(IUIAutomationElement_GetCachedPropertyValue(element, property, &value)) && value.vt == VT_BSTR) {
-        result = SysAllocStringLen(value.bstrVal, (UINT)limited_length(value.bstrVal, SysStringLen(value.bstrVal), ASB_AX_MAX_STRING));
-        if (!result) uia->work->error = E_OUTOFMEMORY;
-    }
-    VariantClear(&value);
-    return result;
 }
 static Json *snapshot_string(AccessibilityUia *uia, const wchar_t *text, size_t length) {
     size_t available = MAX_SNAPSHOT_TEXT - uia->work->text_units;
@@ -133,12 +106,7 @@ static Json *snapshot_string(AccessibilityUia *uia, const wchar_t *text, size_t 
     uia->work->text_units += count;
     return ax_json_string_n(text, count);
 }
-static Json *cached_json_string(AccessibilityUia *uia, IUIAutomationElement *element, PROPERTYID property) {
-    BSTR text = cached_string(uia, element, property);
-    Json *result = snapshot_string(uia, text ? text : L"", SysStringLen(text));
-    SysFreeString(text);
-    return result;
-}
+
 static int is_masked_value(BSTR value) {
     size_t length = SysStringLen(value), i;
     if (length > ASB_AX_MAX_STRING) return 0;
@@ -313,57 +281,74 @@ static Json *reference_array(AccessibilityUia *uia, IUIAutomationElementArray *e
     }
     return result;
 }
-static const wchar_t *role(IUIAutomationElement *element) {
-    int type = cached_int(element, UIA_ControlTypePropertyId, 0);
-    if (type == UIA_ButtonControlTypeId) return L"AXButton";
-    if (type == UIA_CheckBoxControlTypeId) return L"AXCheckBox";
-    if (type == UIA_ComboBoxControlTypeId) return cached_int(element, UIA_IsValuePatternAvailablePropertyId, 0) ? L"AXComboBox" : L"AXPopUpButton";
-    if (type == UIA_EditControlTypeId) return L"AXTextField";
-    if (type == UIA_HyperlinkControlTypeId) return L"AXLink";
-    if (type == UIA_ImageControlTypeId) return L"AXImage";
-    if (type == UIA_ListItemControlTypeId) return L"AXRow";
-    if (type == UIA_ListControlTypeId) return L"AXList";
-    if (type == UIA_MenuControlTypeId) return L"AXMenu";
-    if (type == UIA_MenuBarControlTypeId) return L"AXMenuBar";
-    if (type == UIA_MenuItemControlTypeId) return L"AXMenuItem";
-    if (type == UIA_ProgressBarControlTypeId) return L"AXProgressIndicator";
-    if (type == UIA_RadioButtonControlTypeId) return L"AXRadioButton";
-    if (type == UIA_ScrollBarControlTypeId) return L"AXScrollBar";
-    if (type == UIA_SliderControlTypeId) return L"AXSlider";
-    if (type == UIA_SpinnerControlTypeId) return L"AXIncrementor";
-    if (type == UIA_TabControlTypeId) return L"AXTabGroup";
-    if (type == UIA_TabItemControlTypeId) return L"AXRadioButton";
-    if (type == UIA_TextControlTypeId) return L"AXStaticText";
-    if (type == UIA_ToolBarControlTypeId) return L"AXToolbar";
-    if (type == UIA_ToolTipControlTypeId) return L"AXHelpTag";
-    if (type == UIA_TreeControlTypeId) return L"AXOutline";
-    if (type == UIA_TreeItemControlTypeId) return L"AXRow";
-    if (type == UIA_DataGridControlTypeId || type == UIA_TableControlTypeId) return L"AXTable";
-    if (type == UIA_DataItemControlTypeId) return cached_int(element, UIA_IsGridItemPatternAvailablePropertyId, 0) ? L"AXCell" : L"AXRow";
-    if (type == UIA_CustomControlTypeId) return cached_int(element, UIA_IsGridItemPatternAvailablePropertyId, 0) ? L"AXCell" : L"AXGroup";
-    if (type == UIA_DocumentControlTypeId) return L"AXTextArea";
-    if (type == UIA_WindowControlTypeId) return L"AXWindow";
-    if (type == UIA_HeaderItemControlTypeId) return L"AXColumn";
-    if (type == UIA_SeparatorControlTypeId) return L"AXSplitter";
-    return L"AXGroup";
-}
+static const struct { const long *id; const wchar_t *name; } uia_properties[] = {
+    {&UIA_RuntimeIdPropertyId, L"RuntimeId"},
+    {&UIA_ProcessIdPropertyId, L"ProcessId"},
+    {&UIA_ControlTypePropertyId, L"ControlType"},
+    {&UIA_NamePropertyId, L"Name"},
+    {&UIA_AutomationIdPropertyId, L"AutomationId"},
+    {&UIA_HelpTextPropertyId, L"HelpText"},
+    {&UIA_LocalizedControlTypePropertyId, L"LocalizedControlType"},
+    {&UIA_BoundingRectanglePropertyId, L"BoundingRectangle"},
+    {&UIA_IsEnabledPropertyId, L"IsEnabled"},
+    {&UIA_IsOffscreenPropertyId, L"IsOffscreen"},
+    {&UIA_HasKeyboardFocusPropertyId, L"HasKeyboardFocus"},
+    {&UIA_IsKeyboardFocusablePropertyId, L"IsKeyboardFocusable"},
+    {&UIA_IsPasswordPropertyId, L"IsPassword"},
+    {&UIA_OrientationPropertyId, L"Orientation"},
+    {&UIA_IsInvokePatternAvailablePropertyId, L"IsInvokePatternAvailable"},
+    {&UIA_IsTogglePatternAvailablePropertyId, L"IsTogglePatternAvailable"},
+    {&UIA_IsSelectionItemPatternAvailablePropertyId, L"IsSelectionItemPatternAvailable"},
+    {&UIA_IsSelectionPatternAvailablePropertyId, L"IsSelectionPatternAvailable"},
+    {&UIA_IsExpandCollapsePatternAvailablePropertyId, L"IsExpandCollapsePatternAvailable"},
+    {&UIA_IsValuePatternAvailablePropertyId, L"IsValuePatternAvailable"},
+    {&UIA_IsRangeValuePatternAvailablePropertyId, L"IsRangeValuePatternAvailable"},
+    {&UIA_IsTextPatternAvailablePropertyId, L"IsTextPatternAvailable"},
+    {&UIA_IsScrollItemPatternAvailablePropertyId, L"IsScrollItemPatternAvailable"},
+    {&UIA_IsScrollPatternAvailablePropertyId, L"IsScrollPatternAvailable"},
+    {&UIA_IsGridPatternAvailablePropertyId, L"IsGridPatternAvailable"},
+    {&UIA_IsGridItemPatternAvailablePropertyId, L"IsGridItemPatternAvailable"},
+    {&UIA_IsTablePatternAvailablePropertyId, L"IsTablePatternAvailable"},
+    {&UIA_IsTableItemPatternAvailablePropertyId, L"IsTableItemPatternAvailable"},
+    {&UIA_IsWindowPatternAvailablePropertyId, L"IsWindowPatternAvailable"},
+    {&UIA_IsVirtualizedItemPatternAvailablePropertyId, L"IsVirtualizedItemPatternAvailable"},
+    {&UIA_ValueValuePropertyId, L"ValueValue"},
+    {&UIA_ValueIsReadOnlyPropertyId, L"ValueIsReadOnly"},
+    {&UIA_ToggleToggleStatePropertyId, L"ToggleToggleState"},
+    {&UIA_RangeValueValuePropertyId, L"RangeValueValue"},
+    {&UIA_RangeValueIsReadOnlyPropertyId, L"RangeValueIsReadOnly"},
+    {&UIA_RangeValueMinimumPropertyId, L"RangeValueMinimum"},
+    {&UIA_RangeValueMaximumPropertyId, L"RangeValueMaximum"},
+    {&UIA_RangeValueSmallChangePropertyId, L"RangeValueSmallChange"},
+    {&UIA_RangeValueLargeChangePropertyId, L"RangeValueLargeChange"},
+    {&UIA_SelectionItemIsSelectedPropertyId, L"SelectionItemIsSelected"},
+    {&UIA_SelectionCanSelectMultiplePropertyId, L"SelectionCanSelectMultiple"},
+    {&UIA_SelectionIsSelectionRequiredPropertyId, L"SelectionIsSelectionRequired"},
+    {&UIA_SelectionSelectionPropertyId, L"SelectionSelection"},
+    {&UIA_TableRowHeadersPropertyId, L"TableRowHeaders"},
+    {&UIA_TableColumnHeadersPropertyId, L"TableColumnHeaders"},
+    {&UIA_TableItemRowHeaderItemsPropertyId, L"TableItemRowHeaderItems"},
+    {&UIA_TableItemColumnHeaderItemsPropertyId, L"TableItemColumnHeaderItems"},
+    {&UIA_ExpandCollapseExpandCollapseStatePropertyId, L"ExpandCollapseExpandCollapseState"},
+    {&UIA_GridRowCountPropertyId, L"GridRowCount"},
+    {&UIA_GridColumnCountPropertyId, L"GridColumnCount"},
+    {&UIA_GridItemRowPropertyId, L"GridItemRow"},
+    {&UIA_GridItemColumnPropertyId, L"GridItemColumn"},
+    {&UIA_GridItemRowSpanPropertyId, L"GridItemRowSpan"},
+    {&UIA_GridItemColumnSpanPropertyId, L"GridItemColumnSpan"},
+    {&UIA_ScrollHorizontallyScrollablePropertyId, L"ScrollHorizontallyScrollable"},
+    {&UIA_ScrollVerticallyScrollablePropertyId, L"ScrollVerticallyScrollable"},
+    {&UIA_WindowIsModalPropertyId, L"WindowIsModal"},
+    {&UIA_SelectionItemSelectionContainerPropertyId, L"SelectionItemSelectionContainer"},
+};
+
 static int decode_number(const Json *value, double *number) {
-    if (ax_json_type(value) == AX_JSON_OBJECT && named_equal(value, L"$ax", L"double")) value = named(value, L"value");
     *number = ax_json_double(value, NAN);
     return isfinite(*number);
 }
-static int decode_boolean(const Json *value, int *boolean) {
-    double number;
-    if (ax_json_type(value) == AX_JSON_BOOLEAN) { *boolean = ax_json_bool(value, 0); return 1; }
-    if (!decode_number(value, &number) || (number != 0 && number != 1)) return 0;
-    *boolean = number == 1;
-    return 1;
-}
 static int decode_range(const Json *value, size_t *location, size_t *length) {
-    Json *array;
+    const Json *array = value;
     double a, b;
-    if (!named_equal(value, L"$ax", L"range")) return 0;
-    array = named(value, L"value");
     if (ax_json_type(array) != AX_JSON_ARRAY || ax_json_count(array) != 2) return 0;
     a = ax_json_double(ax_json_at(array, 0), NAN); b = ax_json_double(ax_json_at(array, 1), NAN);
     if (!isfinite(a) || !isfinite(b) || a < 0 || b < 0 || floor(a) != a || floor(b) != b || a + b > ASB_AX_MAX_STRING) return 0;
@@ -371,9 +356,9 @@ static int decode_range(const Json *value, size_t *location, size_t *length) {
     return 1;
 }
 static int decode_point(const Json *value, POINT *point) {
-    Json *array = named(value, L"value");
+    const Json *array = value;
     double x, y;
-    if (!named_equal(value, L"$ax", L"point") || ax_json_type(array) != AX_JSON_ARRAY || ax_json_count(array) != 2) return 0;
+    if (ax_json_type(array) != AX_JSON_ARRAY || ax_json_count(array) != 2) return 0;
     x = ax_json_double(ax_json_at(array, 0), NAN); y = ax_json_double(ax_json_at(array, 1), NAN);
     if (!isfinite(x) || !isfinite(y) || fabs(x) > 100000000 || fabs(y) > 100000000) return 0;
     point->x = (LONG)x; point->y = (LONG)y;
@@ -407,29 +392,7 @@ HRESULT accessibility_uia_create(AccessibilityUia **result) {
     IUIAutomationCondition *condition = NULL;
     HRESULT hr = E_OUTOFMEMORY;
     size_t i;
-    const PROPERTYID properties[] = {
-        UIA_RuntimeIdPropertyId, UIA_ProcessIdPropertyId, UIA_ControlTypePropertyId, UIA_NamePropertyId,
-        UIA_AutomationIdPropertyId, UIA_HelpTextPropertyId, UIA_LocalizedControlTypePropertyId,
-        UIA_BoundingRectanglePropertyId, UIA_IsEnabledPropertyId, UIA_IsOffscreenPropertyId,
-        UIA_HasKeyboardFocusPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_IsPasswordPropertyId, UIA_OrientationPropertyId,
-        UIA_IsInvokePatternAvailablePropertyId, UIA_IsTogglePatternAvailablePropertyId, UIA_IsSelectionItemPatternAvailablePropertyId,
-        UIA_IsSelectionPatternAvailablePropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
-        UIA_IsValuePatternAvailablePropertyId, UIA_IsRangeValuePatternAvailablePropertyId, UIA_IsTextPatternAvailablePropertyId,
-        UIA_IsScrollItemPatternAvailablePropertyId, UIA_IsScrollPatternAvailablePropertyId,
-        UIA_IsGridPatternAvailablePropertyId, UIA_IsGridItemPatternAvailablePropertyId,
-        UIA_IsTablePatternAvailablePropertyId, UIA_IsTableItemPatternAvailablePropertyId,
-        UIA_IsWindowPatternAvailablePropertyId, UIA_IsVirtualizedItemPatternAvailablePropertyId,
-        UIA_ValueValuePropertyId, UIA_ValueIsReadOnlyPropertyId, UIA_ToggleToggleStatePropertyId,
-        UIA_RangeValueValuePropertyId, UIA_RangeValueIsReadOnlyPropertyId, UIA_RangeValueMinimumPropertyId,
-        UIA_RangeValueMaximumPropertyId, UIA_RangeValueSmallChangePropertyId, UIA_RangeValueLargeChangePropertyId,
-        UIA_SelectionItemIsSelectedPropertyId, UIA_SelectionCanSelectMultiplePropertyId, UIA_SelectionIsSelectionRequiredPropertyId,
-        UIA_SelectionSelectionPropertyId, UIA_TableRowHeadersPropertyId, UIA_TableColumnHeadersPropertyId,
-        UIA_TableItemRowHeaderItemsPropertyId, UIA_TableItemColumnHeaderItemsPropertyId,
-        UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_GridRowCountPropertyId, UIA_GridColumnCountPropertyId,
-        UIA_GridItemRowPropertyId, UIA_GridItemColumnPropertyId, UIA_GridItemRowSpanPropertyId, UIA_GridItemColumnSpanPropertyId,
-        UIA_ScrollHorizontallyScrollablePropertyId, UIA_ScrollVerticallyScrollablePropertyId, UIA_WindowIsModalPropertyId
-    };
-    const PATTERNID patterns[] = {UIA_SelectionPatternId, UIA_TablePatternId, UIA_TableItemPatternId};
+    const PATTERNID patterns[] = {UIA_SelectionPatternId, UIA_SelectionItemPatternId, UIA_TablePatternId, UIA_TableItemPatternId};
     if (!result) return E_POINTER;
     *result = NULL;
     uia = calloc(1, sizeof(*uia));
@@ -448,7 +411,7 @@ HRESULT accessibility_uia_create(AccessibilityUia **result) {
     TRY(IUIAutomationCacheRequest_put_AutomationElementMode(uia->cache, AutomationElementMode_Full));
     TRY(IUIAutomation_get_ControlViewCondition(uia->automation, &condition));
     TRY(IUIAutomationCacheRequest_put_TreeFilter(uia->cache, condition));
-    for (i = 0; i < ARRAYSIZE(properties); ++i) TRY(IUIAutomationCacheRequest_AddProperty(uia->cache, properties[i]));
+    for (i = 0; i < ARRAYSIZE(uia_properties); ++i) TRY(IUIAutomationCacheRequest_AddProperty(uia->cache, *uia_properties[i].id));
     for (i = 0; i < ARRAYSIZE(patterns); ++i) TRY(IUIAutomationCacheRequest_AddPattern(uia->cache, patterns[i]));
     TRY(IUIAutomation_CreateCacheRequest(uia->automation, &uia->identity_cache));
     TRY(IUIAutomationCacheRequest_put_TreeScope(uia->identity_cache, TreeScope_Element));
@@ -487,47 +450,45 @@ static int read_text(IUIAutomationTextRange *range, BSTR *text) {
     *text = NULL;
     return SUCCEEDED(IUIAutomationTextRange_GetText(range, ASB_AX_MAX_STRING + 1, text));
 }
-static void add_text(AccessibilityUia *uia, UiaRecord *record, Json *attributes, Json *writable, Json *parameters) {
+static void add_text(AccessibilityUia *uia, UiaRecord *record, Json *properties) {
     IUIAutomationTextPattern *pattern = NULL;
     IUIAutomationTextRange *document = NULL, *selected = NULL, *prefix = NULL;
     IUIAutomationTextRangeArray *selection = NULL;
     BSTR text = NULL, before = NULL, chosen = NULL;
     enum SupportedTextSelection supported = SupportedTextSelection_None;
-    int count = 0, type;
+    int count = 0, i;
     size_t length;
-    Json *value;
-    if (!check_work(uia)) return;
+    Json *value, *ranges = NULL;
     record->captured_complete_text = 0;
     SysFreeString(record->captured_text); record->captured_text = NULL;
-    type = cached_int(record->element, UIA_ControlTypePropertyId, 0);
-    if (!cached_int(record->element, UIA_IsTextPatternAvailablePropertyId, 0) || (type != UIA_EditControlTypeId && type != UIA_DocumentControlTypeId)) return;
+    if (!check_work(uia) || record->secure || !cached_int(record->element, UIA_IsTextPatternAvailablePropertyId, 0)) return;
     if (FAILED(PATTERN(record->element, IUIAutomationTextPattern, UIA_TextPatternId, &pattern)) || !pattern ||
         FAILED(IUIAutomationTextPattern_get_DocumentRange(pattern, &document)) || !document || !read_text(document, &text)) goto done;
     value = snapshot_string(uia, text ? text : L"", SysStringLen(text));
     length = ax_json_length(value);
     record->captured_text = SysAllocStringLen(ax_json_text(value), (UINT)length);
     if (!record->captured_text) { uia->work->error = E_OUTOFMEMORY; ax_json_release(value); goto done; }
-    ax_json_set(attributes, L"AXValue", value);
+    ax_json_set(properties, L"Text.DocumentText", value);
     if (length != SysStringLen(text)) { uia->work->truncated = 1; goto done; }
     record->captured_complete_text = 1;
-    ax_json_set(attributes, L"AXNumberOfCharacters", ax_json_number((double)length));
-    ax_json_append(parameters, ax_json_string(L"AXStringForRange"));
-    ax_json_append(parameters, ax_json_string(L"AXBoundsForRange"));
-    ax_json_append(parameters, ax_json_string(L"AXAttributedStringForRange"));
-    ax_json_append(parameters, ax_json_string(L"AXRangeForPosition"));
-    if (FAILED(IUIAutomationTextPattern_get_SupportedTextSelection(pattern, &supported)) || supported == SupportedTextSelection_None ||
-        FAILED(IUIAutomationTextPattern_GetSelection(pattern, &selection)) || !selection ||
-        FAILED(IUIAutomationTextRangeArray_get_Length(selection, &count)) || count != 1 ||
-        FAILED(IUIAutomationTextRangeArray_GetElement(selection, 0, &selected)) ||
-        FAILED(IUIAutomationTextRange_Clone(document, &prefix)) ||
-        FAILED(IUIAutomationTextRange_MoveEndpointByRange(prefix, TextPatternRangeEndpoint_End, selected, TextPatternRangeEndpoint_Start))) goto done;
-    if (!read_text(prefix, &before) || !read_text(selected, &chosen) || (size_t)SysStringLen(before) + SysStringLen(chosen) > length ||
-        memcmp(text + SysStringLen(before), chosen, SysStringLen(chosen) * sizeof(wchar_t))) goto done;
-    ax_json_set(attributes, L"AXSelectedTextRange", range_value(SysStringLen(before), SysStringLen(chosen)));
-    ax_json_set(attributes, L"AXSelectedText", ax_json_string_n(chosen ? chosen : L"", SysStringLen(chosen)));
-    if (cached_int(record->element, UIA_IsEnabledPropertyId, 0)) ax_json_append(writable, ax_json_string(L"AXSelectedTextRange"));
+    if (FAILED(IUIAutomationTextPattern_get_SupportedTextSelection(pattern, &supported))) goto done;
+    ax_json_set(properties, L"Text.SupportedTextSelection", ax_json_number(supported));
+    if (supported == SupportedTextSelection_None || FAILED(IUIAutomationTextPattern_GetSelection(pattern, &selection)) ||
+        !selection || FAILED(IUIAutomationTextRangeArray_get_Length(selection, &count)) || count > ASB_AX_MAX_NODES) goto done;
+    ranges = ax_json_array();
+    for (i = 0; i < count && check_work(uia); ++i) {
+        if (FAILED(IUIAutomationTextRangeArray_GetElement(selection, i, &selected)) ||
+            FAILED(IUIAutomationTextRange_Clone(document, &prefix)) ||
+            FAILED(IUIAutomationTextRange_MoveEndpointByRange(prefix, TextPatternRangeEndpoint_End, selected, TextPatternRangeEndpoint_Start)) ||
+            !read_text(prefix, &before) || !read_text(selected, &chosen) ||
+            (size_t)SysStringLen(before) + SysStringLen(chosen) > length ||
+            memcmp(text + SysStringLen(before), chosen, SysStringLen(chosen) * sizeof(wchar_t))) goto done;
+        ax_json_append(ranges, range_value(SysStringLen(before), SysStringLen(chosen)));
+        RELEASE(prefix); RELEASE(selected); SysFreeString(before); before = NULL; SysFreeString(chosen); chosen = NULL;
+    }
+    ax_json_set(properties, L"Text.Selection", ranges); ranges = NULL;
 done:
-    SysFreeString(text); SysFreeString(before); SysFreeString(chosen);
+    ax_json_release(ranges); SysFreeString(text); SysFreeString(before); SysFreeString(chosen);
     RELEASE(prefix); RELEASE(selected); RELEASE(selection); RELEASE(document); RELEASE(pattern);
 }
 static void add_relations(AccessibilityUia *uia, UiaRecord *record, Json *attributes) {
@@ -540,30 +501,37 @@ static void add_relations(AccessibilityUia *uia, UiaRecord *record, Json *attrib
         SUCCEEDED(CACHED_PATTERN(element, IUIAutomationSelectionPattern, UIA_SelectionPatternId, &selection)) && selection &&
         SUCCEEDED(IUIAutomationSelectionPattern_GetCachedSelection(selection, &elements))) {
         Json *value = reference_array(uia, elements);
-        ax_json_set(attributes, L"AXSelectedChildren", ax_json_retain(value));
-        ax_json_set(attributes, L"AXSelectedRows", value);
+        ax_json_set(attributes, L"SelectionSelection", value);
     }
     RELEASE(elements); RELEASE(selection);
     if (cached_int(element, UIA_IsTablePatternAvailablePropertyId, 0) &&
         SUCCEEDED(CACHED_PATTERN(element, IUIAutomationTablePattern, UIA_TablePatternId, &table)) && table) {
         if (SUCCEEDED(IUIAutomationTablePattern_GetCachedColumnHeaders(table, &elements)))
-            ax_json_set(attributes, L"AXColumnHeaderUIElements", reference_array(uia, elements));
+            ax_json_set(attributes, L"TableColumnHeaders", reference_array(uia, elements));
         RELEASE(elements);
         if (SUCCEEDED(IUIAutomationTablePattern_GetCachedRowHeaders(table, &elements)))
-            ax_json_set(attributes, L"AXRowHeaderUIElements", reference_array(uia, elements));
+            ax_json_set(attributes, L"TableRowHeaders", reference_array(uia, elements));
         RELEASE(elements);
     }
     RELEASE(table);
     if (cached_int(element, UIA_IsTableItemPatternAvailablePropertyId, 0) &&
         SUCCEEDED(CACHED_PATTERN(element, IUIAutomationTableItemPattern, UIA_TableItemPatternId, &item)) && item) {
         if (SUCCEEDED(IUIAutomationTableItemPattern_GetCachedColumnHeaderItems(item, &elements)))
-            ax_json_set(attributes, L"AXColumnHeaderUIElements", reference_array(uia, elements));
+            ax_json_set(attributes, L"TableItemColumnHeaderItems", reference_array(uia, elements));
         RELEASE(elements);
         if (SUCCEEDED(IUIAutomationTableItemPattern_GetCachedRowHeaderItems(item, &elements)))
-            ax_json_set(attributes, L"AXRowHeaderUIElements", reference_array(uia, elements));
+            ax_json_set(attributes, L"TableItemRowHeaderItems", reference_array(uia, elements));
         RELEASE(elements);
     }
     RELEASE(item);
+    if (cached_int(element, UIA_IsSelectionItemPatternAvailablePropertyId, 0)) {
+        IUIAutomationSelectionItemPattern *selected = NULL;
+        IUIAutomationElement *container = NULL;
+        if (SUCCEEDED(CACHED_PATTERN(element, IUIAutomationSelectionItemPattern, UIA_SelectionItemPatternId, &selected)) && selected &&
+            SUCCEEDED(IUIAutomationSelectionItemPattern_get_CachedSelectionContainer(selected, &container)) && container)
+            ax_json_set(attributes, L"SelectionItemSelectionContainer", reference(uia, container));
+        RELEASE(container); RELEASE(selected);
+    }
 }
 static Json *frame_value(RECT bounds) {
     double values[] = {(double)bounds.left, (double)bounds.top,
@@ -571,178 +539,38 @@ static Json *frame_value(RECT bounds) {
     return numbers(values, 4);
 }
 static Json *metadata(AccessibilityUia *uia, UiaRecord *record, int include_details) {
-    IUIAutomationElement *element = record->element;
-    int enabled = cached_int(element, UIA_IsEnabledPropertyId, 0) != 0;
-    int secure = cached_int(element, UIA_IsPasswordPropertyId, 1) != 0;
-    int value_pattern = cached_int(element, UIA_IsValuePatternAvailablePropertyId, 0);
-    int range_pattern = cached_int(element, UIA_IsRangeValuePatternAvailablePropertyId, 0);
-    int toggle_pattern = cached_int(element, UIA_IsTogglePatternAvailablePropertyId, 0);
-    int selection_item = cached_int(element, UIA_IsSelectionItemPatternAvailablePropertyId, 0);
-    Json *node = ax_json_object(), *attributes = ax_json_object();
-    Json *writable = ax_json_array(), *parameters = ax_json_array(), *actions = ax_json_array();
-    RECT bounds = {0};
-    int orientation;
+    Json *node = ax_json_object(), *values = ax_json_object();
     size_t i;
-    const struct { PROPERTYID property; const wchar_t *name; } strings[] = {
-        {UIA_AutomationIdPropertyId, L"AXIdentifier"}, {UIA_HelpTextPropertyId, L"AXHelp"},
-        {UIA_LocalizedControlTypePropertyId, L"AXRoleDescription"}
-    };
-    if (!node || !attributes || !writable || !parameters || !actions) {
-        ax_json_release(node); ax_json_release(attributes); ax_json_release(writable);
-        ax_json_release(parameters); ax_json_release(actions); uia->work->error = E_OUTOFMEMORY; return NULL;
-    }
-    record->secure = secure;
+    RECT bounds = {0};
+    if (!node || !values) { ax_json_release(node); ax_json_release(values); uia->work->error = E_OUTOFMEMORY; return NULL; }
+    record->secure = cached_int(record->element, UIA_IsPasswordPropertyId, 1) != 0;
     ax_json_set(node, L"id", ax_json_string(record->id));
-    ax_json_set(node, L"role", ax_json_string(role(element)));
-    ax_json_set(node, L"label", cached_json_string(uia, element, UIA_NamePropertyId));
-    ax_json_set(node, L"enabled", ax_json_boolean(enabled));
-    ax_json_set(node, L"focused", ax_json_boolean(cached_int(element, UIA_HasKeyboardFocusPropertyId, 0)));
-    ax_json_set(node, L"secure", ax_json_boolean(secure));
     ax_json_set(node, L"children", ax_json_array());
-    if (secure) ax_json_set(node, L"subrole", ax_json_string(L"AXSecureTextField"));
-    IUIAutomationElement_get_CachedBoundingRectangle(element, &bounds);
-    ax_json_set(node, L"frame", frame_value(bounds));
-    for (i = 0; i < ARRAYSIZE(strings); ++i) {
-        BSTR text = cached_string(uia, element, strings[i].property);
-        if (SysStringLen(text)) ax_json_set(attributes, strings[i].name, snapshot_string(uia, text, SysStringLen(text)));
-        SysFreeString(text);
-    }
-    orientation = cached_int(element, UIA_OrientationPropertyId, 0);
-    if (orientation) ax_json_set(attributes, L"AXOrientation", ax_json_string(orientation == OrientationType_Horizontal ? L"AXHorizontalOrientation" : L"AXVerticalOrientation"));
-    ax_json_set(attributes, L"AXVisible", ax_json_boolean(!cached_int(element, UIA_IsOffscreenPropertyId, 0)));
-    if (enabled && cached_int(element, UIA_IsKeyboardFocusablePropertyId, 0)) ax_json_append(writable, ax_json_string(L"AXFocused"));
-    if (value_pattern) {
-        if (!secure) ax_json_set(attributes, L"AXValue", cached_json_string(uia, element, UIA_ValueValuePropertyId));
-        else {
-            VARIANT value;
-            VariantInit(&value);
-            if (SUCCEEDED(IUIAutomationElement_GetCachedPropertyValue(element, UIA_ValueValuePropertyId, &value)) &&
-                value.vt == VT_BSTR && is_masked_value(value.bstrVal))
-                ax_json_set(attributes, L"AXValue", snapshot_string(uia, value.bstrVal ? value.bstrVal : L"", SysStringLen(value.bstrVal)));
-            VariantClear(&value);
-        }
-        if (enabled && !cached_int(element, UIA_ValueIsReadOnlyPropertyId, 1)) ax_json_append(writable, ax_json_string(L"AXValue"));
-    }
-    if (range_pattern && !secure) {
-        double value;
-        const struct { PROPERTYID property; const wchar_t *name; } ranges[] = {
-            {UIA_RangeValueValuePropertyId, L"AXValue"}, {UIA_RangeValueMinimumPropertyId, L"AXMinValue"}, {UIA_RangeValueMaximumPropertyId, L"AXMaxValue"}
-        };
-        for (i = 0; i < ARRAYSIZE(ranges); ++i)
-            if (cached_number(element, ranges[i].property, &value)) ax_json_set(attributes, ranges[i].name, double_value(value));
-        if (enabled && !cached_int(element, UIA_RangeValueIsReadOnlyPropertyId, 1)) {
-            ax_json_append(writable, ax_json_string(L"AXValue"));
-            if (cached_number(element, UIA_RangeValueSmallChangePropertyId, &value) && value > 0) {
-                ax_json_append(actions, ax_json_string(L"AXIncrement")); ax_json_append(actions, ax_json_string(L"AXDecrement"));
+    for (i = 0; i < ARRAYSIZE(uia_properties) && check_work(uia); ++i) {
+        VARIANT value;
+        Json *encoded = NULL;
+        VariantInit(&value);
+        if (SUCCEEDED(IUIAutomationElement_GetCachedPropertyValue(record->element, *uia_properties[i].id, &value))) {
+            int hidden = record->secure && (*uia_properties[i].id == UIA_RangeValueValuePropertyId ||
+                (*uia_properties[i].id == UIA_ValueValuePropertyId && (value.vt != VT_BSTR || !is_masked_value(value.bstrVal))));
+            if (!hidden) {
+                if (value.vt == VT_BSTR) encoded = snapshot_string(uia, value.bstrVal ? value.bstrVal : L"", SysStringLen(value.bstrVal));
+                else if (value.vt == VT_BOOL) encoded = ax_json_boolean(value.boolVal != VARIANT_FALSE);
+                else if (value.vt == VT_I4) encoded = ax_json_number(value.lVal);
+                else if (value.vt == VT_R8 && isfinite(value.dblVal)) encoded = ax_json_number(value.dblVal);
             }
         }
+        VariantClear(&value);
+        if (encoded) ax_json_set(values, uia_properties[i].name, encoded);
     }
-    if (toggle_pattern && !secure) {
-        ax_json_set(attributes, L"AXValue", ax_json_number(cached_int(element, UIA_ToggleToggleStatePropertyId, 0)));
-        if (enabled && !value_pattern && !range_pattern) ax_json_append(writable, ax_json_string(L"AXValue"));
-    }
-    if (selection_item) {
-        int selected = cached_int(element, UIA_SelectionItemIsSelectedPropertyId, 0) != 0;
-        ax_json_set(attributes, L"AXSelected", ax_json_boolean(selected));
-        if (text_equal(role(element), L"AXRadioButton")) ax_json_set(attributes, L"AXValue", ax_json_number(selected));
-        if (enabled) ax_json_append(writable, ax_json_string(L"AXSelected"));
-    }
-    if (enabled && (cached_int(element, UIA_IsInvokePatternAvailablePropertyId, 0) || toggle_pattern || selection_item))
-        ax_json_append(actions, ax_json_string(L"AXPress"));
-    if (cached_int(element, UIA_IsExpandCollapsePatternAvailablePropertyId, 0)) {
-        int state = cached_int(element, UIA_ExpandCollapseExpandCollapseStatePropertyId, ExpandCollapseState_LeafNode);
-        if (state != ExpandCollapseState_LeafNode) {
-            int expanded = state == ExpandCollapseState_Expanded || state == ExpandCollapseState_PartiallyExpanded;
-            ax_json_set(attributes, L"AXExpanded", ax_json_boolean(expanded));
-            ax_json_set(attributes, L"AXDisclosing", ax_json_boolean(expanded));
-            if (enabled) {
-                ax_json_append(writable, ax_json_string(L"AXExpanded")); ax_json_append(writable, ax_json_string(L"AXDisclosing"));
-                ax_json_append(actions, ax_json_string(L"AXShowMenu"));
-                if (expanded) ax_json_append(actions, ax_json_string(L"AXCancel"));
-                if (!cached_int(element, UIA_IsInvokePatternAvailablePropertyId, 0) && !toggle_pattern && !selection_item)
-                    ax_json_append(actions, ax_json_string(L"AXPress"));
-            }
-        }
-    }
-    if (enabled && (cached_int(element, UIA_IsScrollItemPatternAvailablePropertyId, 0) || cached_int(element, UIA_IsVirtualizedItemPatternAvailablePropertyId, 0)))
-        ax_json_append(actions, ax_json_string(L"AXScrollToVisible"));
-    if (enabled && cached_int(element, UIA_IsScrollPatternAvailablePropertyId, 0)) {
-        if (cached_int(element, UIA_ScrollVerticallyScrollablePropertyId, 0)) {
-            ax_json_append(actions, ax_json_string(L"AXScrollDownByPage")); ax_json_append(actions, ax_json_string(L"AXScrollUpByPage"));
-        }
-        if (cached_int(element, UIA_ScrollHorizontallyScrollablePropertyId, 0)) {
-            ax_json_append(actions, ax_json_string(L"AXScrollRightByPage")); ax_json_append(actions, ax_json_string(L"AXScrollLeftByPage"));
-        }
-    }
-    if (cached_int(element, UIA_IsSelectionPatternAvailablePropertyId, 0)) {
-        ax_json_set(attributes, L"AXAllowsMultipleSelection", ax_json_boolean(cached_int(element, UIA_SelectionCanSelectMultiplePropertyId, 0)));
-        ax_json_set(attributes, L"AXSelectionRequired", ax_json_boolean(cached_int(element, UIA_SelectionIsSelectionRequiredPropertyId, 0)));
-        if (enabled) { ax_json_append(writable, ax_json_string(L"AXSelectedChildren")); ax_json_append(writable, ax_json_string(L"AXSelectedRows")); }
-    }
-    if (cached_int(element, UIA_IsGridPatternAvailablePropertyId, 0)) {
-        ax_json_set(attributes, L"AXRowCount", ax_json_number(cached_int(element, UIA_GridRowCountPropertyId, 0)));
-        ax_json_set(attributes, L"AXColumnCount", ax_json_number(cached_int(element, UIA_GridColumnCountPropertyId, 0)));
-        ax_json_append(parameters, ax_json_string(L"AXCellForColumnAndRow"));
-    }
-    if (cached_int(element, UIA_IsGridItemPatternAvailablePropertyId, 0)) {
-        int row = cached_int(element, UIA_GridItemRowPropertyId, -1), column = cached_int(element, UIA_GridItemColumnPropertyId, -1);
-        int rows = cached_int(element, UIA_GridItemRowSpanPropertyId, 1), columns = cached_int(element, UIA_GridItemColumnSpanPropertyId, 1);
-        if (row >= 0) ax_json_set(attributes, L"AXRowIndexRange", range_value(row, rows > 0 ? rows : 1));
-        if (column >= 0) ax_json_set(attributes, L"AXColumnIndexRange", range_value(column, columns > 0 ? columns : 1));
-    }
-    if (cached_int(element, UIA_IsWindowPatternAvailablePropertyId, 0))
-        ax_json_set(attributes, L"AXModal", ax_json_boolean(cached_int(element, UIA_WindowIsModalPropertyId, 0)));
-    if (include_details && !secure) add_text(uia, record, attributes, writable, parameters);
-    if (include_details) add_relations(uia, record, attributes);
-    ax_json_set(node, L"attributes", attributes);
-    ax_json_set(node, L"writableAttributes", writable);
-    ax_json_set(node, L"parameterizedNames", parameters);
-    ax_json_set(node, L"actions", actions);
+    ax_json_set(values, L"IsPassword", ax_json_boolean(record->secure));
+    if (SUCCEEDED(IUIAutomationElement_get_CachedBoundingRectangle(record->element, &bounds)))
+        ax_json_set(values, L"BoundingRectangle", frame_value(bounds));
+    if (include_details) { add_text(uia, record, values); add_relations(uia, record, values); }
+    ax_json_set(node, L"properties", values);
     return node;
 }
 
-static void collect_structure(AccessibilityUia *uia, Json *node, unsigned depth, int collecting,
-    int captured, Json *rows, Json *columns) {
-    Json *children = named(node, L"children");
-    size_t i;
-    for (i = 0; i < ax_json_count(children) && check_work(uia); ++i) {
-        UiaRecord *child = find_record(uia, ax_json_text(ax_json_at(children, i)));
-        Json *metadata = child ? (captured ? child->captured_metadata : child->metadata) : NULL;
-        if (!metadata) continue;
-        if (named_equal(metadata, L"role", L"AXRow")) ax_json_append(rows, element_reference(child));
-        else if (named_equal(metadata, L"role", L"AXColumn")) ax_json_append(columns, element_reference(child));
-        else if (collecting && depth < 2 && named_equal(metadata, L"role", L"AXGroup"))
-            collect_structure(uia, metadata, depth + 1, collecting, captured, rows, columns);
-    }
-}
-static void add_structural_relations(AccessibilityUia *uia, Json *node, int captured) {
-    Json *attributes = named(node, L"attributes"), *children = named(node, L"children");
-    Json *visible = ax_json_array(), *rows = ax_json_array(), *columns = ax_json_array(), *contents = ax_json_array(), *names = ax_json_array();
-    int collecting = named_equal(node, L"role", L"AXTable") || named_equal(node, L"role", L"AXOutline") || named_equal(node, L"role", L"AXList");
-    size_t i;
-    const wchar_t *base_names[] = {L"AXRole", L"AXRoleDescription", L"AXParent", L"AXWindow", L"AXTopLevelUIElement",
-        L"AXChildren", L"AXPosition", L"AXSize", L"AXEnabled", L"AXFocused", L"AXDescription"};
-    for (i = 0; i < ax_json_count(children) && check_work(uia); ++i) {
-        UiaRecord *child = find_record(uia, ax_json_text(ax_json_at(children, i)));
-        Json *metadata = child ? (captured ? child->captured_metadata : child->metadata) : NULL;
-        if (!metadata) continue;
-        ax_json_append(contents, element_reference(child));
-        if (ax_json_bool(named(named(metadata, L"attributes"), L"AXVisible"), 1)) ax_json_append(visible, element_reference(child));
-    }
-    collect_structure(uia, node, 0, collecting, captured, rows, columns);
-    ax_json_set(attributes, L"AXVisibleChildren", visible);
-    if (collecting) {
-        ax_json_set(attributes, L"AXRows", rows); rows = NULL;
-        ax_json_set(attributes, L"AXContents", contents); contents = NULL;
-        if (ax_json_count(columns)) { ax_json_set(attributes, L"AXColumns", columns); columns = NULL; }
-    }
-    ax_json_release(rows); ax_json_release(columns); ax_json_release(contents);
-    for (i = 0; i < ARRAYSIZE(base_names); ++i) ax_json_append(names, ax_json_string(base_names[i]));
-    if (named(node, L"subrole")) ax_json_append(names, ax_json_string(L"AXSubrole"));
-    for (i = 0; i < ax_json_count(attributes); ++i)
-        if (!text_equal(ax_json_key(attributes, i), L"AXRoleDescription")) ax_json_append(names, ax_json_string(ax_json_key(attributes, i)));
-    ax_json_set(node, L"attributeNames", names);
-}
 static IUIAutomationTextRange *text_prefix(IUIAutomationTextRange *document, size_t offset, uint64_t deadline) {
     int low = 0, high = (int)offset;
     while (low <= high && GetTickCount64() < deadline) {
@@ -765,58 +593,41 @@ static HRESULT text_bounds(AccessibilityUia *uia, IUIAutomationTextRange *range,
     SAFEARRAY *rectangles = NULL;
     HRESULT hr;
     LONG first = 0, last = -1, i;
-    double left = DBL_MAX, top = DBL_MAX, right = -DBL_MAX, bottom = -DBL_MAX;
+    Json *values = ax_json_array();
     TRY(IUIAutomationTextRange_GetBoundingRectangles(range, &rectangles));
     if (!rectangles) { hr = UIA_E_NOTSUPPORTED; goto done; }
     TRY(SafeArrayGetLBound(rectangles, 1, &first)); TRY(SafeArrayGetUBound(rectangles, 1, &last));
-    if (last - first < 65536 && (last - first + 1) % 4 == 0) {
-        for (i = first; i + 3 <= last; i += 4) {
-            double bounds[4] = {0};
-            LONG j;
-            if (!check_work(uia)) { hr = uia->work->error; goto done; }
-            for (j = 0; j < 4; ++j) { LONG index = i + j; TRY(SafeArrayGetElement(rectangles, &index, &bounds[j])); }
-            if (!isfinite(bounds[0]) || !isfinite(bounds[1]) || !isfinite(bounds[2]) || !isfinite(bounds[3])) continue;
-            left = fmin(left, bounds[0]); top = fmin(top, bounds[1]);
-            right = fmax(right, bounds[0] + bounds[2]); bottom = fmax(bottom, bounds[1] + bounds[3]);
-        }
+    if (last - first >= 65536 || (last - first + 1) % 4) { hr = UIA_E_NOTSUPPORTED; goto done; }
+    for (i = first; i <= last; ++i) {
+        double number;
+        if (!check_work(uia)) { hr = uia->work->error; goto done; }
+        TRY(SafeArrayGetElement(rectangles, &i, &number));
+        if (!isfinite(number)) { hr = UIA_E_NOTSUPPORTED; goto done; }
+        ax_json_append(values, ax_json_number(number));
     }
-    if (left == DBL_MAX) hr = UIA_E_NOTSUPPORTED;
-    else {
-        double values[] = {left, top, right - left, bottom - top};
-        *result = typed(L"rect", numbers(values, 4));
-        hr = ax_json_valid(*result) ? S_OK : E_OUTOFMEMORY;
-    }
+    if (!ax_json_valid(values)) { hr = E_OUTOFMEMORY; goto done; }
+    *result = values; values = NULL; hr = S_OK;
 done:
     if (rectangles) SafeArrayDestroy(rectangles);
-    return hr;
+    ax_json_release(values); return hr;
 }
 static Json *text_format_attributes(IUIAutomationTextRange *range) {
-    Json *attributes = ax_json_object(), *font = ax_json_object();
+    Json *attributes = ax_json_object();
     size_t i;
-    const struct { TEXTATTRIBUTEID id; const wchar_t *name; } font_properties[] = {
-        {UIA_FontNameAttributeId, L"AXFontFamily"}, {UIA_FontSizeAttributeId, L"AXFontSize"}
-    }, properties[] = {
-        {UIA_FontWeightAttributeId, L"AXFontWeight"}, {UIA_IsItalicAttributeId, L"AXItalic"},
-        {UIA_UnderlineStyleAttributeId, L"AXUnderlineStyle"}, {UIA_StrikethroughStyleAttributeId, L"AXStrikethroughStyle"}
+    const struct { TEXTATTRIBUTEID id; const wchar_t *name; } fields[] = {
+        {UIA_FontNameAttributeId, L"FontName"}, {UIA_FontSizeAttributeId, L"FontSize"},
+        {UIA_FontWeightAttributeId, L"FontWeight"}, {UIA_IsItalicAttributeId, L"IsItalic"},
+        {UIA_UnderlineStyleAttributeId, L"UnderlineStyle"}, {UIA_StrikethroughStyleAttributeId, L"StrikethroughStyle"}
     };
-    for (i = 0; i < ARRAYSIZE(font_properties); ++i) {
+    for (i = 0; i < ARRAYSIZE(fields); ++i) {
         VARIANT value;
         VariantInit(&value);
-        if (SUCCEEDED(IUIAutomationTextRange_GetAttributeValue(range, font_properties[i].id, &value))) {
-            if (value.vt == VT_BSTR) ax_json_set(font, font_properties[i].name,
+        if (SUCCEEDED(IUIAutomationTextRange_GetAttributeValue(range, fields[i].id, &value))) {
+            if (value.vt == VT_BSTR) ax_json_set(attributes, fields[i].name,
                 ax_json_string_n(value.bstrVal, limited_length(value.bstrVal, SysStringLen(value.bstrVal), ASB_AX_MAX_STRING)));
-            else if (value.vt == VT_R8 && isfinite(value.dblVal)) ax_json_set(font, font_properties[i].name, double_value(value.dblVal));
-        }
-        VariantClear(&value);
-    }
-    if (ax_json_count(font) || !ax_json_valid(font)) ax_json_set(attributes, L"AXFont", typed(L"dictionary", font));
-    else ax_json_release(font);
-    for (i = 0; i < ARRAYSIZE(properties); ++i) {
-        VARIANT value;
-        VariantInit(&value);
-        if (SUCCEEDED(IUIAutomationTextRange_GetAttributeValue(range, properties[i].id, &value))) {
-            if (value.vt == VT_BOOL) ax_json_set(attributes, properties[i].name, ax_json_boolean(value.boolVal != VARIANT_FALSE));
-            else if (value.vt == VT_I4) ax_json_set(attributes, properties[i].name, ax_json_number(value.lVal));
+            else if (value.vt == VT_R8 && isfinite(value.dblVal)) ax_json_set(attributes, fields[i].name, ax_json_number(value.dblVal));
+            else if (value.vt == VT_I4) ax_json_set(attributes, fields[i].name, ax_json_number(value.lVal));
+            else if (value.vt == VT_BOOL) ax_json_set(attributes, fields[i].name, ax_json_boolean(value.boolVal != VARIANT_FALSE));
         }
         VariantClear(&value);
     }
@@ -843,13 +654,14 @@ static HRESULT text_attributed(AccessibilityUia *uia, IUIAutomationTextRange *do
         if (!read_text(cursor, &chosen) || !(count = SysStringLen(chosen)) || count > length - offset) { hr = UIA_E_NOTSUPPORTED; goto done; }
         run = ax_json_object();
         ax_json_set(run, L"range", pair((double)offset, (double)count));
-        ax_json_set(run, L"attributes", typed(L"dictionary", text_format_attributes(cursor)));
+        ax_json_set(run, L"attributes", text_format_attributes(cursor));
         ax_json_append(runs, run);
         offset += count; SysFreeString(chosen); chosen = NULL;
         if (offset < length) TRY(IUIAutomationTextRange_MoveEndpointByRange(cursor, TextPatternRangeEndpoint_Start, cursor, TextPatternRangeEndpoint_End));
     }
     if (offset != length) { hr = UIA_E_NOTSUPPORTED; goto done; }
-    *result = typed(L"attributed", ax_json_string_n(text, length));
+    *result = ax_json_object();
+    ax_json_set(*result, L"text", ax_json_string_n(text, length));
     ax_json_set(*result, L"runs", runs); runs = NULL;
     hr = ax_json_valid(*result) ? S_OK : E_OUTOFMEMORY;
 done:
@@ -873,7 +685,7 @@ static HRESULT text_request(AccessibilityUia *uia, UiaRecord *record, const wcha
     if (setter && (count != SysStringLen(record->text) || (count && memcmp(contents, record->text, count * sizeof(wchar_t))))) {
         hr = UIA_E_ELEMENTNOTAVAILABLE; goto done;
     }
-    if (text_equal(attribute, L"AXRangeForPosition")) {
+    if (text_equal(attribute, L"Text.RangeFromPoint")) {
         POINT point;
         if (!decode_point(parameter, &point)) { hr = E_INVALIDARG; goto done; }
         TRY(IUIAutomationTextPattern_RangeFromPoint(pattern, point, &at));
@@ -888,9 +700,9 @@ static HRESULT text_request(AccessibilityUia *uia, UiaRecord *record, const wcha
     TRY(IUIAutomationTextRange_MoveEndpointByRange(document, TextPatternRangeEndpoint_Start, start, TextPatternRangeEndpoint_End));
     TRY(IUIAutomationTextRange_MoveEndpointByRange(document, TextPatternRangeEndpoint_End, end, TextPatternRangeEndpoint_End));
     if (setter) hr = prepare(uia, deadline) ? IUIAutomationTextRange_Select(document) : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
-    else if (text_equal(attribute, L"AXStringForRange")) { *result = ax_json_string_n(contents + location, length); hr = S_OK; }
-    else if (text_equal(attribute, L"AXBoundsForRange")) hr = text_bounds(uia, document, result);
-    else if (text_equal(attribute, L"AXAttributedStringForRange")) hr = text_attributed(uia, document, contents + location, length, deadline, result);
+    else if (text_equal(attribute, L"Text.GetText")) { *result = ax_json_string_n(contents + location, length); hr = S_OK; }
+    else if (text_equal(attribute, L"Text.GetBoundingRectangles")) hr = text_bounds(uia, document, result);
+    else if (text_equal(attribute, L"Text.GetAttributeRuns")) hr = text_attributed(uia, document, contents + location, length, deadline, result);
     else hr = UIA_E_NOTSUPPORTED;
 done:
     SysFreeString(text); SysFreeString(before);
@@ -899,215 +711,81 @@ done:
     if (FAILED(hr)) { ax_json_release(*result); *result = NULL; }
     return hr;
 }
-static HRESULT set_selection(AccessibilityUia *uia, UiaRecord *container, const Json *selection, uint64_t deadline) {
-    IUIAutomationSelectionPattern *pattern = NULL;
-    IUIAutomationSelectionItemPattern **items = NULL, *item = NULL;
-    IUIAutomationElement *owner = NULL, *element = NULL;
-    IUIAutomationElementArray *selected = NULL;
-    size_t count = ax_json_count(selection), i;
-    int current_count = 0, index;
-    BOOL multiple = FALSE, required = TRUE;
-    HRESULT hr = UIA_E_NOTSUPPORTED;
-    if (count > ASB_AX_MAX_NODES) return E_INVALIDARG;
-    if (FAILED(PATTERN(container->element, IUIAutomationSelectionPattern, UIA_SelectionPatternId, &pattern)) || !pattern) goto done;
-    TRY(IUIAutomationSelectionPattern_get_CurrentCanSelectMultiple(pattern, &multiple));
-    TRY(IUIAutomationSelectionPattern_get_CurrentIsSelectionRequired(pattern, &required));
-    if ((!multiple && count > 1) || (required && !count)) { hr = E_INVALIDARG; goto done; }
-    if (count) {
-        items = calloc(count, sizeof(*items));
-        if (!items) { hr = E_OUTOFMEMORY; goto done; }
-    }
-    ++uia->selection_generation;
-    for (i = 0; i < count; ++i) {
-        Json *value = ax_json_at(selection, i);
-        UiaRecord *record;
-        BOOL equal = FALSE, enabled = FALSE;
-        if (!prepare(uia, deadline)) { hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-        if (!named_equal(value, L"$ax", L"element")) { hr = E_INVALIDARG; goto done; }
-        record = find_record(uia, named_text(value, L"value"));
-        if (!record || record->selection_mark == uia->selection_generation) { hr = E_INVALIDARG; goto done; }
-        record->selection_mark = uia->selection_generation;
-        if (FAILED(PATTERN(record->element, IUIAutomationSelectionItemPattern, UIA_SelectionItemPatternId, &items[i])) || !items[i]) { hr = UIA_E_NOTSUPPORTED; goto done; }
-        TRY(IUIAutomationSelectionItemPattern_get_CurrentSelectionContainer(items[i], &owner));
-        TRY(IUIAutomation_CompareElements(uia->automation, owner, container->element, &equal));
-        RELEASE(owner);
-        if (!equal) { hr = E_INVALIDARG; goto done; }
-        TRY(IUIAutomationElement_get_CurrentIsEnabled(record->element, &enabled));
-        if (!enabled) { hr = UIA_E_ELEMENTNOTENABLED; goto done; }
-    }
-    if (!count) {
-        TRY(IUIAutomationSelectionPattern_GetCurrentSelection(pattern, &selected));
-        if (!selected) { hr = S_OK; goto done; }
-        TRY(IUIAutomationElementArray_get_Length(selected, &current_count));
-        if (current_count > ASB_AX_MAX_NODES) { hr = E_INVALIDARG; goto done; }
-        for (index = 0; index < current_count; ++index) {
-            if (!prepare(uia, deadline)) { hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-            TRY(IUIAutomationElementArray_GetElement(selected, index, &element));
-            if (FAILED(PATTERN(element, IUIAutomationSelectionItemPattern, UIA_SelectionItemPatternId, &item)) || !item) { hr = UIA_E_NOTSUPPORTED; goto done; }
-            if (!prepare(uia, deadline)) { hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-            TRY(IUIAutomationSelectionItemPattern_RemoveFromSelection(item));
-            RELEASE(item); RELEASE(element);
-        }
-    } else for (i = 0; i < count; ++i) {
-        if (!prepare(uia, deadline)) { hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-        TRY(i == 0 ? IUIAutomationSelectionItemPattern_Select(items[i]) : IUIAutomationSelectionItemPattern_AddToSelection(items[i]));
-    }
-    hr = S_OK;
-done:
-    if (items) { for (i = 0; i < count; ++i) RELEASE(items[i]); free(items); }
-    RELEASE(element); RELEASE(owner); RELEASE(item); RELEASE(selected); RELEASE(pattern);
-    return hr;
-}
-static HRESULT set_attribute(AccessibilityUia *uia, UiaRecord *record, const wchar_t *attribute, const Json *value, uint64_t deadline) {
-    IUIAutomationElement *element = record->element, *container = NULL;
+static HRESULT native_operation(AccessibilityUia *uia, UiaRecord *record, const wchar_t *action,
+    const Json *value, uint64_t deadline) {
+    IUIAutomationElement *element = record->element;
+    IUIAutomationInvokePattern *invoke = NULL;
+    IUIAutomationTogglePattern *toggle = NULL;
+    IUIAutomationSelectionItemPattern *selection = NULL;
     IUIAutomationExpandCollapsePattern *expand = NULL;
-    IUIAutomationSelectionItemPattern *item = NULL;
-    IUIAutomationSelectionPattern *selection = NULL;
+    IUIAutomationScrollPattern *scroll = NULL;
+    IUIAutomationScrollItemPattern *scroll_item = NULL;
+    IUIAutomationVirtualizedItemPattern *virtualized = NULL;
     IUIAutomationRangeValuePattern *range = NULL;
     IUIAutomationValuePattern *text = NULL;
-    IUIAutomationTogglePattern *toggle = NULL;
-    Json *ignored = NULL;
-    BSTR input = NULL;
-    BOOL multiple = FALSE, read_only = TRUE;
     HRESULT hr = UIA_E_NOTSUPPORTED;
-    int boolean = 0;
+    BOOL read_only = TRUE;
+    BSTR input = NULL;
     if (!prepare(uia, deadline)) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
-    if (text_equal(attribute, L"AXFocused")) return decode_boolean(value, &boolean) && boolean ? IUIAutomationElement_SetFocus(element) : E_INVALIDARG;
-    if (text_equal(attribute, L"AXSelectedTextRange")) {
-        hr = text_request(uia, record, attribute, value, 1, deadline, &ignored); ax_json_release(ignored); return hr;
-    }
-    if (text_equal(attribute, L"AXSelectedChildren") || text_equal(attribute, L"AXSelectedRows"))
-        return ax_json_type(value) == AX_JSON_ARRAY ? set_selection(uia, record, value, deadline) : E_INVALIDARG;
-    if (text_equal(attribute, L"AXExpanded") || text_equal(attribute, L"AXDisclosing")) {
-        if (!decode_boolean(value, &boolean)) return E_INVALIDARG;
+    if (text_equal(action, L"SetFocus")) return IUIAutomationElement_SetFocus(element);
+    if (text_equal(action, L"Invoke.Invoke")) {
+        if (FAILED(PATTERN(element, IUIAutomationInvokePattern, UIA_InvokePatternId, &invoke)) || !invoke) goto done;
+        hr = prepare(uia, deadline) ? IUIAutomationInvokePattern_Invoke(invoke) : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    } else if (text_equal(action, L"Toggle.Toggle")) {
+        if (FAILED(PATTERN(element, IUIAutomationTogglePattern, UIA_TogglePatternId, &toggle)) || !toggle) goto done;
+        hr = prepare(uia, deadline) ? IUIAutomationTogglePattern_Toggle(toggle) : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    } else if (text_equal(action, L"SelectionItem.Select") || text_equal(action, L"SelectionItem.AddToSelection") ||
+        text_equal(action, L"SelectionItem.RemoveFromSelection")) {
+        if (FAILED(PATTERN(element, IUIAutomationSelectionItemPattern, UIA_SelectionItemPatternId, &selection)) || !selection) goto done;
+        if (!prepare(uia, deadline)) { hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
+        hr = text_equal(action, L"SelectionItem.Select") ? IUIAutomationSelectionItemPattern_Select(selection) :
+            text_equal(action, L"SelectionItem.AddToSelection") ? IUIAutomationSelectionItemPattern_AddToSelection(selection) :
+            IUIAutomationSelectionItemPattern_RemoveFromSelection(selection);
+    } else if (text_equal(action, L"ExpandCollapse.Expand") || text_equal(action, L"ExpandCollapse.Collapse")) {
         if (FAILED(PATTERN(element, IUIAutomationExpandCollapsePattern, UIA_ExpandCollapsePatternId, &expand)) || !expand) goto done;
         if (!prepare(uia, deadline)) { hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-        hr = boolean ? IUIAutomationExpandCollapsePattern_Expand(expand) : IUIAutomationExpandCollapsePattern_Collapse(expand); goto done;
-    }
-    if (text_equal(attribute, L"AXSelected")) {
-        if (!decode_boolean(value, &boolean)) return E_INVALIDARG;
-        if (FAILED(PATTERN(element, IUIAutomationSelectionItemPattern, UIA_SelectionItemPatternId, &item)) || !item) goto done;
-        if (SUCCEEDED(IUIAutomationSelectionItemPattern_get_CurrentSelectionContainer(item, &container)) && container &&
-            SUCCEEDED(PATTERN(container, IUIAutomationSelectionPattern, UIA_SelectionPatternId, &selection)) && selection)
-            IUIAutomationSelectionPattern_get_CurrentCanSelectMultiple(selection, &multiple);
-        if (!prepare(uia, deadline)) { hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-        hr = !boolean ? IUIAutomationSelectionItemPattern_RemoveFromSelection(item) :
-            multiple ? IUIAutomationSelectionItemPattern_AddToSelection(item) : IUIAutomationSelectionItemPattern_Select(item);
-        goto done;
-    }
-    if (!text_equal(attribute, L"AXValue")) goto done;
-    PATTERN(element, IUIAutomationRangeValuePattern, UIA_RangeValuePatternId, &range);
-    if (range) {
+        hr = text_equal(action, L"ExpandCollapse.Expand") ? IUIAutomationExpandCollapsePattern_Expand(expand) :
+            IUIAutomationExpandCollapsePattern_Collapse(expand);
+    } else if (text_equal(action, L"Scroll.Scroll")) {
+        double horizontal, vertical;
+        if (ax_json_type(value) != AX_JSON_ARRAY || ax_json_count(value) != 2 ||
+            !decode_number(ax_json_at(value, 0), &horizontal) || !decode_number(ax_json_at(value, 1), &vertical) ||
+            horizontal < ScrollAmount_LargeDecrement || horizontal > ScrollAmount_SmallIncrement || floor(horizontal) != horizontal ||
+            vertical < ScrollAmount_LargeDecrement || vertical > ScrollAmount_SmallIncrement || floor(vertical) != vertical) { hr = E_INVALIDARG; goto done; }
+        if (FAILED(PATTERN(element, IUIAutomationScrollPattern, UIA_ScrollPatternId, &scroll)) || !scroll) goto done;
+        hr = prepare(uia, deadline) ? IUIAutomationScrollPattern_Scroll(scroll, (enum ScrollAmount)horizontal, (enum ScrollAmount)vertical) : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    } else if (text_equal(action, L"ScrollItem.ScrollIntoView")) {
+        if (FAILED(PATTERN(element, IUIAutomationScrollItemPattern, UIA_ScrollItemPatternId, &scroll_item)) || !scroll_item) goto done;
+        hr = prepare(uia, deadline) ? IUIAutomationScrollItemPattern_ScrollIntoView(scroll_item) : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    } else if (text_equal(action, L"VirtualizedItem.Realize")) {
+        if (FAILED(PATTERN(element, IUIAutomationVirtualizedItemPattern, UIA_VirtualizedItemPatternId, &virtualized)) || !virtualized) goto done;
+        hr = prepare(uia, deadline) ? IUIAutomationVirtualizedItemPattern_Realize(virtualized) : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    } else if (text_equal(action, L"RangeValue.SetValue")) {
         double number, minimum = 0, maximum = 0;
         if (!decode_number(value, &number)) { hr = E_INVALIDARG; goto done; }
+        if (FAILED(PATTERN(element, IUIAutomationRangeValuePattern, UIA_RangeValuePatternId, &range)) || !range) goto done;
         TRY(IUIAutomationRangeValuePattern_get_CurrentIsReadOnly(range, &read_only));
         if (read_only) { hr = UIA_E_NOTSUPPORTED; goto done; }
         TRY(IUIAutomationRangeValuePattern_get_CurrentMinimum(range, &minimum));
         TRY(IUIAutomationRangeValuePattern_get_CurrentMaximum(range, &maximum));
         if (!isfinite(minimum) || !isfinite(maximum) || number < minimum || number > maximum) { hr = E_INVALIDARG; goto done; }
-        hr = prepare(uia, deadline) ? IUIAutomationRangeValuePattern_SetValue(range, number) : HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done;
-    }
-    PATTERN(element, IUIAutomationValuePattern, UIA_ValuePatternId, &text);
-    if (text) {
+        hr = prepare(uia, deadline) ? IUIAutomationRangeValuePattern_SetValue(range, number) : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    } else if (text_equal(action, L"Value.SetValue")) {
         if (ax_json_type(value) != AX_JSON_STRING || ax_json_length(value) > ASB_AX_MAX_STRING ||
             wmemchr(ax_json_text(value), 0, ax_json_length(value))) { hr = E_INVALIDARG; goto done; }
+        if (FAILED(PATTERN(element, IUIAutomationValuePattern, UIA_ValuePatternId, &text)) || !text) goto done;
         TRY(IUIAutomationValuePattern_get_CurrentIsReadOnly(text, &read_only));
         if (read_only) { hr = UIA_E_NOTSUPPORTED; goto done; }
         input = SysAllocStringLen(ax_json_text(value), (UINT)ax_json_length(value));
         if (!input) { hr = E_OUTOFMEMORY; goto done; }
-        hr = prepare(uia, deadline) ? IUIAutomationValuePattern_SetValue(text, input) : HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done;
-    }
-    PATTERN(element, IUIAutomationTogglePattern, UIA_TogglePatternId, &toggle);
-    if (toggle) {
-        double desired;
-        int i;
-        if (ax_json_type(value) == AX_JSON_BOOLEAN) desired = ax_json_bool(value, 0) ? 1 : 0;
-        else if (!decode_number(value, &desired)) { hr = E_INVALIDARG; goto done; }
-        if (desired < 0 || desired > 2 || floor(desired) != desired) { hr = E_INVALIDARG; goto done; }
-        for (i = 0; i < 3; ++i) {
-            enum ToggleState state;
-            TRY(IUIAutomationTogglePattern_get_CurrentToggleState(toggle, &state));
-            if (state == (enum ToggleState)desired) { hr = S_OK; goto done; }
-            if (i == 2) { hr = UIA_E_NOTSUPPORTED; goto done; }
-            if (!prepare(uia, deadline)) { hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-            TRY(IUIAutomationTogglePattern_Toggle(toggle));
-        }
+        hr = prepare(uia, deadline) ? IUIAutomationValuePattern_SetValue(text, input) : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
     }
 done:
-    SysFreeString(input); RELEASE(toggle); RELEASE(text); RELEASE(range);
-    RELEASE(selection); RELEASE(container); RELEASE(item); RELEASE(expand);
+    SysFreeString(input); RELEASE(text); RELEASE(range); RELEASE(virtualized); RELEASE(scroll_item);
+    RELEASE(scroll); RELEASE(expand); RELEASE(selection); RELEASE(toggle); RELEASE(invoke);
     return hr;
 }
-static HRESULT perform(AccessibilityUia *uia, UiaRecord *record, const wchar_t *action, uint64_t deadline) {
-    IUIAutomationElement *element = record->element;
-    IUIAutomationVirtualizedItemPattern *virtualized = NULL;
-    IUIAutomationScrollItemPattern *scroll_item = NULL;
-    IUIAutomationRangeValuePattern *range = NULL;
-    IUIAutomationScrollPattern *scroll = NULL;
-    IUIAutomationExpandCollapsePattern *expand = NULL;
-    IUIAutomationInvokePattern *invoke = NULL;
-    IUIAutomationTogglePattern *toggle = NULL;
-    IUIAutomationSelectionItemPattern *select = NULL;
-    HRESULT hr = UIA_E_NOTSUPPORTED;
-    if (!prepare(uia, deadline)) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
-    if (text_equal(action, L"AXScrollToVisible")) {
-        PATTERN(element, IUIAutomationVirtualizedItemPattern, UIA_VirtualizedItemPatternId, &virtualized);
-        if (virtualized) {
-            if (!prepare(uia, deadline)) { hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-            TRY(IUIAutomationVirtualizedItemPattern_Realize(virtualized));
-        }
-        if (FAILED(PATTERN(element, IUIAutomationScrollItemPattern, UIA_ScrollItemPatternId, &scroll_item)) || !scroll_item) { hr = UIA_E_NOTSUPPORTED; goto done; }
-        hr = prepare(uia, deadline) ? IUIAutomationScrollItemPattern_ScrollIntoView(scroll_item) : HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done;
-    }
-    if (text_equal(action, L"AXIncrement") || text_equal(action, L"AXDecrement")) {
-        double value = 0, change = 0, minimum = 0, maximum = 0, target;
-        BOOL read_only = TRUE;
-        if (FAILED(PATTERN(element, IUIAutomationRangeValuePattern, UIA_RangeValuePatternId, &range)) || !range) goto done;
-        TRY(IUIAutomationRangeValuePattern_get_CurrentIsReadOnly(range, &read_only));
-        if (read_only) { hr = UIA_E_NOTSUPPORTED; goto done; }
-        TRY(IUIAutomationRangeValuePattern_get_CurrentValue(range, &value));
-        TRY(IUIAutomationRangeValuePattern_get_CurrentSmallChange(range, &change));
-        TRY(IUIAutomationRangeValuePattern_get_CurrentMinimum(range, &minimum));
-        TRY(IUIAutomationRangeValuePattern_get_CurrentMaximum(range, &maximum));
-        if (!isfinite(value) || !isfinite(change) || change <= 0 || !isfinite(minimum) || !isfinite(maximum) || minimum > maximum) { hr = UIA_E_NOTSUPPORTED; goto done; }
-        target = fmax(minimum, fmin(maximum, value + (text_equal(action, L"AXIncrement") ? change : -change)));
-        hr = prepare(uia, deadline) ? IUIAutomationRangeValuePattern_SetValue(range, target) : HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done;
-    }
-    if (text_equal(action, L"AXScrollDownByPage") || text_equal(action, L"AXScrollUpByPage") ||
-        text_equal(action, L"AXScrollRightByPage") || text_equal(action, L"AXScrollLeftByPage")) {
-        enum ScrollAmount horizontal = ScrollAmount_NoAmount, vertical = ScrollAmount_NoAmount;
-        if (FAILED(PATTERN(element, IUIAutomationScrollPattern, UIA_ScrollPatternId, &scroll)) || !scroll) goto done;
-        if (text_equal(action, L"AXScrollDownByPage")) vertical = ScrollAmount_LargeIncrement;
-        if (text_equal(action, L"AXScrollUpByPage")) vertical = ScrollAmount_LargeDecrement;
-        if (text_equal(action, L"AXScrollRightByPage")) horizontal = ScrollAmount_LargeIncrement;
-        if (text_equal(action, L"AXScrollLeftByPage")) horizontal = ScrollAmount_LargeDecrement;
-        hr = prepare(uia, deadline) ? IUIAutomationScrollPattern_Scroll(scroll, horizontal, vertical) : HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done;
-    }
-    if (text_equal(action, L"AXShowMenu") || text_equal(action, L"AXCancel")) {
-        if (FAILED(PATTERN(element, IUIAutomationExpandCollapsePattern, UIA_ExpandCollapsePatternId, &expand)) || !expand) goto done;
-        if (!prepare(uia, deadline)) { hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-        hr = text_equal(action, L"AXShowMenu") ? IUIAutomationExpandCollapsePattern_Expand(expand) : IUIAutomationExpandCollapsePattern_Collapse(expand); goto done;
-    }
-    if (text_equal(action, L"AXPress")) {
-        PATTERN(element, IUIAutomationInvokePattern, UIA_InvokePatternId, &invoke);
-        if (invoke) { hr = prepare(uia, deadline) ? IUIAutomationInvokePattern_Invoke(invoke) : HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-        PATTERN(element, IUIAutomationTogglePattern, UIA_TogglePatternId, &toggle);
-        if (toggle) { hr = prepare(uia, deadline) ? IUIAutomationTogglePattern_Toggle(toggle) : HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-        PATTERN(element, IUIAutomationSelectionItemPattern, UIA_SelectionItemPatternId, &select);
-        if (select) { hr = prepare(uia, deadline) ? IUIAutomationSelectionItemPattern_Select(select) : HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-        PATTERN(element, IUIAutomationExpandCollapsePattern, UIA_ExpandCollapsePatternId, &expand);
-        if (expand) {
-            enum ExpandCollapseState state;
-            TRY(IUIAutomationExpandCollapsePattern_get_CurrentExpandCollapseState(expand, &state));
-            if (!prepare(uia, deadline)) { hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
-            hr = state == ExpandCollapseState_Expanded ? IUIAutomationExpandCollapsePattern_Collapse(expand) : IUIAutomationExpandCollapsePattern_Expand(expand);
-        }
-    }
-done:
-    RELEASE(select); RELEASE(toggle); RELEASE(invoke); RELEASE(expand); RELEASE(scroll);
-    RELEASE(range); RELEASE(scroll_item); RELEASE(virtualized);
-    return hr;
-}
+
 typedef struct CaptureWindows {
     HWND owner, windows[64];
     size_t count;
@@ -1224,35 +902,29 @@ HRESULT accessibility_uia_capture(AccessibilityUia *uia, uint64_t deadline, Acce
     if (queued) uia->work->truncated = 1;
     for (i = 0; i < count; ++i) {
         if (!continue_capture(uia)) goto done;
-        add_relations(uia, captured[i], named(captured[i]->captured_metadata, L"attributes"));
+        add_relations(uia, captured[i], named(captured[i]->captured_metadata, L"properties"));
     }
     for (pass = 0; pass < 2; ++pass) for (i = 0; i < count; ++i) {
         int focused;
         if (!continue_capture(uia)) goto done;
         record = captured[i]; focused = cached_int(record->element, UIA_HasKeyboardFocusPropertyId, 0) != 0;
         if ((pass == 0) != focused || record->secure) continue;
-        add_text(uia, record, named(record->captured_metadata, L"attributes"),
-            named(record->captured_metadata, L"writableAttributes"), named(record->captured_metadata, L"parameterizedNames"));
+        add_text(uia, record, named(record->captured_metadata, L"properties"));
     }
     if (!count) goto done;
     if (!accessibility_uia_active(uia) || GetForegroundWindow() != window) {
         uia->work->error = HRESULT_FROM_WIN32(ERROR_CANCELLED); goto done;
     }
-    for (i = 0; i < count; ++i) {
-        if (!check_work(uia)) goto done;
-        add_structural_relations(uia, captured[i]->captured_metadata, 1);
-    }
     {
-        wchar_t path[1024] = {0}, bundle[64];
+        wchar_t path[1024] = {0};
         const wchar_t *base;
         DWORD length = ARRAYSIZE(path);
         HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         Json *app = ax_json_object(), *display = ax_json_object();
         if (process) { QueryFullProcessImageNameW(process, 0, path, &length); CloseHandle(process); }
         base = wcsrchr(path, L'\\'); base = base ? base + 1 : path;
-        swprintf_s(bundle, ARRAYSIZE(bundle), L"win32.%lu", pid);
         ax_json_set(app, L"pid", ax_json_number(pid)); ax_json_set(app, L"name", ax_json_string(*base ? base : L"Windows"));
-        ax_json_set(app, L"bundleId", ax_json_string(bundle));
+        ax_json_set(app, L"processPath", ax_json_string(path));
         ax_json_set(display, L"x", ax_json_number(monitor.rcMonitor.left)); ax_json_set(display, L"y", ax_json_number(monitor.rcMonitor.top));
         ax_json_set(display, L"width", ax_json_number((double)monitor.rcMonitor.right - monitor.rcMonitor.left));
         ax_json_set(display, L"height", ax_json_number((double)monitor.rcMonitor.bottom - monitor.rcMonitor.top));
@@ -1328,7 +1000,6 @@ static Json *query_metadata(AccessibilityUia *uia, UiaRecord *record, BSTR *text
             }
         }
     }
-    add_structural_relations(uia, result, 0);
 done:
     RELEASE(children); RELEASE(parent); RELEASE(expanded);
     if (!ax_json_valid(result) && SUCCEEDED(uia->work->error)) uia->work->error = E_OUTOFMEMORY;
@@ -1358,13 +1029,13 @@ Json *accessibility_uia_request(AccessibilityUia *uia, const Json *message, uint
     if (FAILED(hr) || (DWORD)pid != record->pid) { hr = UIA_E_ELEMENTNOTAVAILABLE; goto done; }
     TRY(IUIAutomationElement_get_CurrentIsPassword(record->element, &secure));
     record->secure = secure != FALSE;
-    if (text_equal(action, L"getFrame")) {
+    if (text_equal(action, L"GetBoundingRectangle")) {
         RECT bounds = {0};
         requires_value = 1;
         TRY(IUIAutomationElement_get_CurrentBoundingRectangle(record->element, &bounds));
         result = frame_value(bounds); goto done;
     }
-    if (text_equal(action, L"hitTest")) {
+    if (text_equal(action, L"ElementFromPoint")) {
         POINT point;
         UiaRecord *target;
         requires_value = 1;
@@ -1375,64 +1046,56 @@ Json *accessibility_uia_request(AccessibilityUia *uia, const Json *message, uint
         else hr = UIA_E_ELEMENTNOTAVAILABLE;
         goto done;
     }
-    if (text_equal(action, L"getMetadata") || text_equal(action, L"getAttribute") || text_equal(action, L"isAttributeSettable")) {
+    if (text_equal(action, L"GetMetadata")) {
         fresh = query_metadata(uia, record, &fresh_text, &fresh_complete_text);
         if (!fresh) { hr = FAILED(uia->work->error) ? uia->work->error : UIA_E_ELEMENTNOTAVAILABLE; goto done; }
-        if (text_equal(action, L"getMetadata")) {
-            if (!record->metadata) {
-                record->metadata = ax_json_retain(fresh);
-                SysFreeString(record->text); record->text = fresh_text; fresh_text = NULL;
-                record->complete_text = fresh_complete_text;
-            }
-            ax_json_set(response, L"record", ax_json_retain(fresh)); hr = S_OK;
-        } else if (text_equal(action, L"isAttributeSettable")) {
-            requires_value = 1;
-            result = ax_json_boolean(has_string(named(fresh, L"writableAttributes"), attribute)); hr = S_OK;
-        } else {
-            Json *found = named(named(fresh, L"attributes"), attribute);
-            requires_value = 1;
-            if (found) { result = ax_json_retain(found); hr = S_OK; } else hr = UIA_E_NOTSUPPORTED;
-        }
-        goto done;
-    }
-    if (text_equal(action, L"getParameterizedAttribute")) {
-        requires_value = 1;
-        if (text_equal(attribute, L"AXCellForColumnAndRow")) {
-            double row, column;
-            hr = E_INVALIDARG;
-            if (ax_json_type(value) != AX_JSON_ARRAY || ax_json_count(value) != 2) goto done;
-            column = ax_json_double(ax_json_at(value, 0), NAN); row = ax_json_double(ax_json_at(value, 1), NAN);
-            if (!isfinite(column) || !isfinite(row) || row < 0 || column < 0 || row >= INT_MAX || column >= INT_MAX || floor(row) != row || floor(column) != column) goto done;
-            if (FAILED(PATTERN(record->element, IUIAutomationGridPattern, UIA_GridPatternId, &grid)) || !grid) { hr = UIA_E_NOTSUPPORTED; goto done; }
-            TRY(IUIAutomationGridPattern_GetItem(grid, (int)row, (int)column, &element));
-            result = reference(uia, element);
-        } else hr = text_request(uia, record, attribute, value, 0, deadline, &result);
-        goto done;
-    }
-    TRY(IUIAutomationElement_get_CurrentIsEnabled(record->element, &enabled));
-    if (!enabled) { hr = UIA_E_ELEMENTNOTENABLED; goto done; }
-    if (!record->metadata) {
-        record->metadata = query_metadata(uia, record, &fresh_text, &fresh_complete_text);
-        if (record->metadata) {
+        if (!record->metadata) {
+            record->metadata = ax_json_retain(fresh);
             SysFreeString(record->text); record->text = fresh_text; fresh_text = NULL;
             record->complete_text = fresh_complete_text;
         }
+        ax_json_set(response, L"record", ax_json_retain(fresh)); hr = S_OK; goto done;
     }
-    if (!ax_json_valid(record->metadata)) {
-        ax_json_release(record->metadata); record->metadata = NULL; uia->work->error = E_OUTOFMEMORY;
-    }
-    if (!check_work(uia)) { hr = uia->work->error; goto done; }
-    hr = UIA_E_NOTSUPPORTED;
-    if (text_equal(action, L"setAttribute")) {
-        if (has_string(named(record->metadata, L"writableAttributes"), attribute)) {
-            mutation = 1; hr = set_attribute(uia, record, attribute, value, deadline);
+    if (text_equal(action, L"GetProperty")) {
+        size_t i;
+        VARIANT property;
+        requires_value = 1; hr = UIA_E_NOTSUPPORTED;
+        for (i = 0; i < ARRAYSIZE(uia_properties); ++i) if (text_equal(attribute, uia_properties[i].name)) break;
+        if (i == ARRAYSIZE(uia_properties)) goto done;
+        VariantInit(&property);
+        hr = IUIAutomationElement_GetCurrentPropertyValue(record->element, *uia_properties[i].id, &property);
+        if (SUCCEEDED(hr) && !(secure && (*uia_properties[i].id == UIA_RangeValueValuePropertyId ||
+            (*uia_properties[i].id == UIA_ValueValuePropertyId && (property.vt != VT_BSTR || !is_masked_value(property.bstrVal)))))) {
+            if (property.vt == VT_BSTR) result = snapshot_string(uia, property.bstrVal ? property.bstrVal : L"", SysStringLen(property.bstrVal));
+            else if (property.vt == VT_BOOL) result = ax_json_boolean(property.boolVal != VARIANT_FALSE);
+            else if (property.vt == VT_I4) result = ax_json_number(property.lVal);
+            else if (property.vt == VT_R8 && isfinite(property.dblVal)) result = ax_json_number(property.dblVal);
         }
-    } else if (has_string(named(record->metadata, L"actions"), action)) {
-        mutation = 1; hr = perform(uia, record, action, deadline);
+        VariantClear(&property);
+        if (SUCCEEDED(hr) && !result) hr = UIA_E_NOTSUPPORTED;
+        goto done;
     }
+    if (text_equal(action, L"Grid.GetItem")) {
+        double row, column;
+        requires_value = 1; hr = E_INVALIDARG;
+        if (ax_json_type(value) != AX_JSON_ARRAY || ax_json_count(value) != 2) goto done;
+        row = ax_json_double(ax_json_at(value, 0), NAN); column = ax_json_double(ax_json_at(value, 1), NAN);
+        if (!isfinite(column) || !isfinite(row) || row < 0 || column < 0 || row >= INT_MAX || column >= INT_MAX || floor(row) != row || floor(column) != column) goto done;
+        if (FAILED(PATTERN(record->element, IUIAutomationGridPattern, UIA_GridPatternId, &grid)) || !grid) { hr = UIA_E_NOTSUPPORTED; goto done; }
+        TRY(IUIAutomationGridPattern_GetItem(grid, (int)row, (int)column, &element));
+        result = reference(uia, element); goto done;
+    }
+    if (text_equal(action, L"Text.GetText") || text_equal(action, L"Text.GetBoundingRectangles") ||
+        text_equal(action, L"Text.GetAttributeRuns") || text_equal(action, L"Text.RangeFromPoint")) {
+        requires_value = 1; hr = text_request(uia, record, action, value, 0, deadline, &result); goto done;
+    }
+    TRY(IUIAutomationElement_get_CurrentIsEnabled(record->element, &enabled));
+    if (!enabled) { hr = UIA_E_ELEMENTNOTENABLED; goto done; }
+    mutation = 1;
+    if (text_equal(action, L"Text.Select")) hr = text_request(uia, record, action, value, 1, deadline, &result);
+    else hr = native_operation(uia, record, action, value, deadline);
 done:
-    RELEASE(grid); RELEASE(element); ax_json_release(fresh);
-    SysFreeString(fresh_text);
+    RELEASE(grid); RELEASE(element); ax_json_release(fresh); SysFreeString(fresh_text);
     if (FAILED(uia->work->error)) hr = uia->work->error;
     if (SUCCEEDED(hr) && requires_value && !ax_json_valid(result)) hr = E_OUTOFMEMORY;
     if (FAILED(hr)) { ax_json_release(result); result = NULL; }
