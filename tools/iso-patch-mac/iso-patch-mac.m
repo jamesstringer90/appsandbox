@@ -28,6 +28,7 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/xattr.h>
 #include <pwd.h>
 #include <grp.h>
 #include <unistd.h>
@@ -371,6 +372,12 @@ static BOOL stage_entry(StageEntry e, NSString *mountPt, NSString **errOut) {
     if (![fm copyItemAtPath:e.src toPath:dst error:&cpErr]) {
         if (errOut) *errOut = [NSString stringWithFormat:@"copy %@ -> %@: %@",
                                e.src, e.destRel, cpErr.localizedDescription];
+        return NO;
+    }
+    if (removexattr(dst.fileSystemRepresentation, "com.apple.quarantine", 0) != 0 &&
+        errno != ENOATTR) {
+        if (errOut) *errOut = [NSString stringWithFormat:@"remove quarantine %@: %s",
+                               e.destRel, strerror(errno)];
         return NO;
     }
     if (chown(dst.fileSystemRepresentation, e.uid, e.gid) != 0) {
