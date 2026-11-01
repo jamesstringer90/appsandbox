@@ -99,6 +99,13 @@ over **virtio-vsock**. On Windows, Linux (Ubuntu) guests reach the GPU through a
 DRM/KMS kernel module (`asb_drm`), Microsoft's WSL2 `dxgkrnl`, and a custom Mesa build. The
 apps are native C / Objective-C with an HTML/JS UI (WebView2 on Windows, WKWebView on macOS).
 
+Windows guests on macOS use **QEMU 11.1.3** with HVF acceleration, built from our
+public [asb-qemu fork](https://github.com/jamesstringer90/asb-qemu/tree/asb-ivshmem-11.1.3).
+It preserves our four ivshmem changes, including support on macOS and the optional
+`x-device-id` override. QEMU, its libraries, and firmware ship inside the macOS app.
+See the [QEMU build notes](vendor/qemu-ivshmem/README.md) for the pinned source and
+rebuild instructions.
+
 # Tips:
 The default username is `user` and the default password is `test123`
 

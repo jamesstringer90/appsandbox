@@ -16,8 +16,8 @@ distribution.
 
 The corresponding source is also published and available at no charge:
 
-  QEMU     https://github.com/jamesstringer90/asb-qemu  (branch asb-ivshmem-11.0.1)
-  GLib     glib-2.88.1.tar.xz + glib-2.88.1-homebrew-hardcoded-paths.diff
+  QEMU     https://github.com/jamesstringer90/asb-qemu  (exact revision in VERSIONS.txt)
+  GLib     glib-2.90.1.tar.xz + glib-2.90.1-homebrew-hardcoded-paths.diff
   gettext  gettext-1.0.tar.gz
            (the GLib/gettext sources are in vendor/qemu-ivshmem/source-mirror/ of the
             AppSandbox source repository)
