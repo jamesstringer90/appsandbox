@@ -2119,6 +2119,46 @@ static void handle_client(AsbConn *client)
                 REPLY("error:bad_format");
             }
         }
+        else if (strcmp(cmd, "set_dhcp") == 0) {
+            wchar_t nic[32] = L"Ethernet";
+            wchar_t wcmd[512];
+            ULONG nic_index = primary_nic_index();
+            STARTUPINFOW si;
+            PROCESS_INFORMATION pi;
+            DWORD exit_code = 1;
+            if (nic_index) swprintf_s(nic, ARRAYSIZE(nic), L"%lu", nic_index);
+
+            swprintf_s(wcmd, ARRAYSIZE(wcmd),
+                L"netsh interface ip set address \"%s\" dhcp", nic);
+            ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+            ZeroMemory(&pi, sizeof(pi));
+            if (CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                               NULL, NULL, &si, &pi)) {
+                WaitForSingleObject(pi.hProcess, 10000);
+                GetExitCodeProcess(pi.hProcess, &exit_code);
+                CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+            }
+            if (exit_code == 0) {
+                swprintf_s(wcmd, ARRAYSIZE(wcmd),
+                    L"netsh interface ip set dns \"%s\" dhcp", nic);
+                ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+                ZeroMemory(&pi, sizeof(pi));
+                exit_code = 1;
+                if (CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                                   NULL, NULL, &si, &pi)) {
+                    WaitForSingleObject(pi.hProcess, 10000);
+                    GetExitCodeProcess(pi.hProcess, &exit_code);
+                    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+                }
+            }
+            if (exit_code == 0) {
+                agent_log("Guest network set to DHCP on interface %S.", nic);
+                REPLY("ok");
+            } else {
+                agent_log("Failed to set guest network to DHCP (exit %lu).", exit_code);
+                REPLY("error:netsh_failed");
+            }
+        }
         else if (strcmp(cmd, "gpu_copy") == 0) {
             /* Host re-triggered GPU copy — ask for share list */
             REPLY("gpu_query");

@@ -408,6 +408,10 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd, buf, sizeof(buf));
             if (n <= 0) goto disconnected;
             ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);
+        } else if (vm->network_mode == NET_EXTERNAL || vm->network_mode == NET_INTERNAL) {
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, "set_dhcp", buf, sizeof(buf));
+            if (n <= 0) goto disconnected;
+            ui_log(L"DHCP network config for \"%s\": %S", vm->name, buf);
         }
 
         /* Send GPU share info to agent (if GPU-PV is assigned).
