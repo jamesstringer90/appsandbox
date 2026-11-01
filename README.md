@@ -14,6 +14,7 @@ Windows features:
 - GPU Acceleration via Paravirtualization (GPU-PV) with support for DirectX 12 (Windows only), OpenGL, Vulkan, CUDA, OpenCL
 - GPU Hardware Video Decoder/Encoder support
 - SSH via Hyper-V socket proxy (no network required)
+- Share a host folder into a Windows VM as a read-write drive letter (SMB over the VM's NAT network)
 - Snapshots
 - Fixed 1080P60 display
 - Host to client hot-key support

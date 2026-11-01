@@ -142,6 +142,17 @@
                 <select id="net-adapter"></select>
             </div>
 
+            <label class="windows-host-only">Shared folders:</label>
+            <div class="form-row windows-host-only" id="shared-folders-create-block">
+                <div class="shared-folders">
+                    <div id="create-shared-folders" class="shared-folders-list"></div>
+                    <div class="shared-folders-actions">
+                        <button type="button" onclick="addSharedFolderRow('create-shared-folders')">+ Add folder</button>
+                        <span class="host-info">Mapped as a read-write drive letter in the VM. Needs NAT networking and a host account that can open the folder.</span>
+                    </div>
+                </div>
+            </div>
+
             <label>Username:</label>
             <div class="cred-row">
                 <input type="text" id="admin-user" value="user" class="input-md" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" required>
@@ -227,6 +238,17 @@
                         <option value="2">External</option>
                         <option value="3">Internal</option>
                     </select>
+                </div>
+
+                <label class="win-only">Shared folders:</label>
+                <div class="form-row win-only" id="edit-shared-folders-block">
+                    <div class="shared-folders">
+                        <div id="edit-shared-folders" class="shared-folders-list"></div>
+                        <div class="shared-folders-actions">
+                            <button type="button" onclick="addSharedFolderRow('edit-shared-folders')">+ Add folder</button>
+                            <span class="host-info">A blank password keeps the password already saved on the host.</span>
+                        </div>
+                    </div>
                 </div>
             </div>
             <span id="edit-vm-warn" class="field-warn" aria-live="polite"></span>

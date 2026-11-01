@@ -41,6 +41,9 @@ void vm_agent_set_hwnd(HWND hwnd)
 
 /* ---- Per-VM connection state ---- */
 
+static void vm_agent_send_shares(SOCKET s, VmInstance *vm);
+static int  share_index_for_unc(VmInstance *vm, const wchar_t *unc);
+
 typedef struct AgentConn {
     /* Stable VM identifier; survives g_vms[] compaction. The actual
        VmInstance* is resolved via asb_find_vm_by_id() at each use. */
@@ -228,6 +231,22 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
 {
     if (strcmp(buf, "heartbeat") == 0) {
         vm->last_heartbeat = GetTickCount64();
+        /* A mapping the guest could not make is retried here, not just at
+           connect time: the NIC may not have been ready, or the user session
+           may not have existed yet, and until now nothing tried again. */
+        if (vm->share_retries < 12 && vm->host_shares.count > 0) {
+            int i, pending = 0;
+            for (i = 0; i < vm->host_shares.count; i++)
+                /* A share the guest cannot access at all will not start working
+                   because we asked again, so it does not keep the retries alive. */
+                if (vm->share_state[i] != 1 && !vm->share_terminal[i]) pending++;
+            if (pending > 0 && GetTickCount64() - vm->share_last_send > 20000) {
+                vm->share_retries++;
+                ui_log(L"Retrying %d shared folder(s) for \"%s\" (attempt %u of 12).",
+                       pending, vm->name, vm->share_retries);
+                vm_agent_send_shares(s, vm);
+            }
+        }
     } else if (strcmp(buf, "os_shutdown") == 0) {
         ui_log(L"Guest OS shutting down for \"%s\".", vm->name);
         vm->agent_online = FALSE;
@@ -270,9 +289,52 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         ui_log(L"[%s] Displays: %S", vm->name, buf + 9);
     } else if (strncmp(buf, "log:", 4) == 0) {
         ui_log(L"[%s] %S", vm->name, buf + 4);
+    } else if (strncmp(buf, "share_status:", 13) == 0) {
+        /* share_status:<letter>|<result>|<unc>, result is "ok:<detail>" or
+           "error:<code>:<detail>". Remember it per share so the UI can show
+           what actually happened, and so failures are retried. */
+        char line[1024];
+        char *bar1, *bar2;
+        wchar_t letter[8] = {0}, result[160] = {0}, unc[600] = {0};
+        int idx;
+
+        strncpy_s(line, sizeof(line), buf + 13, _TRUNCATE);
+        bar1 = strchr(line, '|');
+        if (bar1) {
+            *bar1++ = '\0';
+            bar2 = strchr(bar1, '|');
+            if (bar2) {
+                *bar2++ = '\0';
+                MultiByteToWideChar(CP_UTF8, 0, line, -1, letter, ARRAYSIZE(letter));
+                MultiByteToWideChar(CP_UTF8, 0, bar1, -1, result, ARRAYSIZE(result));
+                MultiByteToWideChar(CP_UTF8, 0, bar2, -1, unc, ARRAYSIZE(unc));
+            }
+        }
+
+        idx = share_index_for_unc(vm, unc);
+        if (idx >= 0) {
+            vm->share_state[idx] = (wcsncmp(result, L"ok", 2) == 0) ? 1 : 2;
+            wcsncpy_s(vm->share_letter[idx], ARRAYSIZE(vm->share_letter[idx]),
+                      letter, _TRUNCATE);
+            wcsncpy_s(vm->share_detail[idx], ARRAYSIZE(vm->share_detail[idx]),
+                      result, _TRUNCATE);
+            /* "Access is denied" is a permission problem: retrying cannot fix
+               it, so record it and let the retry loop ignore this share. */
+            if (vm->share_state[idx] == 2 && !vm->share_terminal[idx] &&
+                (wcsstr(result, L"Access is denied") || wcsstr(result, L"error:5:"))) {
+                vm->share_terminal[idx] = TRUE;
+                ui_log(L"Shared folder \"%s\" in \"%s\" cannot be accessed by the guest; "
+                       L"not retrying it.", vm->host_shares.items[idx].host_path, vm->name);
+            } else if (vm->share_state[idx] == 1) {
+                vm->share_terminal[idx] = FALSE;
+            }
+        }
+        ui_log(L"[%s] Shared folder: %S", vm->name, buf + 13);
+        notify_agent_status(vm);
+    } else if (strncmp(buf, "share_map_done:", 15) == 0) {
+        ui_log(L"Shared folders mapped in \"%s\" (%S)", vm->name, buf + 15);
     } else if (strcmp(buf, "gpu_query") == 0) {
-        if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {
-            char header[64];
+        if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {            char header[64];
             int gi;
             sprintf_s(header, sizeof(header), "gpu_query_response:%d",
                       vm->gpu_shares.count);
@@ -293,6 +355,9 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         } else {
             send_line(s, "gpu_none");
         }
+
+        vm_agent_send_shares(s, vm);
+
     } else if (strcmp(buf, "ssh_ready") == 0) {
         vm->ssh_state = 2;
         vm_ssh_proxy_start(vm);
@@ -316,6 +381,71 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         notify_agent_status(vm);
     }
     return 0;
+}
+
+/* Send the VM's shared host folders to the guest agent. The guest maps each
+   line in the interactive user session (cmdkey + net use) and reports back with
+   share_status: lines. A count of 0 tells the guest to drop every mapping it
+   made previously, so removing a share also removes the drive letter. */
+static void vm_agent_send_shares(SOCKET s, VmInstance *vm)
+{
+    char header[64];
+    wchar_t line[4096];
+    char line_a[8192];
+    int i, send_count;
+
+    if (_wcsicmp(vm->os_type, L"Windows") != 0) return;   /* Windows guests only */
+
+    /* Without NAT the guest has no route to the host, so the shares stay
+       configured but nothing is published or mapped. */
+    send_count = (vm->network_mode == NET_NAT) ? vm->host_shares.count : 0;
+
+    /* Refresh the shares before the guest maps them. Publishing is idempotent
+       and also runs at VM start, but a guest reboot brings the agent back
+       without going through hcs_start_vm, so this keeps them present either
+       way. */
+    if (send_count > 0)
+        asb_shares_publish(vm->name, &vm->host_shares);
+
+    vm->share_last_send = GetTickCount64();
+    sprintf_s(header, sizeof(header), "share_map_response:%d", send_count);
+    send_line(s, header);
+    if (send_count == 0) {
+        for (i = 0; i < ASB_MAX_HOST_SHARES; i++) {
+            vm->share_state[i] = 0;
+            vm->share_letter[i][0] = L'\0';
+            vm->share_detail[i][0] = L'\0';
+        }
+        return;
+    }
+
+    for (i = 0; i < vm->host_shares.count; i++) {
+        if (!asb_share_guest_line(&vm->host_shares.items[i], line, ARRAYSIZE(line))) {
+            ui_log(L"Cannot build the guest mapping for share \"%s\".",
+                   vm->host_shares.items[i].share_name);
+            continue;
+        }
+        if (WideCharToMultiByte(CP_UTF8, 0, line, -1, line_a, sizeof(line_a),
+                                NULL, NULL) == 0)
+            continue;
+        send_line(s, line_a);
+    }
+    ui_log(L"Sent %d shared folder(s) to agent for \"%s\".", send_count, vm->name);
+}
+
+/* Index of the configured share whose guest path is the reported UNC, or -1. */
+static int share_index_for_unc(VmInstance *vm, const wchar_t *unc)
+{
+    wchar_t expected[600];
+    int i;
+
+    for (i = 0; i < vm->host_shares.count; i++) {
+        if (swprintf_s(expected, ARRAYSIZE(expected), L"\\\\%S.1\\%s",
+                       hcn_nat_subnet_base(), vm->host_shares.items[i].share_name) < 0)
+            continue;
+        if (_wcsicmp(expected, unc) == 0) return i;
+    }
+    return -1;
 }
 
 /* Send a tagged command and wait for the tagged response.
@@ -392,6 +522,20 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         vm->last_heartbeat = GetTickCount64();
         ui_log(L"Agent online for \"%s\".", vm->name);
 
+        /* Fresh boot or reconnect: the guest's mappings start over, so do the
+           share bookkeeping. */
+        {
+            int si;
+            vm->share_retries = 0;
+            vm->share_last_send = 0;
+            for (si = 0; si < ASB_MAX_HOST_SHARES; si++) {
+                vm->share_state[si] = 0;
+                vm->share_terminal[si] = FALSE;
+                vm->share_letter[si][0] = L'\0';
+                vm->share_detail[si][0] = L'\0';
+            }
+        }
+
         /* Mark install complete on first agent connection */
         if (!vm->install_complete && !vm->is_template) {
             vm->install_complete = TRUE;
@@ -439,6 +583,9 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         } else {
             send_line(s, "gpu_none");
         }
+
+        /* Shared host folders: map the drive letters now the guest is up. */
+        vm_agent_send_shares(s, vm);
 
         /* Request SSH install/enable if configured */
         if (vm->ssh_enabled) {

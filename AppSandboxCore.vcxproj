@@ -168,6 +168,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\backend_win\asb_core.c" />
+    <ClCompile Include="src\backend_win\asb_shares.c" />
     <ClCompile Include="src\backend_win\asb_display.c" />
     <ClCompile Include="src\backend_win\hcs_vm.c" />
     <ClCompile Include="src\backend_win\hcn_network.c" />
@@ -186,6 +187,7 @@
     <ClInclude Include="src\core\asb_types.h" />
     <ClInclude Include="src\core\protocol.h" />
     <ClInclude Include="src\backend_win\asb_core.h" />
+    <ClInclude Include="src\backend_win\asb_shares.h" />
     <ClInclude Include="src\backend_win\asb_display.h" />
     <ClInclude Include="src\ui.h" />
     <ClInclude Include="src\backend_win\hcs_vm.h" />

@@ -116,15 +116,21 @@ class Client:
         with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
         once it lands. The daemon validates these exactly like the GUI; ramMb is
         rounded down to even here (2 MB-aligned, an HCS requirement, like the GUI).
-        Async + auto-starts; watch status/events."""
+        Async + auto-starts; watch status/events.
+
+        sharedFolders (Windows guests on NAT networking only) publishes host
+        folders as drive letters in the guest: [{"path": r"C:\\work",
+        "driveLetter": "Z", "user": "HOST\\\\me", "password": "..."}]. The host
+        account must be able to read and write the folder; driveLetter is
+        optional (the guest picks a free letter)."""
         if isinstance(cfg.get("ramMb"), int):
             cfg["ramMb"] -= cfg["ramMb"] % 2
         return self._req("POST", "/vms", cfg)
 
     def edit(self, name, **fields):
-        """Change config on a STOPPED VM. Honors ramMb/cpuCores/gpuMode/networkMode
-        (same ranges as create); name is fixed at create and any other key is ignored.
-        Returns (status, body) -- 409 if the VM is running."""
+        """Change config on a STOPPED VM. Honors ramMb/cpuCores/gpuMode/networkMode/
+        sharedFolders (same rules as create); name is fixed at create and any other
+        key is ignored. Returns (status, body) -- 409 if the VM is running."""
         if isinstance(fields.get("ramMb"), int):
             fields["ramMb"] -= fields["ramMb"] % 2   # 2 MB-aligned, like the GUI
         return self._req("PUT", "/vms/%s" % name, fields)

@@ -12,6 +12,8 @@
 
 #include <windows.h>
 
+#include "asb_shares.h"
+
 #ifdef ASB_BUILDING_DLL
 #define ASB_API __declspec(dllexport)
 #else
@@ -64,6 +66,7 @@ typedef struct {
     BOOL   is_template;            /* TRUE = create as template VM */
     const wchar_t *disk_directory; /* parent for a new VM folder; NULL/empty = default */
     const wchar_t *gpu_id;
+    const AsbHostShareList *host_shares; /* host folders to share into a Windows guest, or NULL */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
@@ -196,6 +199,30 @@ ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores);
 ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode);
 ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *gpu_id);
 ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
+
+/* Message for a network-mode change (NULL when allowed). Refused while shared
+   folders exist and the new mode is not NAT. */
+ASB_API const wchar_t *asb_vm_validate_network(AsbVm vm, int mode);
+
+/* ---- Shared host folders (Windows guests on NAT networking) ---- */
+
+/* Replace the VM's shared-folder list. Fills in missing share names, validates
+   the list (use asb_shares_validate for the user-facing message), and stores
+   it. The VM must be stopped. Shares are published on the host while the VM
+   runs and withdrawn when it stops. */
+ASB_API HRESULT asb_vm_set_shares(AsbVm vm, const AsbHostShareList *list);
+
+/* Validate a share list against a VM: fills in share names, inherits stored
+   passwords for entries sent without one, and checks the list the same way
+   asb_vm_set_shares does. Mutates *list. Returns NULL when usable, otherwise
+   the message to show the user. Use this before asb_vm_set_shares when the
+   caller wants the reason (the UI and the headless API do). */
+ASB_API const wchar_t *asb_vm_validate_shares(AsbVm vm, AsbHostShareList *list);
+
+ASB_API int  asb_vm_share_count(AsbVm vm);
+/* Copy the share at index into out (passwords stay DPAPI-protected).
+   Returns FALSE when index is out of range. */
+ASB_API BOOL asb_vm_share_info(AsbVm vm, int index, AsbHostShare *out);
 
 /* ---- Snapshots ---- */
 

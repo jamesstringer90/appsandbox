@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include "gpu_enum.h"
+#include "asb_shares.h"
 
 /* DLL export/import */
 #ifndef ASB_API
@@ -44,6 +45,7 @@ typedef struct {
     wchar_t admin_pass[256];      /* Guest local admin password */
     wchar_t resources_iso_path[MAX_PATH]; /* ISO with autounattend + agent + helpers */
     GpuDriverShareList gpu_shares;         /* Plan9 shares for GPU driver files */
+    AsbHostShareList host_shares;          /* Host folders published as SMB drive letters */
     BOOL    is_template;              /* TRUE = template creation (no GPU/network) */
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
@@ -89,6 +91,15 @@ typedef struct {
     int         vhdx_progress;   /* 0-100 progress percentage */
     wchar_t     vhdx_step[128];  /* Current step description */
     GpuDriverShareList gpu_shares; /* Copy of Plan9 share metadata for agent GPU copy */
+    AsbHostShareList host_shares;  /* Host folders shared into this VM (SMB drive letters) */
+    /* Runtime state of the host_shares entries, filled from the guest's
+       share_status: reports: 0 = not reported yet, 1 = mapped, 2 = failed. */
+    int         share_state[ASB_MAX_HOST_SHARES];
+    BOOL        share_terminal[ASB_MAX_HOST_SHARES];    /* failed in a way retrying cannot fix */
+    wchar_t     share_letter[ASB_MAX_HOST_SHARES][4];   /* drive letter the guest used */
+    wchar_t     share_detail[ASB_MAX_HOST_SHARES][96];  /* guest's reason, when it failed */
+    unsigned    share_retries;      /* re-sends after a failed mapping */
+    ULONGLONG   share_last_send;    /* GetTickCount64() of the last share list sent */
     void       *hcs_callback;    /* HCS_CALLBACK handle from HcsRegisterComputeSystemCallback */
 
     /* Monitor thread (safety net for missed HCS callbacks) */

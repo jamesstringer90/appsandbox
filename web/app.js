@@ -124,6 +124,7 @@ function applyOsTypeUI() {
     revalidateVmName();
     revalidateUsername();
     revalidatePassword();
+    updateSharedFoldersVisibility();
     updateCreateButtons();
 }
 
@@ -142,6 +143,7 @@ window.onHostMessage = function(msg) {
         case 'hostInfo':      updateHostInfo(msg); break;
         case 'browseResult':  onBrowseResult(msg.path); break;
         case 'diskDirectoryBrowseResult': onDiskDirectoryBrowseResult(msg.path); break;
+        case 'sharedFolderBrowseResult': onSharedFolderBrowseResult(msg); break;
         case 'diskSpace':     onDiskSpace(msg); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
@@ -448,6 +450,192 @@ function onDiskDirectoryBrowseResult(path) {
     revalidateDiskDirectory();
 }
 
+/* ---- Shared folders (host folders mapped as drive letters in the guest) ----
+ *
+ * A shared folder is published on the host as an SMB share and mapped in the
+ * guest as a drive letter. Windows guests only, and only with NAT networking:
+ * the guest reaches the host at its NAT gateway. The host never sends a saved
+ * password back, so an existing row shows an empty password field and leaving
+ * it empty keeps the stored one.
+ */
+
+function sharedFoldersUsable() {
+    return !hostBridge.isMac &&
+        document.getElementById('os-type').value === 'Windows' &&
+        parseInt(document.getElementById('net-mode').value) === 1;
+}
+
+function updateSharedFoldersVisibility() {
+    var block = document.getElementById('shared-folders-create-block');
+    if (block) block.style.display = sharedFoldersUsable() ? '' : 'none';
+}
+
+function addSharedFolderRow(containerId, folder) {
+    var container = document.getElementById(containerId);
+    if (!container) return;
+    var existing = !!(folder && folder.path);
+    var row = document.createElement('div');
+    row.className = 'share-row';
+    if (existing) row.dataset.existing = '1';
+
+    var pathWrap = document.createElement('div');
+    pathWrap.className = 'share-path';
+    var pathId = containerId + '-path-' + container.children.length + '-' + Date.now();
+    var path = document.createElement('input');
+    path.type = 'text';
+    path.id = pathId;
+    path.className = 'share-input';
+    path.placeholder = 'Host folder, e.g. C:\\work';
+    path.autocorrect = 'off';
+    path.autocapitalize = 'off';
+    path.spellcheck = false;
+    if (existing) path.value = folder.path;
+    var browse = document.createElement('button');
+    browse.type = 'button';
+    browse.textContent = 'Browse...';
+    browse.addEventListener('click', function() {
+        sendCmd('browseSharedFolder', { inputId: pathId, path: path.value.trim() });
+    });
+    pathWrap.appendChild(path);
+    pathWrap.appendChild(browse);
+
+    var letter = document.createElement('input');
+    letter.type = 'text';
+    letter.maxLength = 1;
+    letter.className = 'share-letter';
+    letter.placeholder = 'auto';
+    letter.title = 'Drive letter in the VM (D-Z), or empty to pick a free one';
+    letter.autocorrect = 'off';
+    letter.autocapitalize = 'off';
+    letter.spellcheck = false;
+    if (existing && folder.driveLetter) letter.value = folder.driveLetter;
+
+    var user = document.createElement('input');
+    user.type = 'text';
+    user.className = 'share-user';
+    user.placeholder = 'Host account';
+    user.title = 'Host account the VM signs in as';
+    user.autocorrect = 'off';
+    user.autocapitalize = 'off';
+    user.spellcheck = false;
+    if (existing && folder.user) user.value = folder.user;
+
+    var pass = document.createElement('input');
+    pass.type = 'password';
+    pass.className = 'share-pass';
+    pass.placeholder = existing ? 'Kept password' : 'Password';
+    pass.title = existing
+        ? 'Leave empty to keep the password already saved on the host'
+        : 'Password of the host account';
+
+    var remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'share-remove';
+    remove.textContent = '\u2715';
+    remove.title = 'Remove this folder';
+    remove.addEventListener('click', function() {
+        container.removeChild(row);
+        updateCreateButtons();
+        updateEditVmModal();
+    });
+
+    row.appendChild(pathWrap);
+    row.appendChild(letter);
+    row.appendChild(user);
+    row.appendChild(pass);
+    row.appendChild(remove);
+    container.appendChild(row);
+}
+
+function renderSharedFolders(containerId, folders) {
+    var container = document.getElementById(containerId);
+    if (!container) return;
+    container.innerHTML = '';
+    (folders || []).forEach(function(folder) { addSharedFolderRow(containerId, folder); });
+}
+
+function collectSharedFolders(containerId) {
+    var container = document.getElementById(containerId);
+    var out = [];
+    if (!container) return out;
+    var rows = container.querySelectorAll('.share-row');
+    for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        var path = r.querySelector('.share-input').value.trim();
+        var letter = r.querySelector('.share-letter').value.trim().toUpperCase();
+        var user = r.querySelector('.share-user').value.trim();
+        var pass = r.querySelector('.share-pass').value;
+        if (!path && !letter && !user && !pass) continue;   /* untouched row */
+        out.push({ path: path, driveLetter: letter, user: user, password: pass });
+    }
+    return out;
+}
+
+function sharedFoldersError(containerId) {
+    var container = document.getElementById(containerId);
+    if (!container) return null;
+    var rows = container.querySelectorAll('.share-row');
+    for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        var path = r.querySelector('.share-input').value.trim();
+        var letter = r.querySelector('.share-letter').value.trim().toUpperCase();
+        var user = r.querySelector('.share-user').value.trim();
+        var pass = r.querySelector('.share-pass').value;
+        var existing = r.dataset.existing === '1';
+        if (!path && !letter && !user && !pass) continue;
+
+        if (!path) return 'Shared folders need a host folder.';
+        if (/[\x00-\x1f\x7f]/.test(path) ||
+            !/^(?:[a-zA-Z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/.test(path))
+            return 'Shared folder paths must be absolute, for example C:\\work.';
+        if (letter && !/^[D-Z]$/.test(letter))
+            return 'Drive letters run from D to Z. Leave the field empty to pick a free letter.';
+        if (!user) return 'Shared folders need the host account the VM signs in as.';
+        if (!pass && !existing) return 'New shared folders need the host account password.';
+        if (pass && /["\r\n]/.test(pass))
+            return 'The share password cannot contain double quotes or line breaks.';
+    }
+    return null;
+}
+
+function sharedFoldersSignature(folders) {
+    return JSON.stringify((folders || []).map(function(f) {
+        return [f.path || '', (f.driveLetter || '').toUpperCase(), f.user || ''];
+    }));
+}
+
+function onSharedFolderBrowseResult(msg) {
+    var field = msg.inputId ? document.getElementById(msg.inputId) : null;
+    if (!field) return;
+    field.value = msg.path;
+    updateCreateButtons();
+    updateEditVmModal();
+}
+
+/* Network cell badge: the drive letters a VM shares from the host. */
+function sharedFoldersBadge(vm) {
+    var folders = vm.sharedFolders || [];
+    if (!folders.length) return '';
+    var letters = folders.map(function(f) {
+        var letter = f.letter || f.driveLetter;
+        var shown = letter ? letter + ':' : 'free';
+        return f.status === 'failed' ? shown + ' \u26A0' : shown;
+    });
+    return ' \u00B7 ' + letters.join(', ');
+}
+
+function sharedFoldersTooltip(vm) {
+    var folders = vm.sharedFolders || [];
+    if (!folders.length) return '';
+    return '\nShared with the host: ' + folders.map(function(f) {
+        var letter = f.letter || f.driveLetter;
+        var line = f.path + ' as ' + (letter ? letter + ':' : 'a free letter');
+        if (f.status === 'failed') line += ' - mapping failed: ' + (f.detail || 'no reason reported');
+        else if (f.status === 'pending') line += ' - not mapped yet';
+        return line;
+    }).join('; ');
+}
+
 function validateDiskDirectory(path) {
     if (!path) return null;  /* Empty uses the host's default. */
     if (/[\x00-\x1f\x7f]/.test(path)) return 'Disk folder cannot contain control characters.';
@@ -517,7 +705,8 @@ function createValidationError(isTemplate) {
     var error = validateVmName(document.getElementById('vm-name').value.trim()) ||
         validateDiskDirectory(document.getElementById('disk-directory').value.trim()) ||
         validateUsername(document.getElementById('admin-user').value.trim(), isTemplate) ||
-        validatePassword(document.getElementById('admin-pass').value);
+        validatePassword(document.getElementById('admin-pass').value) ||
+        sharedFoldersError('create-shared-folders');
     if (error) return error;
     if (document.getElementById('admin-pass').value !== document.getElementById('admin-confirm').value)
         return 'Passwords do not match.';
@@ -623,6 +812,8 @@ function onNetModeChange() {
     var show = (!hostBridge.isMac && mode === 2) ? '' : 'none';
     document.getElementById('net-adapter').style.display = show;
     document.getElementById('net-adapter-label').style.display = show;
+    /* Shared folders need the NAT gateway the guest reaches the host on. */
+    updateSharedFoldersVisibility();
 }
 onNetModeChange();
 
@@ -655,7 +846,9 @@ function gatherConfig() {
         adminConfirm: document.getElementById('admin-confirm').value,
         testMode:    document.getElementById('test-mode').checked,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
-        sshDeployKey: document.getElementById('ssh-deploy-key').checked
+        sshDeployKey: document.getElementById('ssh-deploy-key').checked,
+        sharedFolders: sharedFoldersUsable()
+            ? collectSharedFolders('create-shared-folders') : []
     };
 }
 
@@ -671,6 +864,7 @@ function onSshToggle() {
 function clearCreateForm() {
     document.getElementById('image-path').value = '';
     selectTemplate('', templateDefaultLabel());
+    renderSharedFolders('create-shared-folders', []);
     updateCreateButtons();
 }
 
@@ -824,6 +1018,7 @@ function openCreateModal() {
     document.getElementById('ssh-enabled').checked = false;
     document.getElementById('ssh-deploy-key').checked = false;
     onSshToggle();   /* re-grey "Deploy SSH key" to match the cleared SSH checkbox */
+    renderSharedFolders('create-shared-folders', []);
     /* Reset OS type to Windows on each open. Valid on both hosts (a Mac host
        supports Windows via QEMU); the user can switch to macOS on a Mac. */
     document.getElementById('os-type').value = 'Windows';
@@ -1029,9 +1224,10 @@ function buildRowCells(vm, i, statusTd) {
             hostBridge.isMac && vm.osType === 'Windows'
                 ? 'Windows software rendering (WARP) on the CPU'
                 : 'GPU passed through to the VM via GPU-PV, or None'),
-        makeCell(hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None'),
+        makeCell(hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None') + sharedFoldersBadge(vm),
             hostBridge.isMac ? 'NAT (shared networking)'
-                : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
+                : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'
+                  + sharedFoldersTooltip(vm)),
     ];
     if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
     cells.push(
@@ -1203,6 +1399,9 @@ function openEditVmModal(idx) {
     document.getElementById('edit-cpu-cores').value = vm.cpuCores;
     setGpuSelection('edit-gpu-mode', vm);
     document.getElementById('edit-net-mode').value = String(vm.networkMode);
+    renderSharedFolders('edit-shared-folders', vm.sharedFolders || []);
+    document.getElementById('edit-shared-folders-block').style.display =
+        (!hostBridge.isMac && vm.osType === 'Windows') ? '' : 'none';
     updateEditVmModal();
     document.getElementById('edit-vm-overlay').classList.add('active');
     document.getElementById('edit-ram-size').focus();
@@ -1256,7 +1455,8 @@ function updateEditVmModal() {
         el.disabled = !!disabled;
     });
     var values = editVmValues();
-    var error = disabled ? 'Stop the VM before editing its configuration.' : editVmValidationError(values);
+    var error = disabled ? 'Stop the VM before editing its configuration.'
+                         : (editVmValidationError(values) || sharedFoldersError('edit-shared-folders'));
     document.getElementById('edit-vm-warn').textContent = error;
     document.getElementById('btn-save-edit-vm').disabled = !!error;
 }
@@ -1275,10 +1475,18 @@ function saveEditVm() {
         return field !== 'gpuMode' && field !== 'gpuId' &&
             values[field] !== editVmState.initial[field] && values[field] !== vms[idx][field];
     });
+    var sharesChanged = false;
+    var shares = [];
+    if (!hostBridge.isMac && vms[idx].osType === 'Windows') {
+        shares = collectSharedFolders('edit-shared-folders');
+        sharesChanged = sharedFoldersSignature(shares) !==
+            sharedFoldersSignature(vms[idx].sharedFolders || []);
+    }
     closeEditVmModal();
     fields.forEach(function(field) {
         sendCmd('editVm', { vmIndex: idx, field: field, value: String(values[field]) });
     });
+    if (sharesChanged) sendCmd('setSharedFolders', { vmIndex: idx, sharedFolders: shares });
     if (gpuChanged)
         sendCmd('editVm', { vmIndex: idx, field: 'gpuMode', value: String(values.gpuMode), gpuId: values.gpuId });
 }

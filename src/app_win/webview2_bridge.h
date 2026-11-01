@@ -3,6 +3,8 @@
 
 #include <windows.h>
 
+#include "asb_core.h"
+
 /* Initialize WebView2 in the given parent window.
    Returns TRUE if initialization started (async completion). */
 BOOL webview2_init(HWND parent, HINSTANCE hInstance);
@@ -53,6 +55,14 @@ void jb_append_escaped(JsonBuilder *jb, const wchar_t *s);
 
 BOOL json_has_key(const wchar_t *json, const wchar_t *key);
 
+/* Position on the '[' of an array value for `key`. NULL when the key is
+   missing or is not an array. Pair with json_next_object. */
+const wchar_t *json_find_array(const wchar_t *json, const wchar_t *key);
+
+/* Copy the next object of that array into out (a JSON object, braces
+   included) and advance *cursor past it. FALSE when the array ends. */
+BOOL json_next_object(const wchar_t **cursor, wchar_t *out, size_t out_chars);
+
 /* Extract a string value for a given key from a JSON string.
    Returns TRUE if found. out is null-terminated. */
 BOOL json_get_string(const wchar_t *json, const wchar_t *key,
@@ -63,5 +73,20 @@ BOOL json_get_int(const wchar_t *json, const wchar_t *key, int *out);
 
 /* Extract a boolean value for a given key. Returns TRUE if found. */
 BOOL json_get_bool(const wchar_t *json, const wchar_t *key, BOOL *out);
+
+/* ---- Shared folders (sharedFolders) ----
+
+   Parse "sharedFolders": [ {path, driveLetter, user, password, readOnly}, ... ]
+   into *list, protecting any password with DPAPI as it is read. Passwords may
+   be empty: an edit that leaves one out keeps the stored one. Returns NULL on
+   success or a message to show the user. */
+const wchar_t *json_parse_shared_folders(const wchar_t *json, AsbHostShareList *list);
+
+/* Parse, fill in share names, and validate against a VM (create path, where
+   there is no stored list to inherit a password from). vm_name and
+   network_mode drive the same validation the core applies; a rejected list
+   comes back as a message to show the user (NULL means success). */
+const wchar_t *json_read_shared_folders(const wchar_t *json, AsbHostShareList *list,
+                                        const wchar_t *vm_name, int network_mode);
 
 #endif /* WEBVIEW2_BRIDGE_H */

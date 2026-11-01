@@ -557,3 +557,44 @@ th.icon-col, td.icon-col {
     color: #888;
     text-align: center;
 }
+
+/* ---- Shared folders (host folders mapped as drive letters) ---- */
+
+.shared-folders { display: flex; flex-direction: column; gap: 6px; width: 100%; min-width: 0; }
+.shared-folders-list { display: flex; flex-direction: column; gap: 6px; }
+.shared-folders-list:empty { display: none; }
+.shared-folders-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.shared-folders-actions button { flex-shrink: 0; }
+
+/* Each share is two lines: the folder (with Browse) on its own line, then the
+   drive letter, host account and password. The row wraps at every width, so no
+   control can be squeezed out or painted over by its neighbour - the folder
+   field keeps a floor wide enough for it and the Browse button beside it. */
+.share-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+.share-row .share-path { display: flex; align-items: center; gap: 6px; flex: 1 1 100%; min-width: 0; }
+.share-row .share-path input[type="text"] { flex: 1 1 auto; min-width: 120px; }
+.share-row .share-path button { flex: 0 0 auto; }
+.share-row .share-letter {
+    width: 52px;
+    flex: 0 0 auto;
+    text-align: center;
+    text-transform: uppercase;
+}
+.share-row .share-user { flex: 1 1 90px; min-width: 80px; }
+.share-row .share-pass { flex: 1 1 90px; min-width: 80px; }
+.share-row .share-remove {
+    flex: 0 0 auto;
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 13px;
+    padding: 2px 6px;
+}
+.share-row .share-remove:hover { color: var(--danger); }

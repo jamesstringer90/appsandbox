@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #pragma comment(lib, "shlwapi.lib")
 
@@ -563,6 +564,128 @@ static const wchar_t *json_find_value(const wchar_t *json, const wchar_t *key)
 BOOL json_has_key(const wchar_t *json, const wchar_t *key)
 {
     return json_find_value(json, key) != NULL;
+}
+
+/* Value of `key` when it is a JSON array, positioned on the '['. NULL when the
+   key is missing or holds something else. Pair with json_next_object. */
+const wchar_t *json_find_array(const wchar_t *json, const wchar_t *key)
+{
+    const wchar_t *p = json_find_value(json, key);
+    if (!p) return NULL;
+    while (*p == L' ' || *p == L'\t' || *p == L'\n' || *p == L'\r') p++;
+    return (*p == L'[') ? p : NULL;
+}
+
+/* Copy the next object of an array into out and advance *cursor past it.
+   Returns FALSE when the array ends. Handles nested braces and skips over
+   strings, so braces inside values do not confuse it. */
+BOOL json_next_object(const wchar_t **cursor, wchar_t *out, size_t out_chars)
+{
+    const wchar_t *p = *cursor;
+    size_t o = 0;
+    int depth = 0;
+
+    if (!p || !out || out_chars == 0) return FALSE;
+    out[0] = L'\0';
+
+    while (*p == L' ' || *p == L'\t' || *p == L'\n' || *p == L'\r' || *p == L',') p++;
+    if (*p != L'{') return FALSE;
+
+    for (; *p; p++) {
+        if (*p == L'"') {                     /* copy the string verbatim */
+            if (o + 1 < out_chars) out[o++] = *p;
+            for (p++; *p; p++) {
+                if (o + 1 < out_chars) out[o++] = *p;
+                if (*p == L'\\' && p[1]) {
+                    p++;
+                    if (o + 1 < out_chars) out[o++] = *p;
+                    continue;
+                }
+                if (*p == L'"') break;
+            }
+            if (!*p) break;
+            continue;
+        }
+        if (*p == L'{') depth++;
+        if (o + 1 < out_chars) out[o++] = *p;
+        if (*p == L'}') {
+            depth--;
+            if (depth == 0) {
+                p++;
+                break;
+            }
+        }
+    }
+    out[o] = L'\0';
+    *cursor = p;
+    return depth == 0 && o > 0;
+}
+
+/* ---- Shared folders from a JS message ---- */
+
+const wchar_t *json_parse_shared_folders(const wchar_t *json, AsbHostShareList *list)
+{
+    const wchar_t *arr = json_find_array(json, L"sharedFolders");
+    const wchar_t *cursor;
+    wchar_t obj[4096];
+
+    if (!list) return L"Shared folder list is invalid.";
+    ZeroMemory(list, sizeof(*list));
+    if (!arr) {
+        return json_has_key(json, L"sharedFolders")
+            ? L"sharedFolders must be an array of {path, driveLetter, user, password}."
+            : NULL;
+    }
+
+    cursor = arr + 1;
+    while (json_next_object(&cursor, obj, ARRAYSIZE(obj))) {
+        AsbHostShare *s;
+        wchar_t path[MAX_PATH] = {0}, letter[8] = {0};
+        wchar_t user[128] = {0}, pass[256] = {0};
+        BOOL ro = FALSE;
+
+        if (list->count >= ASB_MAX_HOST_SHARES)
+            return L"Too many shared folders (maximum 8).";
+
+        if (!json_get_string(obj, L"path", path, ARRAYSIZE(path)))
+            return L"Every shared folder needs a host folder.";
+        json_get_string(obj, L"driveLetter", letter, ARRAYSIZE(letter));
+        json_get_string(obj, L"user", user, ARRAYSIZE(user));
+        json_get_string(obj, L"password", pass, ARRAYSIZE(pass));
+        json_get_bool(obj, L"readOnly", &ro);
+
+        s = &list->items[list->count];
+        ZeroMemory(s, sizeof(*s));
+        wcsncpy_s(s->host_path, ARRAYSIZE(s->host_path), path, _TRUNCATE);
+        wcsncpy_s(s->user, ARRAYSIZE(s->user), user, _TRUNCATE);
+        s->read_only = ro;
+        if (letter[0] && letter[0] != L':')
+            s->drive_letter = (wchar_t)towupper(letter[0]);
+        /* The guest passes the password on a command line, so reject what that
+           cannot carry rather than failing later inside the VM. */
+        if (pass[0] && (wcschr(pass, L'"') || wcschr(pass, L'\r') || wcschr(pass, L'\n'))) {
+            SecureZeroMemory(pass, sizeof(pass));
+            return L"The share password cannot contain double quotes or line breaks.";
+        }
+        if (pass[0] &&
+            !asb_share_protect_password(pass, s->pass_enc, ARRAYSIZE(s->pass_enc))) {
+            SecureZeroMemory(pass, sizeof(pass));
+            return L"Could not protect the shared folder password.";
+        }
+        SecureZeroMemory(pass, sizeof(pass));
+        list->count++;
+    }
+
+    return NULL;
+}
+
+const wchar_t *json_read_shared_folders(const wchar_t *json, AsbHostShareList *list,
+                                        const wchar_t *vm_name, int network_mode)
+{
+    const wchar_t *error = json_parse_shared_folders(json, list);
+    if (error) return error;
+    asb_shares_name_for_vm(list, vm_name);
+    return asb_shares_validate(list, network_mode);
 }
 
 BOOL json_get_string(const wchar_t *json, const wchar_t *key,

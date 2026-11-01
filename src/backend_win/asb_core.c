@@ -22,6 +22,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <shlobj.h>
 #include <stdarg.h>
 #include <virtdisk.h>
@@ -512,6 +513,65 @@ static BOOL ensure_appsandbox_ssh_key(wchar_t *pubkey_out, int cap)
 
 /* ---- Persistence: save VM list ---- */
 
+/* Copy the next '|'-separated field of p into out; returns the position after
+   the separator (or at the terminator). Windows paths, share names, account
+   names and hex blobs cannot contain '|', so it is safe as a separator. */
+static const wchar_t *next_config_field(const wchar_t *p, wchar_t *out, size_t out_chars)
+{
+    size_t n = 0;
+    while (*p && *p != L'|') {
+        if (n + 1 < out_chars) out[n++] = *p;
+        p++;
+    }
+    out[n] = L'\0';
+    if (*p == L'|') p++;
+    return p;
+}
+
+/* One line per shared folder:
+   SharedFolder=<host path>|<letter>|<read only>|<share name>|<user>|<pass hex> */
+static void write_shared_folders(FILE *f, const VmInstance *vm)
+{
+    int i;
+    for (i = 0; i < vm->host_shares.count; i++) {
+        const AsbHostShare *s = &vm->host_shares.items[i];
+        fwprintf(f, L"SharedFolder=%s|%c|%d|%s|%s|%s\n",
+                 s->host_path,
+                 s->drive_letter ? (wint_t)s->drive_letter : (wint_t)L'-',
+                 s->read_only ? 1 : 0,
+                 s->share_name, s->user, s->pass_enc);
+    }
+}
+
+static void parse_shared_folder(VmInstance *vm, const wchar_t *value)
+{
+    wchar_t path[MAX_PATH], letter[4], ro[4];
+    wchar_t name[ASB_SHARE_NAME_MAX], user[128], pass[ARRAYSIZE(((AsbHostShare *)0)->pass_enc)];
+    const wchar_t *p = value;
+    AsbHostShare *s;
+
+    if (vm->host_shares.count >= ASB_MAX_HOST_SHARES) return;
+
+    p = next_config_field(p, path, ARRAYSIZE(path));
+    p = next_config_field(p, letter, ARRAYSIZE(letter));
+    p = next_config_field(p, ro, ARRAYSIZE(ro));
+    p = next_config_field(p, name, ARRAYSIZE(name));
+    p = next_config_field(p, user, ARRAYSIZE(user));
+    (void)next_config_field(p, pass, ARRAYSIZE(pass));
+
+    if (!path[0] || !name[0]) return;
+
+    s = &vm->host_shares.items[vm->host_shares.count++];
+    ZeroMemory(s, sizeof(*s));
+    wcsncpy_s(s->host_path, ARRAYSIZE(s->host_path), path, _TRUNCATE);
+    wcsncpy_s(s->share_name, ARRAYSIZE(s->share_name), name, _TRUNCATE);
+    wcsncpy_s(s->user, ARRAYSIZE(s->user), user, _TRUNCATE);
+    wcsncpy_s(s->pass_enc, ARRAYSIZE(s->pass_enc), pass, _TRUNCATE);
+    if (letter[0] && letter[0] != L'-' && letter[0] != L'\0')
+        s->drive_letter = (wchar_t)towupper(letter[0]);
+    s->read_only = (ro[0] == L'1');
+}
+
 static void save_vm_list(void)
 {
     wchar_t path[MAX_PATH];
@@ -578,6 +638,7 @@ static void save_vm_list(void)
             fwprintf(f, L"SshPubKey=%s\n", g_vms[i].ssh_pubkey);
         if (g_vms[i].install_complete)
             fwprintf(f, L"InstallComplete=1\n");
+        write_shared_folders(f, &g_vms[i]);
         fwprintf(f, L"\n");
     }
 
@@ -734,6 +795,8 @@ static void load_vm_list(void)
             wcsncpy_s(vm->ssh_pubkey, 512, line + 10, _TRUNCATE);
         else if (wcsncmp(line, L"InstallComplete=", 16) == 0)
             vm->install_complete = (_wtoi(line + 16) != 0);
+        else if (wcsncmp(line, L"SharedFolder=", 13) == 0)
+            parse_shared_folder(vm, line + 13);
     }
 
     fclose(f);
@@ -893,6 +956,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
             idd_probe_stop(instance);
             asb_log(L"VM \"%s\" exited (event=0x%08X).", instance->name, event);
 
+            asb_shares_withdraw(&instance->host_shares);
             asb_vm_cleanup_network(instance);
             hcs_close_vm(instance);
 
@@ -2781,6 +2845,39 @@ ASB_API void asb_set_vm_removed_callback(AsbVmRemovedCallback cb, void *user_dat
 
 /* ---- Init / Cleanup ---- */
 
+/* ---- Shared host folders: startup cleanup ---- */
+
+/* An unclean exit (crash, or a killed process) leaves the SMB share and its
+   firewall rule published. Drop those that no *running* VM still uses, so a
+   stale share can never outlive the VM it belonged to. */
+static void sweep_orphan_shares(void)
+{
+    wchar_t (*names)[ASB_SHARE_NAME_MAX];
+    int count, i, v, s;
+    size_t cap = (size_t)ASB_MAX_HOST_SHARES * ASB_MAX_VMS;
+
+    if (ASB_MAX_HOST_SHARES <= 0) return;
+    names = (wchar_t (*)[ASB_SHARE_NAME_MAX])HeapAlloc(GetProcessHeap(), 0,
+                                                       sizeof(wchar_t) * ASB_SHARE_NAME_MAX * cap);
+    if (!names) return;
+
+    count = asb_shares_enum_published(names, (int)cap);
+    for (i = 0; i < count; i++) {
+        BOOL keep = FALSE;
+        for (v = 0; v < g_vm_count && !keep; v++) {
+            if (g_vms[v].is_template) continue;
+            for (s = 0; s < g_vms[v].host_shares.count; s++) {
+                if (_wcsicmp(g_vms[v].host_shares.items[s].share_name, names[i]) != 0) continue;
+                if (hcs_is_running_by_enum(g_vms[v].name)) keep = TRUE;
+                break;
+            }
+        }
+        if (!keep) asb_shares_remove_by_name(names[i]);
+    }
+
+    HeapFree(GetProcessHeap(), 0, names);
+}
+
 ASB_API HRESULT asb_init(void)
 {
     if (g_initialized) return S_OK;
@@ -2814,6 +2911,7 @@ ASB_API HRESULT asb_init(void)
 
     load_vm_list();
     scan_templates();
+    sweep_orphan_shares();
 
     if (g_vm_count > 0) asb_log(L"Loaded %d VM(s) from config.", g_vm_count);
     if (g_template_count > 0) asb_log(L"Found %d template(s).", g_template_count);
@@ -3333,6 +3431,27 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         }
     }
 
+    /* Shared host folders. Windows guests only: the drive is mapped with the
+       guest's own SMB client, and it needs NAT so the guest can reach the host
+       at the NAT gateway. Templates never have shares. */
+    if (config->host_shares && !is_template_create &&
+        _wcsicmp(cfg.os_type, L"Windows") == 0) {
+        const wchar_t *share_err;
+
+        if (config->host_shares->count > ASB_MAX_HOST_SHARES) {
+            asb_log(L"Error: Too many shared folders (maximum %d).", ASB_MAX_HOST_SHARES);
+            return E_INVALIDARG;
+        }
+        cfg.host_shares = *config->host_shares;
+        asb_shares_name_for_vm(&cfg.host_shares, cfg.name);
+        share_err = asb_shares_validate(&cfg.host_shares, cfg.network_mode);
+        if (share_err) {
+            asb_log(L"Error: %s", share_err);
+            asb_alert(share_err);
+            return E_INVALIDARG;
+        }
+    }
+
     /* ---- VHDX-first path (Windows, from ISO) ---- */
     {
         BOOL use_vhdx_first = (!from_template &&
@@ -3363,6 +3482,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->building_vhdx = TRUE;
             inst->vhdx_progress = 0;
             memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
+            inst->host_shares = cfg.host_shares;
 
             { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
               snapshot_init(&g_snap_trees[g_vm_count], sd); }
@@ -3434,6 +3554,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->building_vhdx = TRUE;
             inst->vhdx_progress = 0;
             memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
+            inst->host_shares = cfg.host_shares;
 
             { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
               snapshot_init(&g_snap_trees[g_vm_count], sd); }
@@ -3619,6 +3740,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
     update_vm_gpu_name(inst);
     wcscpy_s(inst->resources_iso_path, MAX_PATH, cfg.resources_iso_path);
+    inst->host_shares = cfg.host_shares;
     /* hcs_create_vm copies ssh_enabled onto the instance but not the deploy
        fields, so the from-template path sets them here (the ISO and Linux
        paths set them inline on their own instance copies). */
@@ -4097,10 +4219,110 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     if (idx < 0) return E_INVALIDARG;
     if (g_vms[idx].running) return E_ACCESSDENIED;
     if (mode < 0 || mode > 3) return E_INVALIDARG;
+    /* Shared folders are reached through the NAT gateway; keep the two in step
+       rather than publishing a share the guest cannot reach. */
+    if (mode != ASB_NET_NAT && g_vms[idx].host_shares.count > 0) return E_INVALIDARG;
     g_vms[idx].network_mode = mode;
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
     return S_OK;
+}
+
+/* Message for a network-mode change the caller is about to attempt (NULL when
+   it is fine). Paired with the check inside asb_vm_set_network so the UI and
+   the headless API can explain the refusal. */
+ASB_API const wchar_t *asb_vm_validate_network(AsbVm vm, int mode)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return L"Unknown VM.";
+    if (mode < 0 || mode > 3) return L"Network mode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal).";
+    if (mode != ASB_NET_NAT && g_vms[idx].host_shares.count > 0)
+        return L"Shared folders need NAT networking. Remove them before changing the network mode.";
+    return NULL;
+}
+
+/* ---- Shared host folders ---- */
+
+/* Fill in share names, inherit stored passwords for entries that arrive
+   without one (the UI never shows a saved password), and validate. Callers
+   that need the message before storing the list -- the edit paths -- use this
+   directly; it mutates *list. Returns NULL when the list is usable. */
+ASB_API const wchar_t *asb_vm_validate_shares(AsbVm vm, AsbHostShareList *list)
+{
+    static wchar_t account_msg[512];
+    int idx = vm_index_of(vm);
+    int i, j;
+
+    if (idx < 0 || !list) return L"Shared folder list is invalid.";
+
+    asb_shares_name_for_vm(list, g_vms[idx].name);
+    for (i = 0; i < list->count; i++) {
+        AsbHostShare *s = &list->items[i];
+        if (s->pass_enc[0]) continue;
+        for (j = 0; j < g_vms[idx].host_shares.count; j++) {
+            const AsbHostShare *old = &g_vms[idx].host_shares.items[j];
+            if (_wcsicmp(old->host_path, s->host_path) != 0) continue;
+
+            /* Same folder, different account: the stored password belongs to the
+               other account, so say so instead of failing inside the guest. */
+            if (s->user[0] && old->user[0] && _wcsicmp(old->user, s->user) != 0) {
+                swprintf_s(account_msg, ARRAYSIZE(account_msg),
+                    L"%s is already shared as \"%s\". Enter that account's password, "
+                    L"or remove the folder and add it again for \"%s\".",
+                    s->host_path, old->user, s->user);
+                return account_msg;
+            }
+
+            if (!old->pass_enc[0]) break;
+            wcsncpy_s(s->pass_enc, ARRAYSIZE(s->pass_enc), old->pass_enc, _TRUNCATE);
+            if (!s->user[0])
+                wcsncpy_s(s->user, ARRAYSIZE(s->user), old->user, _TRUNCATE);
+            s->skip_account_check = TRUE;   /* stored secret, already checked once */
+            break;
+        }
+    }
+
+    return asb_shares_validate(list, g_vms[idx].network_mode);
+}
+
+ASB_API HRESULT asb_vm_set_shares(AsbVm vm, const AsbHostShareList *list)
+{
+    int idx = vm_index_of(vm);
+    AsbHostShareList copy;
+
+    if (idx < 0) return E_INVALIDARG;
+    if (g_vms[idx].running) return E_ACCESSDENIED;
+    if (g_vms[idx].is_template) return E_INVALIDARG;
+
+    if (!list || list->count == 0) {
+        ZeroMemory(&g_vms[idx].host_shares, sizeof(g_vms[idx].host_shares));
+    } else {
+        if (_wcsicmp(g_vms[idx].os_type, L"Windows") != 0) return E_INVALIDARG;
+        if (list->count < 0 || list->count > ASB_MAX_HOST_SHARES) return E_INVALIDARG;
+        copy = *list;
+        if (asb_vm_validate_shares(vm, &copy)) return E_INVALIDARG;
+        g_vms[idx].host_shares = copy;
+    }
+
+    save_vm_list();
+    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    return S_OK;
+}
+
+ASB_API int asb_vm_share_count(AsbVm vm)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return 0;
+    return g_vms[idx].host_shares.count;
+}
+
+ASB_API BOOL asb_vm_share_info(AsbVm vm, int index, AsbHostShare *out)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0 || !out || index < 0 || index >= g_vms[idx].host_shares.count)
+        return FALSE;
+    *out = g_vms[idx].host_shares.items[index];
+    return TRUE;
 }
 
 /* ---- Snapshots ---- */

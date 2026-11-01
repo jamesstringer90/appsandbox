@@ -313,6 +313,33 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"sshDeployKey", v->ssh_deploy_key);
     jb_bool(jb, L"sshKeyDeployed", v->ssh_key_deployed);
 
+    /* Shared host folders: paths and accounts only, never the password. */
+    {
+        int s;
+        jb_array_begin(jb, L"sharedFolders");
+        for (s = 0; s < v->host_shares.count; s++) {
+            const AsbHostShare *sh = &v->host_shares.items[s];
+            if (s > 0) jb_append(jb, L",");
+            jb_object_begin(jb);
+            jb_string(jb, L"path", sh->host_path);
+            if (sh->drive_letter) {
+                wchar_t letter[4];
+                swprintf_s(letter, ARRAYSIZE(letter), L"%c", sh->drive_letter);
+                jb_string(jb, L"driveLetter", letter);
+            } else {
+                jb_string(jb, L"driveLetter", L"");
+            }
+            jb_string(jb, L"letter", v->share_letter[s]);   /* what the guest mapped */
+            jb_string(jb, L"user", sh->user);
+            jb_string(jb, L"status", v->share_state[s] == 1 ? L"ok" :
+                                     v->share_state[s] == 2 ? L"failed" : L"pending");
+            jb_string(jb, L"detail", v->share_detail[s]);
+            jb_bool(jb, L"readOnly", sh->read_only);
+            jb_object_end(jb);
+        }
+        jb_array_end(jb);
+    }
+
     /* Snapshot tree */
     {
         int s, b;
@@ -1000,8 +1027,11 @@ static void on_webview2_message(const wchar_t *json)
         wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[256] = {0};
         wchar_t adapter_buf[256] = {0}, disk_buf[MAX_PATH + 1] = {0};
         wchar_t gpu_id[512] = {0};
+        AsbHostShareList shares;
         int val;
         BOOL is_tpl = FALSE;
+
+        ZeroMemory(&shares, sizeof(shares));
 
         json_get_string(json, L"name", name_buf, 256);
         json_get_string(json, L"osType", os_buf, 32);
@@ -1064,6 +1094,18 @@ static void on_webview2_message(const wchar_t *json)
         json_get_bool(json, L"testMode", &cfg.test_mode);
         json_get_bool(json, L"sshEnabled", &cfg.ssh_enabled);
         json_get_bool(json, L"sshDeployKey", &cfg.ssh_deploy_key);
+
+        /* Shared host folders (Windows guests, NAT only). */
+        if (json_has_key(json, L"sharedFolders")) {
+            const wchar_t *serr = json_read_shared_folders(json, &shares, name_buf,
+                                                          cfg.network_mode);
+            if (serr) {
+                SecureZeroMemory(pass_buf, sizeof(pass_buf));
+                ui_show_alert(serr);
+                return;
+            }
+            if (shares.count) cfg.host_shares = &shares;
+        }
 
         {
             const wchar_t *error = asb_validate_gpu_selection(cfg.gpu_mode, cfg.gpu_id);
@@ -1221,7 +1263,11 @@ static void on_webview2_message(const wchar_t *json)
                         error = asb_validate_gpu_selection(mode, gpu_id);
                     if (!error) hr = asb_vm_set_gpu_selection(vm, mode, gpu_id);
                 }
-                else if (wcscmp(field, L"networkMode") == 0) hr = asb_vm_set_network(vm, _wtoi(value));
+                else if (wcscmp(field, L"networkMode") == 0) {
+                    int mode = _wtoi(value);
+                    error = asb_vm_validate_network(vm, mode);
+                    if (!error) hr = asb_vm_set_network(vm, mode);
+                }
                 if (FAILED(hr)) ui_show_alert(error ? error : L"VM configuration could not be updated.");
                 else asb_save();
             }
@@ -1286,6 +1332,59 @@ static void on_webview2_message(const wchar_t *json)
             jb_string(&jb, L"path", file);
             jb_object_end(&jb);
             webview2_post(json_buf);
+        }
+    } else if (wcscmp(action, L"setSharedFolders") == 0) {
+        int idx;
+        AsbHostShareList shares;
+        VmInstance *inst;
+        if (!json_get_int(json, L"vmIndex", &idx) || idx < 0 || idx >= asb_vm_count()) return;
+        inst = asb_vm_instance(asb_vm_get(idx));
+        if (!inst) return;
+        if (inst->running || inst->building_vhdx) {
+            ui_show_alert(L"Shared folders can only be changed while the VM is stopped.");
+            send_vm_list();
+            return;
+        }
+        {
+            const wchar_t *serr = json_parse_shared_folders(json, &shares);
+            if (!serr) serr = asb_vm_validate_shares(asb_vm_get(idx), &shares);
+            if (serr) {
+                ui_show_alert(serr);
+                send_vm_list();
+                return;
+            }
+        }
+        if (FAILED(asb_vm_set_shares(asb_vm_get(idx), &shares)))
+            ui_show_alert(L"Shared folders were not accepted. Check the folder, the host "
+                          L"account and that the VM uses NAT networking.");
+        send_vm_list();
+    } else if (wcscmp(action, L"browseSharedFolder") == 0) {
+        BROWSEINFOW browse;
+        PIDLIST_ABSOLUTE selection;
+        wchar_t initial[MAX_PATH] = {0}, path[MAX_PATH] = {0};
+        wchar_t input_id[128] = {0};
+        json_get_string(json, L"inputId", input_id, ARRAYSIZE(input_id));
+        json_get_string(json, L"path", initial, MAX_PATH);
+        ZeroMemory(&browse, sizeof(browse));
+        browse.hwndOwner = g_hwnd_main;
+        browse.lpszTitle = L"Choose a folder to share with the VM";
+        browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
+        browse.lpfn = disk_folder_browse_callback;
+        browse.lParam = (LPARAM)initial;
+        selection = SHBrowseForFolderW(&browse);
+        if (selection) {
+            if (SHGetPathFromIDListW(selection, path)) {
+                wchar_t json_buf[2048];
+                JsonBuilder jb;
+                jb_init(&jb, json_buf, 2048);
+                jb_object_begin(&jb);
+                jb_string(&jb, L"type", L"sharedFolderBrowseResult");
+                jb_string(&jb, L"inputId", input_id);
+                jb_string(&jb, L"path", path);
+                jb_object_end(&jb);
+                webview2_post(json_buf);
+            }
+            CoTaskMemFree(selection);
         }
     } else if (wcscmp(action, L"snapTake") == 0) {
         int vi;

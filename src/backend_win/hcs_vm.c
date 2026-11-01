@@ -1463,6 +1463,12 @@ HRESULT hcs_start_vm(VmInstance *instance)
     if (!g_hcs_dll || !pfnStart || !instance->handle)
         return E_NOT_VALID_STATE;
 
+    /* Publish shared host folders before the guest can ask for them; the guest
+       agent maps the drive letters as soon as it connects. Shares only make
+       sense on NAT: that is the only mode where the guest can reach the host. */
+    if (instance->host_shares.count > 0 && instance->network_mode == NET_NAT)
+        asb_shares_publish(instance->name, &instance->host_shares);
+
     op = pfnCreateOp(NULL, NULL);
     if (!op) return E_OUTOFMEMORY;
 
@@ -1544,6 +1550,7 @@ HRESULT hcs_terminate_vm(VmInstance *instance)
     hr = hcs_exec_and_wait(hr, op);
 
     instance->running = FALSE;
+    asb_shares_withdraw(&instance->host_shares);
     return hr;
 }
 
