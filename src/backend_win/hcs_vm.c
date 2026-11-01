@@ -883,6 +883,156 @@ static BOOL hcs_nested_virt_supported(void)
     return g_nested_virt == 1;
 }
 
+/* Security metadata is versioned separately from VM configuration. Missing
+   metadata means a legacy VM: preserve its state and adopt only after create
+   succeeds. Never infer a security mismatch from an HCS timeout. */
+#define GUEST_SECURITY_V1 0x41534210u
+
+static DWORD guest_security_mode(const VmConfig *config)
+{
+    BOOL windows = (_wcsicmp(config->os_type, L"Windows") == 0);
+    return GUEST_SECURITY_V1 | (windows && !config->test_mode ? 1u : 0u)
+        | (windows && !ASB_IS_ARM64 ? 2u : 0u);
+}
+
+static BOOL guest_state_paths(const VmConfig *config, wchar_t paths[3][MAX_PATH])
+{
+    wchar_t dir[MAX_PATH], *slash;
+    wcscpy_s(dir, MAX_PATH, config->vhdx_path);
+    slash = wcsrchr(dir, L'\\');
+    if (!slash) return FALSE;
+    *slash = L'\0';
+    return swprintf_s(paths[0], MAX_PATH, L"%s\\vm.vmgs", dir) > 0
+        && swprintf_s(paths[1], MAX_PATH, L"%s\\vm.vmrs", dir) > 0
+        && swprintf_s(paths[2], MAX_PATH, L"%s\\vm.security", dir) > 0;
+}
+
+/* Return absent only for FILE_NOT_FOUND. Access failures and directories must
+   not turn into permission resets or replacement of existing state. */
+static BOOL guest_state_exists(const wchar_t *path, BOOL *exists)
+{
+    DWORD attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        DWORD error = GetLastError();
+        *exists = FALSE;
+        if (error == ERROR_FILE_NOT_FOUND) return TRUE;
+        ui_log(L"Guest state: cannot inspect %s (error %lu).", path, error);
+        return FALSE;
+    }
+    *exists = TRUE;
+    if (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) {
+        ui_log(L"Guest state: refusing directory or reparse point %s.", path);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL prepare_guest_state(const VmConfig *config)
+{
+    wchar_t paths[3][MAX_PATH], backups[3][MAX_PATH];
+    BOOL exists[3], moved[3] = { FALSE, FALSE, FALSE };
+    DWORD previous = 0, bytes = 0, extra_bytes = 0;
+    BYTE extra;
+    HANDLE file;
+    HRESULT hr;
+    int i;
+
+    if (!guest_state_paths(config, paths)) return FALSE;
+    for (i = 0; i < 3; i++)
+        if (!guest_state_exists(paths[i], &exists[i])) return FALSE;
+
+    if (exists[2]) {
+        BOOL valid;
+        file = CreateFileW(paths[2], GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file == INVALID_HANDLE_VALUE) return FALSE;
+        valid = ReadFile(file, &previous, sizeof(previous), &bytes, NULL)
+            && bytes == sizeof(previous)
+            && ReadFile(file, &extra, 1, &extra_bytes, NULL) && extra_bytes == 0
+            && (previous & ~3u) == GUEST_SECURITY_V1;
+        CloseHandle(file);
+        if (!valid) {
+            ui_log(L"Guest state: invalid security metadata; preserving files and stopping.");
+            return FALSE;
+        }
+    }
+
+    if (exists[2] && previous != guest_security_mode(config)) {
+        FILETIME stamp;
+        GetSystemTimeAsFileTime(&stamp);
+        /* Rename without replacement. Retain the old pair and its metadata
+           for rollback; do not clear DACLs if access is denied. */
+        for (i = 0; i < 3; i++) {
+            if (swprintf_s(backups[i], MAX_PATH, L"%s.before-%08lX%08lX",
+                           paths[i], stamp.dwHighDateTime, stamp.dwLowDateTime) < 0)
+                return FALSE;
+        }
+        ui_log(L"Guest state: security settings changed (0x%08X -> 0x%08X); archiving old state.",
+               previous, guest_security_mode(config));
+        for (i = 0; i < 3; i++) {
+            if (!exists[i]) continue;
+            if (!MoveFileW(paths[i], backups[i])) {
+                ui_log(L"Guest state: archive failed for %s (error %lu).", paths[i], GetLastError());
+                while (--i >= 0) {
+                    if (moved[i] && !MoveFileW(backups[i], paths[i]))
+                        ui_log(L"Guest state: restore manually from %s; automatic rollback failed.", backups[i]);
+                }
+                return FALSE;
+            }
+            moved[i] = TRUE;
+            ui_log(L"Guest state backup: %s", backups[i]);
+        }
+        exists[0] = exists[1] = FALSE;
+    } else {
+        ui_log(L"Guest state: preserving existing files (%s security metadata).",
+               exists[2] ? L"unchanged" : L"legacy, no");
+    }
+
+    for (i = 0; i < 2; i++) {
+        if (!exists[i]) {
+            hr = i == 0 ? (pfnCreateVmgs ? pfnCreateVmgs(paths[i]) : E_NOTIMPL)
+                        : (pfnCreateVmrs ? pfnCreateVmrs(paths[i]) : E_NOTIMPL);
+            if (FAILED(hr)) {
+                ui_log(L"Guest state: create failed for %s (0x%08X).", paths[i], hr);
+                return FALSE;
+            }
+            ui_log(L"Guest state: created %s.", paths[i]);
+        }
+        hr = pfnGrantAccess ? pfnGrantAccess(config->name, paths[i]) : E_NOTIMPL;
+        if (FAILED(hr)) {
+            ui_log(L"Guest state: access grant failed for %s (0x%08X); preserving files.", paths[i], hr);
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* Called only after HCS accepted the configuration. A temporary file keeps
+   interrupted writes from corrupting an existing security record. */
+static void record_guest_security(const VmConfig *config)
+{
+    wchar_t paths[3][MAX_PATH], temp[MAX_PATH];
+    DWORD mode = guest_security_mode(config), bytes = 0;
+    HANDLE file;
+    BOOL ok;
+    if (!guest_state_paths(config, paths)
+        || swprintf_s(temp, MAX_PATH, L"%s.tmp", paths[2]) < 0) return;
+    file = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                       FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        ui_log(L"Guest state: cannot record security settings (error %lu); check %s.", GetLastError(), temp);
+        return;
+    }
+    ok = WriteFile(file, &mode, sizeof(mode), &bytes, NULL)
+        && bytes == sizeof(mode) && FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!ok || !MoveFileExW(temp, paths[2], MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        ui_log(L"Guest state: security metadata write failed; check %s before changing security settings.", temp);
+        DeleteFileW(temp);
+    }
+}
+
+
 BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                        wchar_t *json_out, size_t json_out_chars)
 {
@@ -906,7 +1056,6 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     wchar_t vmrs_path[MAX_PATH];
     wchar_t dir[MAX_PATH];
     BOOL is_windows;
-    HRESULT vmgs_hr, vmrs_hr;
     int written;
 
     if (!config || !json_out || json_out_chars < 8192)
@@ -959,7 +1108,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L",\"ApplySecureBootTemplate\":\"Skip\"");
     }
 
-    /* VMGS + VMRS files — always created regardless of TPM/SecureBoot.
+    /* VMGS + VMRS paths are included regardless of TPM/SecureBoot.
        GuestState section is always included in the JSON. */
     wcscpy_s(dir, MAX_PATH, config->vhdx_path);
     {
@@ -969,43 +1118,8 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     swprintf_s(vmgs_path, MAX_PATH, L"%s\\vm.vmgs", dir);
     swprintf_s(vmrs_path, MAX_PATH, L"%s\\vm.vmrs", dir);
 
-    /* Delete stale VMGS/VMRS and recreate — stale files from a previous VM
-       instance with different secure boot state cause 0x80370118 on create.
-       After reboot, HcsGrantVmAccess ACLs persist on old files and may prevent
-       deletion, so reset the DACL before deleting. */
-    vmgs_hr = S_OK;
-    vmrs_hr = S_OK;
-    if (pfnCreateVmgs) {
-        if (!DeleteFileW(vmgs_path) &&
-            GetLastError() == ERROR_ACCESS_DENIED) {
-            /* Reset DACL to allow delete — stale HcsGrantVmAccess ACLs */
-            SetNamedSecurityInfoW(vmgs_path, SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION, NULL, NULL, NULL, NULL);
-            DeleteFileW(vmgs_path);
-        }
-        vmgs_hr = pfnCreateVmgs(vmgs_path);
-        if (FAILED(vmgs_hr))
-            ui_log(L"Warning: HcsCreateEmptyGuestStateFile failed (0x%08X)", vmgs_hr);
-    }
-    if (pfnCreateVmrs) {
-        if (!DeleteFileW(vmrs_path) &&
-            GetLastError() == ERROR_ACCESS_DENIED) {
-            SetNamedSecurityInfoW(vmrs_path, SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION, NULL, NULL, NULL, NULL);
-            DeleteFileW(vmrs_path);
-        }
-        vmrs_hr = pfnCreateVmrs(vmrs_path);
-        if (FAILED(vmrs_hr))
-            ui_log(L"Warning: HcsCreateEmptyRuntimeStateFile failed (0x%08X)", vmrs_hr);
-    }
-
-    /* Grant VM access to VMGS/VMRS files */
-    if (pfnGrantAccess) {
-        if (GetFileAttributesW(vmgs_path) != INVALID_FILE_ATTRIBUTES)
-            pfnGrantAccess(config->name, vmgs_path);
-        if (GetFileAttributesW(vmrs_path) != INVALID_FILE_ATTRIBUTES)
-            pfnGrantAccess(config->name, vmrs_path);
-    }
+    if (!prepare_guest_state(config))
+        return FALSE;
 
     escape_json_path(vmgs_path, vmgs_esc, MAX_PATH * 2);
     escape_json_path(vmrs_path, vmrs_esc, MAX_PATH * 2);
@@ -1273,6 +1387,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
     }
 
     if (SUCCEEDED(hr)) {
+        record_guest_security(config);
         wcscpy_s(instance->name, 256, config->name);
         wcscpy_s(instance->os_type, 32, config->os_type);
         wcscpy_s(instance->vhdx_path, MAX_PATH, config->vhdx_path);
@@ -1366,6 +1481,7 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
     }
 
     if (SUCCEEDED(hr)) {
+        record_guest_security(config);
         wcscpy_s(instance->name, 256, config->name);
         wcscpy_s(instance->os_type, 32, config->os_type);
         wcscpy_s(instance->vhdx_path, MAX_PATH, config->vhdx_path);
