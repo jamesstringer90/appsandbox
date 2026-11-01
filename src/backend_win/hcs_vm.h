@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include "gpu_enum.h"
+#include "asb_net_limits.h"
 
 /* DLL export/import */
 #ifndef ASB_API
@@ -72,9 +73,21 @@ typedef struct {
     wchar_t     gpu_id[512];
     int         network_mode;
     wchar_t     net_adapter[256];     /* Adapter name for External network */
+    /* Internal-mode vSwitch selector: the switch's ElementName. Empty is
+       Auto (the fixed AppSandboxInternal ICS network); a name joins that
+       existing switch's network, borrowed. invalid == TRUE means the
+       stored value failed the shared character rule (the loader or an
+       entrance rejected it): the row starts refused until re-selected,
+       and the invariant invalid == 1 implies selector == "" holds. */
+    wchar_t     internal_switch[INTERNAL_SWITCH_CAP];
+    BOOL        internal_switch_invalid;
     wchar_t     mac_address[18];
     GUID        network_id;
     GUID        endpoint_id;
+    GUID        external_adapter_interface_guid; /* External: this start's selected physical NIC T (runtime-only) */
+    BOOL        delete_network_on_last_release; /* TRUE only for the owned network of THIS start's acquisition: fixed Internal ICS or the derived External ID; FALSE for borrowed switches (runtime-only) */
+    int         acquired_network_mode;   /* WHICH mode's acquisition produced this row's tuple - the cleanup/consume dispatch key, never the user-editable network_mode (runtime-only) */
+    BOOL        network_config_dirty;    /* mode/selector/adapter changed while a failed start retained the handle: the next start tears the stale system down and re-acquires (runtime-only; consumed only at asb_vm_start) */
     GUID        runtime_id;           /* VM RuntimeId for AF_HYPERV connections */
     wchar_t     resources_iso_path[MAX_PATH];
     BOOL        running;
@@ -112,6 +125,16 @@ typedef struct {
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
 } VmInstance;
+
+/* A registered VM template (vms.cfg [Template] blocks plus the template
+   library scan). Carries no network fields: nothing is copied on
+   instantiation. */
+typedef struct {
+    wchar_t name[256];
+    wchar_t os_type[32];
+    wchar_t image_path[MAX_PATH];
+    wchar_t vhdx_path[MAX_PATH];
+} TemplateInfo;
 
 /* Initialize HCS - loads computecore.dll dynamically.
    Returns TRUE if HCS is available. */

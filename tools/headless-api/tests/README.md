@@ -20,6 +20,33 @@ set ASB_ISO_WINDOWS=C:\path\to\Win11_x64.iso
 python tests\run_all.py
 ```
 
+The Windows response integration tests each own a separate daemon and
+temporarily replace `%ProgramData%\AppSandbox\vms.cfg`; neither can run under
+`run_all.py`, which uses an already running daemon. Build the Debug app, stop
+every AppSandbox GUI or daemon, then run these scripts one at a time from an
+elevated shell. Each backs up and restores the configuration byte-for-byte:
+
+```
+python tests\test_response_json_shape.py
+```
+
+This strict-parse test covers the `/vms` list, single-VM GET, and PUT edit
+response shapes, plus the build/edit/delete guards.
+
+```
+python tests\test_response_capacity.py
+```
+
+The response-builder isolation harness needs the Windows MSVC C compiler but
+does not need an elevated shell or a daemon. It compiles the production
+response builder into a temporary directory and injects heap allocation
+failures; its oversized selector is synthetic and cannot be stored in a real
+VM:
+
+```
+python tests\test_response_builder_capacity.py
+```
+
 **macOS** — start the daemon with sudo (required; it is fully non-interactive
 and still operates on YOUR user's VM registry + restore-image cache via
 `SUDO_USER`), then run the harness:
@@ -41,7 +68,10 @@ install, can each take 20–45 min) and uses real disk and bandwidth.
 
 | File | What it covers |
 | --- | --- |
-| `run_all.py` | Master harness. Sweeps leftover `brk-*` VMs, runs the static checks once, then one full per-VM lifecycle per spec **concurrently** (Linux + Windows on a Windows host; two macOS guests on a macOS host — one downloading its IPSW, one installing from the cached image), then the Windows template lifecycle (Windows hosts only). Prints a per-thread summary and a coverage table. This is the entry point. |
+| `run_all.py` | Master harness. Sweeps leftover `brk-*` VMs, runs the static checks once, then one full per-VM lifecycle per spec **concurrently** (Linux + Windows on a Windows host; two macOS guests on a macOS host — one downloading its IPSW, one installing from the cached image), then the Windows template lifecycle (Windows hosts only). Prints a per-thread summary and a coverage table. This is the entry point for lifecycle tests. |
+| `test_response_json_shape.py` | Standalone Windows integration test for strict JSON shape in list, single-VM, and edit responses, plus build/edit/delete guards. Owns its daemon and configuration fixture; run separately as described above. |
+| `test_response_capacity.py` | Standalone Windows integration test for response serialization and selector validation. Owns its daemon and configuration fixture; run separately as described above. |
+| `test_response_builder_capacity.py` | Isolated Windows/MSVC harness for the production response builder's growth, allocation-failure, final-capacity, and single-object paths. Uses temporary files and synthetic oversized data; no daemon or shared configuration. |
 | `vm_lifecycle.py` | The full per-VM sequence, parametrized by a create-spec. Covers create / status / edit / start / graceful shutdown / force-stop / SSE / delete, the during-build guards, **SSH key auto-deploy** (build with `sshDeployKey`, assert `keyDeployed`/`sshState 4`, then a key-only login), a quick **display open/close** once online (skipped on macOS hosts, on Linux guests until the updated agent is pushed, and in non-interactive daemon sessions), and — where `capabilities.snapshots` — snapshots + branches + base branches (asserts 501 on macOS instead). |
 | `test_host_and_validation.py` | No-VM checks: host cores/RAM cross-checked against the exact OS calls the daemon makes (Win32 / sysctl), capability gates, and the create-input-validation rejections matching the GUI's JS guards for the host platform. Builds nothing. |
 | `test_windows_template.py` | Windows-only template lifecycle: create a template (`isTemplate`), wait for sysprep finalization, create a VM from it, then delete the template. Never runs on macOS (`RUN_TEMPLATE = not IS_MAC`). |

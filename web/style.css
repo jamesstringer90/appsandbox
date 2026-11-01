@@ -314,6 +314,13 @@ td.empty-state { text-align: center; color: var(--text-dim); padding: 20px 6px; 
 tr:hover td { background: #252525; }
 tr.selected td { background: #1a3a5a; }
 
+/* Adapter column — inert placeholder for non-External modes; warning tint
+   when the configured adapter is no longer present on the host */
+td.adapter-off { color: var(--text-dim); }
+td.switch-warn { color: #d9a036; }
+td.switch-invalid { color: #d9a036; font-style: italic; }
+td.adapter-missing { color: #d9a036; }
+
 /* Icon columns — fixed width, centered in both header and body */
 th.icon-col, td.icon-col {
     width: 28px;
@@ -412,6 +419,24 @@ th.icon-col, td.icon-col {
     word-break: break-all;
 }
 
+/* Modal message: preserve the sender's line breaks (multi-paragraph
+   diagnostics), keep long URLs inside the box, and keep the text
+   selectable (the body disables selection) so URLs can be copied */
+#modal-message {
+    white-space: pre-line;
+    overflow-wrap: break-word;
+    user-select: text;
+    cursor: text;
+}
+
+/* Linkified URLs: click hands the URL to the host, which opens the
+   default browser (a WebView2 window cannot open new windows itself) */
+#modal-message a {
+    color: #4da3ff;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
 /* Confirmation modal */
 .modal-overlay {
     display: none;
@@ -453,6 +478,7 @@ th.icon-col, td.icon-col {
 .modal-form-body .form-row, .modal-form-body .cred-row,
 .modal-form-body .image-row { min-width: 0; flex-wrap: wrap; }
 .modal-form-body .cred-row input { min-width: 0; }
+#edit-net-adapter { max-width: 100%; }
 #edit-vm-warn, #snapshot-warn { display: block; margin-top: 12px; }
 #edit-vm-warn:empty, #snapshot-warn:empty { display: none; }
 #snapshot-current { overflow-wrap: anywhere; }

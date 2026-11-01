@@ -33,7 +33,9 @@ typedef struct {
     wchar_t *buf;
     size_t   cap;
     size_t   len;
-    int      count;  /* number of key-value pairs at current level */
+    int      count;    /* number of key-value pairs at current level */
+    BOOL     overflow; /* an append was dropped because the buffer filled;
+                          the caller must not post the partial JSON */
 } JsonBuilder;
 
 void jb_init(JsonBuilder *jb, wchar_t *buf, size_t cap);

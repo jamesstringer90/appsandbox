@@ -5,11 +5,17 @@
  * tray icon. All VM orchestration is in asb_core.c (the core library).
  */
 
+/* winsock2 before ui.h/windows.h: hcn_network.h needs the Winsock 2 +
+   ws2tcpip include chain (netioapi types); windows.h would otherwise
+   pull in Winsock 1.1 first and collide with it. */
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include "ui.h"
 #include "asb_core.h"
 #include "resource.h"
 #include "hcs_vm.h"
 #include "hcn_network.h"
+#include "hcn_private.h"
 #include "snapshot.h"
 #include "vm_display.h"
 #include "vm_display_idd.h"
@@ -23,8 +29,10 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <shlobj.h>
+#include <shellapi.h>
 
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -101,7 +109,7 @@ static BOOL detect_home_edition(void)
 static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static void send_vm_list(void);
 static void send_full_state(void);
-static void send_adapters(void);
+static void census_on_consult(void);
 static void send_templates(void);
 
 /* ---- Safe display teardown ---- */
@@ -301,6 +309,8 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_string(jb, L"gpuName", v->gpu_name);
     jb_int(jb, L"networkMode", v->network_mode);
     jb_string(jb, L"netAdapter", v->net_adapter);
+    jb_string(jb, L"internalSwitch", v->internal_switch);
+    jb_bool(jb, L"internalSwitchInvalid", v->internal_switch_invalid);
     jb_bool(jb, L"isTemplate", v->is_template);
     jb_bool(jb, L"hypervVideoOff", v->hyperv_video_off);
     jb_bool(jb, L"buildingVhdx", v->building_vhdx);
@@ -397,22 +407,45 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_object_end(jb);
 }
 
-static void send_vm_list(void)
+/* The shared capacity mechanism for BOTH build_vm_json consumers (the
+   vmList and fullState envelopes differ; the capacity logic does not): a
+   131072-wchar heap buffer, ONE retry at 2x on detected overflow, and the
+   suppress case on overflow past the retry or an allocation failure at
+   either size - a fixed-size stateUnavailable envelope (never a silent
+   drop, never partial JSON; the allocation-failure case names itself).
+   Anything that posted before still posts: the sizing is the baseline
+   heap constant with headroom, never a delta-only calculation. */
+static void send_state_unavailable(const wchar_t *source, const wchar_t *reason)
 {
-    wchar_t buf[131072];
+    wchar_t env[128];
     JsonBuilder jb;
+
+    jb_init(&jb, env, ARRAYSIZE(env));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"stateUnavailable");
+    jb_string(&jb, L"source", source);
+    jb_string(&jb, L"reason", reason);
+    jb_object_end(&jb);
+    if (jb.overflow)
+        return;   /* the fixed envelope cannot overflow; defensive only */
+    webview2_post(env);
+}
+
+/* Build the vmListChanged envelope's contents (the vms array + hostInfo)
+   into a caller-provided buffer. */
+static void build_vm_list_contents(JsonBuilder *jb)
+{
     int i, count = asb_vm_count();
 
-    jb_init(&jb, buf, ARRAYSIZE(buf));
-    jb_object_begin(&jb);
-    jb_string(&jb, L"type", L"vmListChanged");
+    jb_object_begin(jb);
+    jb_string(jb, L"type", L"vmListChanged");
 
-    jb_array_begin(&jb, L"vms");
+    jb_array_begin(jb, L"vms");
     for (i = 0; i < count; i++) {
-        if (i > 0) jb_append(&jb, L",");
-        build_vm_json(&jb, i);
+        if (i > 0) jb_append(jb, L",");
+        build_vm_json(jb, i);
     }
-    jb_array_end(&jb);
+    jb_array_end(jb);
 
     {
         wchar_t hi_buf[32768];
@@ -421,14 +454,39 @@ static void send_vm_list(void)
         jb_object_begin(&hi);
         build_host_info_json(&hi);
         jb_object_end(&hi);
-        if (jb.count > 0) jb_append(&jb, L",");
-        jb_append(&jb, L"\"hostInfo\":");
-        jb_append(&jb, hi_buf);
-        jb.count++;
+        if (jb->count > 0) jb_append(jb, L",");
+        jb_append(jb, L"\"hostInfo\":");
+        jb_append(jb, hi_buf);
+        jb->count++;
     }
+    jb_object_end(jb);
+}
 
-    jb_object_end(&jb);
-    webview2_post(buf);
+static void send_vm_list(void)
+{
+    wchar_t *buf;
+    JsonBuilder jb;
+    size_t cap = 131072;
+    int attempt;
+
+    for (attempt = 0; attempt < 2; attempt++, cap *= 2) {
+        buf = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                   cap * sizeof(wchar_t));
+        if (!buf) {
+            send_state_unavailable(L"vmList", L"allocFailed");
+            return;
+        }
+        jb_init(&jb, buf, (int)cap);
+        build_vm_list_contents(&jb);
+        if (!jb.overflow) {
+            webview2_post(buf);
+            HeapFree(GetProcessHeap(), 0, buf);
+            return;
+        }
+        HeapFree(GetProcessHeap(), 0, buf);
+    }
+    ui_log(L"UI: VM-list message exceeded the retry buffer; suppressed.");
+    send_state_unavailable(L"vmList", L"tooLarge");
 }
 
 static void send_host_info(void)
@@ -451,50 +509,57 @@ static void send_host_info(void)
 #define IF_TYPE_IEEE80211 71
 #endif
 
+/* Selectable adapter entries. The names array is heap-allocated: the
+ * backend already omitted duplicate-name groups, so the capacity only
+ * bounds distinct-named NICs and is logged if reached. */
+#define UI_ADAPTER_CAP 64
+
 typedef struct {
-    wchar_t names[32][256];
+    wchar_t (*names)[256];
     int count;
-    int first_eth;
-    int first_wifi;
+    int capacity;
+    BOOL overflowed;   /* at least one distinct name was actually dropped */
 } AdapterList;
 
 static void adapter_enum_cb(const wchar_t *name, int if_type, void *ctx)
 {
     AdapterList *al = (AdapterList *)ctx;
-    if (al->count >= 32) return;
+    (void)if_type;   /* the default is (Auto) at index 0; type tracking is gone */
+    if (al->count >= al->capacity) {
+        al->overflowed = TRUE;   /* log only when an entry was really dropped */
+        return;
+    }
     wcscpy_s(al->names[al->count], 256, name);
-    if (if_type == IF_TYPE_ETHERNET_CSMACD && al->first_eth < 0)
-        al->first_eth = al->count + 1;
-    else if (if_type == IF_TYPE_IEEE80211 && al->first_wifi < 0)
-        al->first_wifi = al->count + 1;
     al->count++;
 }
 
-static void send_adapters(void)
+/* Collect the backend's safe adapter list (L0-based; duplicate-name
+   groups already omitted there). The capacity is applied only after the
+   backend's full duplicate-group detection, and only then logged.
+   Returns FALSE on allocation failure (the caller emits "(Auto)" only). */
+static BOOL collect_adapters(AdapterList *al)
 {
-    wchar_t buf[8192];
-    JsonBuilder jb;
-    AdapterList al;
-    int def_idx, i;
+    al->capacity = UI_ADAPTER_CAP;
+    al->count = 0;
+    al->overflowed = FALSE;
+    al->names = (wchar_t (*)[256])HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                            UI_ADAPTER_CAP * 256 * sizeof(wchar_t));
+    if (!al->names)
+        return FALSE;
+    hcn_enum_adapters(adapter_enum_cb, al);
+    if (al->overflowed)
+        ui_log(L"External: adapter list capped at %d distinct names; the "
+               L"rest are omitted from the dropdown (Explicit lookup still "
+               L"resolves the full inventory).", al->capacity);
+    return TRUE;
+}
 
-    al.count = 0; al.first_eth = -1; al.first_wifi = -1;
-    hcn_enum_adapters(adapter_enum_cb, &al);
-    def_idx = (al.first_eth >= 0) ? al.first_eth : (al.first_wifi >= 0) ? al.first_wifi : 0;
-
-    jb_init(&jb, buf, 8192);
-    jb_object_begin(&jb);
-    jb_string(&jb, L"type", L"adapters");
-    jb_array_begin(&jb, L"adapters");
-    for (i = 0; i < al.count; i++) {
-        if (i > 0) jb_append(&jb, L",");
-        jb_append(&jb, L"\"");
-        jb_append_escaped(&jb, al.names[i]);
-        jb_append(&jb, L"\"");
+static void free_adapters(AdapterList *al)
+{
+    if (al->names) {
+        HeapFree(GetProcessHeap(), 0, al->names);
+        al->names = NULL;
     }
-    jb_array_end(&jb);
-    jb_int(&jb, L"defaultIndex", def_idx);
-    jb_object_end(&jb);
-    webview2_post(buf);
 }
 
 static void send_templates(void)
@@ -529,71 +594,101 @@ static int CALLBACK disk_folder_browse_callback(HWND hwnd, UINT message, LPARAM 
 
 static void send_full_state(void)
 {
-    wchar_t buf[131072];
+    /* The fullState consumer of the shared capacity mechanism (with the
+       vmList sender): a 131072-wchar heap, ONE retry at 2x on detected
+       overflow, and the suppress envelope - never the whole-message drop
+       the baseline guard performed. The startup state and getState both
+       ride this. */
+    wchar_t *buf;
     JsonBuilder jb;
-    int i, count;
+    size_t cap = 131072;
+    int attempt;
 
-    jb_init(&jb, buf, ARRAYSIZE(buf));
-    jb_object_begin(&jb);
-    jb_string(&jb, L"type", L"fullState");
+    for (attempt = 0; attempt < 2; attempt++, cap *= 2) {
+        int i, count;
 
-    count = asb_vm_count();
-    jb_array_begin(&jb, L"vms");
-    for (i = 0; i < count; i++) {
-        if (i > 0) jb_append(&jb, L",");
-        build_vm_json(&jb, i);
-    }
-    jb_array_end(&jb);
+        buf = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                   cap * sizeof(wchar_t));
+        if (!buf) {
+            send_state_unavailable(L"fullState", L"allocFailed");
+            return;
+        }
+        jb_init(&jb, buf, (int)cap);
+        jb_object_begin(&jb);
+        jb_string(&jb, L"type", L"fullState");
 
-    /* Host info */
-    {
-        wchar_t hi[32768];
-        JsonBuilder hj;
-        jb_init(&hj, hi, ARRAYSIZE(hi));
-        jb_object_begin(&hj);
-        build_host_info_json(&hj);
-        jb_object_end(&hj);
-        if (jb.count > 0) jb_append(&jb, L",");
-        jb_append(&jb, L"\"hostInfo\":");
-        jb_append(&jb, hi);
-        jb.count++;
-    }
-
-    /* Adapters */
-    {
-        AdapterList al;
-        int def_idx;
-        al.count = 0; al.first_eth = -1; al.first_wifi = -1;
-        hcn_enum_adapters(adapter_enum_cb, &al);
-        def_idx = (al.first_eth >= 0) ? al.first_eth : (al.first_wifi >= 0) ? al.first_wifi : 0;
-
-        jb_array_begin(&jb, L"adapters");
-        for (i = 0; i < al.count; i++) {
+        count = asb_vm_count();
+        jb_array_begin(&jb, L"vms");
+        for (i = 0; i < count; i++) {
             if (i > 0) jb_append(&jb, L",");
-            jb_append(&jb, L"\"");
-            jb_append_escaped(&jb, al.names[i]);
-            jb_append(&jb, L"\"");
+            build_vm_json(&jb, i);
         }
         jb_array_end(&jb);
-        jb_int(&jb, L"defaultAdapter", def_idx);
-    }
 
-    /* Templates */
-    {
-        int tc = asb_template_count();
-        jb_array_begin(&jb, L"templates");
-        for (i = 0; i < tc; i++) {
-            if (i > 0) jb_append(&jb, L",");
-            jb_object_begin(&jb);
-            jb_string(&jb, L"name", asb_template_name(i));
-            jb_string(&jb, L"osType", asb_template_os_type(i));
-            jb_object_end(&jb);
+        /* Host info */
+        {
+            wchar_t hi[32768];
+            JsonBuilder hj;
+            jb_init(&hj, hi, ARRAYSIZE(hi));
+            jb_object_begin(&hj);
+            build_host_info_json(&hj);
+            jb_object_end(&hj);
+            if (jb.count > 0) jb_append(&jb, L",");
+            jb_append(&jb, L"\"hostInfo\":");
+            jb_append(&jb, hi);
+            jb.count++;
         }
-        jb_array_end(&jb);
-    }
 
-    jb_object_end(&jb);
-    webview2_post(buf);
+        /* Adapters: the backend's safe list (L0, bound NICs visible,
+           duplicate groups omitted). The default is index 0: (Auto) -
+           selecting External does not pin an adapter. */
+        {
+            AdapterList al;
+
+            if (collect_adapters(&al)) {
+                jb_array_begin(&jb, L"adapters");
+                for (i = 0; i < al.count; i++) {
+                    if (i > 0) jb_append(&jb, L",");
+                    jb_append(&jb, L"\"");
+                    jb_append_escaped(&jb, al.names[i]);
+                    jb_append(&jb, L"\"");
+                }
+                jb_array_end(&jb);
+                jb_int(&jb, L"defaultAdapter", 0);
+                free_adapters(&al);
+            } else {
+                ui_log(L"UI: adapter list allocation failed; the dropdown is "
+                       L"(Auto) only.");
+                jb_array_begin(&jb, L"adapters");
+                jb_array_end(&jb);
+                jb_int(&jb, L"defaultAdapter", 0);
+            }
+        }
+
+        /* Templates */
+        {
+            int tc = asb_template_count();
+            jb_array_begin(&jb, L"templates");
+            for (i = 0; i < tc; i++) {
+                if (i > 0) jb_append(&jb, L",");
+                jb_object_begin(&jb);
+                jb_string(&jb, L"name", asb_template_name(i));
+                jb_string(&jb, L"osType", asb_template_os_type(i));
+                jb_object_end(&jb);
+            }
+            jb_array_end(&jb);
+        }
+
+        jb_object_end(&jb);
+        if (!jb.overflow) {
+            webview2_post(buf);
+            HeapFree(GetProcessHeap(), 0, buf);
+            return;
+        }
+        HeapFree(GetProcessHeap(), 0, buf);
+    }
+    ui_log(L"UI: full-state message exceeded the retry buffer; suppressed.");
+    send_state_unavailable(L"fullState", L"tooLarge");
 }
 
 /* ---- UI logging ---- */
@@ -607,20 +702,33 @@ static void ui_log_post(const wchar_t *msg)
     jb_string(&jb, L"type", L"log");
     jb_string(&jb, L"message", msg);
     jb_object_end(&jb);
+    if (jb.overflow)
+        return;   /* partial JSON is never posted */
     webview2_post(json);
 }
 
 static void ui_show_alert(const wchar_t *message)
 {
     if (GetCurrentThreadId() == g_ui_thread_id) {
-        wchar_t buf[1024];
-        swprintf_s(buf, 1024, L"{\"type\":\"alert\",\"message\":\"%s\"}", message);
-        webview2_post(buf);
+        /* The message text is JSON-escaped through the builder: the
+           reason strings contain quotes and raw %s formatting would
+           emit invalid JSON. 4096-wide buffer for the
+           one-line reason plus wrapping. */
+        wchar_t json[4096];
+        JsonBuilder jb;
+        jb_init(&jb, json, 4096);
+        jb_object_begin(&jb);
+        jb_string(&jb, L"type", L"alert");
+        jb_string(&jb, L"message", message ? message : L"");
+        jb_object_end(&jb);
+        if (jb.overflow)
+            return;   /* partial JSON is never posted */
+        webview2_post(json);
     } else if (g_hwnd_main) {
-        size_t len = wcslen(message) + 1;
+        size_t len = wcslen(message ? message : L"") + 1;
         wchar_t *copy = (wchar_t *)malloc(len * sizeof(wchar_t));
         if (copy) {
-            wcscpy_s(copy, len, message);
+            wcscpy_s(copy, len, message ? message : L"");
             PostMessageW(g_hwnd_main, WM_SHOW_ALERT, 0, (LPARAM)copy);
         }
     }
@@ -999,6 +1107,7 @@ static void on_webview2_message(const wchar_t *json)
         wchar_t name_buf[256] = {0}, os_buf[32] = {0}, img_buf[MAX_PATH] = {0};
         wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[256] = {0};
         wchar_t adapter_buf[256] = {0}, disk_buf[MAX_PATH + 1] = {0};
+        wchar_t sw_buf[INTERNAL_SWITCH_CAP] = {0};
         wchar_t gpu_id[512] = {0};
         int val;
         BOOL is_tpl = FALSE;
@@ -1031,6 +1140,16 @@ static void on_webview2_message(const wchar_t *json)
             return;
         }
         json_get_string(json, L"netAdapter", adapter_buf, 256);
+        /* reject-on-false (the diskDirectory precedent, NOT netAdapter's
+           ignore-false branch): a present key whose decode fails - embedded
+           NUL, over-long, malformed escape - aborts the create. */
+        if (!json_get_string(json, L"internalSwitch", sw_buf,
+                             INTERNAL_SWITCH_CAP) &&
+            json_has_key(json, L"internalSwitch")) {
+            SecureZeroMemory(pass_buf, sizeof(pass_buf));
+            ui_show_alert(L"The internal switch name is invalid or too long.");
+            return;
+        }
         if (!json_get_string(json, L"gpuId", gpu_id, ARRAYSIZE(gpu_id)) &&
             json_has_key(json, L"gpuId")) {
             SecureZeroMemory(pass_buf, sizeof(pass_buf));
@@ -1052,6 +1171,7 @@ static void on_webview2_message(const wchar_t *json)
         cfg.username = user_buf;
         cfg.password = pass_buf;
         cfg.net_adapter = adapter_buf;
+        cfg.internal_switch = sw_buf;
         cfg.is_template = is_tpl;
         cfg.disk_directory = disk_buf;
         cfg.gpu_id = gpu_id;
@@ -1073,8 +1193,16 @@ static void on_webview2_message(const wchar_t *json)
                 return;
             }
         }
-        asb_vm_create(&cfg);
-        SecureZeroMemory(pass_buf, sizeof(pass_buf));
+        {
+            /* The create's own gates alert their own lines (the invalid
+               selector, the acquire's fail-closed reasons); on FAILED the
+               flow aborts here without re-alerting - the row was not
+               added, so no list refresh is needed (harmless if it were). */
+            HRESULT create_hr = asb_vm_create(&cfg);
+            SecureZeroMemory(pass_buf, sizeof(pass_buf));
+            if (FAILED(create_hr))
+                return;
+        }
         send_vm_list();
     } else if (wcscmp(action, L"startVm") == 0) {
         if (!g_prereq_ok) {
@@ -1222,6 +1350,8 @@ static void on_webview2_message(const wchar_t *json)
                     if (!error) hr = asb_vm_set_gpu_selection(vm, mode, gpu_id);
                 }
                 else if (wcscmp(field, L"networkMode") == 0) hr = asb_vm_set_network(vm, _wtoi(value));
+                else if (wcscmp(field, L"netAdapter") == 0) hr = asb_vm_set_net_adapter(vm, value);
+                else if (wcscmp(field, L"internalSwitch") == 0) hr = asb_vm_set_internal_switch(vm, value);
                 if (FAILED(hr)) ui_show_alert(error ? error : L"VM configuration could not be updated.");
                 else asb_save();
             }
@@ -1232,6 +1362,14 @@ static void on_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"selectVm") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx)) g_selected_vm = idx;
+    } else if (wcscmp(action, L"openUrl") == 0) {
+        /* A linkified URL in a modal (setModalMessage). A WebView2 window
+           cannot open new windows itself, so the host opens the default
+           browser. https only: never hand arbitrary schemes to the shell. */
+        wchar_t url[512];
+        if (json_get_string(json, L"url", url, 512) &&
+            wcsncmp(url, L"https://", 8) == 0)
+            ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
     } else if (wcscmp(action, L"getDiskSpace") == 0) {
         wchar_t *copy = _wcsdup(json);
         HANDLE thread = copy ? CreateThread(NULL, 0, disk_space_thread, copy, 0, NULL) : NULL;
@@ -1322,6 +1460,11 @@ static void on_webview2_message(const wchar_t *json)
         if (h) CloseHandle(h);
     } else if (wcscmp(action, L"enableFeatureReboot") == 0) {
         prereq_reboot();
+    } else if (wcscmp(action, L"getInternalSwitches") == 0) {
+        /* The dropdown consult: cache-first (the web renders its own copy
+           or its pending state); the host stages the priorities and kicks
+           a rebuild only when the cache is expired or never built. */
+        census_on_consult();
     } else if (wcscmp(action, L"getState") == 0) {
         send_full_state();
     } else if (wcscmp(action, L"setMinSize") == 0) {
@@ -1395,6 +1538,834 @@ static void CALLBACK ui_vm_removed_callback(int index, void *user_data)
         PostMessageW(g_hwnd_main, WM_VM_REMOVED, (WPARAM)index, 0);
 }
 
+/* ---- Internal vSwitch census manager ----
+ *
+ * One WMI/HCN census worker (display-only), a UI-thread watchdog, a TTL
+ * cache, and the scheduling bits. The worker is a one-shot CreateThread
+ * thread that releases its own session, then posts its completion
+ * notification as its last act; the UI-side handler owns the
+ * publish/discard/launch decision. The census CRITICAL_SECTION is never
+ * deleted and the cancel event is never closed on ANY path: an abandoned
+ * (wedged) worker's last act is to enter the lock and post, so nothing it
+ * can still touch is ever destroyed - all of it is reclaimed by the OS at
+ * process exit, exactly like the module itself.
+ *
+ * Scheduling bits and their windows (each row's setter/clearer/reader):
+ *   worker_active     launch helper -> handler / expiry probe / request
+ *                     probe / drain
+ *   pending_request   ping/consult   launch helper             handler,
+ *                     (genuine)                                expiry probe,
+ *                     request probe
+ *   io_complete       worker (inside its one lock take, ONLY on a
+ *                     successful PostMessageW)  launch helper  expiry guard
+ *                     / request probe gate
+ *   priorities_dirty  a staging write that changes the list  launch helper
+ *                     / kick arms
+ *   published_once    commit / expiry finalize / request-entry terminal
+ *                     publish - NEVER cleared   ping's gate
+ *   invalidation_epoch  ping (only once published_once) / expiry
+ *                     (monotonic)              handler / kick arms / launch
+ *   build_epoch       launch helper             handler / kick arms
+ *   build_thread      launch (same hold; NULL on CreateThread failure)
+ *                     every slot release (same hold)  expiry / request
+ *                     probes - a NON-OWNING alias into the ONE handle set,
+ *                     never closed through
+ *   deadline_fired    first finalize / request-entry terminal publish
+ *                     launch helper (with the launch-cleared set)  expiry
+ *                     handler (the supervision discriminator)
+ *   armed_timer_id    launch (the never-reused ID it arms) / expiry (the
+ *                     kill + the re-arm's fresh ID) / WM_DESTROY
+ *                     (0 = none armed)   WM_TIMER's identity test
+ *   closing           drain (first hold, one-way)  both handlers / guards
+ *   generation        every payload producer (under the lock, before
+ *                     serialization)  the web store's filter
+ *
+ * The worker's one lock take covers the post itself: PostMessageW ONLY
+ * (the SendMessage family is FORBIDDEN under this lock - a cross-thread
+ * synchronous send while the UI thread holds it is an instant deadlock).
+ * The UI-side handler and the expiry commit under the lock and deliver
+ * (the webview post) after releasing it. */
+
+#define WM_CENSUS_DONE         (WM_APP + 20)   /* completion notification */
+#define WM_CENSUS_STALE        (WM_APP + 21)   /* stale-ping (marshaled) */
+
+/* Cache TTL and the per-build HCN probe budget (tuning values from the
+   design's display tolerance; the deadline itself is the UI-side
+   watchdog, never the worker). */
+#define CENSUS_TTL_MS          30000
+#define CENSUS_PROBE_BUDGET    8
+
+/* One census build: the deep-copied priority snapshot, the request, and
+   the payload (worker-owned until the post; the UI side owns it after). */
+typedef struct {
+    UINT64 token;
+    UINT64 build_epoch;
+    HcnInternalCensusRequest req;
+    wchar_t (*priority_store)[INTERNAL_SWITCH_CAP];
+    const wchar_t *priority_names[ASB_MAX_VMS];
+    HcnInternalSwitchCensus census;
+} CensusWork;
+
+typedef struct {
+    UINT64 generation;
+    const wchar_t *reason;
+} CensusNotice;
+
+typedef struct {
+    CensusNotice items[4];
+    size_t count;
+} CensusNoticeBatch;
+
+typedef struct {
+    CRITICAL_SECTION lock;            /* never deleted (the abandon branch) */
+    BOOL closing;
+    BOOL initialized;
+
+    BOOL worker_active;
+    BOOL pending_request;
+    BOOL io_complete;
+    BOOL priorities_dirty;
+    BOOL published_once;
+    BOOL deadline_fired;
+    UINT64 invalidation_epoch;
+    UINT64 build_epoch;
+    UINT64 token_seq;
+    UINT64 timer_seq;
+    UINT_PTR armed_timer_id;
+    UINT64 generation;
+
+    HANDLE build_thread;              /* non-owning alias into the set */
+    HANDLE handles[16];
+    size_t handle_count;
+    HANDLE cancel_event;              /* manual-reset; never closed */
+
+    UINT64 active_token;              /* the completion identity the
+                                         notification carries */
+
+    /* The staged priority list: the ordered array of non-empty stored
+       selectors of Internal-mode VMs (exactly what the launch helper
+       deep-copies); a staging write is dirty iff the array is not
+       identical under ordered, case-sensitive comparison. */
+    wchar_t staged[ASB_MAX_VMS][INTERNAL_SWITCH_CAP];
+    size_t staged_count;
+
+    /* The webview owns the displayed rows; the UI needs only cache validity
+       and age to decide whether a consult is fresh. */
+    BOOL cached_valid;
+    ULONGLONG cache_time;
+} CensusManager;
+
+static CensusManager g_census;
+
+static DWORD WINAPI census_worker_thread(LPVOID param);
+static void census_queue_unavailable_locked(const wchar_t *reason,
+                                            CensusNoticeBatch *notices);
+static void census_flush_notices(CensusNoticeBatch *notices);
+
+/* Arm a fresh, never-reused watchdog ID. Store only the ID Windows
+   actually returned; zero means the caller must publish a terminal state
+   instead of leaving a build with no deadline. */
+static BOOL census_arm_timer_locked(HWND hwnd)
+{
+    UINT_PTR timer_id = (UINT_PTR)++g_census.timer_seq;
+    UINT_PTR armed;
+
+    if (!timer_id)
+        timer_id = (UINT_PTR)++g_census.timer_seq;
+    armed = SetTimer(hwnd, timer_id, WMI_CENSUS_DEADLINE_MS, NULL);
+    if (!armed) {
+        g_census.armed_timer_id = 0;
+        return FALSE;
+    }
+    g_census.armed_timer_id = armed;
+    return TRUE;
+}
+
+/* The stale-ping callback: marshaled to the UI thread with PostMessageW
+   ONLY (never webview2_post from the callback - it may fire on a worker). */
+static void census_stale_cb(void *user_data)
+{
+    (void)user_data;
+    if (g_hwnd_main)
+        PostMessageW(g_hwnd_main, WM_CENSUS_STALE, 0, 0);
+}
+
+/* Free a work (payload included): safe on every shape the enum returns. */
+static void census_work_free(CensusWork *work)
+{
+    if (!work)
+        return;
+    hcn_internal_switch_census_free(&work->census);
+    if (work->priority_store)
+        HeapFree(GetProcessHeap(), 0, work->priority_store);
+    HeapFree(GetProcessHeap(), 0, work);
+}
+
+/* Prune the handle set: a zero-timeout probe plus CloseHandle on the
+   exits. Called from the launch path and the drain (both UI-thread, under
+   the lock). A still-live handle stays for the drain's wait. */
+static void census_prune_handles_locked(void)
+{
+    size_t i = 0;
+    while (i < g_census.handle_count) {
+        HANDLE h = g_census.handles[i];
+        if (!h || WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
+            if (h) CloseHandle(h);
+            g_census.handles[i] = g_census.handles[g_census.handle_count - 1];
+            g_census.handle_count--;
+        } else {
+            i++;
+        }
+    }
+}
+
+/* Stage the latest priority list: the distinct non-empty stored selectors
+   of Internal-mode VMs in VM-list order. Sets priorities_dirty iff the
+   ordered, case-sensitive array actually changed (a miss is the unbounded
+   harm; a false dirty is one bounded rebuild). */
+static void census_stage_priorities_locked(void)
+{
+    wchar_t fresh[ASB_MAX_VMS][INTERNAL_SWITCH_CAP];
+    size_t count = 0;
+    int i, j, n = asb_vm_count();
+    BOOL dirty;
+
+    ZeroMemory(fresh, sizeof(fresh));
+    for (i = 0; i < n && count < ASB_MAX_VMS; i++) {
+        const wchar_t *sel = asb_vm_internal_switch(asb_vm_get(i));
+        if (!sel || !sel[0])
+            continue;
+        for (j = 0; j < (int)count; j++)
+            if (wcscmp(fresh[j], sel) == 0)
+                break;
+        if (j == (int)count) {
+            wcsncpy_s(fresh[count], INTERNAL_SWITCH_CAP, sel, _TRUNCATE);
+            count++;
+        }
+    }
+
+    dirty = (count != g_census.staged_count);
+    if (!dirty) {
+        for (i = 0; i < (int)count; i++) {
+            if (wcscmp(fresh[i], g_census.staged[i]) != 0) {
+                dirty = TRUE;
+                break;
+            }
+        }
+    }
+    if (dirty) {
+        memcpy(g_census.staged, fresh, sizeof(fresh));
+        g_census.staged_count = count;
+        g_census.priorities_dirty = TRUE;
+    }
+}
+
+/* The ONE launch helper (UI-thread-only; called with the lock held): it
+   establishes the watchdog and active token before any fallible work
+   allocation. Allocation/CreateThread/capacity failures therefore reach
+   an UNAVAILABLE terminal through the timer. A timer-arm failure has no
+   watchdog to do that work, so it publishes UNAVAILABLE immediately. */
+static void census_launch_locked(CensusNoticeBatch *notices)
+{
+    CensusWork *work = NULL;
+    HANDLE thread = NULL;
+    size_t i;
+    UINT64 token = ++g_census.token_seq;
+
+    g_census.build_epoch = g_census.invalidation_epoch;
+    g_census.pending_request = FALSE;
+    g_census.io_complete = FALSE;
+    g_census.priorities_dirty = FALSE;
+    g_census.deadline_fired = FALSE;
+    g_census.active_token = token;
+    g_census.worker_active = TRUE;
+    g_census.build_thread = NULL;
+
+    if (g_census.armed_timer_id) {
+        KillTimer(g_hwnd_main, (UINT_PTR)g_census.armed_timer_id);
+        g_census.armed_timer_id = 0;
+    }
+    if (!census_arm_timer_locked(g_hwnd_main)) {
+        g_census.worker_active = FALSE;
+        g_census.pending_request = FALSE;
+        g_census.deadline_fired = TRUE;
+        ui_log(L"UI: census watchdog SetTimer failed (0x%08X).",
+               (unsigned)GetLastError());
+        census_queue_unavailable_locked(
+            L"Internal: host inventory unavailable (the census watchdog could not be armed).",
+            notices);
+        return;
+    }
+
+    census_prune_handles_locked();
+    if (g_census.handle_count >= ARRAYSIZE(g_census.handles)) {
+        ui_log(L"UI: census handle set full; build deferred to watchdog.");
+        return;  /* no worker starts without an owned handle slot */
+    }
+
+    work = (CensusWork *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                    sizeof(CensusWork));
+    if (!work) {
+        ui_log(L"UI: census work allocation failed.");
+        return;  /* active token + timer publishes UNAVAILABLE */
+    }
+    work->priority_store = (wchar_t (*)[INTERNAL_SWITCH_CAP])HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY,
+        g_census.staged_count * INTERNAL_SWITCH_CAP * sizeof(wchar_t));
+    if (!work->priority_store && g_census.staged_count > 0) {
+        ui_log(L"UI: census priority snapshot allocation failed.");
+        census_work_free(work);
+        return;  /* active token + timer publishes UNAVAILABLE */
+    }
+    if (g_census.staged_count > 0) {
+        memcpy(work->priority_store, g_census.staged,
+               g_census.staged_count * INTERNAL_SWITCH_CAP * sizeof(wchar_t));
+        for (i = 0; i < g_census.staged_count; i++)
+            work->priority_names[i] = work->priority_store[i];
+    }
+
+    work->token = token;
+    work->build_epoch = g_census.invalidation_epoch;
+    work->req.priority_names = work->priority_names;
+    work->req.priority_count = g_census.staged_count;
+    work->req.probe_budget = CENSUS_PROBE_BUDGET;
+    work->req.project_for_ui = TRUE;
+    work->req.cancel_event = g_census.cancel_event;
+
+    ResetEvent(g_census.cancel_event);
+    thread = CreateThread(NULL, 0, census_worker_thread, work, 0, NULL);
+    if (thread) {
+        g_census.handles[g_census.handle_count++] = thread;
+        g_census.build_thread = thread;
+    } else {
+        census_work_free(work);
+        ui_log(L"UI: census worker CreateThread failed (0x%08X).",
+               (unsigned)GetLastError());
+    }
+}
+
+static DWORD WINAPI census_worker_thread(LPVOID param)
+{
+    CensusWork *work = (CensusWork *)param;
+    BOOL posted;
+
+    /* The session's lifetime (open, topology, census, probes, close) is
+       inside the enum call; this thread owns the COM apartment. */
+    hcn_enum_internal_switches(&work->req, &work->census);
+
+    /* The one lock take covers the post itself: PostMessageW is bounded
+       and non-blocking. io_complete is stored ONLY on a successful post
+       (SET means the message is queued and the handler will run); a FALSE
+       post frees the payload, sets NOTHING, and exits with worker_active
+       still TRUE and the handle signalled - exactly the state the expiry's
+       handle probe arm exists for. */
+    EnterCriticalSection(&g_census.lock);
+    posted = PostMessageW(g_hwnd_main, WM_CENSUS_DONE, (WPARAM)work->token,
+                          (LPARAM)work);
+    if (posted)
+        g_census.io_complete = TRUE;
+    LeaveCriticalSection(&g_census.lock);
+    if (!posted) {
+        ui_log(L"UI: census completion post failed; build dropped.");
+        census_work_free(work);
+    }
+    return 0;
+}
+
+/* The fixed-size UNAVAILABLE envelope for the census message (overflow,
+   allocation failure, the expiry, and the request entry's terminal
+   publish): a post is always emitted, never partial JSON, and the
+   generation (already taken under the lock) guarantees the store consumes
+   it. */
+static void census_post_unavailable(UINT64 generation, const wchar_t *reason)
+{
+    wchar_t env[512];
+    JsonBuilder jb;
+
+    jb_init(&jb, env, ARRAYSIZE(env));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"internalSwitchCensus");
+    jb_int(&jb, L"generation", (int)(generation & 0x7FFFFFFF));
+    jb_string(&jb, L"state", L"unavailable");
+    jb_string(&jb, L"reason", reason);
+    jb_array_begin(&jb, L"switches");
+    jb_array_end(&jb);
+    jb_object_end(&jb);
+    if (jb.overflow)
+        return;   /* the fixed envelope cannot overflow; defensive only */
+    webview2_post(env);
+}
+
+/* Record a terminal result under the manager lock and defer its WebView
+   delivery until the caller releases that lock. A handler can produce at
+   most two notices (for example, an expired worker followed by a failed
+   follow-up timer arm); the batch preserves their generation order. */
+static void census_queue_unavailable_locked(const wchar_t *reason,
+                                            CensusNoticeBatch *notices)
+{
+    UINT64 generation = ++g_census.generation;
+
+    g_census.cached_valid = TRUE;
+    g_census.cache_time = GetTickCount64() - CENSUS_TTL_MS - 1;
+    g_census.published_once = TRUE;
+    g_census.deadline_fired = TRUE;
+
+    if (notices && notices->count < ARRAYSIZE(notices->items)) {
+        notices->items[notices->count].generation = generation;
+        notices->items[notices->count].reason = reason;
+        notices->count++;
+    } else {
+        /* Capacity is sized for the maximum transitions in one UI event.
+           Preserve fail-closed behavior if a future caller exceeds it. */
+        ui_log(L"UI: census unavailable notice batch is full.");
+    }
+}
+
+static void census_flush_notices(CensusNoticeBatch *notices)
+{
+    size_t i;
+    if (!notices)
+        return;
+    for (i = 0; i < notices->count; i++)
+        census_post_unavailable(notices->items[i].generation,
+                                notices->items[i].reason);
+    notices->count = 0;
+}
+
+/* Serialize the census message (schema: swClass 0=Internal 1=External
+   2=Private 3=Unclassified; verdict 0=Owned 1=Borrowed 2=Rejected
+   3=Unknown - the integers are an ABI, never reordered). Heap buffer with
+   the overflow-suppress: on overflow or allocation failure the fixed
+   unavailable envelope (same generation) is posted instead - never a
+   silent drop, never partial JSON. */
+static void census_post_census(const HcnInternalSwitchCensus *c,
+                               UINT64 generation)
+{
+    wchar_t *buf;
+    JsonBuilder jb;
+    size_t i;
+
+    buf = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                               131072 * sizeof(wchar_t));
+    if (!buf) {
+        census_post_unavailable(generation, L"census message allocation failed");
+        return;
+    }
+    jb_init(&jb, buf, 131072);
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"internalSwitchCensus");
+    jb_int(&jb, L"generation", (int)(generation & 0x7FFFFFFF));
+    switch (c->state) {
+    case HCN_CENSUS_OK:      jb_string(&jb, L"state", L"ok"); break;
+    case HCN_CENSUS_EMPTY:   jb_string(&jb, L"state", L"empty"); break;
+    default:                 jb_string(&jb, L"state", L"unavailable"); break;
+    }
+    jb_string(&jb, L"reason", c->reason_text);
+    jb_array_begin(&jb, L"switches");
+    for (i = 0; i < c->count; i++) {
+        const HcnInternalSwitchEntry *e = &c->entries[i];
+        if (i > 0) jb_append(&jb, L",");
+        jb_object_begin(&jb);
+        jb_string(&jb, L"name", e->name);
+        jb_int(&jb, L"swClass", (int)e->sw_class);
+        jb_string(&jb, L"type", e->type);
+        jb_int(&jb, L"verdict", (int)e->verdict);
+        jb_bool(&jb, L"nameUnusable", e->name_unusable);
+        jb_bool(&jb, L"inDuplicateGroup", e->in_duplicate_name_group);
+        jb_bool(&jb, L"deferEligible", e->defer_eligible);
+        jb_bool(&jb, L"selectable", e->selectable);
+        jb_string(&jb, L"reason", e->reason_text);
+        jb_object_end(&jb);
+    }
+    jb_array_end(&jb);
+    jb_object_end(&jb);
+    if (jb.overflow) {
+        ui_log(L"UI: census message exceeded the buffer; suppressed.");
+        census_post_unavailable(generation, L"census message too large");
+    } else {
+        webview2_post(buf);
+    }
+    HeapFree(GetProcessHeap(), 0, buf);
+}
+
+/* The completion handler's commit/discard/follow-up, all under one hold;
+   the delivery (webview post) and the frees run after it. */
+static void census_on_done(WPARAM wp, LPARAM lp)
+{
+    CensusWork *work = (CensusWork *)lp;
+    const HcnInternalSwitchCensus *to_post = NULL;
+    CensusWork *to_free = NULL;
+    CensusNoticeBatch notices = {0};
+    UINT64 gen = 0;
+
+    EnterCriticalSection(&g_census.lock);
+    if ((UINT64)wp != g_census.active_token) {
+        /* A stale message: take its payload for freeing, do nothing else
+           (an older build's completion must neither kill the new timer
+           nor publish over it). */
+        to_free = work;
+    } else {
+        /* A matching completion owns this token's timer. Kill it before
+           committing or starting a follow-up so a queued WM_TIMER cannot
+           act on the next build. Stale completions never touch this ID. */
+        if (g_census.armed_timer_id) {
+            KillTimer(g_hwnd_main, (UINT_PTR)g_census.armed_timer_id);
+            g_census.armed_timer_id = 0;
+        }
+        if (!g_census.closing &&
+            work->build_epoch == g_census.invalidation_epoch) {
+            /* Commit: the generation is taken here (under the lock, at the
+               moment the payload is produced - before serialization). The
+               work payload stays alive through the post; the cache stores
+               metadata only, so a follow-up cannot invalidate to_post. */
+            gen = ++g_census.generation;
+            g_census.cached_valid = TRUE;
+            g_census.cache_time = GetTickCount64();
+            to_post = &work->census;
+            g_census.published_once = TRUE;
+        } else {
+            /* Discard (a cancelled build's abort, or closing): no cache
+               write; the payload is freed below. The notification is still
+               consumed - "no post" never means no control notification. */
+            to_free = work;
+            work = NULL;
+        }
+        /* The follow-up decision: a kick that landed while the build ran
+           set pending_request; exactly one follow-up starts now (the
+           launch keeps the slot taken), else the slot frees. */
+        if (g_census.pending_request && !g_census.closing)
+            census_launch_locked(&notices);
+        else {
+            g_census.worker_active = FALSE;
+            g_census.build_thread = NULL;
+        }
+        if (work && work != to_free)
+            to_free = work;   /* the shell (store) always frees */
+    }
+    LeaveCriticalSection(&g_census.lock);
+
+    /* Deliver after the hold. */
+    if (to_post)
+        census_post_census(to_post, gen);
+    if (to_free)
+        census_work_free(to_free);
+    census_flush_notices(&notices);
+}
+
+/* The request entry (the ping or the consult), shared shape: the ghost
+   probe runs FIRST and only when the build has NOT delivered (io_complete
+   SET means the completion message is queued and the handler will run - a
+   normally-exited worker in the [post, handler] sliver is NOT a ghost; a
+   SIGNALED/NULL build_thread with the flag clear is). A dead undelivered
+   token whose deadline never fired gets its terminal published FIRST (one
+   UNAVAILABLE, one generation, published_once, deadline_fired SET - an
+   already-finalized token is not re-published), then the slot clears in
+   the same hold and the request's own tail launches directly. The ping
+   additionally invalidates (only once published_once) and unconditionally
+   queues; the consult is a genuine request only when the cache is expired
+  or never built (cache-first answers a fresh consult; the web already
+  holds that payload). Notice batches carry fixed envelopes for posting
+  after the hold. */
+static void census_request_locked(BOOL is_ping, CensusNoticeBatch *notices)
+{
+    BOOL genuine;
+
+    genuine = is_ping || !g_census.cached_valid ||
+              GetTickCount64() - g_census.cache_time >= CENSUS_TTL_MS;
+    if (!genuine)
+        return;
+
+    if (g_census.worker_active && !g_census.io_complete &&
+        (!g_census.build_thread ||
+         WaitForSingleObject(g_census.build_thread, 0) == WAIT_OBJECT_0)) {
+        if (!g_census.deadline_fired)
+            census_queue_unavailable_locked(
+                L"Internal: host inventory unavailable (the census build "
+                L"did not deliver).", notices);
+        g_census.worker_active = FALSE;
+        g_census.build_thread = NULL;
+    }
+
+    if (is_ping) {
+        /* A PING: evidence that the DISPLAYED data is wrong. Invalidates
+           (only once a terminal payload has been published - during the
+           first wait there is no displayed list to be wrong, and the
+           in-flight build's result is the first answer), and queues the
+           correction unconditionally. */
+        if (g_census.published_once)
+            g_census.invalidation_epoch++;
+        g_census.pending_request = TRUE;
+    }
+
+    /* The arms (the request IS the request: the tail launches directly,
+     no follow-up rule): !worker_active -> launch (gated !closing; the
+     fall-through of a cleared ghost and the ordinary free case share this
+     ONE step); the in-flight build can no longer publish or the staged
+     priorities changed -> set pending_request (the handler's follow-up
+     runs it when the slot frees); otherwise -> merge, do nothing - the
+     in-flight build answers this request. */
+    if (!g_census.worker_active) {
+        if (!g_census.closing)
+            census_launch_locked(notices);
+    } else if (g_census.build_epoch != g_census.invalidation_epoch ||
+               g_census.priorities_dirty) {
+        g_census.pending_request = TRUE;
+    }
+}
+
+static void census_on_stale(void)
+{
+    CensusNoticeBatch notices = {0};
+
+    EnterCriticalSection(&g_census.lock);
+    if (g_census.closing) {
+        LeaveCriticalSection(&g_census.lock);
+        return;
+    }
+    census_stage_priorities_locked();
+    census_request_locked(TRUE, &notices);
+    LeaveCriticalSection(&g_census.lock);
+    census_flush_notices(&notices);
+}
+
+/* The dropdown consult (the frontend's getInternalSwitches): cache-first
+   - the web holds its copy and renders it (or its pending state); the
+   host side stages the priorities and kicks a rebuild only when the cache
+   is expired or never built. */
+static void census_on_consult(void)
+{
+    CensusNoticeBatch notices = {0};
+
+    if (!g_census.initialized)
+        return;
+    EnterCriticalSection(&g_census.lock);
+    if (g_census.closing) {
+        LeaveCriticalSection(&g_census.lock);
+        return;
+    }
+    census_stage_priorities_locked();
+    census_request_locked(FALSE, &notices);
+    LeaveCriticalSection(&g_census.lock);
+    census_flush_notices(&notices);
+}
+
+/* The WM_TIMER watchdog: the FIRST test is the message's own ID against
+   armed_timer_id (read under the census lock; a mismatch is a stale tick
+   from a killed predecessor: kill wParam's timer and return, nothing
+   else - WM_TIMER carries only an ID, so a token test is meaningless for
+   it). A matching tick with deadline_fired SET is a supervision tick (the
+   probe alone); CLEAR is the first deadline (the full finalize). */
+static void census_on_timer(HWND hwnd, WPARAM wp)
+{
+    CensusNoticeBatch notices = {0};
+
+    EnterCriticalSection(&g_census.lock);
+
+    if ((UINT_PTR)wp != g_census.armed_timer_id) {
+        KillTimer(hwnd, (UINT_PTR)wp);
+        LeaveCriticalSection(&g_census.lock);
+        return;
+    }
+
+    if (g_census.deadline_fired) {
+        /* A supervision tick: the guard's skip conditions, then the probe
+           alone - NEVER the full finalize (no publish, no epoch bump, no
+           cancel, no launch: those are the first finalize's one-time
+           actions). LIVE handle => re-arm a fresh never-reused ID on the
+           same token; GONE => clear the slot, run the follow-up rule, do
+           not re-arm. */
+        if (g_census.closing || !g_census.worker_active || g_census.io_complete) {
+            /* Disarmed by the matching completion (the handler's commit
+               killed the timer, but a queued tick still lands), by a new
+               launch, or by closing: kill and disarm. */
+            KillTimer(hwnd, (UINT_PTR)wp);
+            g_census.armed_timer_id = 0;
+        } else if (!g_census.build_thread ||
+                   WaitForSingleObject(g_census.build_thread, 0) == WAIT_OBJECT_0) {
+            KillTimer(hwnd, (UINT_PTR)wp);
+            g_census.armed_timer_id = 0;
+            g_census.worker_active = FALSE;
+            g_census.build_thread = NULL;
+            if (g_census.pending_request && !g_census.closing)
+                census_launch_locked(&notices);
+        } else {
+            /* Not proven exited: re-arm a fresh probe-only watchdog ID. */
+            KillTimer(hwnd, (UINT_PTR)wp);
+            g_census.armed_timer_id = 0;
+            if (!census_arm_timer_locked(hwnd))
+                ui_log(L"UI: census supervision SetTimer failed (0x%08X); "
+                       L"worker remains tracked.", (unsigned)GetLastError());
+        }
+        LeaveCriticalSection(&g_census.lock);
+        census_flush_notices(&notices);
+        return;
+    }
+
+    /* The first deadline's guard: io_complete SET (the message is queued,
+       the handler will run - flushing now would be a FALSE timeout),
+       worker_active clear, or closing - skip the finalize, kill only. */
+    if (g_census.io_complete || !g_census.worker_active || g_census.closing) {
+        KillTimer(hwnd, (UINT_PTR)wp);
+        g_census.armed_timer_id = 0;
+        LeaveCriticalSection(&g_census.lock);
+        return;
+    }
+
+    /* The finalize (one hold): the generation is taken here; the cache
+       entry is the fixed UNAVAILABLE payload with an EXPIRED TTL; the
+       epoch increments (a late physical completion fails its build_epoch
+       check and is discarded); the cancel event is signalled (a worker
+       between queries exits and releases the slot); deadline_fired SET;
+       wParam's timer killed (a SetTimer timer is periodic until killed);
+       the live-handle branch re-arms a fresh never-reused ID as a
+       probe-only supervision timer; a GONE handle clears the slot and
+       runs the follow-up rule. The fixed envelope's webview post runs
+       AFTER the hold. */
+    census_queue_unavailable_locked(
+        L"Internal: host inventory unavailable (the census build did not "
+        L"deliver within its deadline).", &notices);
+    g_census.deadline_fired = TRUE;
+    g_census.invalidation_epoch++;
+    if (g_census.cancel_event)
+        SetEvent(g_census.cancel_event);
+    KillTimer(hwnd, (UINT_PTR)wp);
+    g_census.armed_timer_id = 0;
+
+    if (g_census.build_thread &&
+        WaitForSingleObject(g_census.build_thread, 0) != WAIT_OBJECT_0) {
+        /* LIVE: re-arm the probe-only supervision timer (fresh ID, same
+           token - the token cannot discriminate, deadline_fired does). */
+        if (!census_arm_timer_locked(hwnd))
+            ui_log(L"UI: census supervision SetTimer failed (0x%08X); "
+                   L"worker remains tracked.", (unsigned)GetLastError());
+    } else {
+        /* GONE (a failed post, a crash, a CreateThread failure): the slot
+           frees; the follow-up rule runs; a LONE timeout still starts
+           nothing. */
+        g_census.worker_active = FALSE;
+        g_census.build_thread = NULL;
+        if (g_census.pending_request && !g_census.closing)
+            census_launch_locked(&notices);
+    }
+    LeaveCriticalSection(&g_census.lock);
+
+    census_flush_notices(&notices);
+}
+
+/* The WM_DESTROY drain: two brief lock holds with the wait between them
+   lock-free (the worker's one lock take - the post - sits inside the
+   window being waited; a wait under the lock deadlocks every shutdown
+   with an in-flight build). BOTH outcomes at the budget are passes:
+   within it the worker exits and the unload proceeds; at expiry the drain
+   ABANDONS the unload (asb_inhibit_hcn_unload + the module reclaimed at
+   process exit) - and nothing the abandoned worker can still touch is
+   destroyed: the lock is never deleted, the event never closed, the
+   manager's fields are static storage, the remaining handles stay open. */
+static void census_drain(HWND hwnd)
+{
+    HANDLE live[ARRAYSIZE(g_census.handles)];
+    size_t count = 0;
+    size_t i;
+    ULONGLONG deadline;
+    BOOL timed_out = FALSE;
+
+    if (!g_census.initialized)
+        return;
+
+    /* Hold 1: closing, the armed timer killed, the cancel event and the
+       live handle set taken; cache metadata cleared (UI-thread-only). */
+    EnterCriticalSection(&g_census.lock);
+    g_census.closing = TRUE;
+    if (g_census.armed_timer_id) {
+        KillTimer(hwnd, (UINT_PTR)g_census.armed_timer_id);
+        g_census.armed_timer_id = 0;
+    }
+    census_prune_handles_locked();
+    memcpy(live, g_census.handles, g_census.handle_count * sizeof(HANDLE));
+    count = g_census.handle_count;
+    g_census.cached_valid = FALSE;
+    LeaveCriticalSection(&g_census.lock);
+
+    /* Signal the cancel event - NO LOCK HELD. */
+    if (g_census.cancel_event)
+        SetEvent(g_census.cancel_event);
+
+    /* The single-budget wait over every live handle (lock-free). */
+    deadline = GetTickCount64() + CENSUS_DRAIN_WAIT_MS;
+    if (count > 0) {
+        for (;;) {
+            ULONGLONG remaining = deadline - GetTickCount64();
+            DWORD wait_rc;
+            size_t n = count > 64 ? 64 : count;   /* the API's hard cap */
+            if (remaining > CENSUS_DRAIN_WAIT_MS) {   /* underflow: expired */
+                wait_rc = WAIT_TIMEOUT;
+            } else if (remaining == 0) {
+                wait_rc = WAIT_TIMEOUT;
+            } else {
+                wait_rc = WaitForMultipleObjects((DWORD)n, live, TRUE,
+                                                  (DWORD)remaining);
+            }
+            if (wait_rc == WAIT_OBJECT_0)
+                break;
+            if (wait_rc == WAIT_TIMEOUT && GetTickCount64() >= deadline)
+                break;
+            if (wait_rc == WAIT_FAILED)
+                break;
+        }
+        /* Elapsed time never proves thread exit, including after a failed
+           wait. Probe each captured handle; any unknown/unsignaled result
+           inhibits HCN unload. */
+        for (i = 0; i < count; i++) {
+            if (WaitForSingleObject(live[i], 0) != WAIT_OBJECT_0) {
+                timed_out = TRUE;
+                break;
+            }
+        }
+    }
+
+    /* Hold 2: prune the set (zero-timeout probes + CloseHandle on the
+       exits; a wedged handle stays open for the OS). */
+    EnterCriticalSection(&g_census.lock);
+    census_prune_handles_locked();
+    LeaveCriticalSection(&g_census.lock);
+
+    /* PeekMessage-drain any already-queued census payloads on the UI
+       thread and free them (the closing handler is not a no-op: it frees
+       and starts nothing; a notification posted after the budget expired
+       belongs to the abandoned branch - nothing will consume it, the same
+       accepted trade-off as the abandoned thread itself). */
+    {
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, WM_CENSUS_DONE, WM_CENSUS_DONE,
+                            PM_REMOVE)) {
+            CensusWork *work = (CensusWork *)msg.lParam;
+            census_work_free(work);
+        }
+        while (PeekMessageW(&msg, NULL, WM_CENSUS_STALE, WM_CENSUS_STALE,
+                            PM_REMOVE)) {
+            /* dropped: closing ignores pings */
+        }
+    }
+
+    if (timed_out) {
+        ui_log(L"UI: census worker did not exit within %lu ms; the HCN "
+               L"module stays loaded (reclaimed at process exit).",
+               (unsigned long)CENSUS_DRAIN_WAIT_MS);
+        asb_inhibit_hcn_unload();
+    }
+}
+
+/* Initialize the manager (UI init, before any worker thread exists - the
+   thread-creation barrier is the publication fence for the stale-ping
+   callback pair). */
+static void census_init(void)
+{
+    InitializeCriticalSection(&g_census.lock);
+    g_census.cancel_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_census.initialized = TRUE;
+    asb_set_census_stale_callback(census_stale_cb, NULL);
+}
+
 /* ---- Window creation ---- */
 
 HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
@@ -1414,6 +2385,12 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
     asb_set_progress_callback(ui_progress_callback, NULL);
     asb_set_alert_callback(ui_alert_callback, NULL);
     asb_set_vm_removed_callback(ui_vm_removed_callback, NULL);
+
+    /* The census manager's one-time init: the CRITICAL_SECTION, the
+       manual-reset cancel event, and the stale-ping registration - before
+       any worker thread exists (the thread-creation barrier is the
+       publication fence for the callback pair). */
+    census_init();
 
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
@@ -1711,6 +2688,24 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_CENSUS_DONE:
+        /* The census worker's completion notification (posted, never
+           sent): the handler owns the publish/discard/launch decision. */
+        census_on_done(wp, lp);
+        return 0;
+
+    case WM_CENSUS_STALE:
+        /* The acquire's failure ping, marshaled from the worker thread:
+         invalidates the TTL and queues a rebuild. */
+        census_on_stale();
+        return 0;
+
+    case WM_TIMER:
+        /* The census watchdog (every WM_TIMER in this window belongs to
+           it; the ID test drops stale ticks from killed predecessors). */
+        census_on_timer(hwnd, wp);
+        return 0;
+
     case WM_SHOW_ALERT:
     {
         wchar_t *msg_text = (wchar_t *)lp;
@@ -1778,6 +2773,12 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
     {
         int i;
+        /* The census drain runs FIRST: it signals the worker's cancel
+           event, waits the single bounded budget (lock-free), prunes,
+           drains queued payloads, and on a timeout abandons the HCN
+           unload (asb_cleanup then skips hcn_cleanup/FreeLibrary - never
+           unload code under a live thread). */
+        census_drain(hwnd);
         tray_remove();
         webview2_cleanup();
         for (i = 0; i < ASB_MAX_VMS; i++) {

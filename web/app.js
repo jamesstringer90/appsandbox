@@ -135,7 +135,7 @@ window.onHostMessage = function(msg) {
     if (!msg || typeof msg !== 'object') return;
     switch (msg.type) {
         case 'fullState':     onFullState(msg); break;
-        case 'vmListChanged': updateVmList(msg.vms); renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); break;
+        case 'vmListChanged': updateVmList(msg.vms); hasRendered = true; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); break;
         case 'vmStateChanged': onVmStateChanged(msg); break;
         case 'snapListChanged': break; /* snapshots now inline in vmListChanged */
         case 'log':           appendLog(msg.message); break;
@@ -144,13 +144,14 @@ window.onHostMessage = function(msg) {
         case 'diskDirectoryBrowseResult': onDiskDirectoryBrowseResult(msg.path); break;
         case 'diskSpace':     onDiskSpace(msg); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
-        case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
         case 'alert':         showModal('Error', msg.message, 'OK'); break;
         case 'prereqRequired': onPrereqRequired(); break;
         case 'prereqReboot':   onPrereqReboot(); break;
         case 'prereqProgress': onPrereqProgress(msg); break;
         case 'prereqResult':   onPrereqResult(msg); break;
+        case 'internalSwitchCensus': onInternalSwitchCensus(msg); break;
+        case 'stateUnavailable': onStateUnavailable(msg); break;
     }
 };
 
@@ -166,11 +167,16 @@ if (hostBridge.isWebView2) {
 
 function onFullState(msg) {
     updateVmList(msg.vms || []);
+    if (msg.adapters) populateAdapters(msg.adapters, msg.defaultAdapter);
     renderVmTable();
     revalidateVmName();
     if (msg.hostInfo) updateHostInfo(msg.hostInfo);
-    if (msg.adapters) populateAdapters(msg.adapters, msg.defaultAdapter);
     if (msg.templates) populateTemplates(msg.templates);
+    /* The first successfully processed fullState paints the table and
+       latches hasRendered; fullStateDelivered gates the additive
+       state-unavailable notice (the startup envelope is complete). */
+    hasRendered = true;
+    fullStateDelivered = true;
     if (!minSizeReported) {
         minSizeReported = true;
         setTimeout(reportMinSize, 50);
@@ -330,9 +336,343 @@ function populateAdapters(adapters, defaultIdx) {
             sel.appendChild(opt);
         });
     }
-    if (typeof defaultIdx === 'number' && defaultIdx >= 0 && defaultIdx < sel.options.length) {
-        sel.selectedIndex = defaultIdx;
+    /* (Auto) is index 0 and stays the default: switching to
+       External preserves Auto; a non-empty default adapter is never
+       pinned here. */
+    sel.selectedIndex = (typeof defaultIdx === 'number' && defaultIdx >= 0 && defaultIdx < sel.options.length)
+        ? defaultIdx : 0;
+    if (editVmState && !hostBridge.isMac)
+        populateEditVmAdapters(document.getElementById('edit-net-adapter').value);
+}
+
+/* ---- Internal vSwitch census ---- */
+
+/* The disabled sentinel option's value: a string the backend's shared
+   selector rule REJECTS (length at/above the cap). It is never submitted
+   (editVmValues omits the field while the select holds it), and a leaked
+   submit would be E_INVALIDARG and would not persist. Not a reserved
+   name: other control characters are legal selector characters, and
+   "(Auto)" stays unreserved. */
+var INVALID_SENTINEL = new Array(300).join('x');
+
+var internalSwitches = null;    /* the last census payload (state+switches) */
+var censusGeneration = -1;      /* non-increasing arrivals are ignored */
+var hasRendered = false;        /* any successful render (list or full state) */
+var fullStateDelivered = false; /* the first successful fullState alone */
+
+function censusAuthoritative() {
+    return !!internalSwitches &&
+        (internalSwitches.state === 'ok' || internalSwitches.state === 'empty');
+}
+
+/* E2's stored-name matching predicate, one implementation everywhere:
+   case-insensitive equality, name-unusable entries excluded (the same
+   exclusion the backend's resolver applies). */
+function censusEntryMatches(entry, name) {
+    if (!entry || entry.nameUnusable) return false;
+    return entry.name.toLowerCase() === name.toLowerCase();
+}
+
+/* The matched-entry + duplicate counts for a stored selector. */
+function censusLookup(name) {
+    var result = { all: [], internalUnclassified: 0, privateOwn: null, external: null };
+    if (!internalSwitches || !internalSwitches.switches || !name) return result;
+    internalSwitches.switches.forEach(function(e) {
+        if (!censusEntryMatches(e, name)) return;
+        result.all.push(e);
+        if (e.swClass === 0 || e.swClass === 3) result.internalUnclassified++;
+        if (e.swClass === 2 && e.deferEligible) result.privateOwn = e;
+        if (e.swClass === 1) result.external = e;
+    });
+    return result;
+}
+
+/* The entry's concise clause, printed as the cell/option title - never
+   re-derived here (the backend's resolver owns every reason). */
+function censusEntryReason(e) {
+    return (e && e.reason) ? e.reason : '';
+}
+
+/* Prefer the resolver's most informative entry for a stored name:
+   incomplete classification takes precedence, then terminal Internal,
+   terminal External, and finally a DEFER-eligible Private shadow. */
+function censusPreferredMatch(lookup) {
+    var order = [3, 0, 1, 2];
+    var i, j;
+    for (i = 0; i < order.length; i++) {
+        for (j = 0; j < lookup.all.length; j++) {
+            if (lookup.all[j].swClass === order[i]) return lookup.all[j];
+        }
     }
+    return null;
+}
+
+/* The Internal attachment cell: switch/(Auto) plus the INVALID shape. The
+   tint is computed from the matched census entry's class/verdict/uniqueness
+   on authoritative states only (never a claim for an unprobed entry). */
+function makeInternalSwitchCell(vm) {
+    var td = document.createElement('td');
+    if (vm.internalSwitchInvalid) {
+        td.textContent = '(invalid — select a switch)';
+        td.className = 'switch-invalid';
+        td.title = 'The stored switch name in the configuration is invalid; '
+                 + 're-select the switch before starting';
+        return td;
+    }
+    var sw = vm.internalSwitch || '';
+    if (!sw) {
+        td.textContent = '(Auto)';
+        td.title = 'Internal networking uses the built-in AppSandboxInternal switch (Auto)';
+        return td;
+    }
+    td.textContent = sw;
+    if (!censusAuthoritative()) {
+        td.title = 'Joined internal switch (list unavailable)';
+        return td;   /* no tint, no claim without an authoritative census */
+    }
+    var lookup = censusLookup(sw);
+    var match = censusPreferredMatch(lookup);
+    var own = (match && match.swClass === 2 && lookup.privateOwn &&
+               lookup.privateOwn.name.toLowerCase() === sw.toLowerCase())
+        ? lookup.privateOwn : null;
+    if (lookup.internalUnclassified > 1) {
+        td.className = 'switch-warn';
+        td.title = censusEntryReason(match) ||
+                   'Duplicate switch name — cannot resolve which switch this is';
+        return td;
+    }
+    if (match && match.swClass === 1) {
+        td.className = 'switch-warn';
+        td.title = censusEntryReason(match) || 'This switch is an external switch; Internal cannot join it';
+        return td;
+    }
+    if (match && match.swClass === 3) {
+        td.className = 'switch-warn';
+        td.title = censusEntryReason(match) || 'Switch could not be classified';
+        return td;
+    }
+    if (match && match.swClass === 0 && match.verdict === 2) {
+        td.className = 'switch-warn';
+        td.title = censusEntryReason(match) || 'The switch was rejected by the host network';
+        return td;
+    }
+    if (match && match.swClass === 0) {
+        td.title = match.type === 'ICS'
+            ? 'Joined internal switch (ICS: the host provides DHCP)'
+            : 'Joined internal switch';
+        return td;   /* BORROWED or unprobed UNKNOWN: no tint, no claim */
+    }
+    if (own && own.verdict === 2) {
+        td.className = 'switch-warn';
+        td.title = censusEntryReason(own) || 'This switch is not selectable for this VM';
+        return td;
+    }
+    if (own) {
+        /* This VM's own stored selector, DEFER-eligible: unprobed or
+           probe-failed stays UNKNOWN (displayed, no tint, no claim);
+           probed verdicts carry their own clause above. */
+        td.title = 'Joined internal switch';
+        return td;
+    }
+    if (match && match.swClass === 2) {
+        td.className = 'switch-warn';
+        td.title = censusEntryReason(match) || 'This switch has no host adapter to join';
+        return td;
+    }
+    td.className = 'switch-warn';
+    td.title = 'No internal switch with this name on the host';
+    return td;
+}
+
+/* The mode-aware projection of the dialog's stored state: only the
+   selector has shapes that are not its stored string (INVALID, and a
+   stored value on a row whose mode is not Internal - the control seeds
+   and compares it as '' on those rows, the adapter seed's rule). */
+function editVmFieldState(vm, field) {
+    if (!vm) return '';
+    if (field !== 'internalSwitch') return vm[field];
+    if (vm.networkMode !== 3) return '';
+    return vm.internalSwitchInvalid ? INVALID_SENTINEL : (vm.internalSwitch || '');
+}
+
+/* Re-populate the Internal switch select (the create form or the dialog)
+   from the census: the option walk runs for BOTH authoritative states
+   (ok and empty); the create form offers {INTERNAL ∪ UNCLASSIFIED} only
+   and NEVER a PRIVATE entry (deferEligible is ignored there); the dialog
+   additionally offers the VM's own DEFER-eligible PRIVATE selector.
+   Duplicate-name groups merge into ONE disabled option; the product
+   OWNED-verdict entries and the sentinel-named "(Auto)" entry are never
+   offered. The stored value is always present (enabled or disabled). */
+function populateInternalSwitchSelect(sel, vm, selectValue) {
+    var seed = vm ? editVmFieldState(vm, 'internalSwitch') : '';
+    sel.innerHTML = '';
+
+    var auto = document.createElement('option');
+    auto.value = '';
+    auto.textContent = '(Auto)';
+    sel.appendChild(auto);
+
+    if (vm && vm.internalSwitchInvalid) {
+        var sent = document.createElement('option');
+        sent.value = INVALID_SENTINEL;
+        sent.textContent = '— select a switch —';
+        sent.disabled = true;
+        sel.appendChild(sent);
+    }
+
+    var offered = Object.create(null);
+    if (internalSwitches && internalSwitches.switches &&
+        (internalSwitches.state === 'ok' || internalSwitches.state === 'empty')) {
+        internalSwitches.switches.forEach(function(e) {
+            if (e.nameUnusable) return;
+            if (e.verdict === 0) return;                  /* product OWNED: hidden */
+            if (e.swClass === 1 || e.swClass === 2) {
+                if (e.swClass === 2 && vm && e.deferEligible &&
+                    vm.internalSwitch &&
+                    e.name.toLowerCase() === vm.internalSwitch.toLowerCase()) {
+                    /* the per-VM DEFER offer: the VM's own stored selector only */
+                } else {
+                    return;
+                }
+            }
+            var key = e.name.toLowerCase();
+            var prior = offered[key];
+            if (prior) {
+                prior.option.disabled = true;
+                if (e.reason && !prior.reason) {
+                    prior.reason = e.reason;
+                    prior.option.textContent = prior.baseText + ' (' + e.reason + ')';
+                } else if (!prior.reason &&
+                           prior.option.textContent.indexOf('(duplicate name') < 0) {
+                    prior.option.textContent = prior.baseText +
+                        ' (duplicate name — cannot resolve)';
+                }
+                return;
+            }
+            var opt = document.createElement('option');
+            opt.value = e.name;
+            var baseText = e.name === '(Auto)'
+                ? '(Auto) — an actual switch' : e.name;
+            opt.textContent = baseText;
+            opt.disabled = e.inDuplicateGroup || e.verdict === 2 || e.selectable === false;
+            if (opt.disabled && e.reason) opt.textContent += ' (' + e.reason + ')';
+            else if (opt.disabled && e.inDuplicateGroup)
+                opt.textContent += ' (duplicate name — cannot resolve)';
+            else if (opt.disabled)
+                opt.textContent += ' (not selectable)';
+            offered[key] = { option: opt, baseText: baseText, reason: e.reason || '' };
+            sel.appendChild(opt);
+        });
+    } else if (internalSwitches && internalSwitches.state === 'unavailable') {
+        var un = document.createElement('option');
+        un.value = '';
+        un.textContent = '(list unavailable)';
+        un.disabled = true;
+        sel.appendChild(un);
+    } else {
+        var pend = document.createElement('option');
+        pend.value = '';
+        pend.textContent = '(loading switches…)';
+        pend.disabled = true;
+        sel.appendChild(pend);
+    }
+
+    /* The stored value is always present (a fallback option when not
+       otherwise offered), but INSERTING an option must never move the
+       selection off (Auto): the value to SELECT is the control's current
+       value (the projection at open, sel.value on a census arrival). */
+    if (seed && seed !== INVALID_SENTINEL) {
+        var has = Array.prototype.some.call(sel.options, function(o) {
+            return o.value === seed;
+        });
+        if (!has) {
+            var fallback = document.createElement('option');
+            fallback.value = seed;
+            var m = censusLookup(seed);
+            var fbEntry = censusPreferredMatch(m);
+            fallback.textContent = fbEntry && censusEntryReason(fbEntry)
+                ? seed + ' (' + censusEntryReason(fbEntry) + ')'
+                : (censusAuthoritative()
+                    ? seed + (fbEntry ? ' (not selectable)' : ' (not present)')
+                    : seed);
+            fallback.disabled = true;
+            sel.appendChild(fallback);
+        }
+    }
+    /* The value to SELECT is the control's current value on a census
+       arrival (selectValue), the seed at open, (Auto) for the create
+       form. Inserting the stored-name option must never move the
+       selection off (Auto) on a NAT row (the projection seeds '' there,
+       so no fallback is inserted and the control's own value stands). */
+    var want = (selectValue !== undefined) ? selectValue : (seed || '');
+    if (want !== '' && want !== INVALID_SENTINEL &&
+        !Array.prototype.some.call(sel.options, function(o) { return o.value === want; }))
+        want = '';
+    sel.value = want;
+    if (sel.selectedIndex < 0) sel.value = '';
+}
+
+/* The census arrival: generation ordering (non-increasing arrivals are
+   ignored); the newest payload replaces the store; the table re-renders
+   (the row signature carries the census generation:state so exactly the
+   affected cells rebuild); an open dialog re-populates its select in
+   place, preserving the current selection (the sentinel rebuilt first on
+   an INVALID row so the preserved selection always has an option). */
+function onInternalSwitchCensus(msg) {
+    if (typeof msg.generation !== 'number' || msg.generation <= censusGeneration)
+        return;
+    censusGeneration = msg.generation;
+    internalSwitches = { state: msg.state, reason: msg.reason || '',
+                         switches: msg.switches || [] };
+    renderVmTable();
+    if (!hostBridge.isMac) {
+        populateInternalSwitchSelect(document.getElementById('net-internal-switch'),
+                                     null, undefined);
+        if (editVmState) {
+            var vm = vms[vmIndexByName(editVmState.name)];
+            var sel = document.getElementById('edit-internal-switch');
+            if (valuesNetworkMode() === 3)
+                populateInternalSwitchSelect(sel, vm, sel.value);
+        }
+    }
+}
+
+/* The suppress envelope from either VM-list consumer: never a silent
+   drop. With a rendered table the display is KEPT (the refresh case);
+   a source:"fullState" suppression with the startup envelope never
+   delivered surfaces the one-line notice ADDITIVELY beside the kept
+   table; with nothing rendered at all the one-line notice replaces the
+   blank window. */
+function onStateUnavailable(msg) {
+    var reason = (msg.reason === 'allocFailed')
+        ? 'state could not be allocated' : 'state is too large to display';
+    if (!hasRendered) {
+        var tbody = document.getElementById('vm-tbody');
+        if (tbody) {
+            tbody.innerHTML = '';
+            var tr = document.createElement('tr');
+            var td = document.createElement('td');
+            td.colSpan = hostBridge.isMac ? 17 : 18;
+            td.className = 'empty-state';
+            td.textContent = 'The ' + reason + '.';
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+        }
+        return;
+    }
+    if (msg.source === 'fullState' && !fullStateDelivered)
+        appendLog('The full state is unavailable: ' + reason
+                  + '; the list below may be incomplete.');
+}
+
+/* The dialog's live network mode (never the initial row's mode). */
+function valuesNetworkMode() {
+    var sel = document.getElementById('edit-net-mode');
+    return sel ? Number(sel.value) : 0;
+}
+
+function consultInternalSwitches() {
+    if (!hostBridge.isMac) sendCmd('getInternalSwitches', {});
 }
 
 /* ---- Templates ---- */
@@ -617,12 +957,26 @@ function hidePassword() {
     document.getElementById('admin-confirm').type = 'password';
 }
 
+var createSwitchConsulted = false;
+
 function onNetModeChange() {
-    /* Adapter dropdown only relevant for External */
+    /* Adapter dropdown only relevant for External; the switch dropdown
+       only for Internal. The hidden->visible transition of the switch
+       control fires the census consult (once per modal open, never on
+       every redraw). */
     var mode = parseInt(document.getElementById('net-mode').value);
-    var show = (!hostBridge.isMac && mode === 2) ? '' : 'none';
-    document.getElementById('net-adapter').style.display = show;
-    document.getElementById('net-adapter-label').style.display = show;
+    var showAdapter = (!hostBridge.isMac && mode === 2) ? '' : 'none';
+    document.getElementById('net-adapter').style.display = showAdapter;
+    document.getElementById('net-adapter-label').style.display = showAdapter;
+    var showSwitch = (!hostBridge.isMac && mode === 3) ? '' : 'none';
+    document.getElementById('net-internal-switch').style.display = showSwitch;
+    document.getElementById('net-internal-switch-label').style.display = showSwitch;
+    if (showSwitch === '' && !createSwitchConsulted) {
+        createSwitchConsulted = true;
+        consultInternalSwitches();
+    } else if (showSwitch === 'none') {
+        createSwitchConsulted = false;
+    }
 }
 onNetModeChange();
 
@@ -650,6 +1004,12 @@ function gatherConfig() {
         gpuId:       gpu.gpuId,
         networkMode: hostBridge.isMac ? 1 : parseInt(document.getElementById('net-mode').value),
         netAdapter:  hostBridge.isMac ? '' : document.getElementById('net-adapter').value,
+        /* Sent only in mode 3 (the LIVE dropdown mode): the create form
+           has no stored selector, so nothing is sent in other modes and
+           the backend forces the field empty anyway. */
+        internalSwitch: (!hostBridge.isMac &&
+                         parseInt(document.getElementById('net-mode').value) === 3)
+            ? document.getElementById('net-internal-switch').value : '',
         adminUser:   document.getElementById('admin-user').value.trim(),
         adminPass:   document.getElementById('admin-pass').value,
         adminConfirm: document.getElementById('admin-confirm').value,
@@ -1032,6 +1392,7 @@ function buildRowCells(vm, i, statusTd) {
         makeCell(hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None'),
             hostBridge.isMac ? 'NAT (shared networking)'
                 : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
+        makeAdapterCell(vm),
     ];
     if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
     cells.push(
@@ -1057,7 +1418,7 @@ function renderVmTable() {
         tbody.innerHTML = '';
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = hostBridge.isMac ? 16 : 17;
+        td.colSpan = hostBridge.isMac ? 17 : 18;
         td.className = 'empty-state';
         var btn = document.createElement('button');
         btn.className = 'primary empty-state-btn';
@@ -1108,7 +1469,10 @@ function renderVmTable() {
             vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort,
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
-            vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode,
+            vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode, vm.netAdapter,
+            vm.internalSwitch, vm.internalSwitchInvalid,
+            currentAdapters.join('\u0001'),
+            (internalSwitches ? censusGeneration + ':' + internalSwitches.state : ''),
             selectedSnap.get(vm.name) || 'current',
             /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
                so makeSnapCell re-runs. These fields only change on user snapshot
@@ -1158,6 +1522,31 @@ function makeCell(text, title) {
     return td;
 }
 
+/* Adapter summary. Editing lives in the VM settings dialog. A missing
+   configured adapter keeps its name and warning until explicitly changed. */
+function makeAdapterCell(vm) {
+    if (!hostBridge.isMac && vm.networkMode === 3)
+        return makeInternalSwitchCell(vm);
+    var td = document.createElement('td');
+    if (hostBridge.isMac || vm.networkMode !== 2) {
+        td.textContent = '—';
+        td.className = 'adapter-off';
+        td.title = 'External mode only: the bridged adapter';
+        return td;
+    }
+    var stored = vm.netAdapter || '';
+    td.textContent = stored || '(Auto)';
+    if (stored && !hostBridge.isMac && currentAdapters.indexOf(stored) < 0) {
+        td.className = 'adapter-missing';
+        td.title = 'Configured adapter is not present on the host; the next start will fail External resolution';
+    } else {
+        td.title = stored
+            ? 'External network is bound to this adapter'
+            : 'External network picks the adapter automatically (Auto)';
+    }
+    return td;
+}
+
 function makeIconCell(cls, icon, active, handler, extraClass, title) {
     var td = document.createElement('td');
     td.className = 'icon-col';
@@ -1193,6 +1582,25 @@ function vmIndexByName(name) {
     return vms.findIndex(function(vm) { return vm.name === name; });
 }
 
+function populateEditVmAdapters(selected) {
+    var sel = document.getElementById('edit-net-adapter');
+    sel.innerHTML = '<option value="">(Auto)</option>';
+    currentAdapters.forEach(function(name) {
+        var opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+    });
+    if (selected && currentAdapters.indexOf(selected) < 0) {
+        var missing = document.createElement('option');
+        missing.value = selected;
+        missing.textContent = selected + ' (not present)';
+        missing.disabled = true;
+        sel.appendChild(missing);
+    }
+    sel.value = selected;
+}
+
 function openEditVmModal(idx) {
     var vm = vms[idx];
     if (!vm || vm.running || vm.buildingVhdx) return;
@@ -1203,9 +1611,18 @@ function openEditVmModal(idx) {
     document.getElementById('edit-cpu-cores').value = vm.cpuCores;
     setGpuSelection('edit-gpu-mode', vm);
     document.getElementById('edit-net-mode').value = String(vm.networkMode);
+    populateEditVmAdapters(vm.networkMode === 2 ? (vm.netAdapter || '') : '');
+    /* The switch select seeds from the mode-aware projection (the
+       sentinel on an INVALID row, '' on a non-Internal row). */
+    populateInternalSwitchSelect(document.getElementById('edit-internal-switch'),
+                                 vm, editVmFieldState(vm, 'internalSwitch'));
     updateEditVmModal();
     document.getElementById('edit-vm-overlay').classList.add('active');
     document.getElementById('edit-ram-size').focus();
+    /* Opening an already-Internal dialog consults (once per open; the
+       hidden->visible transition in updateEditVmModal covers switching
+       into Internal). */
+    if (!hostBridge.isMac && vm.networkMode === 3) consultInternalSwitches();
 }
 
 function closeEditVmModal() {
@@ -1233,6 +1650,20 @@ function editVmValues() {
     if (!hostBridge.isMac) {
         Object.assign(values, selectedGpu('edit-gpu-mode'));
         values.networkMode = Number(document.getElementById('edit-net-mode').value);
+        if (values.networkMode === 2)
+            values.netAdapter = document.getElementById('edit-net-adapter').value;
+        /* The selector is collected ONLY when the LIVE dropdown reads
+           mode 3 (never the initial row's mode), and is omitted entirely
+           while the select still holds the sentinel token (leaving the
+           sentinel untouched on a save that changed other fields keeps
+           the invalid flag: the recovery requires an explicit choice).
+           A same-mode-3 save after a hidden->visible switch sends the
+           control's value, so the user's confirmed choice survives. */
+        if (values.networkMode === 3) {
+            var sw = document.getElementById('edit-internal-switch').value;
+            if (sw !== INVALID_SENTINEL)
+                values.internalSwitch = sw;
+        }
     }
     return values;
 }
@@ -1256,6 +1687,20 @@ function updateEditVmModal() {
         el.disabled = !!disabled;
     });
     var values = editVmValues();
+    var showAdapter = !hostBridge.isMac && values.networkMode === 2;
+    var showSwitch = !hostBridge.isMac && values.networkMode === 3;
+    var wasSwitchVisible = document.getElementById('edit-internal-switch-row').style.display !== 'none';
+    document.getElementById('edit-net-adapter-label').style.display = showAdapter ? '' : 'none';
+    document.getElementById('edit-net-adapter-row').style.display = showAdapter ? '' : 'none';
+    document.getElementById('edit-net-adapter').disabled = !!disabled || !showAdapter;
+    document.getElementById('edit-internal-switch-label').style.display = showSwitch ? '' : 'none';
+    document.getElementById('edit-internal-switch-row').style.display = showSwitch ? '' : 'none';
+    document.getElementById('edit-internal-switch').disabled = !!disabled || !showSwitch;
+    /* The hidden->visible transition of the switch control is the census
+       consult trigger (once per transition, never on every input/redraw):
+       a dialog opened on a non-Internal VM has consulted nothing, so
+       switching it into Internal needs the list. */
+    if (showSwitch && !wasSwitchVisible && !disabled) consultInternalSwitches();
     var error = disabled ? 'Stop the VM before editing its configuration.' : editVmValidationError(values);
     document.getElementById('edit-vm-warn').textContent = error;
     document.getElementById('btn-save-edit-vm').disabled = !!error;
@@ -1271,9 +1716,16 @@ function saveEditVm() {
     var gpuChanged = !hostBridge.isMac &&
         gpuSelectionValue(values) !== gpuSelectionValue(editVmState.initial) &&
         gpuSelectionValue(values) !== gpuSelectionValue(vms[idx]);
+    /* The changed-field filter is sentinel-aware through the ONE
+       mode-aware projection, on BOTH comparisons: the stored state of a
+       field as the DIALOG represents it (the selector is the sentinel on
+       an INVALID row and '' on a non-Internal row), never the raw stored
+       string - comparing against the raw value would suppress the
+       {invalid} -> (Auto) recovery and drop a re-picked name. */
     var fields = Object.keys(values).filter(function(field) {
-        return field !== 'gpuMode' && field !== 'gpuId' &&
-            values[field] !== editVmState.initial[field] && values[field] !== vms[idx][field];
+        if (field === 'gpuMode' || field === 'gpuId') return false;
+        return values[field] !== editVmFieldState(editVmState.initial, field) &&
+               values[field] !== editVmFieldState(vms[idx], field);
     });
     closeEditVmModal();
     fields.forEach(function(field) {
@@ -1707,10 +2159,38 @@ function onPrereqResult(msg) {
 
 /* ---- Modal ---- */
 
+/* Fill the modal message element, turning bare http(s) URLs into clickable
+ * links. A link click hands the URL to the host (openUrl action), which
+ * opens the default browser - a WebView2 window cannot open new windows
+ * itself. Text nodes stay selectable (see the #modal-message CSS). */
+function setModalMessage(message) {
+    var el = document.getElementById('modal-message');
+    var re = /(https?:\/\/[^\s]+)/g;
+    var last = 0, m;
+    el.textContent = '';
+    while ((m = re.exec(message)) !== null) {
+        if (m.index > last)
+            el.appendChild(document.createTextNode(message.slice(last, m.index)));
+        var a = document.createElement('a');
+        a.href = m[1];
+        a.textContent = m[1];
+        (function(url) {
+            a.onclick = function(e) {
+                e.preventDefault();
+                sendCmd('openUrl', { url: url });
+            };
+        })(m[1]);
+        el.appendChild(a);
+        last = m.index + m[1].length;
+    }
+    if (last < message.length)
+        el.appendChild(document.createTextNode(message.slice(last)));
+}
+
 function showModal(title, message, confirmText, opts) {
     var previousFocus = document.activeElement;
     document.getElementById('modal-title').textContent = title;
-    document.getElementById('modal-message').textContent = message;
+    setModalMessage(message);
     var confirmBtn = document.getElementById('modal-confirm-btn');
     confirmBtn.textContent = confirmText || 'Confirm';
     confirmBtn.className = (opts && opts.confirmClass) || 'danger';

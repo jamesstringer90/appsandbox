@@ -191,7 +191,8 @@ methods return `(http_status, body)` so you can branch on the status code.
 
 A **status object** has: `name, osType, state, running, agentOnline,
 installComplete, building, progress, sshState, sshPort, ramMb, hddGb, cpuCores,
-gpuMode, networkMode, displayOpen`.
+gpuMode, networkMode, displayOpen, gpuId, gpuName, netAdapter, internalSwitch,
+internalSwitchInvalid`.
 
 ### Lifecycle  *(return `(status, body)`)*
 | Method | Effect |
@@ -312,6 +313,7 @@ rather than forwarding bad input to the core.
 | `gpuMode` | `0` None · `1` Default (paravirtual) · `2` Try all |
 | `networkMode` | `0` None · `1` NAT · `2` External · `3` Internal |
 | `netAdapter` | host adapter name (for External mode) |
+| `internalSwitch` | Hyper-V internal vSwitch name to join (Internal mode only; empty/absent = Auto, the built-in `AppSandboxInternal` ICS switch). Windows validation and inactive-mode behavior are described below. |
 | `adminUser` | required for a normal create. Linux: ≤32, starts `[a-z_]`, body `[a-z0-9_-]`. Windows: ≤20, none of `"\/[]:;|=,+*?<>`, no trailing `.`, not a reserved name (CON, PRN, …). |
 | `adminPass` | required on Linux (≤255 bytes); optional on Windows |
 | `testMode` | skip interactive setup where supported |
@@ -319,8 +321,20 @@ rather than forwarding bad input to the core.
 | `sshDeployKey` | deploy the AppSandbox public key for password-less login (**requires `sshEnabled`**; rejected `400` otherwise) |
 | `isTemplate` | build a template (Windows only; can't be built from another template) |
 
-`edit()` accepts `ramMb`, `cpuCores`, `gpuMode`, `networkMode` with the same
-range rules, and **only while the VM is stopped**. `name` cannot be changed.
+On Windows, a supplied `internalSwitch` must first decode as a JSON string of
+at most 255 UTF-16 code units without embedded NUL; a decoding failure returns
+`400` at both create and edit. Creates with `networkMode: 3` and
+`isTemplate: false`, and all edits, also reject CR/LF, unpaired surrogates, and
+U+FFFF with `400`. Template and non-Internal creates ignore the decoded
+selector and do not store it.
+
+`edit()` accepts `ramMb`, `cpuCores`, `gpuMode`, `networkMode`, `netAdapter`,
+and `internalSwitch` with the same range rules, and **only while the VM is
+stopped**. `name` cannot be changed. The selector is validated **before any
+setter runs**: a multi-field PUT carrying both `networkMode` and an invalid
+`internalSwitch` changes neither (no half-applied configuration). A mode
+change out of Internal clears the stored selector; a same-value mode set is a
+no-op that keeps it.
 
 ### SSH key deploy (password-less login)
 
@@ -403,3 +417,22 @@ password). `test_windows_template.py` covers the Windows template build →
 create-from-template → delete cycle. Default guest credentials are
 `user` / `test123`. See [`tests/README.md`](tests/README.md) for the file-by-file
 layout.
+
+The Windows response-capacity and selector-validation integration test is
+separate from `run_all.py`: it starts its own daemon and temporarily replaces
+the shared `%ProgramData%\AppSandbox\vms.cfg`. Build the Debug app, close every
+AppSandbox GUI or daemon, then run it from an elevated shell. The script backs
+up and restores the configuration byte-for-byte:
+
+```
+python tests\test_response_capacity.py
+```
+
+The isolated response-builder capacity harness compiles the production
+serializer helpers with controlled heap failures. It uses a synthetic
+oversized response row, does not start a daemon, and does not read or replace
+`vms.cfg`:
+
+```
+python tests\test_response_builder_capacity.py
+```

@@ -73,6 +73,7 @@ COVERAGE = [
     ("GET /vms (list), /vms/{n} status",        "per-VM (all threads)"),
     ("PUT /vms/{n} edit + validation",          "per-VM (config-at-start + reject)"),
     ("config applied at start (ram/cpu/gpu/net)","per-VM"),
+    ("internalSwitch fields + response capacity", "separate test_response_capacity.py"),
     ("POST .../start (+ from snapshot/branch)", "per-VM"),
     ("POST .../shutdown (graceful)",            "per-VM"),
     ("POST .../stop (force) + idempotency",     "per-VM"),
@@ -167,6 +168,8 @@ for label in sorted(results):
 ran = set(results)
 failed = {k for k, f in results.items() if f}
 def status_for(where):
+    if "separate" in where:
+        return "separate"
     toks = []
     if "static" in where: toks.append("static")
     if "per-VM" in where: toks.append("per-VM")
