@@ -257,6 +257,11 @@ struct VmDisplayIdd {
     /* Clipboard (extracted to vm_clipboard.c) */
     VmClipboard      clipboard;
 
+    /* Clipboard sharing toggles (system-menu overrides, persisted in
+       display_settings.json). Default TRUE = share in both directions. */
+    volatile BOOL    clip_share_host_to_guest;
+    volatile BOOL    clip_share_guest_to_host;
+
     /* Audio playback channel (:0004 — guest→host render) */
     volatile SOCKET  audio_socket;
     HANDLE           audio_recv_thread;
@@ -288,6 +293,8 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
+#define IDM_CLIP_H2G       0x1030
+#define IDM_CLIP_G2H       0x1040
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -645,39 +652,54 @@ static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, si
     swprintf_s(out, out_chars, L"%s\\display_settings.json", dir);
 }
 
-static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys)
+static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys,
+                                      BOOL share_h2g, BOOL share_g2h)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
     if (!vhdx_path || vhdx_path[0] == L'\0') return;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
-    fprintf(f, "{\"transmitKeyboardHotkeys\":%d}\n", transmit_hotkeys ? 1 : 0);
+    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"shareHostToGuest\":%d,\"shareGuestToHost\":%d}\n",
+            transmit_hotkeys ? 1 : 0, share_h2g ? 1 : 0, share_g2h ? 1 : 0);
     fclose(f);
 }
 
 /* Read the persisted setting; if the file is absent, create it with the
-   default (off) and return FALSE. Returns the transmit-hotkeys value. */
-static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path)
+   defaults (hotkeys off, clipboard sharing on) and return FALSE. Returns the
+   transmit-hotkeys value; the two clipboard flags are written back through
+   the output params. */
+static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path,
+                                                BOOL *share_h2g, BOOL *share_g2h)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
     char buf[256];
     BOOL transmit = FALSE;
+    BOOL h2g = TRUE, g2h = TRUE;
 
     if (!vhdx_path || vhdx_path[0] == L'\0') return FALSE;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
 
     if (_wfopen_s(&f, path, L"r") != 0 || !f) {
         /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
-        idd_display_settings_save(vhdx_path, FALSE);
-        return FALSE;
+        idd_display_settings_save(vhdx_path, FALSE, TRUE, TRUE);
+        goto out;
     }
     if (fgets(buf, sizeof(buf), f)) {
         if (strstr(buf, "\"transmitKeyboardHotkeys\":1"))
             transmit = TRUE;
+        /* Clipboard flags: missing keys keep the defaults above. */
+        if (strstr(buf, "\"shareHostToGuest\""))
+            h2g = strstr(buf, "\"shareHostToGuest\":1") != NULL;
+        if (strstr(buf, "\"shareGuestToHost\""))
+            g2h = strstr(buf, "\"shareGuestToHost\":1") != NULL;
     }
     fclose(f);
+
+out:
+    if (share_h2g) *share_h2g = h2g;
+    if (share_g2h) *share_g2h = g2h;
     return transmit;
 }
 
@@ -1883,8 +1905,13 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         if (!d->clipboard) {
             d->clipboard = vm_clipboard_create(&d->runtime_id, d->os_type,
                                                d->hwnd, clip_log_callback, d);
-            if (d->clipboard)
+            if (d->clipboard) {
                 idd_log(d, L"Clipboard module created.");
+                /* Apply the persisted sharing toggles (default: both on). */
+                vm_clipboard_set_share_directions(d->clipboard,
+                                                  d->clip_share_host_to_guest,
+                                                  d->clip_share_guest_to_host);
+            }
         }
 
         /* Ensure audio recv thread is running (:0004, guest→host).
@@ -2216,6 +2243,13 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
+            AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(sysmenu, MF_STRING, IDM_CLIP_H2G, L"Share Host Clipboard with Guest");
+            AppendMenuW(sysmenu, MF_STRING, IDM_CLIP_G2H, L"Share Guest Clipboard with Host");
+            CheckMenuItem(sysmenu, IDM_CLIP_H2G,
+                          MF_BYCOMMAND | (d->clip_share_host_to_guest ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(sysmenu, IDM_CLIP_G2H,
+                          MF_BYCOMMAND | (d->clip_share_guest_to_host ? MF_CHECKED : MF_UNCHECKED));
         }
     }
 
@@ -2364,10 +2398,50 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 idd_flush_held_keys(d);
             }
             idd_update_kbd_hook(d);
-            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys);
+            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys,
+                                      d->clip_share_host_to_guest,
+                                      d->clip_share_guest_to_host);
             idd_log(d, d->transmit_hotkeys
                         ? L"Transmit Keyboard Hotkeys: ON."
                         : L"Transmit Keyboard Hotkeys: OFF.");
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_CLIP_H2G) {
+            HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
+            d->clip_share_host_to_guest = !d->clip_share_host_to_guest;
+            if (sysmenu) {
+                CheckMenuItem(sysmenu, IDM_CLIP_H2G,
+                              MF_BYCOMMAND | (d->clip_share_host_to_guest ? MF_CHECKED : MF_UNCHECKED));
+            }
+            if (d->clipboard)
+                vm_clipboard_set_share_directions(d->clipboard,
+                                                  d->clip_share_host_to_guest,
+                                                  d->clip_share_guest_to_host);
+            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys,
+                                      d->clip_share_host_to_guest,
+                                      d->clip_share_guest_to_host);
+            idd_log(d, d->clip_share_host_to_guest
+                        ? L"Share host clipboard with guest: ON."
+                        : L"Share host clipboard with guest: OFF.");
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_CLIP_G2H) {
+            HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
+            d->clip_share_guest_to_host = !d->clip_share_guest_to_host;
+            if (sysmenu) {
+                CheckMenuItem(sysmenu, IDM_CLIP_G2H,
+                              MF_BYCOMMAND | (d->clip_share_guest_to_host ? MF_CHECKED : MF_UNCHECKED));
+            }
+            if (d->clipboard)
+                vm_clipboard_set_share_directions(d->clipboard,
+                                                  d->clip_share_host_to_guest,
+                                                  d->clip_share_guest_to_host);
+            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys,
+                                      d->clip_share_host_to_guest,
+                                      d->clip_share_guest_to_host);
+            idd_log(d, d->clip_share_guest_to_host
+                        ? L"Share guest clipboard with host: ON."
+                        : L"Share guest clipboard with host: OFF.");
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_SHOW_LOG) {
@@ -2790,6 +2864,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd)
 {
     VmDisplayIdd *d;
+    BOOL h2g = TRUE, g2h = TRUE;
 
     if (!vm) return NULL;
 
@@ -2815,10 +2890,13 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->clipboard          = NULL;
     d->cursor_visible     = TRUE;
 
-    /* Load the per-VM display setting, creating display_settings.json with
-       the default (off) if this VM doesn't have one yet. The hook itself is
-       installed later, on the window thread, once the window exists. */
-    d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path);
+    /* Load the per-VM display settings, creating display_settings.json with
+       the defaults (hotkeys off, clipboard sharing on) if this VM doesn't
+       have one yet. The hook itself is installed later, on the window thread,
+       once the window exists. */
+    d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path, &h2g, &g2h);
+    d->clip_share_host_to_guest = h2g;
+    d->clip_share_guest_to_host = g2h;
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;
