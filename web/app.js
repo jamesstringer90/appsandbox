@@ -1375,6 +1375,12 @@ function parseSnapValue(val) {
     return {snapIndex: parseInt(parts[0]), branchIndex: parseInt(parts[1])};
 }
 
+/* Index of the snapshot `snap` was taken on, or -2 for the base (also for an
+   unknown parent, so a snapshot is never hidden). */
+function snapshotParent(snap) {
+    return typeof snap.parent === 'number' && snap.parent >= 0 ? snap.parent : -2;
+}
+
 function snapshotTreeSignature(vm) {
     return JSON.stringify([vm.hasSnapshots, vm.baseBranches || [], vm.snapshots || []]);
 }
@@ -1397,7 +1403,14 @@ function snapshotRowValue(vm, value) {
 function snapshotPath(vm, value) {
     var p = snapshotSelection(vm, value);
     var path = 'Base';
-    if (p.snapshot) path += ' \u2192 ' + p.snapshot.name;
+    if (p.snapshot) {
+        var chain = [], s = p.snapIndex, snaps = vm.snapshots || [];
+        while (s >= 0 && snaps[s] && chain.length < snaps.length) {
+            chain.unshift(snaps[s].name);
+            s = snapshotParent(snaps[s]);
+        }
+        path += ' \u2192 ' + chain.join(' \u2192 ');
+    }
     if (p.branch) path += ' \u2192 ' + (p.branch.name || 'branch ' + (p.branchIndex + 1));
     if (value !== 'current' && p.branchIndex < 0) path += ' [new branch]';
     return path;
@@ -1516,13 +1529,18 @@ function renderSnapshotModal() {
         var children = document.createElement('ul');
         base.appendChild(children);
         addBranches(children, vm.baseBranches || [], 'base-');
-        (vm.snapshots || []).forEach(function(snap, i) {
-            var item = addChoice(children, String(i), snap.name,
-                (snap.date ? 'Created ' + snap.date + ' · ' : '') + 'New branch on start');
-            var branches = document.createElement('ul');
-            item.appendChild(branches);
-            addBranches(branches, snap.branches || [], i + '-');
-        });
+        /* A snapshot sits under the one it was taken on, after that one's branches */
+        (function addSnapshots(parent, parentIndex) {
+            (vm.snapshots || []).forEach(function(snap, i) {
+                if (snapshotParent(snap) !== parentIndex) return;
+                var item = addChoice(parent, String(i), snap.name,
+                    (snap.date ? 'Created ' + snap.date + ' · ' : '') + 'New branch on start');
+                var branches = document.createElement('ul');
+                item.appendChild(branches);
+                addBranches(branches, snap.branches || [], i + '-');
+                addSnapshots(branches, i);
+            });
+        })(children, -2);
     }
     if (focusedValue !== null && !disabled) {
         var focusChoice = Array.from(tree.querySelectorAll('.snapshot-choice')).find(function(choice) { return choice.value === focusedValue; });
@@ -1557,7 +1575,7 @@ function snapshotActionIndex(context) {
 function takeSnapshot() {
     var context = snapshotActionContext();
     if (!context) return;
-    showModal('New Snapshot', 'Create a new snapshot of the base disk. Snapshots are frozen points in time that you can create independent branches from.', 'Create', {
+    showModal('New Snapshot', 'Freeze the current disk as a new snapshot; the VM continues on a new branch of it. Snapshots are frozen points in time that you can create independent branches from.', 'Create', {
         confirmClass: 'primary',
         input: { label: 'Snapshot name:', value: 'Snapshot ' + ((context.vm.snapshots || []).length + 1) }
     }).then(function(result) {
@@ -1592,6 +1610,16 @@ function deleteSnapshot() {
     var p = snapshotSelection(context.vm, context.value);
     var target = p.branch || p.snapshot;
     if (!target) return;
+    if (!p.branch) {
+        var child = (context.vm.snapshots || []).find(function(snap) {
+            return snapshotParent(snap) === p.snapIndex;
+        });
+        if (child) {
+            showModal('Cannot Delete Snapshot', 'Snapshot "' + child.name + '" was taken on "' + target.name +
+                '" and depends on its disk. Delete "' + child.name + '" first.', 'OK', { confirmClass: 'primary' });
+            return;
+        }
+    }
     showModal(p.branch ? 'Delete Branch' : 'Delete Snapshot',
         p.branch ? 'Delete branch "' + (target.name || '') + '"? Its parent disk will be kept.'
             : 'Delete snapshot "' + target.name + '" and all its branches?', 'Delete'
