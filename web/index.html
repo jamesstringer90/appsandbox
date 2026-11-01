@@ -160,6 +160,7 @@
             <label>Options:</label>
             <div class="form-row">
                 <label class="needs-windows" title="Disable Secure Boot and enable test-signing (required to load the test-signed guest drivers)"><input type="checkbox" id="test-mode"> Test Mode</label>
+                <label class="win-only" title="Copy nvidia-smi and its matching NVML runtime from the selected host NVIDIA driver"><input type="checkbox" id="copy-nvidia-smi" disabled> Copy nvidia-smi</label>
                 <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled" onchange="onSshToggle()"> SSH Server</label>
                 <label title="Deploy the AppSandbox SSH public key so you can connect with key auth (requires SSH Server)"><input type="checkbox" id="ssh-deploy-key" disabled> Deploy SSH key</label>
             </div>

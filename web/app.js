@@ -124,6 +124,7 @@ function applyOsTypeUI() {
     revalidateVmName();
     revalidateUsername();
     revalidatePassword();
+    updateCopyNvidiaSmiState();
     updateCreateButtons();
 }
 
@@ -207,6 +208,7 @@ function updateHostInfo(info) {
         JSON.stringify(info.gpus) !== JSON.stringify(lastHostInfo && lastHostInfo.gpus))
         populateGpus(info.gpus);
     lastHostInfo = info;
+    updateCopyNvidiaSmiState();
     var diskDirectory = document.getElementById('disk-directory');
     if (diskDirectoryBeforeEdit === null && info.defaultDiskDirectory &&
         (!diskDirectory.value || diskDirectory.value === previousDefault))
@@ -265,8 +267,32 @@ function populateGpus(gpus) {
     });
 }
 
+function updateCopyNvidiaSmiState() {
+    var checkbox = document.getElementById('copy-nvidia-smi');
+    if (!checkbox) return;
+    var osType = document.getElementById('os-type').value;
+    var selection = selectedGpu('gpu-mode');
+    var gpus = (lastHostInfo && Array.isArray(lastHostInfo.gpus)) ? lastHostInfo.gpus : [];
+    var eligible = !hostBridge.isMac && osType === 'Windows' && selection.gpuMode === 1;
+
+    if (eligible && selection.gpuId) {
+        var selected = gpus.find(function(gpu) { return gpu.id === selection.gpuId; });
+        eligible = !!selected && selected.isNvidia === true;
+    } else if (eligible) {
+        /* HCS does not reveal which adapter Default GPU will choose. On a
+           mixed-vendor host require an explicit NVIDIA selection. */
+        eligible = gpus.length > 0 && gpus.every(function(gpu) { return gpu.isNvidia === true; });
+    }
+
+    checkbox.disabled = !eligible;
+    if (!eligible) checkbox.checked = false;
+}
+
 ['gpu-mode', 'edit-gpu-mode'].forEach(function(id) {
-    document.getElementById(id).addEventListener('change', function() { updateGpuTitle(this); });
+    document.getElementById(id).addEventListener('change', function() {
+        updateGpuTitle(this);
+        if (id === 'gpu-mode') updateCopyNvidiaSmiState();
+    });
 });
 
 function selectedDiskDirectory() {
@@ -654,6 +680,7 @@ function gatherConfig() {
         adminPass:   document.getElementById('admin-pass').value,
         adminConfirm: document.getElementById('admin-confirm').value,
         testMode:    document.getElementById('test-mode').checked,
+        copyNvidiaSmi: document.getElementById('copy-nvidia-smi').checked,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
         sshDeployKey: document.getElementById('ssh-deploy-key').checked
     };
@@ -670,7 +697,9 @@ function onSshToggle() {
 
 function clearCreateForm() {
     document.getElementById('image-path').value = '';
+    document.getElementById('copy-nvidia-smi').checked = false;
     selectTemplate('', templateDefaultLabel());
+    updateCopyNvidiaSmiState();
     updateCreateButtons();
 }
 
@@ -821,6 +850,7 @@ function openCreateModal() {
     document.getElementById('admin-pass').value = 'test123';
     document.getElementById('admin-confirm').value = 'test123';
     document.getElementById('test-mode').checked = false;
+    document.getElementById('copy-nvidia-smi').checked = false;
     document.getElementById('ssh-enabled').checked = false;
     document.getElementById('ssh-deploy-key').checked = false;
     onSshToggle();   /* re-grey "Deploy SSH key" to match the cleared SSH checkbox */

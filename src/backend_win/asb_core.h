@@ -61,6 +61,7 @@ typedef struct {
     BOOL   test_mode;              /* TRUE = disable Secure Boot (test-signed drivers) */
     BOOL   ssh_enabled;            /* TRUE = install OpenSSH Server in guest */
     BOOL   ssh_deploy_key;         /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
+    BOOL   copy_nvidia_smi;        /* TRUE = copy NVIDIA-SMI + NVML into a Windows guest */
     BOOL   is_template;            /* TRUE = create as template VM */
     const wchar_t *disk_directory; /* parent for a new VM folder; NULL/empty = default */
     const wchar_t *gpu_id;

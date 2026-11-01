@@ -360,6 +360,145 @@ static BOOL validate_dll_export(const wchar_t *path, WORD machine, const char *r
     return found;
 }
 
+static BOOL fixed_file_version(const wchar_t *path, VS_FIXEDFILEINFO *out)
+{
+    DWORD ignored = 0, size = GetFileVersionInfoSizeW(path, &ignored);
+    BYTE *data;
+    VS_FIXEDFILEINFO *info = NULL;
+    UINT info_size = 0;
+    BOOL result = FALSE;
+
+    if (!size) return FALSE;
+    data = malloc(size);
+    if (!data) return FALSE;
+    if (GetFileVersionInfoW(path, 0, size, data) &&
+        VerQueryValueW(data, L"\\", (void **)&info, &info_size) && info &&
+        info_size >= sizeof(*info) && info->dwSignature == VS_FFI_SIGNATURE) {
+        *out = *info;
+        result = TRUE;
+    }
+    free(data);
+    return result;
+}
+
+static BOOL matching_file_versions(const wchar_t *a_path, const wchar_t *b_path)
+{
+    VS_FIXEDFILEINFO a, b;
+    return fixed_file_version(a_path, &a) && fixed_file_version(b_path, &b) &&
+           a.dwFileVersionMS == b.dwFileVersionMS &&
+           a.dwFileVersionLS == b.dwFileVersionLS;
+}
+
+static BOOL run_nvidia_smi_probe(const wchar_t *exe, char *detail, size_t detail_size,
+                                 DWORD *exit_code)
+{
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    STARTUPINFOW si = { 0 };
+    PROCESS_INFORMATION pi = { 0 };
+    HANDLE read_pipe = INVALID_HANDLE_VALUE, write_pipe = INVALID_HANDLE_VALUE;
+    wchar_t command[MAX_PATH + 4];
+    DWORD wait, read_count;
+    size_t used = 0;
+    BOOL ok = FALSE;
+
+    if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0)) return FALSE;
+    SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = write_pipe;
+    si.hStdError = write_pipe;
+    swprintf_s(command, ARRAYSIZE(command), L"\"%s\"", exe);
+
+    if (!CreateProcessW(NULL, command, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        if (detail && detail_size)
+            sprintf_s(detail, detail_size, "CreateProcess failed (%lu)", GetLastError());
+        goto done;
+    }
+    CloseHandle(write_pipe);
+    write_pipe = INVALID_HANDLE_VALUE;
+    wait = WaitForSingleObject(pi.hProcess, 10000);
+    if (wait != WAIT_OBJECT_0) {
+        TerminateProcess(pi.hProcess, ERROR_TIMEOUT);
+        WaitForSingleObject(pi.hProcess, 2000);
+        if (detail && detail_size) strcpy_s(detail, detail_size, "probe timed out");
+        *exit_code = ERROR_TIMEOUT;
+        goto process_done;
+    }
+    GetExitCodeProcess(pi.hProcess, exit_code);
+    if (detail && detail_size) {
+        while (used + 1 < detail_size &&
+               ReadFile(read_pipe, detail + used, (DWORD)(detail_size - used - 1),
+                        &read_count, NULL) && read_count) {
+            used += read_count;
+        }
+        detail[used] = 0;
+        while (used && (detail[used - 1] == '\r' || detail[used - 1] == '\n'))
+            detail[--used] = 0;
+    }
+    ok = TRUE;
+
+process_done:
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+done:
+    if (write_pipe != INVALID_HANDLE_VALUE) CloseHandle(write_pipe);
+    if (read_pipe != INVALID_HANDLE_VALUE) CloseHandle(read_pipe);
+    return ok;
+}
+
+BOOL nvidia_smi_provision(NvidiaSmiFailure *failure, char *detail, size_t detail_size)
+{
+#if defined(_M_X64)
+    wchar_t sys[MAX_PATH], exe[MAX_PATH], dll[MAX_PATH];
+    DWORD length, exit_code = 1;
+    int attempt;
+
+    if (failure) *failure = NVIDIA_SMI_FAILURE_FILES;
+    if (detail && detail_size) detail[0] = 0;
+    length = GetSystemDirectoryW(sys, MAX_PATH);
+    if (!length || length >= MAX_PATH) {
+        if (detail && detail_size) strcpy_s(detail, detail_size, "GetSystemDirectory failed");
+        return FALSE;
+    }
+    swprintf_s(exe, MAX_PATH, L"%s\\nvidia-smi.exe", sys);
+    swprintf_s(dll, MAX_PATH, L"%s\\nvml.dll", sys);
+    if (!validate_dll_export(exe, IMAGE_FILE_MACHINE_AMD64, NULL)) {
+        if (detail && detail_size) strcpy_s(detail, detail_size,
+            "nvidia-smi.exe is missing or is not a valid x64 PE executable");
+        return FALSE;
+    }
+    if (!validate_dll_export(dll, IMAGE_FILE_MACHINE_AMD64, "nvmlInit_v2")) {
+        if (detail && detail_size) strcpy_s(detail, detail_size,
+            "nvml.dll is missing, invalid, or does not export nvmlInit_v2");
+        return FALSE;
+    }
+    if (!matching_file_versions(exe, dll)) {
+        if (detail && detail_size) strcpy_s(detail, detail_size,
+            "nvidia-smi.exe and nvml.dll file versions do not match");
+        return FALSE;
+    }
+
+    if (failure) *failure = NVIDIA_SMI_FAILURE_RUNTIME;
+    for (attempt = 0; attempt < 3; attempt++) {
+        if (run_nvidia_smi_probe(exe, detail, detail_size, &exit_code) && exit_code == 0) {
+            if (failure) *failure = NVIDIA_SMI_FAILURE_NONE;
+            return TRUE;
+        }
+        if (attempt < 2) Sleep(2000);
+    }
+    if (detail && detail_size && !detail[0])
+        sprintf_s(detail, detail_size, "nvidia-smi exited with code %lu", exit_code);
+    return FALSE;
+#else
+    if (failure) *failure = NVIDIA_SMI_FAILURE_FILES;
+    if (detail && detail_size)
+        strcpy_s(detail, detail_size, "x64 NVIDIA-SMI is unsupported on this guest architecture");
+    return FALSE;
+#endif
+}
+
 static BOOL validate_nvidia_opencl_dll(const wchar_t *path, BOOL shim)
 {
     return validate_dll_export(path, IMAGE_FILE_MACHINE_AMD64, "clGetExtensionFunctionAddress") &&

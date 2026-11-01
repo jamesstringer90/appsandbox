@@ -181,7 +181,7 @@ methods return `(http_status, body)` so you can branch on the status code.
 | Method | Returns |
 |---|---|
 | `version()` | `{product, version, apiVersion, hostOs, capabilities}` |
-| `host()` | `{hostCores, hostRamMb, freeGb, vmCores, vmRamMb, vmHddGb}` (capacity + what running/declared VMs use) |
+| `host()` | `{hostCores, hostRamMb, freeGb, vmCores, vmRamMb, vmHddGb, gpus}` (capacity + VM usage; each Windows-host GPU record includes `id`, `name`, `location`, and reliable boolean `isNvidia` metadata) |
 | `list()` | list of VM status objects |
 | `status(name)` | one VM's status (raises `KeyError` on 404) |
 | `ssh_info(name)` | `{host, port, user, sshState, enabled, keyDeployed}` (loopback-forwarded SSH; `sshState 4` = ready + key deployed) |
@@ -191,7 +191,7 @@ methods return `(http_status, body)` so you can branch on the status code.
 
 A **status object** has: `name, osType, state, running, agentOnline,
 installComplete, building, progress, sshState, sshPort, ramMb, hddGb, cpuCores,
-gpuMode, networkMode, displayOpen`.
+gpuMode, copyNvidiaSmi, networkMode, displayOpen`.
 
 ### Lifecycle  *(return `(status, body)`)*
 | Method | Effect |
@@ -310,6 +310,8 @@ rather than forwarding bad input to the core.
 | `hddGb` | ≥1 |
 | `cpuCores` | ≥1 |
 | `gpuMode` | `0` None · `1` Default (paravirtual) · `2` Try all |
+| `gpuId` | Optional adapter ID from `host()["gpus"]`; selects a specific GPU-PV adapter with Default GPU mode. |
+| `copyNvidiaSmi` | Optional boolean, default `false`. Create-only; on a Windows host with a Windows guest, copies the selected NVIDIA driver's `nvidia-smi.exe` and `nvml.dll`. Requires GPU mode Default and an explicit NVIDIA `gpuId` on mixed-vendor hosts. Unsupported combinations are accepted but normalized to `false`. |
 | `networkMode` | `0` None · `1` NAT · `2` External · `3` Internal |
 | `netAdapter` | host adapter name (for External mode) |
 | `adminUser` | required for a normal create. Linux: ≤32, starts `[a-z_]`, body `[a-z0-9_-]`. Windows: ≤20, none of `"\/[]:;|=,+*?<>`, no trailing `.`, not a reserved name (CON, PRN, …). |

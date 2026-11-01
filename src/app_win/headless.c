@@ -253,7 +253,7 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos += sprintf_s(out + pos, cap - pos,
         ",\"state\":\"%s\",\"running\":%s,\"agentOnline\":%s,\"installComplete\":%s,"
         "\"building\":%s,\"progress\":%d,\"sshState\":%d,\"sshPort\":%lu,"
-        "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,\"networkMode\":%d,"
+        "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,\"copyNvidiaSmi\":%s,\"networkMode\":%d,"
         "\"displayOpen\":%s,\"gpuId\":",
         derive_state(v),
         v->running ? "true" : "false", v->agent_online ? "true" : "false",
@@ -262,7 +262,7 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state,   /* 4 = ready + key deployed */
         (unsigned long)v->ssh_port,
         (unsigned long)v->ram_mb, (unsigned long)v->hdd_gb, (unsigned long)v->cpu_cores,
-        v->gpu_mode, v->network_mode,
+        v->gpu_mode, v->copy_nvidia_smi ? "true" : "false", v->network_mode,
         display_is_open(v->unique_id) ? "true" : "false");
     pos = append_wstr(out, cap, pos, v->gpu_id);
     pos += sprintf_s(out + pos, cap - pos, ",\"gpuName\":");
@@ -306,6 +306,8 @@ static int build_host_info(char *buf, int cap)
         pos = append_wstr(buf, cap, pos, gpus->gpus[i].name);
         pos += sprintf_s(buf + pos, cap - pos, ",\"location\":");
         pos = append_wstr(buf, cap, pos, gpus->gpus[i].location);
+        pos += sprintf_s(buf + pos, cap - pos, ",\"isNvidia\":%s",
+                         gpu_info_is_nvidia(&gpus->gpus[i]) ? "true" : "false");
         pos += sprintf_s(buf + pos, cap - pos, "}");
     }
     pos += sprintf_s(buf + pos, cap - pos, "]}");
@@ -707,6 +709,7 @@ static int handle_request(PHTTP_REQUEST req)
             if (json_get_bool(body, L"testMode", &bv)) cfg.test_mode = bv;
             if (json_get_bool(body, L"sshEnabled", &bv)) cfg.ssh_enabled = bv;
             if (json_get_bool(body, L"sshDeployKey", &bv)) cfg.ssh_deploy_key = bv;
+            if (json_get_bool(body, L"copyNvidiaSmi", &bv)) cfg.copy_nvidia_smi = bv;
             if (json_get_bool(body, L"isTemplate", &bv)) cfg.is_template = bv;
             if (cfg.ssh_deploy_key && !cfg.ssh_enabled) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",

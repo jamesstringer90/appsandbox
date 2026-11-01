@@ -1287,6 +1287,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
         instance->test_mode = config->test_mode;
         wcscpy_s(instance->admin_user, 128, config->admin_user);
         instance->ssh_enabled = config->ssh_enabled;
+        instance->copy_nvidia_smi = config->copy_nvidia_smi;
         memcpy(&instance->gpu_shares, &config->gpu_shares, sizeof(GpuDriverShareList));
         instance->running = FALSE;
 
@@ -1380,6 +1381,7 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
         instance->test_mode = config->test_mode;
         wcscpy_s(instance->admin_user, 128, config->admin_user);
         instance->ssh_enabled = config->ssh_enabled;
+        instance->copy_nvidia_smi = config->copy_nvidia_smi;
         memcpy(&instance->gpu_shares, &config->gpu_shares, sizeof(GpuDriverShareList));
         instance->running = FALSE;
 

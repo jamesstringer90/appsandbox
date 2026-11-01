@@ -569,7 +569,10 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
     GpuCopyState *state = (GpuCopyState *)param;
     int i;
     int total_files = 0;
+    int driver_files_copied = 0;
     int failed_shares = 0;
+    BOOL nvidia_smi_requested = FALSE;
+    BOOL nvidia_smi_copy_failed = FALSE;
     char msg[256];
     wchar_t gl_dir[MAX_PATH], native_dir[MAX_PATH];
 
@@ -582,12 +585,21 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
         wchar_t dest_wide[MAX_PATH];
         int files = 0;
         int rc;
+        BOOL nvidia_smi_share =
+            strncmp(si->share_name, "AppSandbox.NvidiaSmi", 20) == 0;
+
+        if (nvidia_smi_share) nvidia_smi_requested = TRUE;
 
         dest_wide[0] = 0;
         if (MultiByteToWideChar(CP_UTF8, 0, si->dest_path, -1, dest_wide, MAX_PATH) == 0) {
             agent_log("GPU copy share '%s': dest path conversion failed (%lu), skipping.",
                       si->share_name, GetLastError());
-            failed_shares++;
+            if (nvidia_smi_share) {
+                nvidia_smi_copy_failed = TRUE;
+                agent_log_to_host("NVIDIA-SMI: optional destination path conversion failed.");
+            } else {
+                failed_shares++;
+            }
             continue;
         }
 
@@ -634,13 +646,22 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
 
         if (rc != P9_OK) {
             agent_log("GPU copy share '%s' failed (rc=%d).", si->share_name, rc);
-            failed_shares++;
+            if (nvidia_smi_share) {
+                nvidia_smi_copy_failed = TRUE;
+                if (strstr(si->filter, "nvml.dll") && !strstr(si->filter, "nvidia-smi.exe"))
+                    agent_log_to_host("NVIDIA-SMI: nvml.dll provisioning failed (rc=%d).", rc);
+                else
+                    agent_log_to_host("NVIDIA-SMI: optional file provisioning failed (rc=%d).", rc);
+            } else {
+                failed_shares++;
+            }
         } else {
             agent_log("GPU copy share '%s' done (%d files).", si->share_name, files);
             if (strcmp(si->share_name, "AppSandbox.Nvidia") == 0)
                 wcscpy_s(native_dir, MAX_PATH, dest_wide);
         }
         total_files += files;
+        if (!nvidia_smi_share) driver_files_copied += files;
 
         /* Send progress to host */
         sprintf_s(msg, sizeof(msg), "gpu_copy_progress:%d/%d", i + 1, state->count);
@@ -650,7 +671,7 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
 
     /* If files were copied and vrd.inf has error 43, restart GPU + IDD devices
        and re-disable Hyper-V Video adapter. */
-    if (total_files > 0 && check_gpu_error43()) {
+    if (driver_files_copied > 0 && check_gpu_error43()) {
         agent_log("GPU drivers copied and error 43 detected - attempting device restart.");
         cycle_gpu_devices(state->notify_sock, TRUE);
 
@@ -658,10 +679,25 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
         Sleep(2000);
         disable_hyperv_video(state->notify_sock);
         */
-    } else if (total_files > 0) {
+    } else if (driver_files_copied > 0) {
         agent_log("GPU drivers copied, no error 43 - no device restart needed.");
     } else {
         agent_log("All GPU driver files already present (pre-staged) - no copy or restart needed.");
+    }
+
+    if (nvidia_smi_requested && !nvidia_smi_copy_failed) {
+        NvidiaSmiFailure failure;
+        char detail[1024];
+        if (nvidia_smi_provision(&failure, detail, sizeof(detail))) {
+            agent_log("NVIDIA-SMI: validated x64 PE/NVML and runtime probe succeeded.");
+            agent_log_to_host("NVIDIA-SMI: provisioned and successfully initialized NVML.");
+        } else if (failure == NVIDIA_SMI_FAILURE_RUNTIME) {
+            agent_log("NVIDIA-SMI: files validated but runtime probe failed: %s", detail);
+            agent_log_to_host("NVIDIA-SMI: files were provisioned, but this driver/GPU-PV combination did not expose usable NVML: %.700s", detail);
+        } else {
+            agent_log("NVIDIA-SMI: validation failed: %s", detail);
+            agent_log_to_host("NVIDIA-SMI: file validation failed: %.800s", detail);
+        }
     }
 
     if (failed_shares == 0 && (gl_dir[0] || native_dir[0] || gpu_prefers_system_opengl()))

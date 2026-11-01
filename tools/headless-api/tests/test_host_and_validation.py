@@ -56,6 +56,10 @@ host = c.host()
 check("hostCores matches the OS", host["hostCores"] == os_cores(), "daemon=%s os=%s" % (host["hostCores"], os_cores()))
 check("hostRamMb matches the OS", host["hostRamMb"] == os_ram_mb(), "daemon=%s os=%s" % (host["hostRamMb"], os_ram_mb()))
 check("vmCores / vmRamMb present and >= 0", host.get("vmCores", -1) >= 0 and host.get("vmRamMb", -1) >= 0)
+if not IS_MAC:
+    check("Windows GPU records expose boolean isNvidia",
+          all(isinstance(g.get("isNvidia"), bool) for g in host.get("gpus", [])),
+          "gpus=%r" % host.get("gpus", []))
 v = c.version()
 check("version product == AppSandbox", v.get("product") == "AppSandbox")
 caps = v.get("capabilities", {})

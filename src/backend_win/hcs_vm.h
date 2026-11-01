@@ -48,6 +48,7 @@ typedef struct {
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
     BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
+    BOOL    copy_nvidia_smi;         /* TRUE = copy NVIDIA-SMI + NVML into a Windows guest */
 } VmConfig;
 
 /* Runtime state of a VM */
@@ -111,6 +112,7 @@ typedef struct {
     BOOL        ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key to the guest */
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
+    BOOL        copy_nvidia_smi;         /* TRUE = optional NVIDIA-SMI provisioning requested */
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.

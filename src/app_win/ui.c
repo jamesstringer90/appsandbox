@@ -251,6 +251,7 @@ static void build_host_info_json(JsonBuilder *jb)
         jb_string(jb, L"id", gpu_list->gpus[i].interface_path);
         jb_string(jb, L"name", gpu_list->gpus[i].name);
         jb_string(jb, L"location", gpu_list->gpus[i].location);
+        jb_bool(jb, L"isNvidia", gpu_info_is_nvidia(&gpu_list->gpus[i]));
         jb_object_end(jb);
     }
     jb_array_end(jb);
@@ -299,6 +300,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"gpuMode", v->gpu_mode);
     jb_string(jb, L"gpuId", v->gpu_id);
     jb_string(jb, L"gpuName", v->gpu_name);
+    jb_bool(jb, L"copyNvidiaSmi", v->copy_nvidia_smi);
     jb_int(jb, L"networkMode", v->network_mode);
     jb_string(jb, L"netAdapter", v->net_adapter);
     jb_bool(jb, L"isTemplate", v->is_template);
@@ -1064,6 +1066,7 @@ static void on_webview2_message(const wchar_t *json)
         json_get_bool(json, L"testMode", &cfg.test_mode);
         json_get_bool(json, L"sshEnabled", &cfg.ssh_enabled);
         json_get_bool(json, L"sshDeployKey", &cfg.ssh_deploy_key);
+        json_get_bool(json, L"copyNvidiaSmi", &cfg.copy_nvidia_smi);
 
         {
             const wchar_t *error = asb_validate_gpu_selection(cfg.gpu_mode, cfg.gpu_id);

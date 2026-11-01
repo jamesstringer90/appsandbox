@@ -54,12 +54,14 @@ try:
     print("=== create a Windows template ===")
     code, _ = c.create(name=TPL, osType="Windows", imagePath=ISO_WIN, ramMb=4000, hddGb=64,
                        cpuCores=4, gpuMode=1, networkMode=1, adminUser="user", adminPass="test123",
-                       testMode=True, isTemplate=True)
+                       testMode=True, isTemplate=True, copyNvidiaSmi=True)
     check("template create -> 202", code == 202, "code=%s" % code)
     deadline = time.time() + 90
     while time.time() < deadline and TPL not in names():
         time.sleep(2)
     check("template appears in /vms while building", TPL in names())
+    if TPL in names():
+        check("template forces copyNvidiaSmi false", c.status(TPL).get("copyNvidiaSmi") is False)
     check("delete-during-build guard applies to template -> 409", c.delete_vm(TPL)[0] == 409)
 
     print("    waiting for sysprep finalization (template -> /templates, leaves /vms)...", flush=True)
@@ -93,6 +95,7 @@ try:
     check("create-from-template -> 202", code == 202, "code=%s" % code)
     s = c.wait_online(FROMTPL, timeout=1800)   # boots from the generalized template all the way to online
     check("VM-from-template reaches online", s["state"] == "online", "state=%s" % s["state"])
+    check("VM-from-template defaults copyNvidiaSmi false", s.get("copyNvidiaSmi") is False)
     # graceful, agent-mediated shutdown (force only as a fallback so the test can finish)
     gcode, _ = c.shutdown(FROMTPL)
     check("from-template graceful shutdown -> 202", gcode == 202, "code=%s" % gcode)
