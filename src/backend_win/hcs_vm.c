@@ -1152,9 +1152,11 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L"\"ComputeTopology\":{"
                 L"\"Memory\":{"
                     L"\"SizeInMB\":%lu,"
-                    L"\"AllowOvercommit\":true,"
-                    L"\"EnableDeferredCommit\":true,"
-                    L"\"EnableColdDiscardHint\":true"
+                    /* AllowOvercommit with deferred commit asks for dynamic memory.
+                       With nested virtualization and GuestStateOnly isolation
+                       HcsStartComputeSystem rejects it with 0x80070032
+                       ERROR_NOT_SUPPORTED. A fixed size starts. */
+                    L"\"AllowOvercommit\":false"
                 L"},"
                 L"\"Processor\":{"
                     L"\"Count\":%lu"
