@@ -5,6 +5,9 @@ fixture uses WPF and WinForms UI Automation providers; the macOS fixture uses na
 AppKit controls. The HTML pages work on either platform. Their control behavior and
 test data are preserved from the fixtures used for Mac-host validation.
 
+The [compatibility chart](../../docs/accessibility-validation/SUPPORT.md) records
+observed results, known failures and remaining coverage for both guest platforms.
+
 ## Windows
 
 Build on Windows with PowerShell and .NET Framework 4.8; no NuGet packages or Visual
