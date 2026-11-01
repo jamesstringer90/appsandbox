@@ -103,6 +103,10 @@ struct VmClipboardData {
     volatile LONG    writer_suppress;
     HANDLE           writer_thread;
     CRITICAL_SECTION writer_cs;
+    /* Deferred sends set by window-thread paths when writer_cs is busy (a
+       long transfer is streaming); drained by clip_writer_unlock. */
+    volatile LONG    format_list_pending;
+    volatile LONG    sync_pending;       /* -1 = none, 0 = off, 1 = on */
 
     /* Reader channel (:0006 guest->host) */
     volatile SOCKET  reader_socket;
@@ -201,6 +205,10 @@ static SOCKET clip_connect_hv(const GUID *vm_runtime_id, const GUID *service_gui
     ioctlsocket(s, FIONBIO, &nonblock);
     sock_timeout = 5000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&sock_timeout, sizeof(sock_timeout));
+    /* Bound blocking sends so a stalled guest cannot pin a sender (and the
+       writer_cs it holds) forever. */
+    sock_timeout = 10000;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char *)&sock_timeout, sizeof(sock_timeout));
     return s;
 }
 
@@ -430,6 +438,9 @@ static HGLOBAL clip_build_hdrop_from_temp(const wchar_t *temp_dir)
 
 /* ---- Writer channel: send SYNC_ENABLE ---- */
 
+static void clip_flush_pending_locked(VmClipboard clip);
+static void clip_writer_unlock(VmClipboard clip);
+
 static void clip_send_sync_enable(VmClipboard clip, BOOL enabled)
 {
     ClipHeader hdr;
@@ -446,7 +457,7 @@ static void clip_send_sync_enable(VmClipboard clip, BOOL enabled)
     EnterCriticalSection(&clip->writer_cs);
     clip_send_all(s, &hdr, sizeof(hdr));
     clip_send_all(s, &flag, 1);
-    LeaveCriticalSection(&clip->writer_cs);
+    clip_writer_unlock(clip);
 
     clip_log(clip, L"CLIP: Sent SYNC_ENABLE(%d) to guest.", (int)flag);
 }
@@ -507,9 +518,61 @@ static void clip_send_format_list(VmClipboard clip)
     EnterCriticalSection(&clip->writer_cs);
     clip_send_all(s, &hdr, sizeof(hdr));
     clip_send_all(s, buf, offset);
-    LeaveCriticalSection(&clip->writer_cs);
+    clip_writer_unlock(clip);
 
     clip_log(clip, L"CLIP: Sent format list (%u formats) to guest.", count);
+}
+
+/* ---- Writer lock: never block the window thread, service deferred sends ----
+   Window-thread paths (focus / clipboard-update) use TryEnterCriticalSection;
+   if a writer-channel send holds writer_cs (e.g. a large CF_HDROP paste
+   streaming a whole file tree) they set a pending flag instead of blocking the
+   message pump. Every writer_cs exit path goes through clip_writer_unlock(),
+   which re-checks after leaving, so a pending flag set while the lock was held
+   is always serviced by the next holder — and a stream is never interleaved
+   mid-message. */
+
+static void clip_flush_pending_locked(VmClipboard clip)
+{
+    LONG sync;
+
+    if (clip->writer_socket == INVALID_SOCKET) {
+        InterlockedExchange(&clip->format_list_pending, 0);
+        InterlockedExchange(&clip->sync_pending, -1);
+        return;
+    }
+
+    sync = InterlockedExchange(&clip->sync_pending, -1);
+    if (sync != -1) {
+        clip_send_sync_enable(clip, sync != 0);
+        if (sync != 0)
+            InterlockedExchange(&clip->format_list_pending, 1);
+    }
+
+    if (InterlockedCompareExchange(&clip->format_list_pending, 0, 1) == 1)
+        clip_send_format_list(clip);
+}
+
+static void clip_writer_unlock(VmClipboard clip)
+{
+    LeaveCriticalSection(&clip->writer_cs);
+    if (TryEnterCriticalSection(&clip->writer_cs)) {
+        clip_flush_pending_locked(clip);
+        LeaveCriticalSection(&clip->writer_cs);
+    }
+}
+
+/* Window-thread entry: send now if the writer is idle, otherwise remember to
+   send when the current holder finishes. Never blocks the calling thread. */
+static void clip_send_format_list_deferred(VmClipboard clip)
+{
+    if (clip->writer_socket == INVALID_SOCKET) return;
+    if (TryEnterCriticalSection(&clip->writer_cs)) {
+        clip_send_format_list(clip);
+        clip_writer_unlock(clip);
+    } else {
+        InterlockedExchange(&clip->format_list_pending, 1);
+    }
 }
 
 /* ---- Writer channel: handle DATA_REQ from guest ---- */
@@ -531,7 +594,7 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
         hdr.data_size = 0;
         EnterCriticalSection(&clip->writer_cs);
         clip_send_all(s, &hdr, sizeof(hdr));
-        LeaveCriticalSection(&clip->writer_cs);
+        clip_writer_unlock(clip);
         return;
     }
 
@@ -556,7 +619,7 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
                 hdr.format = CF_HDROP;
                 hdr.data_size = 0;
                 clip_send_all(s, &hdr, sizeof(hdr));
-                LeaveCriticalSection(&clip->writer_cs);
+                clip_writer_unlock(clip);
             } else {
                 CloseClipboard();
                 goto send_empty;
@@ -574,7 +637,7 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
         hdr.data_size = 0;
         EnterCriticalSection(&clip->writer_cs);
         clip_send_all(s, &hdr, sizeof(hdr));
-        LeaveCriticalSection(&clip->writer_cs);
+        clip_writer_unlock(clip);
         return;
     }
 
@@ -592,7 +655,7 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
         clip_send_all(s, &hdr, sizeof(hdr));
         if (hdr.data_size > 0)
             clip_send_all(s, ptr, (int)hdr.data_size);
-        LeaveCriticalSection(&clip->writer_cs);
+        clip_writer_unlock(clip);
 
         if (ptr) GlobalUnlock(hData);
         CloseClipboard();
@@ -603,7 +666,7 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
         hdr.data_size = 0;
         EnterCriticalSection(&clip->writer_cs);
         clip_send_all(s, &hdr, sizeof(hdr));
-        LeaveCriticalSection(&clip->writer_cs);
+        clip_writer_unlock(clip);
     }
 }
 
@@ -1004,6 +1067,8 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
     clip->reader_socket = INVALID_SOCKET;
     clip->writer_suppress = 0;
     clip->reader_suppress = 0;
+    clip->format_list_pending = 0;
+    clip->sync_pending = -1;
 
     InitializeCriticalSection(&clip->writer_cs);
     InitializeCriticalSection(&clip->reader_cs);
@@ -1080,10 +1145,16 @@ ASB_API void vm_clipboard_set_sync_enabled(VmClipboard clip, BOOL enabled)
     clip_log(clip, L"CLIP: Window %s — clipboard sync %s.",
              enabled ? L"focused" : L"unfocused",
              enabled ? L"ON" : L"OFF");
-    clip_send_sync_enable(clip, enabled);
 
-    if (enabled) {
-        clip_send_format_list(clip);
+    /* Window thread: never block on writer_cs (a large CF_HDROP paste may be
+       streaming a whole file tree). Send now if idle, else defer. */
+    if (TryEnterCriticalSection(&clip->writer_cs)) {
+        clip_send_sync_enable(clip, enabled);
+        if (enabled)
+            clip_send_format_list(clip);
+        clip_writer_unlock(clip);
+    } else {
+        InterlockedExchange(&clip->sync_pending, enabled ? 1L : 0L);
     }
 }
 
@@ -1100,7 +1171,7 @@ ASB_API void vm_clipboard_on_clipboard_update(VmClipboard clip)
     /* Focus gate */
     if (!clip->sync_enabled) return;
 
-    clip_send_format_list(clip);
+    clip_send_format_list_deferred(clip);
 }
 
 ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)

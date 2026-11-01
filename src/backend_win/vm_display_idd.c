@@ -253,6 +253,7 @@ struct VmDisplayIdd {
     HWND           log_hwnd;        /* top-level log window */
     HWND           log_list_hwnd;   /* listbox inside log window */
     HWND           render_hwnd;     /* child window for D3D11 rendering */
+    DWORD          window_thread_id;/* owning thread of log/render windows */
 
     /* Clipboard (extracted to vm_clipboard.c) */
     VmClipboard      clipboard;
@@ -462,6 +463,9 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
     wchar_t buf[512];
     va_list ap;
     LRESULT count;
+    DWORD_PTR result;
+    BOOL from_window_thread;
+    LRESULT sent;
 
     if (!d || !d->log_list_hwnd || d->stop) return;
 
@@ -469,17 +473,40 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
     vswprintf_s(buf, 512, fmt, ap);
     va_end(ap);
 
-    count = SendMessageW(d->log_list_hwnd, LB_ADDSTRING, 0, (LPARAM)buf);
+    /* Cross-thread SendMessage can deadlock another thread against the window
+       thread (e.g. a sender logs while the window thread waits for it). Use a
+       bounded SendMessageTimeout off-thread and drop the line on timeout. */
+    from_window_thread = (d->window_thread_id == GetCurrentThreadId());
+
+    if (from_window_thread) {
+        count = SendMessageW(d->log_list_hwnd, LB_ADDSTRING, 0, (LPARAM)buf);
+    } else {
+        sent = SendMessageTimeoutW(d->log_list_hwnd, LB_ADDSTRING, 0, (LPARAM)buf,
+                                   SMTO_ABORTIFHUNG | SMTO_NORMAL, 200, &result);
+        if (!sent) return;
+        count = (LRESULT)result;
+    }
 
     /* Trim old entries */
     while (count > MAX_LOG_LINES) {
-        SendMessageW(d->log_list_hwnd, LB_DELETESTRING, 0, 0);
+        if (from_window_thread) {
+            SendMessageW(d->log_list_hwnd, LB_DELETESTRING, 0, 0);
+        } else if (!SendMessageTimeoutW(d->log_list_hwnd, LB_DELETESTRING, 0, 0,
+                                        SMTO_ABORTIFHUNG | SMTO_NORMAL, 200, &result)) {
+            break;
+        }
         count--;
     }
 
-    /* Scroll to bottom and force repaint even when not focused */
-    SendMessageW(d->log_list_hwnd, LB_SETTOPINDEX, (WPARAM)(count - 1), 0);
-    UpdateWindow(d->log_list_hwnd);
+    /* Scroll to bottom and force repaint even when not focused (same-thread
+       only; off-thread UpdateWindow would block on WM_PAINT the same way) */
+    if (from_window_thread) {
+        SendMessageW(d->log_list_hwnd, LB_SETTOPINDEX, (WPARAM)(count - 1), 0);
+        UpdateWindow(d->log_list_hwnd);
+    } else {
+        SendMessageTimeoutW(d->log_list_hwnd, LB_SETTOPINDEX, (WPARAM)(count - 1), 0,
+                            SMTO_ABORTIFHUNG | SMTO_NORMAL, 200, &result);
+    }
 }
 
 /* ---- Send input packet to guest ---- */
@@ -2175,6 +2202,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     wchar_t title[300];
     MSG msg;
+
+    d->window_thread_id = GetCurrentThreadId();
 
     ensure_idd_class(d->hInstance);
 
