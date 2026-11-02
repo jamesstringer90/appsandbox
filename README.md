@@ -19,30 +19,35 @@ Windows features:
 - Host to client hot-key support
 - Provision and boot with / without internet
 - Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support
-- Headless mode: a scriptable local HTTP/JSON API + dependency-free Python SDK (`asb.py`) for creating and driving GPU-accelerated VMs programmatically
+- A local HTTP/JSON API and dependency-free Python SDK (`asb.py`) work alongside the GUI, or independently in headless mode
 
 Mac features:
 - macOS or Windows 11 ARM VM support
-- Zero touch install for Windows 11, macOS has 3 unskippable onboarding steps
+- Zero touch install for Windows 11 and macOS 27 or newer, including account creation and automatic login to the desktop
 - Copy and Paste
 - 2 Channel Audio
 - macOS: GPU Acceleration via Paravirtualization with support for Metal, Windows: No GPU Acceleration
 - SSH via virtio-vsock (no network required)
 - Fixed 1080P60 display on Windows 11 guests, Dynamic display sizing on macOS guests
 - Provision and boot with / without internet
-- Headless mode: the same scriptable local HTTP/JSON API + Python SDK (`asb.py`) as on Windows, for driving macOS and Windows 11 VMs programmatically
+- Templates for macOS and Windows guests, including creating instances with larger disks
+- Shared NAT and DHCP network for macOS and Windows guests, allowing communication between them
+- Nested virtualization enabled automatically for Windows guests when the Mac supports it; macOS guests do not support nested virtualization
+- Menu-bar controls for running VMs
+- The same local HTTP/JSON API and Python SDK (`asb.py`) as on Windows, available alongside the GUI or independently in headless mode
 
 Requirements:
-Windows 11 with an x64 Processor or macOS Tahoe (M Series)
+Windows 11 with an x64 Processor or macOS 27 or newer on Apple silicon. Creating a new macOS VM requires a macOS 27 or newer restore image; existing older VMs remain supported.
 
 ## About App Sandbox
 
 App Sandbox creates and runs full desktop virtual machines — Windows 11, Ubuntu, and
 macOS. It is free and open-source (MIT), distributed as prebuilt binaries (EV-signed on
 Windows, Apple-Developer-signed on macOS) on its
-[Releases](https://github.com/jamesstringer90/appsandbox/releases) page. It is driven two
-ways: from a graphical UI, or programmatically through a headless daemon with a
-dependency-free Python SDK (`asb.py`). Either way you pick an OS, point it at an installer
+[Releases](https://github.com/jamesstringer90/appsandbox/releases) page. Its graphical UI
+and local API control the same running core, so you can use the UI and the
+dependency-free Python SDK (`asb.py`) together. You can also run the core headlessly.
+Either way you pick an OS, point it at an installer
 image, and App Sandbox provisions the disk, runs an unattended install, and boots the
 guest. You supply a Windows or Ubuntu ISO; macOS guests download their restore image
 automatically. It runs on a Windows 11 (x64) PC or an Apple Silicon Mac, including laptops.
@@ -67,21 +72,47 @@ Virtual Machine Platform is the same Windows feature WSL2 uses.
 - Scripting the VM lifecycle from code — create, snapshot, branch, SSH into, and delete
   GPU-accelerated VMs — with the Python SDK.
 
-**Headless API.** 
-`appsandbox.exe --headless` 
-(or `sudo /Appsandbox.app/Contents/MacOS/AppSandbox --headless` on macOS) starts a
-single-owner daemon that hosts the same core as the GUI and exposes it as a Docker-style
-local HTTP/JSON API on `127.0.0.1`, identical on both platforms. The stdlib-only Python SDK
+**GUI and headless API.** Opening App Sandbox also starts its local HTTP/JSON API
+on `127.0.0.1`. GUI, API, and tray/menu-bar actions share the same VM state and viewer
+ownership. Connect with `asb.connect()` while the app is open; no second daemon is needed.
+
+For standalone operation, run `appsandbox.exe --headless` from an elevated Windows
+shell, or `sudo /Applications/AppSandbox.app/Contents/MacOS/AppSandbox --headless`
+on macOS. `-headless` is also accepted. This starts the core without the management
+window or automatic VM viewers. On a local Mac desktop, a menu-bar icon provides VM
+controls and Quit; menu-bar availability is optional. SSH and non-graphical sessions
+run without AppKit or a menu bar. Viewers open only on explicit requests in a supported
+local desktop session. Only one core process can run at a time.
+
+The Mac app requests administrator authorization at startup and retains its process
+privileges for that run; creating or starting another VM does not require another
+authorization. Closing the Mac management window leaves the core and API running;
+Quit stops them and their VMs. Headless Ctrl-C also performs cleanup.
+
+The stdlib-only Python SDK
 (`asb.py`) wraps it: create GPU-accelerated VMs (GPU-PV is a `gpuMode` create option), SSH
 in over an auto-deployed key (Windows, Ubuntu, or macOS guests), snapshot and branch them,
 open the live display, and run several at once — how many run concurrently is bounded by host
 CPU, RAM, and GPU memory, not by a fixed limit. The daemon is single-host — it drives VMs on
 the machine it runs on and does not provision cloud VMs; for CI, run it on a self-hosted
-runner. Provisioning a VM runs a full unattended install; snapshots, branches, and templates
-(Windows-only) start a new VM from a provisioned state instead of reinstalling. A VM persists
+runner. Templates avoid repeating the OS installation: Windows hosts support Windows
+templates, and Mac hosts support both Windows and macOS templates. Instances have their
+own writable disks and can request more space than the template. New instances continue
+working after their template is deleted. Deletion is refused while an older Windows VM
+still requires the template. Windows templates use
+Sysprep; Mac instances receive a new virtual machine identity and provision their account
+at first boot. Templates retain the base filesystem's identifiers and are not a guarantee
+of unique fingerprints for every third-party program. Snapshots and branches remain
+Windows-host-only. A VM persists
 until deleted. A snapshot is a disk-state checkpoint taken with the VM stopped, and a branch
 forks a writable disk from it to run divergent actions. The full API reference and runnable
 examples are in [`tools/headless-api/`](tools/headless-api/).
+
+**Guest networking.** On Mac hosts, Windows and macOS guests use the same Apple-managed
+NAT network and receive addresses through DHCP. For newly provisioned Windows NAT guests
+on either host, App Sandbox sets the guest adapter's network profile to Private and enables
+Windows' existing IPv4 ping rule for the local subnet. This does not open arbitrary
+application ports or automatically change the firewall policy inside older guests.
 
 **How it works:** this repo also aims to be a working example of creating full desktop VMs
 programmatically with the Windows HCS/HCN APIs and Apple's Virtualization.framework. On

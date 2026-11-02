@@ -13,17 +13,19 @@
 #import "vz_display.h"
 #import "host_info.h"
 #import "vm_dir.h"
-#import "EventLogWindow.h"
 
 #include "asb_types.h"
+#include "asb_events.h"
+#include "headless.h"
 
 #pragma mark - Static state
 
 static __weak WKWebView *g_webView;
 
-static NSMutableArray<NSString *> *g_vmNames;
 
 static BOOL g_initialized;
+static unsigned g_subscription;
+static BOOL g_refresh_pending;
 
 #pragma mark - JSON helpers
 
@@ -54,47 +56,6 @@ static void postToJs(NSDictionary *message) {
 
 #pragma mark - Event translation
 
-static NSDictionary *vmToJsDict(const AsbVmMac *vm) {
-    BOOL isWindows = strcasecmp(vm->os_type, "Windows") == 0;
-    return @{
-        @"name":            [NSString stringWithUTF8String:vm->name],
-        @"osType":          [NSString stringWithUTF8String:vm->os_type],
-        @"diskDirectory":   [VmDir diskDirectoryForVm:@(vm->name)].URLByDeletingLastPathComponent.path,
-        @"running":         @(vm->running || (!vm->disk_built && vm->install_progress >= 0)),
-        @"shuttingDown":    @(vm->shutting_down ? YES : NO),
-        @"agentOnline":     @(vm->agent_online ? YES : NO),
-        @"ramMb":           @(vm->ram_mb),
-        @"hddGb":           @(vm->hdd_gb),
-        @"cpuCores":        @(vm->cpu_cores),
-        @"gpuMode":         @(vm->gpu_mode),
-        @"gpuName":         isWindows ? @"Software (WARP)" : [HostInfo hostGpuName],
-        @"networkMode":     @1,
-        @"netAdapter":      @"",
-        @"isTemplate":      @NO,
-        @"hypervVideoOff":  @NO,
-        /* Disk-build phase: feed the shared web/app.js "Building Disk (X%)" / "Staging
-         * files..." branch (which keys on buildingVhdx/vhdxStaging/vhdxProgress), matching
-         * the Windows GUI. True only while the local disk build runs (install_progress is a
-         * real 0..100 percent; it becomes -1 when the guest first-boot takes over). */
-        @"buildingVhdx":    @(!vm->disk_built && vm->install_progress >= 0),
-        @"vhdxStaging":     @(!vm->disk_built && vm->install_progress >= 0 &&
-                              strstr(vm->install_status, "Staging") != NULL),
-        @"vhdxProgress":    @(vm->install_progress < 0 ? 0 : vm->install_progress),
-        @"installComplete": @(vm->install_complete ? YES : NO),
-        @"installStatus":   [NSString stringWithUTF8String:vm->install_status],
-        @"sshEnabled":      @(vm->ssh_enabled ? YES : NO),
-        @"sshPort":         @(vm->ssh_port),
-        @"sshState":        @((vm->ssh_key_deployed && vm->ssh_state == 2) ? 4 : vm->ssh_state),
-        @"sshDeployKey":    @(vm->ssh_deploy_key ? YES : NO),
-        @"sshKeyDeployed":  @(vm->ssh_key_deployed ? YES : NO),
-        @"snapCurrent":     @(-1),
-        @"snapCurrentBranch": @(-1),
-        @"hasSnapshots":    @NO,
-        @"baseBranches":    @[],
-        @"snapshots":       @[],
-    };
-}
-
 static NSDictionary *buildHostInfoDict(void) {
     int vmCores = 0;
     int vmRamMb = 0;
@@ -119,36 +80,30 @@ static NSDictionary *buildHostInfoDict(void) {
     };
 }
 
-static void collectVms(NSMutableArray<NSDictionary *> *outJs,
-                        NSMutableArray<NSString *> *outNames) {
+static void collectVms(NSMutableArray<NSDictionary *> *outJs) {
     int count = asb_mac_vm_count();
     for (int i = 0; i < count; i++) {
         AsbVmMac *vm = asb_mac_vm_get(i);
-        [outJs addObject:vmToJsDict(vm)];
-        [outNames addObject:[NSString stringWithUTF8String:vm->name]];
+        if (vm->template_ready) continue;
+        [outJs addObject:asb_mac_vm_snapshot(vm)];
     }
 }
 
 static void sendVmListChanged(void) {
     NSMutableArray<NSDictionary *> *jsVms = [NSMutableArray array];
-    NSMutableArray<NSString *> *names = [NSMutableArray array];
-    collectVms(jsVms, names);
-
-    g_vmNames = names;
+    collectVms(jsVms);
 
     postToJs(@{
         @"type": @"vmListChanged",
         @"vms": jsVms,
         @"hostInfo": buildHostInfoDict(),
     });
+    postToJs(@{ @"type": @"templates", @"templates": asb_mac_templates() });
 }
 
 static void sendFullState(void) {
     NSMutableArray<NSDictionary *> *jsVms = [NSMutableArray array];
-    NSMutableArray<NSString *> *names = [NSMutableArray array];
-    collectVms(jsVms, names);
-
-    g_vmNames = names;
+    collectVms(jsVms);
 
     postToJs(@{
         @"type": @"fullState",
@@ -156,19 +111,8 @@ static void sendFullState(void) {
         @"hostInfo": buildHostInfoDict(),
         @"adapters": @[],
         @"defaultAdapter": @0,
-        @"templates": @[],
+        @"templates": asb_mac_templates(),
     });
-}
-
-static void syncEventLogVisibility(void) {
-    int running = 0;
-    int count = asb_mac_vm_count();
-    for (int i = 0; i < count; i++) {
-        AsbVmMac *vm = asb_mac_vm_get(i);
-        if (vm && vm->running) running++;
-    }
-    if (running > 0) [[EventLogWindow shared] show];
-    else             [[EventLogWindow shared] hide];
 }
 
 static void sendLog(NSString *message) {
@@ -181,46 +125,35 @@ static void sendAlert(NSString *message) {
     postToJs(@{ @"type": @"alert", @"message": message });
 }
 
-/* Diag events go to the Event Log window only — separate channel from
- * the user-visible main log (which lives in the WebView). Matches
- * Windows' IDD log split where protocol chatter is a different stream
- * from the main app log. */
-static void sendDiag(NSString *message) {
-    if (!message) return;
-    [[EventLogWindow shared] appendLine:message];
-}
-
 #pragma mark - Orchestrator event callback
 
-static void AsbEventCallback(int type, const char *vm_name,
-                               int int_value, const char *str_value) {
-    (void)vm_name; (void)int_value;
-    NSString *str = str_value ? [NSString stringWithUTF8String:str_value] : nil;
-    switch (type) {
-        case CORE_VM_EVENT_LOG:
-            sendLog(str);
-            break;
-        case CORE_VM_EVENT_ALERT:
-            sendAlert(str);
-            break;
+static void AsbEventCallback(const CoreVmEvent *event, void *context) {
+    (void)context;
+    int type = event->type;
+    NSString *str = event->str_value ? @(event->str_value) : nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_initialized) return;
+        switch (type) {
         case CORE_VM_EVENT_DIAG:
-            sendDiag(str);
-            break;
-        case CORE_VM_EVENT_STATE_CHANGED:
+        case CORE_VM_EVENT_LOG: sendLog(str); return;
+        case CORE_VM_EVENT_ALERT: sendAlert(str); return;
+        default: break;
+        }
+        if (g_refresh_pending) return;
+        g_refresh_pending = YES;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            g_refresh_pending = NO;
+            if (!g_initialized) return;
             sendVmListChanged();
-            syncEventLogVisibility();
-            break;
-        case CORE_VM_EVENT_LIST_CHANGED:
-            sendVmListChanged();
-            syncEventLogVisibility();
-            break;
-        case CORE_VM_EVENT_PROGRESS:
-        case CORE_VM_EVENT_INSTALL_STATUS:
-        case CORE_VM_EVENT_AGENT_STATUS:
-        default:
-            sendVmListChanged();
-            break;
-    }
+        });
+    });
+}
+
+void ui_shutdown(void) {
+    g_initialized = NO;
+    asb_events_unsubscribe(g_subscription);
+    asb_api_stop();
+    g_webView = nil;
 }
 
 #pragma mark - Public entry points
@@ -247,8 +180,8 @@ void ui_set_webview(WKWebView *webView) {
 
     cleanupStaleSshScripts();
     asb_mac_init();
-    asb_mac_set_event_cb(AsbEventCallback);
-    g_vmNames = [NSMutableArray array];
+    g_subscription = asb_events_subscribe(AsbEventCallback, NULL);
+    if (!asb_api_start(1)) sendAlert(@"The local API could not start. See headless.log for details.");
 }
 
 void ui_post_json(NSString *json) {
@@ -261,11 +194,9 @@ void ui_post_json(NSString *json) {
 
 #pragma mark - Incoming action dispatch
 
-static NSString *vmNameAtIndex(id indexValue) {
-    if (![indexValue respondsToSelector:@selector(intValue)]) return nil;
-    int idx = [indexValue intValue];
-    if (idx < 0 || idx >= (int)g_vmNames.count) return nil;
-    return g_vmNames[idx];
+static AsbVmId vmIdForMessage(NSDictionary *msg) {
+    id target = msg[@"vmId"];
+    return [target isKindOfClass:[NSString class]] ? asb_vm_id_parse([target UTF8String]) : 0;
 }
 
 static void handleCreateVm(NSDictionary *msg) {
@@ -301,50 +232,50 @@ static void handleCreateVm(NSDictionary *msg) {
                                 gpuMode, networkMode, imagePath,
                                 diskDirectory.UTF8String,
                                 [adminUser UTF8String], [adminPass UTF8String],
-                                sshEnabled, sshDeployKey, testMode);
+                                sshEnabled, sshDeployKey, testMode, [msg[@"isTemplate"] boolValue],
+                                asb_vm_id_parse([msg[@"templateId"] UTF8String]),
+                                [msg[@"templateName"] UTF8String]);
     if (rc != 0) {
         sendAlert([NSString stringWithFormat:@"Create failed (error %d)", rc]);
     }
 }
 
 static void handleStartVm(NSDictionary *msg) {
-    NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
-    if (!n) return;
-    asb_mac_vm_start([n UTF8String]);
+    AsbVmId vm_id = vmIdForMessage(msg);
+    if (!vm_id) return;
+    asb_mac_vm_start(vm_id);
 }
 
 static void handleStopVm(NSDictionary *msg) {
-    NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
-    if (!n) return;
-    asb_mac_vm_stop([n UTF8String], 1);
+    AsbVmId vm_id = vmIdForMessage(msg);
+    if (!vm_id) return;
+    asb_mac_vm_stop(vm_id, 1);
 }
 
 static void handleShutdownVm(NSDictionary *msg) {
-    NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
-    if (!n) return;
-    asb_mac_vm_stop([n UTF8String], 0);
+    AsbVmId vm_id = vmIdForMessage(msg);
+    if (!vm_id) return;
+    asb_mac_vm_stop(vm_id, 0);
 }
 
 static void handleDeleteVm(NSDictionary *msg) {
-    NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
-    if (!n) return;
-    asb_mac_vm_delete([n UTF8String]);
+    AsbVmId vm_id = vmIdForMessage(msg);
+    if (!vm_id) return;
+    asb_mac_vm_delete(vm_id);
 }
 
 static void handleConnectDisplay(NSDictionary *msg) {
-    NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
-    if (!n) return;
-    AsbVmMac *vm = asb_mac_vm_find([n UTF8String]);
-    if (vm && vm->display) {
-        [vm->display showDisplay];
-    }
+    AsbVmId vm_id = vmIdForMessage(msg);
+    if (!vm_id) return;
+    int rc = asb_mac_open_display(vm_id);
+    if (rc != BACKEND_OK) sendAlert(@"The VM display is not ready yet. Wait for the guest to finish starting.");
 }
 
 static void handleEditVm(NSDictionary *msg) {
-    NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
+    AsbVmId vm_id = vmIdForMessage(msg);
     NSString *field = msg[@"field"];
     id rawValue = msg[@"value"];
-    if (!n || ![field isKindOfClass:[NSString class]] ||
+    if (!vm_id || ![field isKindOfClass:[NSString class]] ||
         (![rawValue isKindOfClass:[NSString class]] && ![rawValue isKindOfClass:[NSNumber class]])) {
         sendAlert(@"VM configuration could not be updated.");
         sendVmListChanged();
@@ -352,13 +283,13 @@ static void handleEditVm(NSDictionary *msg) {
     }
     NSString *value = [rawValue isKindOfClass:[NSString class]]
         ? rawValue : [NSString stringWithFormat:@"%@", rawValue];
-    AsbVmMac *vm = asb_mac_vm_find(n.UTF8String);
+    AsbVmMac *vm = asb_mac_vm_find_by_id(vm_id);
     if (!vm) {
         sendAlert(@"VM configuration could not be updated.");
     } else if (vm->running || (!vm->disk_built && vm->install_progress >= 0)) {
         sendAlert(@"VM settings can only be changed when the VM is stopped and its disk build has finished.");
     } else {
-        int rc = asb_mac_vm_edit([n UTF8String], [field UTF8String], [value UTF8String]);
+        int rc = asb_mac_vm_edit(vm_id, [field UTF8String], [value UTF8String]);
         if (rc != BACKEND_OK) sendAlert(@"VM configuration could not be updated.");
     }
     sendVmListChanged();
@@ -371,8 +302,6 @@ static void handleBrowseImage(NSDictionary *msg) {
         panel.canChooseFiles = YES;
         panel.canChooseDirectories = NO;
         panel.allowsMultipleSelection = NO;
-        /* .iso for a Windows guest (built from a Microsoft ISO), .ipsw for a
-         * macOS restore image. Both guest types are now creatable on a Mac host. */
         NSMutableArray<UTType *> *types = [NSMutableArray array];
         UTType *iso  = [UTType typeWithFilenameExtension:@"iso"];
         UTType *ipsw = [UTType typeWithFilenameExtension:@"ipsw"];
@@ -462,9 +391,9 @@ void ui_handle_message(NSString *json) {
     } else if ([action isEqualToString:@"selectVm"]) {
         /* Selection is a UI-local concept; the native side doesn't care. */
     } else if ([action isEqualToString:@"sshConnect"]) {
-        NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
-        if (!n) return;
-        AsbVmMac *vm = asb_mac_vm_find([n UTF8String]);
+        AsbVmId vm_id = vmIdForMessage(msg);
+        if (!vm_id) return;
+        AsbVmMac *vm = asb_mac_vm_find_by_id(vm_id);
         if (!vm) { sendLog(@"SSH: vm not found"); return; }
         if (vm->ssh_port <= 0) {
             sendLog([NSString stringWithFormat:
@@ -503,7 +432,7 @@ void ui_handle_message(NSString *json) {
             keyopt, quotedUser, vm->ssh_port];
         NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
             [NSString stringWithFormat:@"appsandbox-ssh-%@-%u.command",
-             n, arc4random()]];
+             msg[@"vmId"], arc4random()]];
         NSError *wErr = nil;
         if (![body writeToFile:tmp atomically:YES
                       encoding:NSUTF8StringEncoding error:&wErr]) {
@@ -524,11 +453,14 @@ void ui_handle_message(NSString *json) {
         }
         sendLog([NSString stringWithFormat:@"SSH: opened Terminal (127.0.0.1:%d as %@)",
                  vm->ssh_port, user]);
+    } else if ([action isEqualToString:@"deleteTemplate"]) {
+        AsbVmMac *vm = asb_mac_vm_find_by_id(asb_vm_id_parse([msg[@"templateId"] UTF8String]));
+        if (!vm || !vm->template_ready || asb_mac_vm_delete(vm->unique_id) != BACKEND_OK)
+            sendAlert(@"Template could not be deleted.");
     } else if ([action isEqualToString:@"snapTake"] ||
                [action isEqualToString:@"snapDelete"] ||
                [action isEqualToString:@"snapDeleteBranch"] ||
                [action isEqualToString:@"snapRename"] ||
-               [action isEqualToString:@"deleteTemplate"] ||
                [action isEqualToString:@"enableFeature"] ||
                [action isEqualToString:@"enableFeatureReboot"]) {
         sendLog([NSString stringWithFormat:@"%@ is not supported on macOS yet.", action]);

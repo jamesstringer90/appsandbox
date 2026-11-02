@@ -22,6 +22,6 @@
     <key>StandardErrorPath</key>
     <string>/var/log/appsandbox-agent.log</string>
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Interactive</string>
 </dict>
 </plist>

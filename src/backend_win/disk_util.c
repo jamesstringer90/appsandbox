@@ -115,6 +115,103 @@ HRESULT vhdx_create_differencing(const wchar_t *child_path, const wchar_t *paren
     return S_OK;
 }
 
+HRESULT vhdx_copy(const wchar_t *path, const wchar_t *source_path,
+                  HANDLE cancel_event, VhdxCopyProgress progress, void *context)
+{
+    VIRTUAL_STORAGE_TYPE storage_type = { VIRTUAL_STORAGE_TYPE_DEVICE_VHDX, VHDX_VENDOR_MS };
+    CREATE_VIRTUAL_DISK_PARAMETERS params = {0};
+    OVERLAPPED overlapped = {0};
+    HANDLE disk = INVALID_HANDLE_VALUE, events[2];
+    DWORD result;
+    BOOL cancelling = FALSE;
+    int last_percent = -1;
+
+    if (!path || !source_path || !cancel_event) return E_INVALIDARG;
+    if (WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0)
+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    overlapped.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!overlapped.hEvent) return HRESULT_FROM_WIN32(GetLastError());
+    events[0] = overlapped.hEvent;
+    events[1] = cancel_event;
+    params.Version = CREATE_VIRTUAL_DISK_VERSION_2;
+    params.Version2.SourcePath = source_path;
+    params.Version2.SourceVirtualStorageType = storage_type;
+    params.Version2.SectorSizeInBytes = 512;
+    params.Version2.PhysicalSectorSizeInBytes = 4096;
+    result = CreateVirtualDisk(&storage_type, path, VIRTUAL_DISK_ACCESS_NONE, NULL,
+                               CREATE_VIRTUAL_DISK_FLAG_NONE, 0, &params,
+                               &overlapped, &disk);
+    if (result == ERROR_SUCCESS || result == ERROR_IO_PENDING) {
+        while (result == ERROR_IO_PENDING) {
+            VIRTUAL_DISK_PROGRESS status = {0};
+            DWORD wait = WaitForMultipleObjects(cancelling ? 1 : 2, events, FALSE, 250);
+            if (wait == WAIT_OBJECT_0 + 1) {
+                cancelling = TRUE;
+                CancelIoEx(disk, &overlapped);
+            }
+            result = GetVirtualDiskOperationProgress(disk, &overlapped, &status);
+            if (result != ERROR_SUCCESS) {
+                CancelIoEx(disk, &overlapped);
+                WaitForSingleObject(overlapped.hEvent, INFINITE);
+                break;
+            }
+            result = status.OperationStatus;
+            if (result == ERROR_IO_PENDING && progress && status.CompletionValue) {
+                int percent = (int)(100.0 * (double)status.CurrentValue / (double)status.CompletionValue);
+                if (percent > 100) percent = 100;
+                if (percent != last_percent) {
+                    progress(percent, context);
+                    last_percent = percent;
+                }
+            }
+        }
+        CloseHandle(disk);
+    }
+    CloseHandle(overlapped.hEvent);
+    if (cancelling) result = ERROR_CANCELLED;
+    if (result == ERROR_SUCCESS && progress && last_percent != 100)
+        progress(100, context);
+    return HRESULT_FROM_WIN32(result);
+}
+
+HRESULT vhdx_get_identifiers(const wchar_t *path, GUID *identifier, GUID *parent)
+{
+    VIRTUAL_STORAGE_TYPE storage_type = { VIRTUAL_STORAGE_TYPE_DEVICE_VHDX, VHDX_VENDOR_MS };
+    OPEN_VIRTUAL_DISK_PARAMETERS params = {0};
+    GET_VIRTUAL_DISK_INFO info = {0};
+    HANDLE disk = INVALID_HANDLE_VALUE;
+    ULONG size = sizeof(info);
+    DWORD result;
+
+    if (!path || !identifier || !parent) return E_INVALIDARG;
+    ZeroMemory(identifier, sizeof(*identifier));
+    ZeroMemory(parent, sizeof(*parent));
+    params.Version = OPEN_VIRTUAL_DISK_VERSION_2;
+    params.Version2.GetInfoOnly = TRUE;
+    params.Version2.ReadOnly = TRUE;
+    result = OpenVirtualDisk(&storage_type, path, VIRTUAL_DISK_ACCESS_NONE,
+                             OPEN_VIRTUAL_DISK_FLAG_NO_PARENTS, &params, &disk);
+    if (result != ERROR_SUCCESS) return HRESULT_FROM_WIN32(result);
+    info.Version = GET_VIRTUAL_DISK_INFO_IDENTIFIER;
+    result = GetVirtualDiskInformation(disk, &size, &info, NULL);
+    if (result == ERROR_SUCCESS) {
+        *identifier = info.Identifier;
+        size = sizeof(info);
+        info.Version = GET_VIRTUAL_DISK_INFO_PROVIDER_SUBTYPE;
+        result = GetVirtualDiskInformation(disk, &size, &info, NULL);
+        if (result == ERROR_SUCCESS && info.ProviderSubtype == 4) {
+            size = sizeof(info);
+            info.Version = GET_VIRTUAL_DISK_INFO_PARENT_IDENTIFIER;
+            result = GetVirtualDiskInformation(disk, &size, &info, NULL);
+            if (result == ERROR_SUCCESS) *parent = info.ParentIdentifier;
+        } else if (result == ERROR_SUCCESS && info.ProviderSubtype != 2 && info.ProviderSubtype != 3) {
+            result = ERROR_NOT_SUPPORTED;
+        }
+    }
+    CloseHandle(disk);
+    return HRESULT_FROM_WIN32(result);
+}
+
 static DWORD vhdx_query_virtual_size(HANDLE vhd_handle, ULONGLONG *size_bytes)
 {
     GET_VIRTUAL_DISK_INFO info;
@@ -841,7 +938,8 @@ static void remove_staging_dir(const wchar_t *dir)
     RemoveDirectoryW(dir);
 }
 
-static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir, BOOL ssh_enabled);
+static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir,
+                                  BOOL ssh_enabled, BOOL nat_network);
 
 /* ---- SSH MSI download / cache ---- */
 
@@ -877,6 +975,7 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
                               BOOL is_template,
                               BOOL test_mode,
                               BOOL ssh_enabled,
+                              BOOL nat_network,
                               const wchar_t *lang)
 {
     wchar_t dir[MAX_PATH];
@@ -916,118 +1015,7 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
         ui_log(L"Warning: failed to write autounattend.xml");
 
     /* Agent + input helper + VDD driver files + SSH MSI */
-    stage_agent_and_setup(staging, res_dir, ssh_enabled);
-
-    /* setup.cmd — first-logon script: installs agent service.
-       This runs from the ISO drive, so %~dp0 is the ISO root. */
-    swprintf_s(file_path, MAX_PATH, L"%s\\setup.cmd", staging);
-    {
-        FILE *cmd;
-        if (_wfopen_s(&cmd, file_path, L"w") == 0 && cmd) {
-            fputs(
-                "@echo off\r\n"
-                "set LOG=%SystemRoot%\\AppSandbox\\setup.log\r\n"
-                "mkdir \"%SystemRoot%\\AppSandbox\" 2>nul\r\n"
-                "echo === setup.cmd started === >> \"%LOG%\"\r\n",
-                cmd);
-            asb_provision_login_setup(cmd);
-            fputs(
-                "\r\n"
-                "REM Install guest agent\r\n"
-                "if exist \"%~dp0appsandbox-agent.exe\" (\r\n"
-                "    copy /Y \"%~dp0appsandbox-agent.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
-                "    if exist \"%~dp0appsandbox-input.exe\" copy /Y \"%~dp0appsandbox-input.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
-                "    if exist \"%~dp0appsandbox-displays.exe\" copy /Y \"%~dp0appsandbox-displays.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
-                "    if exist \"%~dp0appsandbox-clipboard.exe\" copy /Y \"%~dp0appsandbox-clipboard.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
-                "    if exist \"%~dp0appsandbox-clipboard-reader.exe\" copy /Y \"%~dp0appsandbox-clipboard-reader.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
-                "    if exist \"%~dp0appsandbox-audio.exe\" copy /Y \"%~dp0appsandbox-audio.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
-                "    \"%SystemRoot%\\AppSandbox\\appsandbox-agent.exe\" --install >> \"%LOG%\" 2>&1\r\n"
-                ")\r\n"
-                "echo === setup.cmd finished === >> \"%LOG%\"\r\n",
-                cmd);
-            fclose(cmd);
-        } else {
-            ui_log(L"Warning: failed to write setup.cmd");
-        }
-    }
-
-    /* SetupComplete.cmd — runs as SYSTEM after setup, before first logon.
-       Copied to C:\Windows\Setup\Scripts\ during specialize pass.
-       Installs VDD driver (cert + test signing + devcon) + optionally OpenSSH. */
-    swprintf_s(file_path, MAX_PATH, L"%s\\SetupComplete.cmd", staging);
-    {
-        FILE *sc;
-        if (_wfopen_s(&sc, file_path, L"w") == 0 && sc) {
-            fputs(
-                "@echo off\r\n"
-                "set LOG=%SystemRoot%\\AppSandbox\\setup.log\r\n"
-                "mkdir \"%SystemRoot%\\AppSandbox\" 2>nul\r\n"
-                "echo === SetupComplete.cmd started === >> \"%LOG%\"\r\n"
-                "\r\n"
-                "REM Find ISO drive\r\n"
-                "set ISODRV=\r\n"
-                "for %%d in (D E F G H I J) do @if exist %%d:\\drivers\\AppSandboxVDD.inf set ISODRV=%%d:\r\n"
-                "if \"%ISODRV%\"==\"\" (\r\n"
-                "    echo [VDD] Could not find ISO drive with driver files >> \"%LOG%\"\r\n"
-                "    goto :done\r\n"
-                ")\r\n"
-                "echo [VDD] Found driver files on %ISODRV% >> \"%LOG%\"\r\n"
-                "\r\n"
-                "REM Enable test signing\r\n"
-                "echo [VDD] Enabling test signing... >> \"%LOG%\"\r\n"
-                "bcdedit /set testsigning on >> \"%LOG%\" 2>&1\r\n"
-                "\r\n"
-                "REM Install certificate\r\n"
-                "if exist \"%ISODRV%\\drivers\\AppSandboxVDD.cer\" (\r\n"
-                "    echo [VDD] Installing certificate... >> \"%LOG%\"\r\n"
-                "    certutil -addstore Root \"%ISODRV%\\drivers\\AppSandboxVDD.cer\" >> \"%LOG%\" 2>&1\r\n"
-                "    certutil -f -addstore TrustedPublisher \"%ISODRV%\\drivers\\AppSandboxVDD.cer\" >> \"%LOG%\" 2>&1\r\n"
-                ")\r\n"
-                "\r\n"
-                "REM Install driver with devcon\r\n"
-                "echo [VDD] Installing driver with devcon... >> \"%LOG%\"\r\n"
-                "dir \"%ISODRV%\\drivers\\\" >> \"%LOG%\" 2>&1\r\n"
-                "\"%ISODRV%\\drivers\\devcon.exe\" install \"%ISODRV%\\drivers\\AppSandboxVDD.inf\" Root\\AppSandboxVDD >> \"%LOG%\" 2>&1\r\n"
-                "echo [VDD] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
-                "\r\n"
-                "REM Disable display sleep so IDD swap chain stays alive\r\n"
-                "powercfg /change monitor-timeout-ac 0\r\n"
-                "powercfg /change monitor-timeout-dc 0\r\n"
-                "powercfg /change standby-timeout-ac 0\r\n"
-                "powercfg /change standby-timeout-dc 0\r\n"
-                "echo [PWR] Display sleep disabled >> \"%LOG%\"\r\n"
-                "\r\n"
-                "REM Install VAD driver with devcon\r\n"
-                "if exist \"%ISODRV%\\drivers\\AppSandboxVAD.inf\" (\r\n"
-                "    echo [VAD] Installing driver with devcon... >> \"%LOG%\"\r\n"
-                "    \"%ISODRV%\\drivers\\devcon.exe\" install \"%ISODRV%\\drivers\\AppSandboxVAD.inf\" Root\\AppSandboxVAD >> \"%LOG%\" 2>&1\r\n"
-                "    echo [VAD] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
-                ")\r\n"
-                "\r\n",
-                sc);
-
-            if (ssh_enabled) {
-                fputs(
-                    "REM Install OpenSSH Server\r\n"
-                    "if exist \"%ISODRV%\\" SSH_MSI_NAME_A "\" (\r\n"
-                    "    echo [SSH] Installing OpenSSH Server... >> \"%LOG%\"\r\n"
-                    "    msiexec /i \"%ISODRV%\\" SSH_MSI_NAME_A "\" /qn /norestart >> \"%LOG%\" 2>&1\r\n"
-                    "    echo [SSH] msiexec exit code: %errorlevel% >> \"%LOG%\"\r\n"
-                    "    sc config sshd start= auto >> \"%LOG%\" 2>&1\r\n"
-                    "    net start sshd >> \"%LOG%\" 2>&1\r\n"
-                    "    echo [SSH] Done >> \"%LOG%\"\r\n"
-                    ")\r\n"
-                    "\r\n",
-                    sc);
-            }
-
-            fputs(
-                ":done\r\n"
-                "echo === SetupComplete.cmd finished === >> \"%LOG%\"\r\n",
-                sc);
-            fclose(sc);
-        }
-    }
+    stage_agent_and_setup(staging, res_dir, ssh_enabled, nat_network);
 
     /* Build ISO from staging directory */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -1053,144 +1041,35 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
 static BOOL generate_unattend_instance(const wchar_t *output_path,
                                         const wchar_t *vm_name,
                                         const wchar_t *admin_user,
-                                        const wchar_t *b64_password,
+                                        const wchar_t *admin_pass,
                                         const wchar_t *lang)
 {
     FILE *f;
-    BOOL written;
-    wchar_t user_xml[1024];
-    wchar_t comp_name[16];
+    char name_u[64], user_u[256], pass_u[512], lang_u[128], input_u[512];
     wchar_t input_locale[128];
     get_host_keyboard_settings(input_locale, ARRAYSIZE(input_locale), NULL, NULL);
-    if (!xml_escape_text(admin_user, user_xml, ARRAYSIZE(user_xml)))
+    if (!WideCharToMultiByte(CP_UTF8, 0, vm_name, -1, name_u, sizeof(name_u), NULL, NULL) ||
+        !WideCharToMultiByte(CP_UTF8, 0, admin_user, -1, user_u, sizeof(user_u), NULL, NULL) ||
+        !WideCharToMultiByte(CP_UTF8, 0, admin_pass, -1, pass_u, sizeof(pass_u), NULL, NULL) ||
+        !WideCharToMultiByte(CP_UTF8, 0, lang ? lang : L"en-US", -1, lang_u, sizeof(lang_u), NULL, NULL) ||
+        !WideCharToMultiByte(CP_UTF8, 0, input_locale, -1, input_u, sizeof(input_u), NULL, NULL)) {
+        SecureZeroMemory(pass_u, sizeof(pass_u));
         return FALSE;
-    wcsncpy_s(comp_name, 16, vm_name, 15);
-
-    if (_wfopen_s(&f, output_path, L"w,ccs=UTF-8") != 0 || !f)
+    }
+    if (_wfopen_s(&f, output_path, L"wb") != 0 || !f) {
+        SecureZeroMemory(pass_u, sizeof(pass_u));
         return FALSE;
-
-    fwprintf(f,
-        L"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
-        L"<unattend xmlns=\"urn:schemas-microsoft-com:unattend\"\n"
-        L"          xmlns:wcm=\"http://schemas.microsoft.com/WMIConfig/2002/State\">\n"
-        L"\n"
-        L"    <settings pass=\"specialize\">\n"
-        L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
-        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
-        L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
-        L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-        L"            <ComputerName>%s</ComputerName>\n"
-        L"        </component>\n"
-        L"        <component name=\"Microsoft-Windows-Deployment\"\n"
-        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
-        L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
-        L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-        L"            <ExtendOSPartition><Extend>true</Extend></ExtendOSPartition>\n"
-        L"            <RunSynchronous>\n"
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>1</Order>\n"
-        L"                    <Path>reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path>\n"
-        L"                </RunSynchronousCommand>\n"
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>2</Order>\n"
-        L"                    <Path>bcdedit /set recoveryenabled No</Path>\n"
-        L"                </RunSynchronousCommand>\n"
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>3</Order>\n"
-        L"                    <Path>bcdedit /set bootstatuspolicy IgnoreAllFailures</Path>\n"
-        L"                </RunSynchronousCommand>\n"
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>4</Order>\n"
-        L"                    <Path>cmd /c mkdir C:\\Windows\\Setup\\Scripts</Path>\n"
-        L"                </RunSynchronousCommand>\n"
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>5</Order>\n"
-        L"                    <Path>cmd /c for %%d in (D E F G H I J) do @if exist %%d:\\SetupComplete.cmd copy /Y %%d:\\SetupComplete.cmd C:\\Windows\\Setup\\Scripts\\</Path>\n"
-        L"                </RunSynchronousCommand>\n"
-#if ASB_IS_ARM64
-        /* ARM Windows HCS has no vTPM — Windows 11 LabConfig hardware-check bypass keys. */
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>6</Order>\n"
-        L"                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>\n"
-        L"                </RunSynchronousCommand>\n"
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>7</Order>\n"
-        L"                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>\n"
-        L"                </RunSynchronousCommand>\n"
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>8</Order>\n"
-        L"                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>\n"
-        L"                </RunSynchronousCommand>\n"
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>9</Order>\n"
-        L"                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path>\n"
-        L"                </RunSynchronousCommand>\n"
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>10</Order>\n"
-        L"                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path>\n"
-        L"                </RunSynchronousCommand>\n"
-#endif
-        L"            </RunSynchronous>\n"
-        L"        </component>\n"
-        L"    </settings>\n"
-        L"\n"
-        L"    <settings pass=\"oobeSystem\">\n"
-        L"        <component name=\"Microsoft-Windows-International-Core\"\n"
-        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
-        L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
-        L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-        L"            <InputLocale>%s</InputLocale>\n"
-        L"            <SystemLocale>%s</SystemLocale>\n"
-        L"            <UILanguage>%s</UILanguage>\n"
-        L"            <UserLocale>%s</UserLocale>\n"
-        L"        </component>\n"
-        L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
-        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
-        L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
-        L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-        L"            <OOBE>\n"
-        L"                <HideEULAPage>true</HideEULAPage>\n"
-        L"                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>\n"
-        L"                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>\n"
-        L"                <ProtectYourPC>3</ProtectYourPC>\n"
-        L"            </OOBE>\n"
-        L"            <UserAccounts><LocalAccounts>\n"
-        L"                <LocalAccount wcm:action=\"add\">\n"
-        L"                    <Name>%s</Name>\n"
-        L"                    <Group>Administrators</Group>\n"
-        L"                    <Password><Value>%s</Value><PlainText>false</PlainText></Password>\n"
-        L"                </LocalAccount>\n"
-        L"            </LocalAccounts></UserAccounts>\n"
-        L"            <AutoLogon>\n"
-        L"                <Enabled>true</Enabled>\n"
-        L"                <Username>%s</Username>\n"
-        L"                <Password><Value>%s</Value><PlainText>false</PlainText></Password>\n"
-        L"                <LogonCount>1</LogonCount>\n"
-        L"            </AutoLogon>\n"
-        L"            <FirstLogonCommands>\n"
-        L"                <SynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>1</Order>\n"
-        L"                    <Description>Run AppSandbox setup</Description>\n"
-        L"                    <CommandLine>cmd /c \"for %%d in (D E F G H I J) do @if exist %%d:\\setup.cmd call %%d:\\setup.cmd\"</CommandLine>\n"
-        L"                    <RequiresUserInput>false</RequiresUserInput>\n"
-        L"                </SynchronousCommand>\n"
-        L"            </FirstLogonCommands>\n"
-        L"        </component>\n"
-        L"    </settings>\n"
-        L"</unattend>\n",
-        comp_name,
-        input_locale, lang, lang, lang,
-        user_xml, b64_password,
-        user_xml, b64_password);
-
-    written = !ferror(f);
-    if (fclose(f) != 0)
-        written = FALSE;
-    return written;
+    }
+    int rc = asb_provision_unattend_instance(f, name_u, user_u, pass_u,
+        ASB_IS_ARM64 ? "arm64" : "amd64", 0, ASB_IS_ARM64, lang_u, input_u);
+    SecureZeroMemory(pass_u, sizeof(pass_u));
+    if (fclose(f) != 0) rc = -1;
+    return rc == 0;
 }
 
 /* Helper: copy agent exe to staging and write setup.cmd */
-static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir, BOOL ssh_enabled)
+static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir,
+                                  BOOL ssh_enabled, BOOL nat_network)
 {
     wchar_t src_path[MAX_PATH], file_path[MAX_PATH];
     BOOL found_agent = FALSE;
@@ -1430,112 +1309,17 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
         }
     }
 
-    /* setup.cmd — first-logon script: installs agent service only */
     swprintf_s(file_path, MAX_PATH, L"%s\\setup.cmd", staging);
-    {
-        FILE *cmd;
-        if (_wfopen_s(&cmd, file_path, L"w") == 0 && cmd) {
-            fputs(
-                "@echo off\r\n"
-                "set LOG=%SystemRoot%\\AppSandbox\\setup.log\r\n"
-                "mkdir \"%SystemRoot%\\AppSandbox\" 2>nul\r\n"
-                "echo === instance setup.cmd started === >> \"%LOG%\"\r\n",
-                cmd);
-            asb_provision_login_setup(cmd);
-            fputs(
-                "\r\n"
-                "REM Install guest agent\r\n"
-                "if exist \"%~dp0appsandbox-agent.exe\" (\r\n"
-                "    copy /Y \"%~dp0appsandbox-agent.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
-                "    if exist \"%~dp0appsandbox-input.exe\" copy /Y \"%~dp0appsandbox-input.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
-                "    if exist \"%~dp0appsandbox-displays.exe\" copy /Y \"%~dp0appsandbox-displays.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
-                "    if exist \"%~dp0appsandbox-clipboard.exe\" copy /Y \"%~dp0appsandbox-clipboard.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
-                "    if exist \"%~dp0appsandbox-clipboard-reader.exe\" copy /Y \"%~dp0appsandbox-clipboard-reader.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
-                "    if exist \"%~dp0appsandbox-audio.exe\" copy /Y \"%~dp0appsandbox-audio.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
-                "    \"%SystemRoot%\\AppSandbox\\appsandbox-agent.exe\" --install >> \"%LOG%\" 2>&1\r\n"
-                ")\r\n"
-                "echo === instance setup.cmd finished === >> \"%LOG%\"\r\n",
-                cmd);
-            fclose(cmd);
-        }
+    FILE *cmd;
+    if (_wfopen_s(&cmd, file_path, L"wb") == 0 && cmd) {
+        asb_provision_setup_cmd(cmd, nat_network, 1);
+        fclose(cmd);
     }
-
-    /* SetupComplete.cmd — runs as SYSTEM after setup, before first logon.
-       Copied to C:\Windows\Setup\Scripts\ during specialize pass.
-       Installs VDD driver (cert + test signing + devcon) + optionally OpenSSH. */
     swprintf_s(file_path, MAX_PATH, L"%s\\SetupComplete.cmd", staging);
-    {
-        FILE *sc;
-        if (_wfopen_s(&sc, file_path, L"w") == 0 && sc) {
-            fputs(
-                "@echo off\r\n"
-                "set LOG=%SystemRoot%\\AppSandbox\\setup.log\r\n"
-                "mkdir \"%SystemRoot%\\AppSandbox\" 2>nul\r\n"
-                "echo === SetupComplete.cmd started === >> \"%LOG%\"\r\n"
-                "\r\n"
-                "REM Find ISO drive\r\n"
-                "set ISODRV=\r\n"
-                "for %%d in (D E F G H I J) do @if exist %%d:\\drivers\\AppSandboxVDD.inf set ISODRV=%%d:\r\n"
-                "if \"%ISODRV%\"==\"\" (\r\n"
-                "    echo [VDD] Could not find ISO drive with driver files >> \"%LOG%\"\r\n"
-                "    goto :done\r\n"
-                ")\r\n"
-                "echo [VDD] Found driver files on %ISODRV% >> \"%LOG%\"\r\n"
-                "\r\n"
-                "REM Enable test signing\r\n"
-                "echo [VDD] Enabling test signing... >> \"%LOG%\"\r\n"
-                "bcdedit /set testsigning on >> \"%LOG%\" 2>&1\r\n"
-                "\r\n"
-                "REM Install certificate\r\n"
-                "if exist \"%ISODRV%\\drivers\\AppSandboxVDD.cer\" (\r\n"
-                "    echo [VDD] Installing certificate... >> \"%LOG%\"\r\n"
-                "    certutil -addstore Root \"%ISODRV%\\drivers\\AppSandboxVDD.cer\" >> \"%LOG%\" 2>&1\r\n"
-                "    certutil -f -addstore TrustedPublisher \"%ISODRV%\\drivers\\AppSandboxVDD.cer\" >> \"%LOG%\" 2>&1\r\n"
-                ")\r\n"
-                "\r\n"
-                "REM Install driver with devcon\r\n"
-                "echo [VDD] Installing driver with devcon... >> \"%LOG%\"\r\n"
-                "dir \"%ISODRV%\\drivers\\\" >> \"%LOG%\" 2>&1\r\n"
-                "\"%ISODRV%\\drivers\\devcon.exe\" install \"%ISODRV%\\drivers\\AppSandboxVDD.inf\" Root\\AppSandboxVDD >> \"%LOG%\" 2>&1\r\n"
-                "echo [VDD] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
-                "\r\n"
-                "REM Disable display sleep so IDD swap chain stays alive\r\n"
-                "powercfg /change monitor-timeout-ac 0\r\n"
-                "powercfg /change monitor-timeout-dc 0\r\n"
-                "powercfg /change standby-timeout-ac 0\r\n"
-                "powercfg /change standby-timeout-dc 0\r\n"
-                "echo [PWR] Display sleep disabled >> \"%LOG%\"\r\n"
-                "\r\n"
-                "REM Install VAD driver with devcon\r\n"
-                "if exist \"%ISODRV%\\drivers\\AppSandboxVAD.inf\" (\r\n"
-                "    echo [VAD] Installing driver with devcon... >> \"%LOG%\"\r\n"
-                "    \"%ISODRV%\\drivers\\devcon.exe\" install \"%ISODRV%\\drivers\\AppSandboxVAD.inf\" Root\\AppSandboxVAD >> \"%LOG%\" 2>&1\r\n"
-                "    echo [VAD] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
-                ")\r\n"
-                "\r\n",
-                sc);
-
-            if (ssh_enabled) {
-                fputs(
-                    "REM Install OpenSSH Server\r\n"
-                    "if exist \"%ISODRV%\\" SSH_MSI_NAME_A "\" (\r\n"
-                    "    echo [SSH] Installing OpenSSH Server... >> \"%LOG%\"\r\n"
-                    "    msiexec /i \"%ISODRV%\\" SSH_MSI_NAME_A "\" /qn /norestart >> \"%LOG%\" 2>&1\r\n"
-                    "    echo [SSH] msiexec exit code: %errorlevel% >> \"%LOG%\"\r\n"
-                    "    sc config sshd start= auto >> \"%LOG%\" 2>&1\r\n"
-                    "    net start sshd >> \"%LOG%\" 2>&1\r\n"
-                    "    echo [SSH] Done >> \"%LOG%\"\r\n"
-                    ")\r\n"
-                    "\r\n",
-                    sc);
-            }
-
-            fputs(
-                ":done\r\n"
-                "echo === SetupComplete.cmd finished === >> \"%LOG%\"\r\n",
-                sc);
-            fclose(sc);
-        }
+    FILE *sc;
+    if (_wfopen_s(&sc, file_path, L"wb") == 0 && sc) {
+        asb_provision_setupcomplete(sc, ssh_enabled ? SSH_MSI_NAME_A : NULL, 1);
+        fclose(sc);
     }
 }
 
@@ -1546,12 +1330,12 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        wchar_t *admin_pass,
                                        const wchar_t *res_dir,
                                        BOOL ssh_enabled,
+                                       BOOL nat_network,
                                        const wchar_t *lang)
 {
     wchar_t dir[MAX_PATH];
     wchar_t staging[MAX_PATH];
     wchar_t file_path[MAX_PATH];
-    wchar_t b64_pass[512];
     wchar_t *last_slash;
     HRESULT hr;
 
@@ -1562,12 +1346,6 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
     wcscpy_s(dir, MAX_PATH, iso_path);
     last_slash = wcsrchr(dir, L'\\');
     if (last_slash) *last_slash = L'\0';
-
-    if (!encode_unattend_password(admin_pass, b64_pass, 512)) {
-        SecureZeroMemory(admin_pass, wcslen(admin_pass) * sizeof(wchar_t));
-        return E_FAIL;
-    }
-    SecureZeroMemory(admin_pass, wcslen(admin_pass) * sizeof(wchar_t));
 
     /* Delete stale ISO */
     if (GetFileAttributesW(iso_path) != INVALID_FILE_ATTRIBUTES)
@@ -1581,22 +1359,24 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
 
     /* unattend.xml (NOT autounattend.xml — post-sysprep mini-setup uses this name) */
     swprintf_s(file_path, MAX_PATH, L"%s\\unattend.xml", staging);
-    if (!generate_unattend_instance(file_path, vm_name, admin_user, b64_pass, lang)) {
+    if (!generate_unattend_instance(file_path, vm_name, admin_user, admin_pass, lang)) {
         ui_log(L"Error: failed to write instance unattend.xml");
-        SecureZeroMemory(b64_pass, sizeof(b64_pass));
+        SecureZeroMemory(admin_pass, wcslen(admin_pass) * sizeof(wchar_t));
         remove_staging_dir(staging);
         return E_FAIL;
     }
 
+    SecureZeroMemory(admin_pass, wcslen(admin_pass) * sizeof(wchar_t));
+
     /* Agent exe + setup.cmd + SSH MSI */
-    stage_agent_and_setup(staging, res_dir, ssh_enabled);
+    stage_agent_and_setup(staging, res_dir, ssh_enabled, nat_network);
 
     /* Build ISO */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     hr = create_iso_from_dir(iso_path, staging, L"APPSETUP");
     CoUninitialize();
 
-    SecureZeroMemory(b64_pass, sizeof(b64_pass));
+    SecureZeroMemory(admin_pass, wcslen(admin_pass) * sizeof(wchar_t));
     remove_staging_dir(staging);
 
     if (SUCCEEDED(hr))
@@ -1670,121 +1450,28 @@ BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
                                       BOOL test_mode)
 {
     FILE *f;
-    wchar_t comp_name[16];
-
-    if (!output_path || !vm_name)
+    char name_u[64];
+    if (!output_path || !vm_name ||
+        !WideCharToMultiByte(CP_UTF8, 0, vm_name, -1, name_u, sizeof(name_u), NULL, NULL))
         return FALSE;
-
-    wcsncpy_s(comp_name, 16, vm_name, 15);
-
-    if (_wfopen_s(&f, output_path, L"w,ccs=UTF-8") != 0 || !f)
-        return FALSE;
-
-    /* specialize pass: ComputerName + BypassNRO + testsigning + BitLocker disable */
-    fwprintf(f,
-        L"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
-        L"<unattend xmlns=\"urn:schemas-microsoft-com:unattend\"\n"
-        L"          xmlns:wcm=\"http://schemas.microsoft.com/WMIConfig/2002/State\">\n"
-        L"\n"
-        L"    <settings pass=\"specialize\">\n"
-        L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
-        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
-        L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
-        L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-        L"            <ComputerName>%s</ComputerName>\n"
-        L"        </component>\n"
-        L"        <component name=\"Microsoft-Windows-Deployment\"\n"
-        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
-        L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
-        L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-        L"            <RunSynchronous>\n"
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>1</Order>\n"
-        L"                    <Path>reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path>\n"
-        L"                </RunSynchronousCommand>\n",
-        comp_name);
-
-    {
-        int order = 2;
-        fwprintf(f,
-            L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-            L"                    <Order>%d</Order>\n"
-            L"                    <Path>bcdedit /set recoveryenabled No</Path>\n"
-            L"                </RunSynchronousCommand>\n"
-            L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-            L"                    <Order>%d</Order>\n"
-            L"                    <Path>bcdedit /set bootstatuspolicy IgnoreAllFailures</Path>\n"
-            L"                </RunSynchronousCommand>\n", order, order + 1);
-        order += 2;
-        if (test_mode) {
-            fwprintf(f,
-                L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-                L"                    <Order>%d</Order>\n"
-                L"                    <Path>bcdedit /set testsigning on</Path>\n"
-                L"                </RunSynchronousCommand>\n", order++);
-        }
-#if ASB_IS_ARM64
-        write_tpm_bypass_commands(f, order);
-#endif
-    }
-
-    fwprintf(f,
-        L"            </RunSynchronous>\n"
-        L"        </component>\n"
-        L"        <component name=\"Microsoft-Windows-SecureStartup-FilterDriver\"\n"
-        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
-        L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
-        L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-        L"            <PreventDeviceEncryption>true</PreventDeviceEncryption>\n"
-        L"        </component>\n"
-        L"    </settings>\n"
-        L"\n");
-
-    /* oobeSystem: Reseal Audit mode (no user account, boots into audit) */
-    /* auditUser: sysprep /generalize /oobe /shutdown /mode:vm */
-    fwprintf(f,
-        L"    <settings pass=\"oobeSystem\">\n"
-        L"        <component name=\"Microsoft-Windows-Deployment\"\n"
-        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
-        L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
-        L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-        L"            <Reseal>\n"
-        L"                <Mode>Audit</Mode>\n"
-        L"            </Reseal>\n"
-        L"        </component>\n"
-        L"    </settings>\n"
-        L"\n"
-        L"    <settings pass=\"auditUser\">\n"
-        L"        <component name=\"Microsoft-Windows-Deployment\"\n"
-        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
-        L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
-        L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
-        L"            <RunSynchronous>\n"
-        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
-        L"                    <Order>1</Order>\n"
-        L"                    <Description>Generalize VM and shut down for templating</Description>\n"
-        L"                    <Path>C:\\Windows\\System32\\Sysprep\\sysprep.exe /generalize /oobe /shutdown /mode:vm</Path>\n"
-        L"                </RunSynchronousCommand>\n"
-        L"            </RunSynchronous>\n"
-        L"        </component>\n"
-        L"    </settings>\n"
-        L"</unattend>\n");
-
-    fclose(f);
-    return TRUE;
+    if (_wfopen_s(&f, output_path, L"wb") != 0 || !f) return FALSE;
+    int rc = asb_provision_unattend_template(f, name_u, ASB_IS_ARM64 ? "arm64" : "amd64",
+                                           test_mode, ASB_IS_ARM64);
+    if (fclose(f) != 0) rc = -1;
+    return rc == 0;
 }
 
 /* Generate setup.cmd for VHDX-first boot (agent already on disk).
    Delegates to the shared platform-neutral generator (tools/provision/win_provision.c)
    so the Windows-host and macOS-host builders stage byte-identical scripts. "wb" keeps
    the generator's exact CRLF bytes (no text-mode \r doubling). */
-BOOL generate_vhdx_setup_cmd(const wchar_t *output_path)
+BOOL generate_vhdx_setup_cmd(const wchar_t *output_path, BOOL nat_network)
 {
     FILE *cmd;
     int rc;
     if (_wfopen_s(&cmd, output_path, L"wb") != 0 || !cmd)
         return FALSE;
-    rc = asb_provision_setup_cmd(cmd);
+    rc = asb_provision_setup_cmd(cmd, nat_network, 0);
     fclose(cmd);
     return rc == 0;
 }
@@ -1801,7 +1488,7 @@ BOOL generate_vhdx_setupcomplete(const wchar_t *output_path, BOOL ssh_enabled)
     int rc;
     if (_wfopen_s(&sc, output_path, L"wb") != 0 || !sc)
         return FALSE;
-    rc = asb_provision_setupcomplete(sc, ssh_enabled ? SSH_MSI_NAME_A : NULL);
+    rc = asb_provision_setupcomplete(sc, ssh_enabled ? SSH_MSI_NAME_A : NULL, 0);
     fclose(sc);
     return rc == 0;
 }

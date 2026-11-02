@@ -8,6 +8,7 @@
 
 #include <winsock2.h>
 #include "asb_core.h"
+#include "asb_events.h"
 #include "hcs_vm.h"
 #include "gpu_enum.h"
 #include "hcn_network.h"
@@ -21,6 +22,7 @@
 #include "ui.h"
 
 #include <stdio.h>
+#include <io.h>
 #include <stdlib.h>
 #include <shlobj.h>
 #include <stdarg.h>
@@ -147,15 +149,30 @@ static void prepare_gl_layers_share(GpuDriverShareList *shares)
     gpu_append_gl_layers_share(shares, dir);
 }
 
-static VmInstance g_vms[ASB_MAX_VMS];
+typedef struct {
+    VmInstance vm;
+    SnapshotTree snapshots;
+} VmRecord;
+static VmRecord g_vm_storage[ASB_MAX_VMS];
+static VmRecord *g_vm_order[ASB_MAX_VMS];
+#define VM_AT(index) (g_vm_order[(index)]->vm)
+#define SNAP_AT(index) (g_vm_order[(index)]->snapshots)
 static int g_vm_count = 0;
+static BOOL g_config_load_failed;
 
 /* Monotonically-increasing per-VM ID. Never reused; 0 is reserved as
    "unassigned." Used by long-lived threads (agent, IDD probe) so they
    keep working across compactions of g_vms[]. */
-static UINT64 g_next_vm_id = 1;
 
-static SnapshotTree g_snap_trees[ASB_MAX_VMS];
+static void remove_vm_record(int index)
+{
+    VmRecord *removed = g_vm_order[index];
+    int j;
+    for (j = index; j < g_vm_count - 1; ++j) g_vm_order[j] = g_vm_order[j + 1];
+    g_vm_order[--g_vm_count] = removed;
+    if (removed->vm.start_thread) CloseHandle(removed->vm.start_thread);
+    ZeroMemory(removed, sizeof(*removed));
+}
 
 typedef struct {
     wchar_t name[256];
@@ -165,6 +182,32 @@ typedef struct {
 } TemplateInfo;
 static TemplateInfo g_templates[ASB_MAX_TEMPLATES];
 static int g_template_count = 0;
+
+typedef struct {
+    HANDLE thread;
+    HANDLE cancel_event;
+    wchar_t source[MAX_PATH];
+} TemplateCopy;
+static TemplateCopy g_template_copies[ASB_MAX_VMS];
+
+static void release_template_copy(TemplateCopy *copy)
+{
+    if (copy->thread) CloseHandle(copy->thread);
+    if (copy->cancel_event) CloseHandle(copy->cancel_event);
+    ZeroMemory(copy, sizeof(*copy));
+}
+
+static void stop_template_copies(void)
+{
+    int i;
+    for (i = 0; i < ASB_MAX_VMS; i++)
+        if (g_template_copies[i].cancel_event) SetEvent(g_template_copies[i].cancel_event);
+    for (i = 0; i < ASB_MAX_VMS; i++) {
+        if (g_template_copies[i].thread)
+            WaitForSingleObject(g_template_copies[i].thread, INFINITE);
+        release_template_copy(&g_template_copies[i]);
+    }
+}
 
 static wchar_t g_last_iso_path[MAX_PATH] = { 0 };
 static BOOL g_suppress_tray_warn = FALSE;
@@ -185,6 +228,42 @@ static void                *g_alert_ud     = NULL;
 static AsbVmRemovedCallback g_removed_cb   = NULL;
 static void                *g_removed_ud   = NULL;
 
+static void core_event(int type, AsbVm vm, int value, const wchar_t *message, BOOL staging)
+{
+    CoreVmEvent event = {0};
+    char text[16384];
+    event.vm_id = vm ? vm_inst(vm)->unique_id : 0;
+    event.type = type; event.int_value = value; event.staging = staging;
+    if (vm) WideCharToMultiByte(CP_UTF8, 0, asb_vm_name(vm), -1,
+                               event.vm_name, sizeof(event.vm_name), NULL, NULL);
+    if (message) {
+        text[0] = 0;
+        WideCharToMultiByte(CP_UTF8, 0, message, -1, text, sizeof(text), NULL, NULL);
+        event.str_value = text;
+    }
+    asb_events_emit(&event);
+}
+static void notify_log(const wchar_t *s, void *ud) {
+    if (g_log_cb) g_log_cb(s, ud);
+    core_event(CORE_VM_EVENT_LOG, NULL, 0, s, FALSE);
+}
+static void notify_alert(const wchar_t *s, void *ud) {
+    if (g_alert_cb) g_alert_cb(s, ud);
+    core_event(CORE_VM_EVENT_ALERT, NULL, 0, s, FALSE);
+}
+static void notify_state(AsbVm vm, BOOL running, void *ud) {
+    if (g_state_cb) g_state_cb(vm, running, ud);
+    core_event(CORE_VM_EVENT_STATE_CHANGED, vm, running, NULL, FALSE);
+}
+static void notify_progress(AsbVm vm, int pct, BOOL staging, void *ud) {
+    if (g_progress_cb) g_progress_cb(vm, pct, staging, ud);
+    core_event(CORE_VM_EVENT_PROGRESS, vm, pct, NULL, staging);
+}
+static void notify_removed(int index, void *ud) {
+    if (g_removed_cb) g_removed_cb(index, ud);
+    asb_events_changed();
+}
+
 /* ---- Internal logging (writes to appsandbox.log and the registered log callback) ---- */
 
 static void asb_log(const wchar_t *fmt, ...)
@@ -204,12 +283,12 @@ static void asb_log(const wchar_t *fmt, ...)
         }
     }
 
-    if (g_log_cb) g_log_cb(buf, g_log_ud);
+    notify_log(buf, g_log_ud);
 }
 
 static void asb_alert(const wchar_t *message)
 {
-    if (g_alert_cb) g_alert_cb(message, g_alert_ud);
+    notify_alert(message, g_alert_ud);
 }
 
 /* ---- Public: ui_log (called by shared modules like hcs_vm.c, etc.) ---- */
@@ -231,7 +310,7 @@ ASB_API void ui_log(const wchar_t *fmt, ...)
         }
     }
 
-    if (g_log_cb) g_log_cb(buf, g_log_ud);
+    notify_log(buf, g_log_ud);
 }
 
 /* ---- IDD probe (detect VDD availability during install) ---- */
@@ -382,8 +461,9 @@ static int vm_index_of(AsbVm vm)
 {
     int idx;
     if (!vm) return -1;
-    idx = (int)(vm_inst(vm) - g_vms);
-    return (idx >= 0 && idx < g_vm_count) ? idx : -1;
+    for (idx = 0; idx < g_vm_count; ++idx)
+        if (vm_inst(vm) == &VM_AT(idx)) return idx;
+    return -1;
 }
 
 ASB_API VmInstance *asb_find_vm_by_id(UINT64 id)
@@ -391,7 +471,7 @@ ASB_API VmInstance *asb_find_vm_by_id(UINT64 id)
     int i;
     if (id == 0) return NULL;
     for (i = 0; i < g_vm_count; i++) {
-        if (g_vms[i].unique_id == id) return &g_vms[i];
+        if (VM_AT(i).unique_id == id) return &VM_AT(i);
     }
     return NULL;
 }
@@ -512,15 +592,29 @@ static BOOL ensure_appsandbox_ssh_key(wchar_t *pubkey_out, int cap)
 
 /* ---- Persistence: save VM list ---- */
 
-static void save_vm_list(void)
+static BOOL save_vm_list(void)
 {
-    wchar_t path[MAX_PATH];
+    if (g_config_load_failed) return FALSE;
+    asb_events_changed();
+    wchar_t path[MAX_PATH], temporary[MAX_PATH], directory[MAX_PATH];
     FILE *f;
     int i;
 
     get_config_path(path, MAX_PATH);
 
-    if (_wfopen_s(&f, path, L"w,ccs=UTF-8") != 0 || !f) return;
+    wcscpy_s(directory, MAX_PATH, path);
+    wchar_t *slash = wcsrchr(directory, L'\\');
+    if (!slash) return FALSE;
+    *slash = 0;
+    if (!GetTempFileNameW(directory, L"asb", 0, temporary)) {
+        asb_alert(L"Cannot save VM configuration; the previous file was preserved.");
+        return FALSE;
+    }
+    if (_wfopen_s(&f, temporary, L"w,ccs=UTF-8") != 0 || !f) {
+        DeleteFileW(temporary);
+        asb_alert(L"Cannot save VM configuration; the previous file was preserved.");
+        return FALSE;
+    }
 
     if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn) {
         fwprintf(f, L"[Settings]\n");
@@ -540,48 +634,57 @@ static void save_vm_list(void)
     }
 
     for (i = 0; i < g_vm_count; i++) {
-        if (g_vms[i].building_vhdx) continue;
+        if (VM_AT(i).building_vhdx) continue;
         fwprintf(f, L"[VM]\n");
-        fwprintf(f, L"Name=%s\n", g_vms[i].name);
-        fwprintf(f, L"OsType=%s\n", g_vms[i].os_type);
-        fwprintf(f, L"ImagePath=%s\n", g_vms[i].image_path);
-        fwprintf(f, L"VhdxPath=%s\n", g_vms[i].vhdx_path);
-        fwprintf(f, L"RamMB=%lu\n", g_vms[i].ram_mb);
-        fwprintf(f, L"HddGB=%lu\n", g_vms[i].hdd_gb);
-        fwprintf(f, L"CpuCores=%lu\n", g_vms[i].cpu_cores);
-        fwprintf(f, L"GpuMode=%d\n", g_vms[i].gpu_mode);
-        fwprintf(f, L"GpuName=%s\n", g_vms[i].gpu_name);
-        if (g_vms[i].gpu_id[0])
-            fwprintf(f, L"GpuId=%s\n", g_vms[i].gpu_id);
-        fwprintf(f, L"NetworkMode=%d\n", g_vms[i].network_mode);
-        if (g_vms[i].net_adapter[0] != L'\0')
-            fwprintf(f, L"NetAdapter=%s\n", g_vms[i].net_adapter);
-        if (g_vms[i].mac_address[0])
-            fwprintf(f, L"MacAddress=%s\n", g_vms[i].mac_address);
-        if (g_vms[i].resources_iso_path[0] != L'\0')
-            fwprintf(f, L"ResourcesIso=%s\n", g_vms[i].resources_iso_path);
-        if (g_vms[i].nat_ip[0] != '\0')
-            fwprintf(f, L"NatIp=%S\n", g_vms[i].nat_ip);
-        if (g_vms[i].is_template)
+        wchar_t id[ASB_VM_ID_TEXT_SIZE];
+        asb_vm_id_format_w(VM_AT(i).unique_id, id);
+        fwprintf(f, L"Id=%s\n", id);
+        fwprintf(f, L"Name=%s\n", VM_AT(i).name);
+        fwprintf(f, L"OsType=%s\n", VM_AT(i).os_type);
+        fwprintf(f, L"ImagePath=%s\n", VM_AT(i).image_path);
+        fwprintf(f, L"VhdxPath=%s\n", VM_AT(i).vhdx_path);
+        fwprintf(f, L"RamMB=%lu\n", VM_AT(i).ram_mb);
+        fwprintf(f, L"HddGB=%lu\n", VM_AT(i).hdd_gb);
+        fwprintf(f, L"CpuCores=%lu\n", VM_AT(i).cpu_cores);
+        fwprintf(f, L"GpuMode=%d\n", VM_AT(i).gpu_mode);
+        fwprintf(f, L"GpuName=%s\n", VM_AT(i).gpu_name);
+        if (VM_AT(i).gpu_id[0])
+            fwprintf(f, L"GpuId=%s\n", VM_AT(i).gpu_id);
+        fwprintf(f, L"NetworkMode=%d\n", VM_AT(i).network_mode);
+        if (VM_AT(i).net_adapter[0] != L'\0')
+            fwprintf(f, L"NetAdapter=%s\n", VM_AT(i).net_adapter);
+        if (VM_AT(i).mac_address[0])
+            fwprintf(f, L"MacAddress=%s\n", VM_AT(i).mac_address);
+        if (VM_AT(i).resources_iso_path[0] != L'\0')
+            fwprintf(f, L"ResourcesIso=%s\n", VM_AT(i).resources_iso_path);
+        if (VM_AT(i).nat_ip[0] != '\0')
+            fwprintf(f, L"NatIp=%S\n", VM_AT(i).nat_ip);
+        if (VM_AT(i).is_template)
             fwprintf(f, L"IsTemplate=1\n");
-        if (g_vms[i].test_mode)
+        if (VM_AT(i).test_mode)
             fwprintf(f, L"TestMode=1\n");
-        if (g_vms[i].admin_user[0])
-            fwprintf(f, L"AdminUser=%s\n", g_vms[i].admin_user);
-        if (g_vms[i].ssh_enabled)
+        if (VM_AT(i).admin_user[0])
+            fwprintf(f, L"AdminUser=%s\n", VM_AT(i).admin_user);
+        if (VM_AT(i).ssh_enabled)
             fwprintf(f, L"SshEnabled=1\n");
-        if (g_vms[i].ssh_port)
-            fwprintf(f, L"SshPort=%lu\n", g_vms[i].ssh_port);
-        if (g_vms[i].ssh_deploy_key)
+        if (VM_AT(i).ssh_port)
+            fwprintf(f, L"SshPort=%lu\n", VM_AT(i).ssh_port);
+        if (VM_AT(i).ssh_deploy_key)
             fwprintf(f, L"SshDeployKey=1\n");
-        if (g_vms[i].ssh_pubkey[0])
-            fwprintf(f, L"SshPubKey=%s\n", g_vms[i].ssh_pubkey);
-        if (g_vms[i].install_complete)
+        if (VM_AT(i).ssh_pubkey[0])
+            fwprintf(f, L"SshPubKey=%s\n", VM_AT(i).ssh_pubkey);
+        if (VM_AT(i).install_complete)
             fwprintf(f, L"InstallComplete=1\n");
         fwprintf(f, L"\n");
     }
 
-    fclose(f);
+    BOOL ok = !ferror(f) && fflush(f) == 0 && _commit(_fileno(f)) == 0;
+    if (fclose(f) != 0) ok = FALSE;
+    if (ok && MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return TRUE;
+    DeleteFileW(temporary);
+    asb_alert(L"Cannot save VM configuration; the previous file was preserved.");
+    return FALSE;
 }
 
 /* ---- Persistence: load VM list ---- */
@@ -643,9 +746,8 @@ static void load_vm_list(void)
             in_settings = FALSE;
             tpl = NULL;
             if (g_vm_count >= ASB_MAX_VMS) break;
-            vm = &g_vms[g_vm_count];
+            vm = &VM_AT(g_vm_count);
             ZeroMemory(vm, sizeof(VmInstance));
-            vm->unique_id = g_next_vm_id++;
             g_vm_count++;
             continue;
         }
@@ -683,7 +785,9 @@ static void load_vm_list(void)
 
         if (!vm) continue;
 
-        if (wcsncmp(line, L"Name=", 5) == 0)
+        if (wcsncmp(line, L"Id=", 3) == 0)
+            vm->unique_id = asb_vm_id_parse_w(line + 3);
+        else if (wcsncmp(line, L"Name=", 5) == 0)
             wcscpy_s(vm->name, 256, line + 5);
         else if (wcsncmp(line, L"OsType=", 7) == 0)
             wcscpy_s(vm->os_type, 32, line + 7);
@@ -743,19 +847,32 @@ static void load_vm_list(void)
         int i;
         for (i = 0; i < g_vm_count; i++) {
             wchar_t snap_dir[MAX_PATH];
-            g_vms[i].handle = NULL;
-            g_vms[i].running = FALSE;
-            if (resolve_vm_gpu_selection(&g_vms[i])) gpu_changed = TRUE;
-            if (vm_load_state_json(g_vms[i].vhdx_path))
-                g_vms[i].install_complete = TRUE;
-            if (get_vm_disk_root(g_vms[i].vhdx_path, snap_dir) &&
+            VM_AT(i).handle = NULL;
+            VM_AT(i).running = FALSE;
+            if (resolve_vm_gpu_selection(&VM_AT(i))) gpu_changed = TRUE;
+            if (vm_load_state_json(VM_AT(i).vhdx_path))
+                VM_AT(i).install_complete = TRUE;
+            if (get_vm_disk_root(VM_AT(i).vhdx_path, snap_dir) &&
                 wcslen(snap_dir) + 10 < MAX_PATH) {
                 wcscat_s(snap_dir, MAX_PATH, L"\\snapshots");
-                snapshot_init(&g_snap_trees[i], snap_dir);
+                snapshot_init(&SNAP_AT(i), snap_dir);
             }
         }
     }
-    if (gpu_changed) save_vm_list();
+    AsbVmId ids[ASB_MAX_VMS];
+    for (int i = 0; i < g_vm_count; ++i) ids[i] = VM_AT(i).unique_id;
+    int migrated = asb_vm_ids_ensure(ids, (size_t)g_vm_count);
+    if (migrated < 0) {
+        asb_log(L"Cannot assign persistent VM identities.");
+        g_config_load_failed = TRUE;
+        g_vm_count = 0;
+        return;
+    }
+    for (int i = 0; i < g_vm_count; ++i) VM_AT(i).unique_id = ids[i];
+    if ((gpu_changed || migrated) && !save_vm_list()) {
+        g_config_load_failed = TRUE;
+        g_vm_count = 0;
+    }
 }
 
 /* ---- Template scanning ---- */
@@ -871,16 +988,17 @@ static BOOL remove_dir_recursive(const wchar_t *dir)
 static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
 {
     int i;
+    UINT64 vm_id;
 
     if (!instance) return;
+    vm_id = instance->unique_id;
 
     for (i = 0; i < g_vm_count; i++) {
-        if (&g_vms[i] != instance) continue;
+        if (&VM_AT(i) != instance) continue;
 
         if (event == 0x00000001) {
             /* VM exited */
-            if (!instance->running) break;
-            instance->running = FALSE;
+            if (!InterlockedCompareExchange((LONG *)&instance->running, FALSE, TRUE)) break;
             instance->shutdown_requested = FALSE;
             instance->hyperv_video_off = FALSE;
             /* Re-deploy on next boot: the guest disk may change while stopped
@@ -923,12 +1041,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
                     wcscpy_s(ti->image_path, MAX_PATH, instance->image_path);
                     wcscpy_s(ti->vhdx_path, MAX_PATH, instance->vhdx_path);
                 }
-                for (j = i; j < g_vm_count - 1; j++) {
-                    g_vms[j] = g_vms[j+1];
-                    g_snap_trees[j] = g_snap_trees[j+1];
-                }
-                ZeroMemory(&g_vms[g_vm_count-1], sizeof(VmInstance));
-                g_vm_count--;
+                remove_vm_record(i);
                 LeaveCriticalSection(&g_cs);
 
                 scan_templates();
@@ -936,7 +1049,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
                 /* Fire the removed callback last - WM_VM_REMOVED is async, so
                    both g_vms[] and g_templates[] must be fully updated before
                    the UI thread can pull the message and re-query them. */
-                if (g_removed_cb) g_removed_cb(i, g_removed_ud);
+                notify_removed(i, g_removed_ud);
             }
 
             save_vm_list();
@@ -948,8 +1061,8 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
     }
 
     /* Notify consumer */
-    if (g_state_cb && instance)
-        g_state_cb(vm_handle(instance), instance->running, g_state_ud);
+    if (vm_id && instance->unique_id == vm_id)
+        notify_state(vm_handle(instance), instance->running, g_state_ud);
 }
 
 /* Returns TRUE if any other running VM (excluding `self`) is still attached
@@ -960,9 +1073,9 @@ static BOOL another_vm_uses_network_mode(const VmInstance *self, int mode)
     int i;
     if (mode == NET_NONE) return FALSE;
     for (i = 0; i < g_vm_count; i++) {
-        const VmInstance *v = &g_vms[i];
+        const VmInstance *v = &VM_AT(i);
         if (v == self) continue;
-        if (!v->running) continue;
+        if (!v->running && !v->starting && !v->building_vhdx) continue;
         if (v->network_cleaned) continue;
         if (v->network_mode != mode) continue;
         return TRUE;
@@ -999,7 +1112,7 @@ static HRESULT ensure_vm_mac_address(VmInstance *vm)
                 (id.Data4[2] & 0xFC) | 0x02, id.Data4[3], id.Data4[4],
                 id.Data4[5], id.Data4[6], id.Data4[7]);
             for (i = 0; i < g_vm_count; i++) {
-                if (&g_vms[i] != vm && _wcsicmp(address, g_vms[i].mac_address) == 0)
+                if (&VM_AT(i) != vm && _wcsicmp(address, VM_AT(i).mac_address) == 0)
                     break;
             }
             if (i == g_vm_count) {
@@ -1026,12 +1139,12 @@ static BOOL allocate_nat_ip(VmInstance *vm)
     if (sscanf_s(base, "%d.%d.%d", &ba, &bb, &bc) != 3) return FALSE;
 
     for (i = 0; i < g_vm_count; i++) {
-        if (&g_vms[i] == vm) continue;
-        if (g_vms[i].nat_ip[0] == '\0') continue;
+        if (&VM_AT(i) == vm) continue;
+        if (VM_AT(i).nat_ip[0] == '\0') continue;
         /* Only consider entries that share our current /24. Stale entries
            from a prior run with a different subnet are ignored - their
            endpoints died with the previous NAT network. */
-        if (sscanf_s(g_vms[i].nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) == 4 &&
+        if (sscanf_s(VM_AT(i).nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) == 4 &&
             a == ba && b == bb && c == bc && d >= 2 && d <= 254)
             used[d] = TRUE;
     }
@@ -1127,14 +1240,16 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             if (SUCCEEDED(hr) && args->network_mode == NET_NAT) save_vm_list();
             if (FAILED(hr)) {
                 asb_log(L"Error: Network endpoint failed (0x%08X).", hr);
-                if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
+                vm->starting = FALSE;
+                notify_state(vm_handle(vm), FALSE, g_state_ud);
                 free(args); return 1;
             }
             vm->network_id = args->network_id;
             vm->endpoint_id = args->endpoint_id;
         } else {
             asb_log(L"Error: Network unavailable (0x%08X).", hr);
-            if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
+            vm->starting = FALSE;
+            notify_state(vm_handle(vm), FALSE, g_state_ud);
             free(args); return 1;
         }
     }
@@ -1168,7 +1283,8 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             hcn_delete_endpoint(&args->endpoint_id);
             endpoint_guid_str[0] = L'\0';
         }
-        if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
+        vm->starting = FALSE;
+        notify_state(vm_handle(vm), FALSE, g_state_ud);
         free(args); return 1;
     }
 
@@ -1189,7 +1305,8 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         hcs_start_monitor(vm);
     }
 
-    if (g_state_cb) g_state_cb(vm_handle(vm), vm->running, g_state_ud);
+    vm->starting = FALSE;
+    notify_state(vm_handle(vm), vm->running, g_state_ud);
     free(args);
     return 0;
 }
@@ -1198,8 +1315,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
 
 typedef struct {
     VmConfig config;
-    int      vm_index;
-    UINT64   vm_unique_id;   /* stable id; survives g_vms[] compaction (H13) */
+    UINT64   vm_unique_id;
     wchar_t  vhdx_dir[MAX_PATH];
     wchar_t  endpoint_guid[64];
     GUID     network_id;
@@ -1212,7 +1328,33 @@ typedef struct {
     wchar_t  language[32];
     wchar_t  input_locale[128];
     BOOL     vhdx_created;
+    TemplateCopy *template_copy;
 } VhdxCreateArgs;
+
+static BOOL template_copy_cancelled(VhdxCreateArgs *args)
+{
+    if (!args->template_copy ||
+        WaitForSingleObject(args->template_copy->cancel_event, 0) != WAIT_OBJECT_0) return FALSE;
+    args->result = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    wcscpy_s(args->error_msg, 512, L"Template instance creation cancelled");
+    if (args->has_network) {
+        hcn_delete_endpoint(&args->endpoint_id);
+        args->has_network = FALSE;
+        args->endpoint_guid[0] = L'\0';
+    }
+    return TRUE;
+}
+
+static void template_copy_progress(int percent, void *context)
+{
+    VhdxCreateArgs *args = (VhdxCreateArgs *)context;
+    VmInstance *vm;
+    EnterCriticalSection(&g_cs);
+    vm = asb_find_vm_by_id(args->vm_unique_id);
+    if (vm) vm->vhdx_progress = percent;
+    LeaveCriticalSection(&g_cs);
+    if (vm) notify_progress(vm_handle(vm), percent, FALSE, g_progress_ud);
+}
 
 static DWORD WINAPI vhdx_create_thread(LPVOID param)
 {
@@ -1231,6 +1373,44 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
     DWORD bytes_read, exit_code;
     int manifest_count;
     HRESULT hr;
+
+    if (args->template_copy) {
+        asb_log(L"Copying template to an independent VHDX for \"%s\"...", args->config.name);
+        args->result = vhdx_copy(args->config.vhdx_path, args->template_copy->source,
+                                 args->template_copy->cancel_event, template_copy_progress, args);
+        if (template_copy_cancelled(args)) goto done;
+        if (SUCCEEDED(args->result))
+            args->result = vhdx_grow(args->config.vhdx_path, args->config.hdd_gb);
+        if (template_copy_cancelled(args)) goto done;
+        if (SUCCEEDED(args->result)) {
+            VmInstance *vm;
+            EnterCriticalSection(&g_cs);
+            vm = asb_find_vm_by_id(args->vm_unique_id);
+            if (vm) {
+                vm->vhdx_staging = TRUE;
+                vm->vhdx_progress = 0;
+            }
+            LeaveCriticalSection(&g_cs);
+            if (vm) notify_progress(vm_handle(vm), 0, TRUE, g_progress_ud);
+            GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
+            slash = wcsrchr(exe_dir, L'\\'); if (slash) *slash = L'\0';
+            swprintf_s(res_dir, MAX_PATH, L"%s\\resources", exe_dir);
+            if (GetFileAttributesW(res_dir) == INVALID_FILE_ATTRIBUTES)
+                wcscpy_s(res_dir, MAX_PATH, exe_dir);
+            swprintf_s(args->config.resources_iso_path, MAX_PATH, L"%s\\resources.iso", args->vhdx_dir);
+            args->result = iso_create_instance_resources(args->config.resources_iso_path,
+                args->config.name, args->config.admin_user, args->config.admin_pass,
+                res_dir, args->config.ssh_enabled, args->config.network_mode == NET_NAT,
+                args->language);
+        }
+        if (FAILED(args->result)) {
+            swprintf_s(args->error_msg, 512, L"Template instance preparation failed (0x%08X)", args->result);
+            goto done;
+        }
+        vm_save_language_json(args->config.vhdx_path, args->language);
+        args->vhdx_created = TRUE;
+        goto disk_ready;
+    }
 
     /* Create staging directory */
     swprintf_s(staging, MAX_PATH, L"%s\\_vhdx_staging", args->vhdx_dir);
@@ -1256,7 +1436,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
 
     /* Generate setup.cmd */
     swprintf_s(file_path, MAX_PATH, L"%s\\setup.cmd", staging);
-    generate_vhdx_setup_cmd(file_path);
+    generate_vhdx_setup_cmd(file_path, args->config.network_mode == NET_NAT);
 
     /* Generate SetupComplete.cmd */
     swprintf_s(file_path, MAX_PATH, L"%s\\SetupComplete.cmd", staging);
@@ -1337,8 +1517,6 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                         } else if (strncmp(line, "PROGRESS:", 9) == 0) {
                             int pct = atoi(line + 9);
                             BOOL is_staging = (strstr(line + 9, "Staging") != NULL);
-                            /* Resolve by stable id under g_cs: g_vms[] may
-                               have been compacted while we were building (H13). */
                             VmInstance *pvm;
                             EnterCriticalSection(&g_cs);
                             pvm = asb_find_vm_by_id(args->vm_unique_id);
@@ -1347,8 +1525,8 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                                 pvm->vhdx_staging = is_staging;
                             }
                             LeaveCriticalSection(&g_cs);
-                            if (g_progress_cb && pvm)
-                                g_progress_cb(vm_handle(pvm), pct, is_staging, g_progress_ud);
+                            if (pvm)
+                                notify_progress(vm_handle(pvm), pct, is_staging, g_progress_ud);
                         } else if (strncmp(line, "ERROR:", 6) == 0) {
                             if (args->error_msg[0] == L'\0')
                                 MultiByteToWideChar(CP_ACP, 0, line + 6, -1, args->error_msg, 512);
@@ -1403,20 +1581,23 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
 
     args->vhdx_created = TRUE;
 
+disk_ready:
+    if (template_copy_cancelled(args)) goto done;
+
     /* Allocate NAT IP before endpoint creation.
        args->vm_inst isn't set yet (HCS VM not created), so allocate
        into the g_vms[] entry directly via vm_index. */
-    if (args->config.network_mode == NET_NAT && args->vm_index >= 0 && args->vm_index < g_vm_count) {
-        if (allocate_nat_ip(&g_vms[args->vm_index])) {
-            asb_log(L"Allocated NAT IP %S for new VM.", g_vms[args->vm_index].nat_ip);
+    VmInstance *network_vm = asb_find_vm_by_id(args->vm_unique_id);
+    if (args->config.network_mode == NET_NAT && network_vm) {
+        if (allocate_nat_ip(network_vm)) {
+            asb_log(L"Allocated NAT IP %S for new VM.", network_vm->nat_ip);
             save_vm_list();
         }
     }
 
     /* Network */
     if (args->config.network_mode != NET_NONE) {
-        char *nat_ip = (args->vm_index >= 0 && args->vm_index < g_vm_count)
-                        ? g_vms[args->vm_index].nat_ip : NULL;
+        char *nat_ip = network_vm ? network_vm->nat_ip : NULL;
         switch (args->config.network_mode) {
         case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
         case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
@@ -1425,8 +1606,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         }
         if (SUCCEEDED(hr)) {
             BOOL is_nat = (args->config.network_mode == NET_NAT);
-            size_t ip_size = (args->vm_index >= 0 && args->vm_index < g_vm_count)
-                              ? sizeof(g_vms[args->vm_index].nat_ip) : 0;
+            size_t ip_size = network_vm ? sizeof(network_vm->nat_ip) : 0;
             hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
                                           args->endpoint_guid, 64,
                                           nat_ip, ip_size, is_nat,
@@ -1444,7 +1624,8 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
     }
 
     args->config.image_path[0] = L'\0';
-    args->config.resources_iso_path[0] = L'\0';
+    if (!args->template_copy) args->config.resources_iso_path[0] = L'\0';
+    if (template_copy_cancelled(args)) goto done;
 
     /* Create HCS VM */
     {
@@ -1468,6 +1649,10 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
             goto done;
         }
 
+        if (template_copy_cancelled(args)) {
+            hcs_close_vm(&temp_inst);
+            goto done;
+        }
         hr = hcs_start_vm(&temp_inst);
         if (FAILED(hr)) {
             args->result = hr;
@@ -1497,6 +1682,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
     }
 
 done:
+    SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
     /* Clean up staging dir */
     {
         wchar_t staging_dir[MAX_PATH];
@@ -1512,15 +1698,13 @@ done:
         VmInstance *inst;
         int idx;
 
-        /* Resolve by stable id under g_cs: g_vms[] may have been compacted
-           (entries shifted down) while we were building, so the cached
-           vm_index can now point at a different VM or be out of range (H13). */
         EnterCriticalSection(&g_cs);
         inst = asb_find_vm_by_id(args->vm_unique_id);
-        idx = inst ? (int)(inst - g_vms) : -1;
+        idx = vm_index_of(vm_handle(inst));
         if (inst) {
             inst->building_vhdx = FALSE;
             wcscpy_s(inst->mac_address, ARRAYSIZE(inst->mac_address), args->config.mac_address);
+            wcscpy_s(inst->resources_iso_path, MAX_PATH, args->config.resources_iso_path);
 
             if (SUCCEEDED(args->result)) {
                 VmInstance *heap_inst = args->vm_inst;
@@ -1554,30 +1738,26 @@ done:
                 LeaveCriticalSection(&g_cs);
                 asb_log(L"VM \"%s\" created but failed to start: %s", inst->name, args->error_msg);
                 asb_log(L"You can adjust settings and start it manually.");
-                if (args->result == (HRESULT)0x800705AF)
-                    asb_alert(L"The host doesn't have enough resources to start this VM.");
-                else
-                    asb_alert(L"Failed to start VM, check its configuration.");
+                if (args->result != HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+                    if (args->result == (HRESULT)0x800705AF)
+                        asb_alert(L"The host doesn't have enough resources to start this VM.");
+                    else
+                        asb_alert(L"Failed to start VM, check its configuration.");
+                }
                 save_vm_list();
             } else {
                 /* VHDX never created - remove VM from list and clean up files */
-                int j;
                 asb_log(L"Error creating VM \"%s\": %s", inst->name, args->error_msg);
-                if (g_removed_cb) g_removed_cb(idx, g_removed_ud);
-                for (j = idx; j < g_vm_count - 1; j++) {
-                    g_vms[j] = g_vms[j + 1];
-                    g_snap_trees[j] = g_snap_trees[j + 1];
-                }
-                ZeroMemory(&g_vms[g_vm_count - 1], sizeof(VmInstance));
-                g_vm_count--;
+                remove_vm_record(idx);
+                inst = NULL;
                 LeaveCriticalSection(&g_cs);
                 /* Delete leftover directory so a retry doesn't hit FILE_EXISTS */
                 remove_dir_recursive(args->vhdx_dir);
                 save_vm_list();
+                notify_removed(idx, g_removed_ud);
             }
 
-            if (g_state_cb)
-                g_state_cb(vm_handle(inst), inst->running, g_state_ud);
+            if (inst) notify_state(vm_handle(inst), inst->running, g_state_ud);
         } else {
             /* VM was deleted while building: don't leak the started HCS
                handle copy, and don't write into a stale slot. */
@@ -2368,8 +2548,6 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
                                "Staging grub modules") and ext4/squashfs
                                progress lines do not. */
                             BOOL is_staging = (strstr(line + 9, "Staging") != NULL);
-                            /* Resolve by stable id under g_cs: g_vms[] may
-                               have been compacted while we were building (H13). */
                             VmInstance *pvm;
                             EnterCriticalSection(&g_cs);
                             pvm = asb_find_vm_by_id(vm_unique_id);
@@ -2378,8 +2556,8 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
                                 pvm->vhdx_staging = is_staging;
                             }
                             LeaveCriticalSection(&g_cs);
-                            if (g_progress_cb && pvm)
-                                g_progress_cb(vm_handle(pvm), pct, is_staging, g_progress_ud);
+                            if (pvm)
+                                notify_progress(vm_handle(pvm), pct, is_staging, g_progress_ud);
                         } else if (strncmp(line, "ERROR:", 6) == 0) {
                             if (error_msg && error_msg[0] == L'\0')
                                 MultiByteToWideChar(CP_ACP, 0, line + 6, -1, error_msg, (int)error_msg_cap);
@@ -2424,8 +2602,7 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
  */
 typedef struct {
     VmConfig    config;
-    int         vm_index;
-    UINT64      vm_unique_id;  /* stable id; survives g_vms[] compaction (H13) */
+    UINT64      vm_unique_id;
     wchar_t     vhdx_dir[MAX_PATH];
     wchar_t     endpoint_guid[64];
     GUID        network_id;
@@ -2585,17 +2762,17 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
        into the HCN endpoint policy below and pushed to the guest at
        runtime by the agent (set_ip -> static netplan); the guest never
        DHCPs in NAT mode. ---- */
-    if (args->config.network_mode == NET_NAT && args->vm_index >= 0 && args->vm_index < g_vm_count) {
-        if (allocate_nat_ip(&g_vms[args->vm_index])) {
-            asb_log(L"Allocated NAT IP %S for new VM.", g_vms[args->vm_index].nat_ip);
+    VmInstance *network_vm = asb_find_vm_by_id(args->vm_unique_id);
+    if (args->config.network_mode == NET_NAT && network_vm) {
+        if (allocate_nat_ip(network_vm)) {
+            asb_log(L"Allocated NAT IP %S for new VM.", network_vm->nat_ip);
             save_vm_list();
         }
     }
 
     /* ---- 5. Network + endpoint (same as vhdx_create_thread:1114). ---- */
     if (args->config.network_mode != NET_NONE) {
-        char *nat_ip = (args->vm_index >= 0 && args->vm_index < g_vm_count)
-                        ? g_vms[args->vm_index].nat_ip : NULL;
+        char *nat_ip = network_vm ? network_vm->nat_ip : NULL;
         switch (args->config.network_mode) {
         case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
         case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
@@ -2604,8 +2781,7 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         }
         if (SUCCEEDED(hr)) {
             BOOL is_nat = (args->config.network_mode == NET_NAT);
-            size_t ip_size = (args->vm_index >= 0 && args->vm_index < g_vm_count)
-                              ? sizeof(g_vms[args->vm_index].nat_ip) : 0;
+            size_t ip_size = network_vm ? sizeof(network_vm->nat_ip) : 0;
             hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
                                           args->endpoint_guid, 64,
                                           nat_ip, ip_size, is_nat,
@@ -2661,17 +2837,13 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     }
 
 done:
-    /* ---- Completion (same as vhdx_create_thread:1206). ---- */
     {
         VmInstance *inst;
         int idx;
 
-        /* Resolve by stable id under g_cs: g_vms[] may have been compacted
-           (entries shifted down) while we were building, so the cached
-           vm_index can now point at a different VM or be out of range (H13). */
         EnterCriticalSection(&g_cs);
         inst = asb_find_vm_by_id(args->vm_unique_id);
-        idx = inst ? (int)(inst - g_vms) : -1;
+        idx = vm_index_of(vm_handle(inst));
         if (inst) {
             inst->building_vhdx = FALSE;
             wcscpy_s(inst->mac_address, ARRAYSIZE(inst->mac_address), args->config.mac_address);
@@ -2710,22 +2882,16 @@ done:
                     asb_alert(L"Failed to start VM, check its configuration.");
                 save_vm_list();
             } else {
-                int j;
                 asb_log(L"Error creating VM \"%s\": %s", inst->name, args->error_msg);
-                if (g_removed_cb) g_removed_cb(idx, g_removed_ud);
-                for (j = idx; j < g_vm_count - 1; j++) {
-                    g_vms[j] = g_vms[j + 1];
-                    g_snap_trees[j] = g_snap_trees[j + 1];
-                }
-                ZeroMemory(&g_vms[g_vm_count - 1], sizeof(VmInstance));
-                g_vm_count--;
+                remove_vm_record(idx);
+                inst = NULL;
                 LeaveCriticalSection(&g_cs);
                 remove_dir_recursive(args->vhdx_dir);
                 save_vm_list();
+                notify_removed(idx, g_removed_ud);
             }
 
-            if (g_state_cb)
-                g_state_cb(vm_handle(inst), inst->running, g_state_ud);
+            if (inst) notify_state(vm_handle(inst), inst->running, g_state_ud);
         } else {
             /* VM was deleted while building: don't leak the started HCS
                handle copy, and don't write into a stale slot. */
@@ -2785,6 +2951,8 @@ ASB_API HRESULT asb_init(void)
 {
     if (g_initialized) return S_OK;
     InitializeCriticalSection(&g_cs);
+    for (int i = 0; i < ASB_MAX_VMS; ++i) g_vm_order[i] = &g_vm_storage[i];
+    g_vm_count = 0;
 
     if (!hcs_init())
         asb_log(L"HCS: NOT available (is Hyper-V enabled?)");
@@ -2812,6 +2980,7 @@ ASB_API HRESULT asb_init(void)
 
     hcs_set_state_callback(asb_hcs_state_changed);
 
+    g_config_load_failed = FALSE;
     load_vm_list();
     scan_templates();
 
@@ -2827,13 +2996,19 @@ ASB_API void asb_cleanup(void)
     int i;
     if (!g_initialized) return;
 
+    stop_template_copies();
     for (i = 0; i < g_vm_count; i++) {
-        hcs_stop_monitor(&g_vms[i]);
-        vm_ssh_proxy_stop(&g_vms[i]);
-        vm_agent_stop(&g_vms[i]);
-        idd_probe_stop(&g_vms[i]);
-        if (g_vms[i].running) hcs_terminate_vm(&g_vms[i]);
-        hcs_close_vm(&g_vms[i]);
+        if (VM_AT(i).start_thread) {
+            WaitForSingleObject(VM_AT(i).start_thread, INFINITE);
+            CloseHandle(VM_AT(i).start_thread);
+            VM_AT(i).start_thread = NULL;
+        }
+        hcs_stop_monitor(&VM_AT(i));
+        vm_ssh_proxy_stop(&VM_AT(i));
+        vm_agent_stop(&VM_AT(i));
+        idd_probe_stop(&VM_AT(i));
+        if (VM_AT(i).running) hcs_terminate_vm(&VM_AT(i));
+        hcs_close_vm(&VM_AT(i));
     }
 
     hcs_cleanup();
@@ -2847,6 +3022,7 @@ ASB_API void asb_detach(void)
     int i;
     if (!g_initialized) return;
 
+    stop_template_copies();
     /* Cleanly release HCS resources WITHOUT terminating running VMs.
        Used by short-lived consumers that start a VM
        and exit - the VM keeps running after the process is gone.
@@ -2857,12 +3033,17 @@ ASB_API void asb_detach(void)
        handle.  Instead, let the OS close it during process teardown after
        the callback is already gone. */
     for (i = 0; i < g_vm_count; i++) {
-        hcs_stop_monitor(&g_vms[i]);
-        vm_ssh_proxy_stop(&g_vms[i]);
-        vm_agent_stop(&g_vms[i]);
-        idd_probe_stop(&g_vms[i]);
-        hcs_unregister_vm_callback(&g_vms[i]);
-        g_vms[i].handle = NULL;  /* abandon handle - OS will close it */
+        if (VM_AT(i).start_thread) {
+            WaitForSingleObject(VM_AT(i).start_thread, INFINITE);
+            CloseHandle(VM_AT(i).start_thread);
+            VM_AT(i).start_thread = NULL;
+        }
+        hcs_stop_monitor(&VM_AT(i));
+        vm_ssh_proxy_stop(&VM_AT(i));
+        vm_agent_stop(&VM_AT(i));
+        idd_probe_stop(&VM_AT(i));
+        hcs_unregister_vm_callback(&VM_AT(i));
+        VM_AT(i).handle = NULL;  /* abandon handle - OS will close it */
     }
 
     g_initialized = FALSE;
@@ -3112,6 +3293,13 @@ ASB_API const wchar_t *asb_validate_password(const wchar_t *os_type,
 
 ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 {
+    return asb_vm_create_with_id(config, NULL);
+}
+
+ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *created_id)
+{
+    if (created_id) *created_id = 0;
+    if (g_config_load_failed) return E_FAIL;
     VmConfig cfg;
     VmInstance *inst;
     wchar_t vhdx_dir[MAX_PATH];
@@ -3235,7 +3423,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     {
         int i;
         for (i = 0; i < g_vm_count; i++) {
-            if (_wcsicmp(g_vms[i].name, cfg.name) == 0) { existing_idx = i; break; }
+            if (_wcsicmp(VM_AT(i).name, cfg.name) == 0) { existing_idx = i; break; }
         }
     }
     if (existing_idx >= 0) {
@@ -3261,16 +3449,19 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (is_template_create) {
         int pending = 0, i;
         for (i = 0; i < g_vm_count; i++)
-            if (g_vms[i].is_template) pending++;
+            if (VM_AT(i).is_template) pending++;
         if (g_template_count + pending >= ASB_MAX_TEMPLATES) {
             asb_log(L"Maximum template count reached (%d)", ASB_MAX_TEMPLATES);
             return E_OUTOFMEMORY;
         }
     }
 
-    inst = &g_vms[g_vm_count];
+    inst = &VM_AT(g_vm_count);
     ZeroMemory(inst, sizeof(VmInstance));
-    inst->unique_id = g_next_vm_id++;
+    do { inst->unique_id = asb_vm_id_new(); }
+    while (inst->unique_id && asb_find_vm_by_id(inst->unique_id));
+    if (!inst->unique_id) return E_FAIL;
+    if (created_id) *created_id = inst->unique_id;
 
     /* Net adapter */
     if (config->net_adapter && config->net_adapter[0] != L'\0' &&
@@ -3340,8 +3531,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                                 cfg.image_path[0] != L'\0' &&
                                 (is_template_create || cfg.admin_pass[0] != L'\0'));
 
-        if (use_vhdx_first) {
-            VhdxCreateArgs *args;
+        if (use_vhdx_first || from_template) {
+            VhdxCreateArgs *args = NULL;
+            HANDLE thread;
 
             wcscpy_s(inst->name, 256, cfg.name);
             wcscpy_s(inst->os_type, 32, cfg.os_type);
@@ -3365,7 +3557,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
 
             { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
-              snapshot_init(&g_snap_trees[g_vm_count], sd); }
+              snapshot_init(&SNAP_AT(g_vm_count), sd); }
             g_vm_count++;
 
             if (!is_template_create)
@@ -3376,22 +3568,66 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             args = (VhdxCreateArgs *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(VhdxCreateArgs));
             if (!args) {
                 asb_log(L"Error: Out of memory for VHDX create args.");
-                g_vm_count--;
-                return E_OUTOFMEMORY;
+                hr = E_OUTOFMEMORY;
+                goto build_failed;
             }
             memcpy(&args->config, &cfg, sizeof(VmConfig));
-            args->vm_index = g_vm_count - 1;
+            SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
             args->vm_unique_id = inst->unique_id;
             wcscpy_s(args->vhdx_dir, MAX_PATH, vhdx_dir);
             wcscpy_s(args->net_adapter, 256, inst->net_adapter);
 
             get_host_keyboard_settings(args->input_locale, ARRAYSIZE(args->input_locale), NULL, NULL);
 
+            if (from_template) {
+                int i;
+                for (i = 0; i < ASB_MAX_VMS; i++) {
+                    TemplateCopy *copy = &g_template_copies[i];
+                    if (copy->thread && WaitForSingleObject(copy->thread, 0) == WAIT_OBJECT_0)
+                        release_template_copy(copy);
+                    if (!copy->thread) {
+                        args->template_copy = copy;
+                        break;
+                    }
+                }
+                hr = HRESULT_FROM_WIN32(ERROR_BUSY);
+                if (args->template_copy) {
+                    args->template_copy->cancel_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+                    hr = args->template_copy->cancel_event ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+                }
+                if (FAILED(hr)) goto build_failed;
+                wcscpy_s(args->template_copy->source, MAX_PATH, g_templates[template_idx].vhdx_path);
+                wcscpy_s(args->language, ARRAYSIZE(args->language), L"en-US");
+                vm_load_language_json(args->template_copy->source, args->language, ARRAYSIZE(args->language));
+                inst->image_path[0] = L'\0';
+                args->config.image_path[0] = L'\0';
+            }
             asb_log(L"Building VHDX for \"%s\" (this may take several minutes)...", cfg.name);
-            CloseHandle(CreateThread(NULL, 0, vhdx_create_thread, args, 0, NULL));
-
-            if (g_state_cb) g_state_cb(vm_handle(inst), FALSE, g_state_ud);
+            thread = CreateThread(NULL, 0, vhdx_create_thread, args, CREATE_SUSPENDED, NULL);
+            if (!thread) {
+                hr = HRESULT_FROM_WIN32(GetLastError());
+                goto build_failed;
+            }
+            if (args->template_copy) args->template_copy->thread = thread;
+            notify_state(vm_handle(inst), FALSE, g_state_ud);
+            ResumeThread(thread);
+            if (!from_template) CloseHandle(thread);
             return S_OK;
+
+build_failed:
+            SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
+            if (args) {
+                if (args->template_copy) release_template_copy(args->template_copy);
+                SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
+                HeapFree(GetProcessHeap(), 0, args);
+            }
+            EnterCriticalSection(&g_cs);
+            remove_vm_record(vm_index_of(vm_handle(inst)));
+            LeaveCriticalSection(&g_cs);
+            if (created_id) *created_id = 0;
+            remove_dir_recursive(vhdx_dir);
+            save_vm_list();
+            return hr;
         }
     }
 
@@ -3436,7 +3672,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
 
             { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
-              snapshot_init(&g_snap_trees[g_vm_count], sd); }
+              snapshot_init(&SNAP_AT(g_vm_count), sd); }
             g_vm_count++;
 
             vm_save_state_json(cfg.vhdx_path, FALSE);
@@ -3449,7 +3685,6 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                 return E_OUTOFMEMORY;
             }
             memcpy(&args->config, &cfg, sizeof(VmConfig));
-            args->vm_index = g_vm_count - 1;
             args->vm_unique_id = inst->unique_id;
             wcscpy_s(args->vhdx_dir, MAX_PATH, vhdx_dir);
             wcscpy_s(args->net_adapter, 256, inst->net_adapter);
@@ -3465,48 +3700,22 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
             SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
 
-            if (g_state_cb) g_state_cb(vm_handle(inst), FALSE, g_state_ud);
+            notify_state(vm_handle(inst), FALSE, g_state_ud);
             return S_OK;
         }
     }
 
-    /* ---- Synchronous path (from-template, non-Windows, etc.) ---- */
-
     /* Populate name early so log lines (e.g. NAT IP allocation) identify the VM. */
     wcscpy_s(inst->name, 256, cfg.name);
 
-    /* Create disk (synchronous path: from-template only — Linux ISO
-       creates go through the use_linux_cloud branch above; Windows ISO
-       installs go through use_vhdx_first above). */
-    if (from_template) {
-        asb_log(L"Creating differencing VHDX from template \"%s\"...", g_templates[template_idx].name);
-        hr = vhdx_create_differencing(cfg.vhdx_path, g_templates[template_idx].vhdx_path);
-        if (FAILED(hr)) {
-            asb_log(L"Error: Failed to create differencing VHDX (0x%08X)", hr);
-            remove_dir_recursive(vhdx_dir);
-            return hr;
-        }
-        /* The child initially inherits the parent's capacity. Grow only the
-           new child before attaching it; the template remains unchanged. */
-        hr = vhdx_grow(cfg.vhdx_path, (ULONGLONG)cfg.hdd_gb);
-        if (FAILED(hr)) {
-            asb_log(L"Error: Failed to size template instance VHDX to %lu GB (0x%08X).",
-                    cfg.hdd_gb, hr);
-            asb_alert(L"Failed to apply the requested HDD size to the template instance.");
-            remove_dir_recursive(vhdx_dir);
-            return hr;
-        }
-        asb_log(L"Differencing VHDX ready (%lu GB).", cfg.hdd_gb);
-    } else {
-        asb_log(L"Creating VHDX: %s (%lu GB)...", cfg.vhdx_path, cfg.hdd_gb);
-        hr = vhdx_create(cfg.vhdx_path, (ULONGLONG)cfg.hdd_gb);
-        if (FAILED(hr)) {
-            asb_log(L"Error: Failed to create VHDX (0x%08X)", hr);
-            remove_dir_recursive(vhdx_dir);
-            return hr;
-        }
-        asb_log(L"VHDX created successfully.");
+    asb_log(L"Creating VHDX: %s (%lu GB)...", cfg.vhdx_path, cfg.hdd_gb);
+    hr = vhdx_create(cfg.vhdx_path, (ULONGLONG)cfg.hdd_gb);
+    if (FAILED(hr)) {
+        asb_log(L"Error: Failed to create VHDX (0x%08X)", hr);
+        remove_dir_recursive(vhdx_dir);
+        return hr;
     }
+    asb_log(L"VHDX created successfully.");
 
     /* Resources ISO */
     {
@@ -3522,35 +3731,17 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         if (is_template_create) {
             if (_wcsicmp(cfg.os_type, L"Windows") == 0 && cfg.image_path[0] != L'\0') {
                 hr = iso_create_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
-                                           res_dir_buf, TRUE, cfg.test_mode, cfg.ssh_enabled, L"en-US");
+                                           res_dir_buf, TRUE, cfg.test_mode, cfg.ssh_enabled,
+                                           cfg.network_mode == NET_NAT, L"en-US");
                 if (SUCCEEDED(hr)) wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                 else asb_log(L"Warning: Failed to create template resources ISO (0x%08X).", hr);
-            }
-        } else if (from_template) {
-            /* Every Windows instance needs mini-setup, including the OS
-               partition extension when its child VHDX was enlarged. */
-            if (_wcsicmp(cfg.os_type, L"Windows") == 0) {
-                wchar_t template_lang[32] = L"en-US";
-                vm_load_language_json(g_templates[template_idx].vhdx_path, template_lang, 32);
-                hr = iso_create_instance_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
-                                                    res_dir_buf, cfg.ssh_enabled, template_lang);
-                if (SUCCEEDED(hr)) {
-                    wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
-                    vm_save_language_json(cfg.vhdx_path, template_lang);
-                }
-                else {
-                    asb_log(L"Error: Failed to create instance resources ISO (0x%08X).", hr);
-                    asb_alert(L"Failed to prepare the template instance's Windows setup.");
-                    SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
-                    remove_dir_recursive(vhdx_dir);
-                    return hr;
-                }
             }
         } else {
             if (_wcsicmp(cfg.os_type, L"Windows") == 0 && cfg.image_path[0] != L'\0' &&
                 cfg.admin_pass[0] != L'\0') {
                 hr = iso_create_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
-                                           res_dir_buf, FALSE, cfg.test_mode, cfg.ssh_enabled, L"en-US");
+                                           res_dir_buf, FALSE, cfg.test_mode, cfg.ssh_enabled,
+                                           cfg.network_mode == NET_NAT, L"en-US");
                 if (SUCCEEDED(hr)) wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                 else asb_log(L"Warning: Failed to create resources ISO (0x%08X).", hr);
             }
@@ -3626,7 +3817,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
 
     { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
-      snapshot_init(&g_snap_trees[g_vm_count], sd); }
+      snapshot_init(&SNAP_AT(g_vm_count), sd); }
     g_vm_count++;
 
     if (!is_template_create)
@@ -3650,7 +3841,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
     save_vm_list();
 
-    if (g_state_cb) g_state_cb(vm_handle(inst), inst->running, g_state_ud);
+    notify_state(vm_handle(inst), inst->running, g_state_ud);
     return S_OK;
 }
 
@@ -3664,9 +3855,12 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
 
     idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    inst = &g_vms[idx];
+    inst = &VM_AT(idx);
+    if (inst->starting || inst->building_vhdx) return E_ACCESSDENIED;
+    SnapshotTree *tree = &SNAP_AT(idx);
 
     if (inst->running) { asb_log(L"VM \"%s\" is already running.", inst->name); return S_FALSE; }
+    inst->display_suppressed = FALSE;
     if (resolve_vm_gpu_selection(inst)) save_vm_list();
     if (inst->network_mode != NET_NONE) {
         HRESULT hr = ensure_vm_mac_address(inst);
@@ -3678,34 +3872,34 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
     if (snap_idx >= 0 || snap_idx == -2) {
         HRESULT hr;
         if (branch_idx >= 0) {
-            hr = snapshot_select_branch(&g_snap_trees[idx], inst, snap_idx, branch_idx);
+            hr = snapshot_select_branch(tree, inst, snap_idx, branch_idx);
         } else {
-            hr = snapshot_new_branch(&g_snap_trees[idx], inst, snap_idx);
+            hr = snapshot_new_branch(tree, inst, snap_idx);
             if (SUCCEEDED(hr) && branch_name && branch_name[0] != L'\0') {
                 int new_bi;
                 if (snap_idx == -2)
-                    new_bi = g_snap_trees[idx].base_branch_count - 1;
+                    new_bi = tree->base_branch_count - 1;
                 else
-                    new_bi = g_snap_trees[idx].nodes[snap_idx].branch_count - 1;
+                    new_bi = tree->nodes[snap_idx].branch_count - 1;
                 if (new_bi >= 0)
-                    snapshot_rename(&g_snap_trees[idx], snap_idx, new_bi, branch_name);
+                    snapshot_rename(tree, snap_idx, new_bi, branch_name);
             }
         }
         if (FAILED(hr)) {
             asb_log(L"Error: Failed to select branch (0x%08X)", hr);
-            if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
+            notify_state(vm, FALSE, g_state_ud);
             return hr;
         }
         if (snap_idx == -2) asb_log(L"Switching to base branch...");
-        else asb_log(L"Switching to \"%s\" branch...", g_snap_trees[idx].nodes[snap_idx].name);
+        else asb_log(L"Switching to \"%s\" branch...", tree->nodes[snap_idx].name);
         save_vm_list();
     }
 
     {
-        HRESULT hr = snapshot_ensure_writable(&g_snap_trees[idx], inst);
+        HRESULT hr = snapshot_ensure_writable(tree, inst);
         if (FAILED(hr)) {
             asb_log(L"Error: Failed to create working branch (0x%08X)", hr);
-            if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
+            notify_state(vm, FALSE, g_state_ud);
             return hr;
         }
         if (hr == S_OK) {
@@ -3737,7 +3931,16 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->network_mode = inst->network_mode;
         inst->network_cleaned = FALSE;
         asb_log(L"Starting VM \"%s\" (background)...", inst->name);
-        CloseHandle(CreateThread(NULL, 0, start_vm_thread, args, 0, NULL));
+        if (inst->start_thread) CloseHandle(inst->start_thread);
+        inst->starting = TRUE;
+        inst->start_thread = CreateThread(NULL, 0, start_vm_thread, args, CREATE_SUSPENDED, NULL);
+        if (!inst->start_thread) {
+            inst->starting = FALSE;
+            free(args);
+            return HRESULT_FROM_WIN32(GetLastError());
+        }
+        ResumeThread(inst->start_thread);
+        asb_events_changed();
     } else {
         BOOL selected_gpu = inst->gpu_id[0] != L'\0';
         HRESULT hr = hcs_start_vm(inst);
@@ -3757,7 +3960,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         vm_agent_start(inst);
         idd_probe_start(inst);
         hcs_start_monitor(inst);
-        if (g_state_cb) g_state_cb(vm, TRUE, g_state_ud);
+        notify_state(vm, TRUE, g_state_ud);
     }
 
     return S_OK;
@@ -3771,7 +3974,8 @@ ASB_API HRESULT asb_vm_shutdown(AsbVm vm)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    inst = &g_vms[idx];
+    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
+    inst = &VM_AT(idx);
 
     if (!inst->running) { asb_log(L"VM \"%s\" is not running.", inst->name); return S_FALSE; }
 
@@ -3790,7 +3994,7 @@ ASB_API HRESULT asb_vm_shutdown(AsbVm vm)
     inst->shutdown_time = GetTickCount64();
     asb_log(L"Shutdown signal sent to \"%s\".", inst->name);
 
-    if (g_state_cb) g_state_cb(vm, TRUE, g_state_ud);
+    notify_state(vm, TRUE, g_state_ud);
     return S_OK;
 }
 
@@ -3802,7 +4006,8 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    inst = &g_vms[idx];
+    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
+    inst = &VM_AT(idx);
 
     if (!inst->running) { asb_log(L"VM \"%s\" is not running.", inst->name); return S_FALSE; }
 
@@ -3827,7 +4032,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
     asb_log(L"VM \"%s\" terminated.", inst->name);
     save_vm_list();
 
-    if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
+    notify_state(vm, FALSE, g_state_ud);
     return S_OK;
 }
 
@@ -3843,7 +4048,9 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
 
     idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    inst = &g_vms[idx];
+    inst = &VM_AT(idx);
+    if (inst->building_vhdx || inst->starting) return E_ACCESSDENIED;
+    if (inst->start_thread) WaitForSingleObject(inst->start_thread, INFINITE);
     if (!get_vm_disk_root(inst->vhdx_path, dir)) return E_INVALIDARG;
     attrs = GetFileAttributesW(dir);
     if (attrs == INVALID_FILE_ATTRIBUTES) {
@@ -3892,12 +4099,8 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
 
     /* Compact arrays */
     EnterCriticalSection(&g_cs);
-    for (i = idx; i < g_vm_count - 1; i++) {
-        g_vms[i] = g_vms[i + 1];
-        g_snap_trees[i] = g_snap_trees[i + 1];
-    }
-    ZeroMemory(&g_vms[g_vm_count - 1], sizeof(VmInstance));
-    g_vm_count--;
+    idx = vm_index_of(vm);
+    if (idx >= 0) remove_vm_record(idx);
     LeaveCriticalSection(&g_cs);
 
     save_vm_list();
@@ -3925,7 +4128,7 @@ ASB_API void asb_vm_disk_directory(AsbVm vm, wchar_t *out, size_t out_len)
 ASB_API AsbVm asb_vm_get(int index)
 {
     if (index < 0 || index >= g_vm_count) return NULL;
-    return vm_handle(&g_vms[index]);
+    return vm_handle(&VM_AT(index));
 }
 
 ASB_API AsbVm asb_vm_find(const wchar_t *name)
@@ -3933,8 +4136,8 @@ ASB_API AsbVm asb_vm_find(const wchar_t *name)
     int i;
     if (!name) return NULL;
     for (i = 0; i < g_vm_count; i++) {
-        if (_wcsicmp(g_vms[i].name, name) == 0)
-            return vm_handle(&g_vms[i]);
+        if (_wcsicmp(VM_AT(i).name, name) == 0)
+            return vm_handle(&VM_AT(i));
     }
     return NULL;
 }
@@ -3973,6 +4176,14 @@ ASB_API BOOL asb_vm_idd_ready(AsbVm vm)
        the frame service to "check" would itself become the single consumer and
        blank the display, so readiness is a passive read of these latched flags. */
     return inst->agent_online && inst->idd_ready;
+}
+
+ASB_API void asb_vm_set_display_suppressed(AsbVm vm, BOOL suppressed)
+{
+    VmInstance *inst = vm_inst(vm);
+    if (!inst || inst->display_suppressed == suppressed) return;
+    inst->display_suppressed = suppressed;
+    asb_events_changed();
 }
 
 ASB_API BOOL asb_vm_is_building(AsbVm vm)
@@ -4031,19 +4242,20 @@ ASB_API HRESULT asb_vm_set_name(AsbVm vm, const wchar_t *name)
     int idx = vm_index_of(vm);
     int i;
     if (idx < 0) return E_INVALIDARG;
-    inst = &g_vms[idx];
+    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
+    inst = &VM_AT(idx);
     if (inst->running) return E_ACCESSDENIED;
     if (!name || name[0] == L'\0') return E_INVALIDARG;
 
     for (i = 0; i < g_vm_count; i++) {
-        if (i != idx && _wcsicmp(g_vms[i].name, name) == 0) {
+        if (i != idx && _wcsicmp(VM_AT(i).name, name) == 0) {
             asb_log(L"Name \"%s\" is already in use.", name);
             return E_INVALIDARG;
         }
     }
     wcscpy_s(inst->name, 256, name);
     save_vm_list();
-    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    notify_state(vm, inst->running, g_state_ud);
     return S_OK;
 }
 
@@ -4051,11 +4263,11 @@ ASB_API HRESULT asb_vm_set_ram(AsbVm vm, DWORD ram_mb)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (g_vms[idx].running) return E_ACCESSDENIED;
+    if (VM_AT(idx).running || VM_AT(idx).building_vhdx || VM_AT(idx).starting) return E_ACCESSDENIED;
     if (ram_mb < 4000) ram_mb = 4000;
-    g_vms[idx].ram_mb = ram_mb;
+    VM_AT(idx).ram_mb = ram_mb;
     save_vm_list();
-    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    notify_state(vm, VM_AT(idx).running, g_state_ud);
     return S_OK;
 }
 
@@ -4063,11 +4275,11 @@ ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (g_vms[idx].running) return E_ACCESSDENIED;
+    if (VM_AT(idx).running || VM_AT(idx).building_vhdx || VM_AT(idx).starting) return E_ACCESSDENIED;
     if (cores < 1) cores = 1;
-    g_vms[idx].cpu_cores = cores;
+    VM_AT(idx).cpu_cores = cores;
     save_vm_list();
-    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    notify_state(vm, VM_AT(idx).running, g_state_ud);
     return S_OK;
 }
 
@@ -4080,14 +4292,14 @@ ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (g_vms[idx].running || g_vms[idx].building_vhdx) return E_ACCESSDENIED;
+    if (VM_AT(idx).running || VM_AT(idx).building_vhdx || VM_AT(idx).starting) return E_ACCESSDENIED;
     if (asb_validate_gpu_selection(gpu_mode, gpu_id)) return E_INVALIDARG;
-    g_vms[idx].gpu_mode = gpu_mode;
-    wcscpy_s(g_vms[idx].gpu_id, ARRAYSIZE(g_vms[idx].gpu_id),
+    VM_AT(idx).gpu_mode = gpu_mode;
+    wcscpy_s(VM_AT(idx).gpu_id, ARRAYSIZE(VM_AT(idx).gpu_id),
         gpu_id && gpu_id[0] ? find_gpu(gpu_id)->interface_path : L"");
-    update_vm_gpu_name(&g_vms[idx]);
+    update_vm_gpu_name(&VM_AT(idx));
     save_vm_list();
-    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    notify_state(vm, VM_AT(idx).running, g_state_ud);
     return S_OK;
 }
 
@@ -4095,11 +4307,11 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (g_vms[idx].running) return E_ACCESSDENIED;
+    if (VM_AT(idx).running || VM_AT(idx).building_vhdx || VM_AT(idx).starting) return E_ACCESSDENIED;
     if (mode < 0 || mode > 3) return E_INVALIDARG;
-    g_vms[idx].network_mode = mode;
+    VM_AT(idx).network_mode = mode;
     save_vm_list();
-    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    notify_state(vm, VM_AT(idx).running, g_state_ud);
     return S_OK;
 }
 
@@ -4111,22 +4323,23 @@ ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)
     int idx = vm_index_of(vm);
     wchar_t snap_name[128];
     if (idx < 0) return E_INVALIDARG;
-    if (g_vms[idx].running) { asb_log(L"VM must be stopped to take a snapshot."); return E_ACCESSDENIED; }
+    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
+    if (VM_AT(idx).running) { asb_log(L"VM must be stopped to take a snapshot."); return E_ACCESSDENIED; }
 
     if (name && name[0] != L'\0')
         wcscpy_s(snap_name, 128, name);
     else
-        swprintf_s(snap_name, 128, L"Snapshot %d", g_snap_trees[idx].count + 1);
+        swprintf_s(snap_name, 128, L"Snapshot %d", SNAP_AT(idx).count + 1);
 
-    asb_log(L"Taking snapshot \"%s\" of VM \"%s\"...", snap_name, g_vms[idx].name);
-    hr = snapshot_take(&g_snap_trees[idx], &g_vms[idx], snap_name);
+    asb_log(L"Taking snapshot \"%s\" of VM \"%s\"...", snap_name, VM_AT(idx).name);
+    hr = snapshot_take(&SNAP_AT(idx), &VM_AT(idx), snap_name);
     if (FAILED(hr))
         asb_log(L"Error: Snapshot failed (0x%08X)", hr);
     else
         asb_log(L"Snapshot \"%s\" created.", snap_name);
 
     save_vm_list();
-    if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
+    notify_state(vm, FALSE, g_state_ud);
     return hr;
 }
 
@@ -4135,15 +4348,16 @@ ASB_API HRESULT asb_snap_delete(AsbVm vm, int snap_idx)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
+    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
     if (snap_idx < 0) { asb_log(L"Select a snapshot to delete."); return E_INVALIDARG; }
 
     asb_log(L"Deleting snapshot %d...", snap_idx);
-    hr = snapshot_delete(&g_snap_trees[idx], &g_vms[idx], snap_idx);
+    hr = snapshot_delete(&SNAP_AT(idx), &VM_AT(idx), snap_idx);
     if (FAILED(hr)) asb_log(L"Error: Failed to delete snapshot (0x%08X)", hr);
     else asb_log(L"Snapshot deleted.");
 
     save_vm_list();
-    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    notify_state(vm, VM_AT(idx).running, g_state_ud);
     return hr;
 }
 
@@ -4152,12 +4366,13 @@ ASB_API HRESULT asb_snap_new_branch(AsbVm vm, int snap_idx)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
+    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
 
-    hr = snapshot_new_branch(&g_snap_trees[idx], &g_vms[idx], snap_idx);
+    hr = snapshot_new_branch(&SNAP_AT(idx), &VM_AT(idx), snap_idx);
     if (FAILED(hr)) asb_log(L"Error: Failed to create branch (0x%08X)", hr);
 
     save_vm_list();
-    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    notify_state(vm, VM_AT(idx).running, g_state_ud);
     return hr;
 }
 
@@ -4166,17 +4381,18 @@ ASB_API HRESULT asb_snap_delete_branch(AsbVm vm, int snap_idx, int branch_idx)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
+    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
 
     asb_log(L"Deleting branch %d of %s...", branch_idx,
             snap_idx == -2 ? L"base"
-              : (snap_idx >= 0 && snap_idx < g_snap_trees[idx].count
-                   ? g_snap_trees[idx].nodes[snap_idx].name : L"?"));
-    hr = snapshot_delete_branch(&g_snap_trees[idx], &g_vms[idx], snap_idx, branch_idx);
+              : (snap_idx >= 0 && snap_idx < SNAP_AT(idx).count
+                   ? SNAP_AT(idx).nodes[snap_idx].name : L"?"));
+    hr = snapshot_delete_branch(&SNAP_AT(idx), &VM_AT(idx), snap_idx, branch_idx);
     if (FAILED(hr)) asb_log(L"Error: Failed to delete branch (0x%08X)", hr);
     else asb_log(L"Branch deleted.");
 
     save_vm_list();
-    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    notify_state(vm, VM_AT(idx).running, g_state_ud);
     return hr;
 }
 
@@ -4186,9 +4402,10 @@ ASB_API HRESULT asb_snap_rename(AsbVm vm, int snap_idx, int branch_idx,
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
+    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
 
-    hr = snapshot_rename(&g_snap_trees[idx], snap_idx, branch_idx, new_name);
-    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    hr = snapshot_rename(&SNAP_AT(idx), snap_idx, branch_idx, new_name);
+    notify_state(vm, VM_AT(idx).running, g_state_ud);
     return hr;
 }
 
@@ -4196,27 +4413,27 @@ ASB_API int asb_snap_count(AsbVm vm)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return 0;
-    return g_snap_trees[idx].count;
+    return SNAP_AT(idx).count;
 }
 
 ASB_API int asb_snap_base_branch_count(AsbVm vm)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return 0;
-    return g_snap_trees[idx].base_branch_count;
+    return SNAP_AT(idx).base_branch_count;
 }
 
 ASB_API BOOL asb_snap_get_info(AsbVm vm, int snap_idx, AsbSnapshotInfo *out)
 {
     int idx = vm_index_of(vm);
     if (idx < 0 || !out) return FALSE;
-    if (snap_idx < 0 || snap_idx >= g_snap_trees[idx].count) return FALSE;
-    if (!g_snap_trees[idx].nodes[snap_idx].valid) return FALSE;
+    if (snap_idx < 0 || snap_idx >= SNAP_AT(idx).count) return FALSE;
+    if (!SNAP_AT(idx).nodes[snap_idx].valid) return FALSE;
 
     out->index = snap_idx;
-    wcscpy_s(out->name, 128, g_snap_trees[idx].nodes[snap_idx].name);
-    wcscpy_s(out->guid, 64, g_snap_trees[idx].nodes[snap_idx].guid);
-    out->branch_count = g_snap_trees[idx].nodes[snap_idx].branch_count;
+    wcscpy_s(out->name, 128, SNAP_AT(idx).nodes[snap_idx].name);
+    wcscpy_s(out->guid, 64, SNAP_AT(idx).nodes[snap_idx].guid);
+    out->branch_count = SNAP_AT(idx).nodes[snap_idx].branch_count;
     return TRUE;
 }
 
@@ -4228,12 +4445,12 @@ ASB_API BOOL asb_snap_get_branch_info(AsbVm vm, int snap_idx, int branch_idx,
     if (idx < 0 || !out) return FALSE;
 
     if (snap_idx == -2) {
-        if (branch_idx < 0 || branch_idx >= g_snap_trees[idx].base_branch_count) return FALSE;
-        br = &g_snap_trees[idx].base_branches[branch_idx];
+        if (branch_idx < 0 || branch_idx >= SNAP_AT(idx).base_branch_count) return FALSE;
+        br = &SNAP_AT(idx).base_branches[branch_idx];
     } else {
-        if (snap_idx < 0 || snap_idx >= g_snap_trees[idx].count) return FALSE;
-        if (branch_idx < 0 || branch_idx >= g_snap_trees[idx].nodes[snap_idx].branch_count) return FALSE;
-        br = &g_snap_trees[idx].nodes[snap_idx].branches[branch_idx];
+        if (snap_idx < 0 || snap_idx >= SNAP_AT(idx).count) return FALSE;
+        if (branch_idx < 0 || branch_idx >= SNAP_AT(idx).nodes[snap_idx].branch_count) return FALSE;
+        br = &SNAP_AT(idx).nodes[snap_idx].branches[branch_idx];
     }
 
     if (!br->valid) return FALSE;
@@ -4251,7 +4468,7 @@ ASB_API void asb_snap_get_current(AsbVm vm, int *snap_idx, int *branch_idx)
         if (branch_idx) *branch_idx = -1;
         return;
     }
-    snapshot_find_current(&g_snap_trees[idx], g_vms[idx].vhdx_path, snap_idx, branch_idx);
+    snapshot_find_current(&SNAP_AT(idx), VM_AT(idx).vhdx_path, snap_idx, branch_idx);
 }
 
 /* ---- Templates ---- */
@@ -4273,14 +4490,55 @@ ASB_API const wchar_t *asb_template_os_type(int index)
 ASB_API HRESULT asb_template_delete(const wchar_t *name)
 {
     wchar_t tpl_dir[MAX_PATH];
+    GUID template_id, template_parent;
     DWORD attrs;
     HRESULT hr;
     int index, i;
 
+    if (g_config_load_failed) return E_FAIL;
     if (!name || name[0] == L'\0') return E_INVALIDARG;
     for (index = 0; index < g_template_count; index++)
         if (_wcsicmp(g_templates[index].name, name) == 0) break;
     if (index == g_template_count) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    for (i = 0; i < ASB_MAX_VMS; i++) {
+        TemplateCopy *copy = &g_template_copies[i];
+        if (copy->thread && _wcsicmp(copy->source, g_templates[index].vhdx_path) == 0 &&
+            WaitForSingleObject(copy->thread, 0) != WAIT_OBJECT_0) {
+            asb_log(L"Template \"%s\" is still being copied.", name);
+            return HRESULT_FROM_WIN32(ERROR_BUSY);
+        }
+    }
+    hr = vhdx_get_identifiers(g_templates[index].vhdx_path, &template_id, &template_parent);
+    if (FAILED(hr)) return hr;
+    EnterCriticalSection(&g_cs);
+    for (i = 0; i < g_vm_count; i++) {
+        GUID disk_id, parent_id;
+        wchar_t base_path[MAX_PATH], root[MAX_PATH];
+        const wchar_t *base;
+        if (VM_AT(i).building_vhdx) continue;
+        base = SNAP_AT(i).base_vhdx;
+        if (!base[0]) {
+            if (!get_vm_disk_root(VM_AT(i).vhdx_path, root) ||
+                swprintf_s(base_path, MAX_PATH, L"%s\\disk.vhdx", root) < 0) {
+                hr = E_INVALIDARG;
+                break;
+            }
+            base = base_path;
+        }
+        hr = vhdx_get_identifiers(base, &disk_id, &parent_id);
+        if (FAILED(hr)) {
+            asb_log(L"Cannot verify disk dependencies for \"%s\" (0x%08X). Template was retained.",
+                    VM_AT(i).name, hr);
+            break;
+        }
+        if (IsEqualGUID(&parent_id, &template_id) || IsEqualGUID(&disk_id, &template_id)) {
+            asb_log(L"Template \"%s\" is required by existing VM \"%s\".", name, VM_AT(i).name);
+            hr = HRESULT_FROM_WIN32(ERROR_BUSY);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+    if (FAILED(hr)) return hr;
     if (!get_vm_disk_root(g_templates[index].vhdx_path, tpl_dir)) return E_INVALIDARG;
     attrs = GetFileAttributesW(tpl_dir);
     if (attrs == INVALID_FILE_ATTRIBUTES) {
@@ -4307,6 +4565,7 @@ ASB_API HRESULT asb_template_delete(const wchar_t *name)
 ASB_API void asb_template_rescan(void)
 {
     scan_templates();
+    asb_events_changed();
 }
 
 /* ---- Wait helpers ---- */
@@ -4367,22 +4626,22 @@ ASB_API void asb_reconnect_running(void)
 {
     int i;
     for (i = 0; i < g_vm_count; i++) {
-        if (g_vms[i].running) continue;  /* already tracked */
-        if (hcs_try_open_vm(&g_vms[i])) {
+        if (VM_AT(i).running) continue;  /* already tracked */
+        if (hcs_try_open_vm(&VM_AT(i))) {
             /* Full reconnect: we have a handle, so register callback + monitor */
-            hcs_register_vm_callback(&g_vms[i]);
-            hcs_start_monitor(&g_vms[i]);
-            vm_agent_start(&g_vms[i]);
-            idd_probe_start(&g_vms[i]);
-        } else if (hcs_is_running_by_enum(g_vms[i].name)) {
+            hcs_register_vm_callback(&VM_AT(i));
+            hcs_start_monitor(&VM_AT(i));
+            vm_agent_start(&VM_AT(i));
+            idd_probe_start(&VM_AT(i));
+        } else if (hcs_is_running_by_enum(VM_AT(i).name)) {
             /* HCS open failed (stale handle from dead process) but enumeration
                confirms the VM is running.  Mark it so queries return the right
                state.  We don't have a handle so we can't register callbacks
                or monitor - the start path will destroy the stale system and
                recreate it when needed. */
-            g_vms[i].running = TRUE;
+            VM_AT(i).running = TRUE;
             asb_log(L"Reconnect: \"%s\" is running (via enumeration, no handle).",
-                    g_vms[i].name);
+                    VM_AT(i).name);
         }
     }
 }
@@ -4421,7 +4680,7 @@ ASB_API SnapshotTree *asb_vm_snap_tree(AsbVm vm)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return NULL;
-    return &g_snap_trees[idx];
+    return &SNAP_AT(idx);
 }
 
 ASB_API GpuList *asb_gpu_list(void) { return &g_gpu_list; }

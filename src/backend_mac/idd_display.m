@@ -1,3 +1,4 @@
+#include "asb_events.h"
 /*
  * idd_display.m -- live Windows-guest IDD desktop + input over ivshmem (ch2 + ch3).
  *
@@ -17,6 +18,7 @@
  */
 
 #import "idd_display.h"
+#import "asb_core_mac.h"
 #import "asb_ivshmem_transport.h"
 #import "vm_dir.h"
 #import <AudioToolbox/AudioToolbox.h>
@@ -546,7 +548,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 }
 
 - (instancetype)initWithName:(NSString *)name
-                   transport:(AsbIvshmemTransport *)transport
+                   transport:(AsbIvshmemTransport *)transport vmId:(uint64_t)vmId
 {
     pthread_once(&g_vkOnce, build_keymap);
 
@@ -565,6 +567,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
     if (!self) return nil;
 
     _name = [name copy];
+    _vmId = vmId;
     _transport = transport;
     _stop = 1;
     _displayFd = -1;
@@ -1066,6 +1069,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
 }
 
 - (void)showDisplay {
+    self.userClosed = NO;
+    asb_events_changed();
     [self showWindow:nil];
     /* Bring the window to the front. The headless daemon is an Accessory app, so its window would
        otherwise open behind the active app; activating brings it forward and gives it key focus.
@@ -1997,6 +2002,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
 - (void)windowWillClose:(NSNotification *)notification {
     self.userClosed = YES;   /* mark closed (X button or programmatic) before teardown */
+    asb_mac_display_did_close(self.vmId, self);
+    asb_events_changed();
     [self teardown];
 }
 

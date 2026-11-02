@@ -1,24 +1,9 @@
-/*
- * headless.c -- AppSandbox headless daemon (appsandbox.exe --headless).
- *
- * Single-owner daemon: hosts the core for the process lifetime and serves a
- * Docker-style local HTTP/JSON API over http.sys (loopback). A discovery file
- * (%ProgramData%\AppSandbox\host.json) gives clients the port + bearer token.
- *
- * Threading:
- *   - bootstrap thread: asb_init + asb_reconnect_running, then PARKS forever
- *     (hcs_init brands it g_ui_thread_id; letting it exit risks thread-id reuse
- *     and the 30s message-pump path).
- *   - the HTTP receive loop runs on the main thread and IS the single serialized
- *     command/worker thread (one request to completion before the next) -> all
- *     asb_* calls serialized, and it is NOT g_ui_thread_id -> clean INFINITE wait.
- *
- * The exe is GUI-subsystem (no console); diagnostics go to headless.log.
- */
 
 #define _CRT_RAND_S
 #include <winsock2.h>   /* before windows.h: guards out the winsock.h that http.h clashes with */
 #include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
 #pragma warning(push)
 #pragma warning(disable: 4201)   /* <http.h> uses nameless structs/unions (C4201) */
 #include <http.h>
@@ -28,12 +13,15 @@
 #include <stdarg.h>
 
 #include "headless.h"
+#include "ui.h"
+#include "asb_events.h"
 #include "asb_core.h"          /* full API incl. internal VmInstance */
 #include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
 #include "vm_display_idd.h"    /* IDD display window, opened on demand via the API */
 
 #pragma comment(lib, "httpapi.lib")
+#pragma comment(lib, "advapi32.lib")
 
 #define ASB_API_VERSION  "v1"
 /* Product version derives from Directory.Build.props (the single source of truth):
@@ -50,6 +38,7 @@
 
 /* forward decls (used by the event callbacks defined below) */
 static void broadcast_event(const char *json);
+static int append_json_str(char *out, int cap, int pos, const char *s);
 static int  append_wstr(char *out, int cap, int pos, const wchar_t *w);
 
 /* ---- SSE event broadcast (GET /v1/events) ---- */
@@ -61,6 +50,12 @@ static LONG               g_ev_seq = 0;        /* total events ever produced */
 static volatile LONG      g_stop_all = 0;      /* signals SSE threads to exit */
 
 /* ---- IDD display windows (POST/DELETE /v1/vms/{name}/display) ---- */
+static HWND g_gui_hwnd;
+static DWORD g_gui_thread;
+static HANDLE g_server_thread;
+static unsigned g_api_subscription;
+static BOOL g_api_initialized;
+static LONG g_sse_count;
 static HINSTANCE g_hinst;   /* captured in run_headless; passed to vm_display_idd */
 
 /* Per-VM display handles, keyed by VM unique_id (survives g_vms[] compaction). The
@@ -87,6 +82,7 @@ static void display_drop(DisplayEntry *e)   /* destroy the window + free the slo
 /* TRUE if this VM has a live (not user-closed) display window. */
 static BOOL display_is_open(UINT64 vm_id)
 {
+    if (g_gui_hwnd) return ui_display_is_open(vm_id);
     DisplayEntry *e = display_find(vm_id);
     return e && e->disp && vm_display_idd_is_open(e->disp);
 }
@@ -128,40 +124,40 @@ static void hlog(const wchar_t *fmt, ...)
     LeaveCriticalSection(&g_log_cs);
 }
 
-static void core_log_cb(const wchar_t *message, void *ud) { (void)ud; hlog(L"[core] %s", message); }
-
-/* Event callbacks. They fire on background / HCS / worker threads -- and
-   SYNCHRONOUSLY on the request thread mid-command. Strictly non-blocking and
-   re-entrant-safe: read identity synchronously, log, return. */
-static void state_cb(AsbVm vm, BOOL running, void *ud)
+static void api_event(const CoreVmEvent *event, void *context)
 {
-    char ev[768]; int pos;
-    (void)ud;
-    hlog(L"[event] state    : %-20s running=%d", asb_vm_name(vm), (int)running);
-    pos = sprintf_s(ev, sizeof(ev), "{\"event\":\"vmStateChanged\",\"name\":");
-    pos = append_wstr(ev, sizeof(ev), pos, asb_vm_name(vm));
-    sprintf_s(ev + pos, sizeof(ev) - pos, ",\"running\":%s}", running ? "true" : "false");
-    broadcast_event(ev);
-}
-static void progress_cb(AsbVm vm, int pct, BOOL staging, void *ud)
-{
-    char ev[768]; int pos;
-    (void)ud;
-    hlog(L"[event] progress : %-20s %3d%% staging=%d", asb_vm_name(vm), pct, (int)staging);
-    pos = sprintf_s(ev, sizeof(ev), "{\"event\":\"vmProgress\",\"name\":");
-    pos = append_wstr(ev, sizeof(ev), pos, asb_vm_name(vm));
-    sprintf_s(ev + pos, sizeof(ev) - pos, ",\"progress\":%d,\"staging\":%s}", pct, staging ? "true" : "false");
-    broadcast_event(ev);
-}
-static void alert_cb(const wchar_t *message, void *ud)
-{
-    char ev[768]; int pos;
-    (void)ud;
-    hlog(L"[event] ALERT    : %s", message);
-    pos = sprintf_s(ev, sizeof(ev), "{\"event\":\"alert\",\"message\":");
-    pos = append_wstr(ev, sizeof(ev), pos, message);
-    sprintf_s(ev + pos, sizeof(ev) - pos, "}");
-    broadcast_event(ev);
+    char ev[4096], idText[ASB_VM_ID_TEXT_SIZE]; int pos;
+    asb_vm_id_format(event->vm_id, idText);
+    (void)context;
+    if (g_stop_all) return;
+    switch (event->type) {
+    case CORE_VM_EVENT_LOG:
+        hlog(L"%S", event->str_value ? event->str_value : "");
+        break;
+    case CORE_VM_EVENT_STATE_CHANGED:
+    case CORE_VM_EVENT_PROGRESS:
+        pos = sprintf_s(ev, sizeof(ev), "{\"event\":\"%s\",\"id\":\"%s\",\"name\":",
+            event->type == CORE_VM_EVENT_PROGRESS ? "vmProgress" : "vmStateChanged", idText);
+        pos = append_json_str(ev, sizeof(ev), pos, event->vm_name);
+        if (event->type == CORE_VM_EVENT_PROGRESS)
+            sprintf_s(ev + pos, sizeof(ev) - pos, ",\"progress\":%d,\"staging\":%s}",
+                      event->int_value, event->staging ? "true" : "false");
+        else sprintf_s(ev + pos, sizeof(ev) - pos, ",\"running\":%s}",
+                       event->int_value ? "true" : "false");
+        broadcast_event(ev);
+        break;
+    case CORE_VM_EVENT_LIST_CHANGED:
+    case CORE_VM_EVENT_AGENT_STATUS:
+        broadcast_event("{\"event\":\"vmListChanged\"}");
+        break;
+    case CORE_VM_EVENT_ALERT:
+        pos = sprintf_s(ev, sizeof(ev), "{\"event\":\"alert\",\"message\":");
+        pos = append_json_str(ev, sizeof(ev), pos, event->str_value ? event->str_value : "");
+        sprintf_s(ev + pos, sizeof(ev) - pos, "}");
+        broadcast_event(ev);
+        break;
+    default: break;
+    }
 }
 
 /* ---- ProgramData paths ---- */
@@ -232,6 +228,7 @@ static int append_wstr(char *out, int cap, int pos, const wchar_t *w)
 static const char *derive_state(VmInstance *v)
 {
     if (v->building_vhdx)      return "building";
+    if (v->starting)           return "booting";
     if (!v->running)           return "stopped";
     if (v->shutdown_requested) return "stopping";
     if (!v->install_complete)  return "installing";
@@ -243,7 +240,9 @@ static const char *derive_state(VmInstance *v)
 static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
 {
     wchar_t disk_directory[MAX_PATH];
-    pos += sprintf_s(out + pos, cap - pos, "{\"name\":");
+    char id[ASB_VM_ID_TEXT_SIZE];
+    asb_vm_id_format(v->unique_id, id);
+    pos += sprintf_s(out + pos, cap - pos, "{\"id\":\"%s\",\"name\":", id);
     pos  = append_wstr(out, cap, pos, v->name);
     pos += sprintf_s(out + pos, cap - pos, ",\"osType\":");
     pos  = append_wstr(out, cap, pos, v->os_type);
@@ -319,10 +318,31 @@ static HTTP_SERVER_SESSION_ID g_session;
 static HTTP_URL_GROUP_ID      g_url_group;
 static char                   g_token[48];
 
+typedef struct {
+    PHTTP_REQUEST request;
+    wchar_t body[8192];
+    BOOL valid_body;
+    USHORT status;
+    char reason[64];
+    char *response;
+    int stop;
+    HANDLE done;
+} ApiCall;
+static ApiCall *g_gui_call;
+
+BOOL asb_api_busy(void) { return GetCurrentThreadId() == g_gui_thread && g_gui_call != NULL; }
+
 static void send_response(HTTP_REQUEST_ID reqId, USHORT status, const char *reason,
                           const char *ctype, const char *body)
 {
     HTTP_RESPONSE resp; HTTP_DATA_CHUNK chunk; ULONG sent = 0;
+    if (asb_api_busy()) {
+        g_gui_call->status = status;
+        strcpy_s(g_gui_call->reason, sizeof(g_gui_call->reason), reason);
+        free(g_gui_call->response);
+        g_gui_call->response = _strdup(body ? body : "{}");
+        return;
+    }
     RtlZeroMemory(&resp, sizeof(resp));
     resp.StatusCode = status;
     resp.pReason = reason; resp.ReasonLength = (USHORT)strlen(reason);
@@ -347,18 +367,19 @@ static void send_err(HTTP_REQUEST_ID id, USHORT status, const char *reason, cons
     send_json(id, status, reason, b);
 }
 
-static void send_hr(HTTP_REQUEST_ID id, const char *action, const char *nu, HRESULT hr)
+static void send_hr(HTTP_REQUEST_ID id, const char *action, const char *nu, AsbVmId vm_id, HRESULT hr)
 {
-    char b[512];
+    char b[512], idText[ASB_VM_ID_TEXT_SIZE];
+    asb_vm_id_format(vm_id, idText);
     if (SUCCEEDED(hr)) {
         sprintf_s(b, sizeof(b),
-            "{\"ok\":true,\"accepted\":true,\"action\":\"%s\",\"name\":\"%s\",\"hr\":\"0x%08lX\"}",
-            action, nu, (unsigned long)hr);
+            "{\"ok\":true,\"accepted\":true,\"action\":\"%s\",\"name\":\"%s\",\"id\":\"%s\",\"hr\":\"0x%08lX\"}",
+            action, nu, idText, (unsigned long)hr);
         send_json(id, 202, "Accepted", b);
     } else {
         sprintf_s(b, sizeof(b),
-            "{\"ok\":false,\"action\":\"%s\",\"name\":\"%s\",\"error\":{\"hr\":\"0x%08lX\"}}",
-            action, nu, (unsigned long)hr);
+            "{\"ok\":false,\"action\":\"%s\",\"name\":\"%s\",\"id\":\"%s\",\"error\":{\"hr\":\"0x%08lX\"}}",
+            action, nu, idText, (unsigned long)hr);
         send_json(id, 500, "Internal Server Error", b);
     }
 }
@@ -368,6 +389,11 @@ static BOOL body_to_wide(PHTTP_REQUEST req, wchar_t *wout, int wcap)
 {
     char body[8192]; int pos = 0;
     wout[0] = 0;
+    if (asb_api_busy()) {
+        if (!g_gui_call->valid_body || wcslen(g_gui_call->body) >= (size_t)wcap) return FALSE;
+        wcscpy_s(wout, wcap, g_gui_call->body);
+        return TRUE;
+    }
     for (;;) {
         ULONG bytes = 0;
         ULONG r = HttpReceiveRequestEntityBody(g_req_queue, req->RequestId, 0,
@@ -439,8 +465,8 @@ static DWORD WINAPI sse_thread(LPVOID param)
     resp.Headers.KnownHeaders[HttpHeaderCacheControl].RawValueLength = (USHORT)strlen("no-cache");
     if (HttpSendHttpResponse(g_req_queue, id, HTTP_SEND_RESPONSE_FLAG_MORE_DATA,
                              &resp, NULL, &sent, NULL, 0, NULL, NULL) != NO_ERROR)
-        return 0;
-    if (!sse_write(id, "retry: 3000\n\n", 13)) return 0;
+        goto finished;
+    if (!sse_write(id, "retry: 3000\n\n", 13)) goto finished;
 
     EnterCriticalSection(&g_ev_cs);
     my_seq = g_ev_seq;   /* only stream events from connect onward */
@@ -473,6 +499,11 @@ static DWORD WINAPI sse_thread(LPVOID param)
         for (i = 0; i < nframes; i++) free(frames[i]);
         if (!alive) break;   /* client disconnected */
     }
+finished:
+    EnterCriticalSection(&g_ev_cs);
+    --g_sse_count;
+    WakeAllConditionVariable(&g_ev_cv);
+    LeaveCriticalSection(&g_ev_cs);
     return 0;
 }
 
@@ -582,8 +613,18 @@ static int handle_request(PHTTP_REQUEST req)
         if (idp) {
             HANDLE h;
             *idp = req->RequestId;
+            EnterCriticalSection(&g_ev_cs);
+            ++g_sse_count;
+            LeaveCriticalSection(&g_ev_cs);
             h = CreateThread(NULL, 0, sse_thread, idp, 0, NULL);
-            if (h) CloseHandle(h); else { free(idp); send_err(req->RequestId, 500, "Internal Server Error", "thread", "spawn failed"); }
+            if (h) CloseHandle(h);
+            else {
+                EnterCriticalSection(&g_ev_cs);
+                --g_sse_count;
+                LeaveCriticalSection(&g_ev_cs);
+                free(idp);
+                send_err(req->RequestId, 500, "Internal Server Error", "thread", "spawn failed");
+            }
         }
         return 0;   /* response owned by the SSE thread */
     }
@@ -613,8 +654,13 @@ static int handle_request(PHTTP_REQUEST req)
     if (verb == HttpVerbDELETE && wcsncmp(path, L"/v1/templates/", 14) == 0) {
         const wchar_t *name = path + 14;
         HRESULT hr = asb_template_delete(name);
+        if (hr == HRESULT_FROM_WIN32(ERROR_BUSY)) {
+            send_err(req->RequestId, 409, "Conflict", "template_in_use",
+                     "This template is still required by an existing VM or an active disk copy.");
+            return 0;
+        }
         char nu[256] = {0}; WideCharToMultiByte(CP_UTF8,0,name,-1,nu,sizeof(nu),NULL,NULL);
-        send_hr(req->RequestId, "deleteTemplate", nu, hr);
+        send_hr(req->RequestId, "deleteTemplate", nu, 0, hr);
         return 0;
     }
 
@@ -762,22 +808,24 @@ static int handle_request(PHTTP_REQUEST req)
             }
             WideCharToMultiByte(CP_UTF8,0,name,-1,nu,sizeof(nu),NULL,NULL);
             {
-                HRESULT hr = asb_vm_create(&cfg);
+                AsbVmId created_id = 0;
+                HRESULT hr = asb_vm_create_with_id(&cfg, &created_id);
                 SecureZeroMemory(pass, sizeof(pass));
                 /* create is async + auto-starts; success/failure also via events/alerts */
-                send_hr(req->RequestId, "createVm", nu, hr);
+                send_hr(req->RequestId, "createVm", nu, created_id, hr);
             }
             return 0;
         }
     }
 
-    /* ---- /v1/vms/{name}[/sub] ---- */
-    if (wcsncmp(path, L"/v1/vms/", 8) == 0) {
-        const wchar_t *rest = path + 8;
+    if (wcsncmp(path, L"/v1/vms/", 8) == 0 || wcsncmp(path, L"/v1/vm-ids/", 11) == 0) {
+        BOOL by_id = wcsncmp(path, L"/v1/vm-ids/", 11) == 0;
+        const wchar_t *rest = path + (by_id ? 11 : 8);
         const wchar_t *slash = wcschr(rest, L'/');
         wchar_t name[256];
         const wchar_t *sub = NULL;
         AsbVm vm;
+        AsbVmId vm_id;
         char nu[256] = {0};
 
         if (slash && (size_t)(slash - rest) < 256) {
@@ -789,9 +837,14 @@ static int handle_request(PHTTP_REQUEST req)
             send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "name too long");
             return 0;
         }
-        vm = asb_vm_find(name);
+        vm = by_id ? (AsbVm)asb_find_vm_by_id(asb_vm_id_parse_w(name)) : asb_vm_find(name);
         if (!vm) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
-        WideCharToMultiByte(CP_UTF8, 0, name, -1, nu, sizeof(nu), NULL, NULL);
+        vm_id = asb_vm_instance(vm)->unique_id;
+        if (verb != HttpVerbGET && asb_vm_instance(vm)->starting) {
+            send_err(req->RequestId, 409, "Conflict", "vm_starting", "VM start is in progress; retry once it completes");
+            return 0;
+        }
+        WideCharToMultiByte(CP_UTF8, 0, asb_vm_name(vm), -1, nu, sizeof(nu), NULL, NULL);
 
         if (sub == NULL) {
             VmInstance *inst = asb_vm_instance(vm);
@@ -846,7 +899,7 @@ static int handle_request(PHTTP_REQUEST req)
                 if (has_gpu) {
                     hr = asb_vm_set_gpu_selection(vm, gpu_mode, gpu_id);
                     if (FAILED(hr)) {
-                        send_hr(req->RequestId, "editVm", nu, hr);
+                        send_hr(req->RequestId, "editVm", nu, vm_id, hr);
                         return 0;
                     }
                 }
@@ -859,7 +912,7 @@ static int handle_request(PHTTP_REQUEST req)
                     append_vm_json(buf, sizeof(buf), 0, inst);
                     send_json(req->RequestId, 200, "OK", buf);
                 } else {
-                    send_hr(req->RequestId, "editVm", nu, hr);
+                    send_hr(req->RequestId, "editVm", nu, vm_id, hr);
                 }
                 return 0;
             }
@@ -878,13 +931,13 @@ static int handle_request(PHTTP_REQUEST req)
             json_get_int(body, L"snapIndex", &si);
             json_get_int(body, L"branchIndex", &bi);
             json_get_string(body, L"branchName", bname, 128);
-            send_hr(req->RequestId, "start", nu, asb_vm_start(vm, si, bi, bname[0] ? bname : NULL));
+            send_hr(req->RequestId, "start", nu, vm_id, asb_vm_start(vm, si, bi, bname[0] ? bname : NULL));
             return 0;
         }
         if (verb == HttpVerbPOST && wcscmp(sub, L"shutdown") == 0)
-            { send_hr(req->RequestId, "shutdown", nu, asb_vm_shutdown(vm)); return 0; }
+            { send_hr(req->RequestId, "shutdown", nu, vm_id, asb_vm_shutdown(vm)); return 0; }
         if (verb == HttpVerbPOST && wcscmp(sub, L"stop") == 0)
-            { send_hr(req->RequestId, "stop", nu, asb_vm_stop(vm)); return 0; }
+            { send_hr(req->RequestId, "stop", nu, vm_id, asb_vm_stop(vm)); return 0; }
         if (verb == HttpVerbPOST && wcscmp(sub, L"delete") == 0) {
             /* Refuse delete while the VHDX is building: the build worker holds the
                disk open, so removing the folder would orphan it. building_vhdx
@@ -896,8 +949,9 @@ static int handle_request(PHTTP_REQUEST req)
                          "wait for the build to finish, then delete");
                 return 0;
             }
+            if (dv && g_gui_hwnd) ui_display_close(dv->unique_id);
             if (dv) display_drop(display_find(dv->unique_id));   /* close its display window first */
-            send_hr(req->RequestId, "delete", nu, asb_vm_delete(vm));
+            send_hr(req->RequestId, "delete", nu, vm_id, asb_vm_delete(vm));
             return 0;
         }
 
@@ -943,6 +997,12 @@ static int handle_request(PHTTP_REQUEST req)
                              "the VM's virtual display driver is not up yet; retry shortly");
                     return 0;
                 }
+                if (g_gui_hwnd) {
+                    if (!ui_display_open(v->unique_id))
+                        send_err(req->RequestId, 500, "Internal Server Error", "display_failed", "failed to open display");
+                    else send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"displayOpen\":true}");
+                    return 0;
+                }
                 e = display_find(v->unique_id);   /* present => still open (a closed one was reaped above) */
                 if (e) {
                     vm_display_idd_focus(e->disp);            /* already open -> bring to front */
@@ -967,7 +1027,8 @@ static int handle_request(PHTTP_REQUEST req)
                 return 0;
             }
             if (verb == HttpVerbDELETE) {
-                display_drop(display_find(v->unique_id));
+                if (g_gui_hwnd) ui_display_close(v->unique_id);
+                else display_drop(display_find(v->unique_id));
                 send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"displayOpen\":false}");
                 return 0;
             }
@@ -1051,7 +1112,7 @@ static int handle_request(PHTTP_REQUEST req)
                 }
                 body_to_wide(req, body, 1024);
                 json_get_string(body, L"name", sname, 128);
-                send_hr(req->RequestId, "snapTake", nu, asb_snap_take(vm, sname[0] ? sname : NULL));
+                send_hr(req->RequestId, "snapTake", nu, vm_id, asb_snap_take(vm, sname[0] ? sname : NULL));
                 return 0;
             }
         }
@@ -1066,7 +1127,7 @@ static int handle_request(PHTTP_REQUEST req)
                    (No standalone "new branch": the GUI creates branches by starting
                     from a snapshot, exposed via POST .../start with a branchName.) */
                 if (verb == HttpVerbDELETE && *brest == L'/') {
-                    send_hr(req->RequestId, "snapDeleteBranch", nu,
+                    send_hr(req->RequestId, "snapDeleteBranch", nu, vm_id,
                             asb_snap_delete_branch(vm, sidx, _wtoi(brest + 1)));
                     return 0;
                 }
@@ -1078,7 +1139,7 @@ static int handle_request(PHTTP_REQUEST req)
                                  "the base is not a deletable snapshot; delete a base branch via .../snapshots/-2/branches/{i}");
                         return 0;
                     }
-                    send_hr(req->RequestId, "snapDelete", nu, asb_snap_delete(vm, sidx));
+                    send_hr(req->RequestId, "snapDelete", nu, vm_id, asb_snap_delete(vm, sidx));
                     return 0;
                 }
                 if (verb == HttpVerbPUT) {   /* rename; branchIndex optional (-1 = the snapshot itself) */
@@ -1089,7 +1150,7 @@ static int handle_request(PHTTP_REQUEST req)
                         send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "name required");
                         return 0;
                     }
-                    send_hr(req->RequestId, "snapRename", nu, asb_snap_rename(vm, sidx, bidx, nm));
+                    send_hr(req->RequestId, "snapRename", nu, vm_id, asb_snap_rename(vm, sidx, bidx, nm));
                     return 0;
                 }
             }
@@ -1116,7 +1177,7 @@ static int handle_request(PHTTP_REQUEST req)
             VmInstance *v = asb_vm_instance(asb_vm_get(i));
             /* A building VM has running=false but its worker holds the disk;
                shutting down mid-build would orphan it -- block that too. */
-            if (v && (v->running || v->building_vhdx)) {
+            if (v && (v->running || v->building_vhdx || v->starting)) {
                 if (running) p2 += sprintf_s(rbuf + p2, sizeof(rbuf) - p2, ",");
                 p2 = append_wstr(rbuf, sizeof(rbuf), p2, v->name);
                 running++;
@@ -1147,18 +1208,57 @@ static void gen_token(void)
     g_token[40] = 0;
 }
 
-static void write_discovery(int port)
+static BOOL write_discovery(int port)
 {
-    wchar_t path[MAX_PATH]; FILE *f = NULL;
+    wchar_t path[MAX_PATH], sddl[512];
+    HANDLE token = NULL, file = INVALID_HANDLE_VALUE;
+    TOKEN_USER *user = NULL;
+    LPWSTR sid = NULL;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    PACL dacl = NULL;
+    BOOL present, defaulted, ok = FALSE;
+    DWORD size = 0, written;
+    BY_HANDLE_FILE_INFORMATION info;
+    char json[512];
+    int length;
     programdata_path(path, MAX_PATH, L"host.json");
-    if (_wfopen_s(&f, path, L"w") == 0 && f) {
-        fprintf(f,
-            "{\"endpoint\":\"http://127.0.0.1:%d\",\"port\":%d,\"token\":\"%s\","
-            "\"pid\":%lu,\"version\":\"%s\",\"apiVersion\":\"%s\"}\n",
-            port, port, g_token, GetCurrentProcessId(), ASB_PRODUCT_VER, ASB_API_VERSION);
-        fclose(f);
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) goto done;
+    GetTokenInformation(token, TokenUser, NULL, 0, &size);
+    user = malloc(size);
+    if (!user || !GetTokenInformation(token, TokenUser, user, size, &size) ||
+        !ConvertSidToStringSidW(user->User.Sid, &sid)) goto done;
+    swprintf_s(sddl, ARRAYSIZE(sddl), L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;%s)", sid);
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1,
+                                                             &descriptor, NULL) ||
+        !GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted) || !present)
+        goto done;
+    {
+        SECURITY_ATTRIBUTES attributes = { sizeof(attributes), descriptor, FALSE };
+        file = CreateFileW(path, GENERIC_WRITE | WRITE_DAC | WRITE_OWNER, 0, &attributes,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     }
-    hlog(L"discovery file written: %s", path);
+    if (file == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(file, &info) ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
+        info.nNumberOfLinks != 1) goto done;
+    if (SetSecurityInfo(file, SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        user->User.Sid, NULL, dacl, NULL) != ERROR_SUCCESS) goto done;
+    length = sprintf_s(json, sizeof(json),
+        "{\"endpoint\":\"http://127.0.0.1:%d\",\"port\":%d,\"token\":\"%s\","
+        "\"pid\":%lu,\"version\":\"%s\",\"apiVersion\":\"%s\"}\n",
+        port, port, g_token, GetCurrentProcessId(), ASB_PRODUCT_VER, ASB_API_VERSION);
+    if (length < 0 || !SetEndOfFile(file) ||
+        !WriteFile(file, json, (DWORD)length, &written, NULL) || written != (DWORD)length ||
+        !FlushFileBuffers(file)) goto done;
+    ok = TRUE;
+done:
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (token) CloseHandle(token);
+    if (descriptor) LocalFree(descriptor);
+    if (sid) LocalFree(sid);
+    free(user);
+    hlog(ok ? L"discovery file written: %s" : L"cannot securely write discovery file: %s", path);
+    return ok;
 }
 
 static void delete_discovery(void)
@@ -1201,26 +1301,22 @@ static int http_start(int *out_port)
     return 0;
 }
 
-/* ---- Startup prerequisite checks ----
- * The exe is GUI-subsystem, so to surface a failure to someone who ran
- * `appsandbox.exe --headless` from a terminal we attach to the launching
- * console and print there; if there's no parent console (GUI launch) we fall
- * back to a message box. Either way the reason is also logged. */
 static void cli_fail(const wchar_t *msg)
 {
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    BOOL attached = FALSE;
     hlog(L"STARTUP ABORT: %s", msg);
-    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-        HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
-        char u[1024]; DWORD wr; int n;
-        if (h && h != INVALID_HANDLE_VALUE) {
-            n = WideCharToMultiByte(CP_UTF8, 0, msg, -1, u, sizeof(u), NULL, NULL);
-            if (n > 1) WriteFile(h, u, (DWORD)(n - 1), &wr, NULL);
-            WriteFile(h, "\r\n", 2, &wr, NULL);
-        }
-        FreeConsole();
-    } else {
-        MessageBoxW(NULL, msg, L"App Sandbox  --headless", MB_ICONERROR | MB_OK);
+    if (!h || h == INVALID_HANDLE_VALUE) {
+        attached = AttachConsole(ATTACH_PARENT_PROCESS);
+        h = GetStdHandle(STD_ERROR_HANDLE);
     }
+    if (h && h != INVALID_HANDLE_VALUE) {
+        char u[1024]; DWORD wr; int n;
+        n = WideCharToMultiByte(CP_UTF8, 0, msg, -1, u, sizeof(u), NULL, NULL);
+        if (n > 1) WriteFile(h, u, (DWORD)(n - 1), &wr, NULL);
+        WriteFile(h, "\r\n", 2, &wr, NULL);
+    }
+    if (attached) FreeConsole();
 }
 
 static BOOL is_elevated(void)
@@ -1254,19 +1350,134 @@ static BOOL os_supported(wchar_t *why, int whycap)
     return TRUE;
 }
 
+LRESULT asb_api_dispatch(void *opaque)
+{
+    ApiCall *call = opaque;
+    if (g_stop_all || ui_command_active() || g_gui_call) {
+        call->status = g_stop_all ? 503 : 409;
+        strcpy_s(call->reason, sizeof(call->reason), g_stop_all ? "Service Unavailable" : "Conflict");
+        call->response = _strdup("{\"error\":{\"code\":\"busy\",\"message\":\"Application is busy; retry the request.\"}}");
+    } else {
+        g_gui_call = call;
+        call->stop = handle_request(call->request);
+        g_gui_call = NULL;
+        ui_refresh_from_core();
+    }
+    SetEvent(call->done);
+    return 0;
+}
+
+static DWORD WINAPI api_thread(LPVOID unused)
+{
+    ULONG capacity = sizeof(HTTP_REQUEST) + 16384;
+    PHTTP_REQUEST req = malloc(capacity);
+    int stop = 0;
+    (void)unused;
+    while (req && !stop && !g_stop_all) {
+        ULONG bytes = 0;
+        HTTP_REQUEST_ID id = HTTP_NULL_ID;
+        ULONG rc = HttpReceiveHttpRequest(g_req_queue, id, 0, req, capacity, &bytes, NULL);
+        if (rc == ERROR_MORE_DATA) {
+            PHTTP_REQUEST grown;
+            id = req->RequestId;
+            capacity = bytes;
+            grown = realloc(req, capacity);
+            if (!grown) break;
+            req = grown;
+            rc = HttpReceiveHttpRequest(g_req_queue, id, 0, req, capacity, &bytes, NULL);
+        }
+        if (rc != NO_ERROR) break;
+        const wchar_t *path = req->CookedUrl.pAbsPath;
+        if (!g_gui_hwnd || !auth_ok(req) ||
+            (req->Verb == HttpVerbGET && path &&
+             (!wcscmp(path, L"/v1/version") || !wcscmp(path, L"/v1/events")))) {
+            stop = handle_request(req);
+        } else {
+            ApiCall call = {0};
+            call.request = req;
+            call.valid_body = body_to_wide(req, call.body, ARRAYSIZE(call.body));
+            call.done = CreateEventW(NULL, TRUE, FALSE, NULL);
+            if (!call.done) break;
+            if (PostMessageW(g_gui_hwnd, WM_ASB_API_REQUEST, 0, (LPARAM)&call)) {
+                WaitForSingleObject(call.done, INFINITE);
+                send_json(req->RequestId, call.status ? call.status : 500,
+                          call.status ? call.reason : "Internal Server Error",
+                          call.response ? call.response : "{}");
+                stop = call.stop;
+            }
+            CloseHandle(call.done);
+            free(call.response);
+        }
+    }
+    free(req);
+    if (stop && g_gui_hwnd) PostMessageW(g_gui_hwnd, WM_ASB_API_SHUTDOWN, 0, 0);
+    return 0;
+}
+
+BOOL asb_api_start(HINSTANCE instance, HWND owner)
+{
+    int port;
+    if (g_server_thread) return TRUE;
+    if (!g_api_initialized) {
+        open_log();
+        InitializeCriticalSection(&g_ev_cs);
+        InitializeConditionVariable(&g_ev_cv);
+        g_api_initialized = TRUE;
+    }
+    g_stop_all = 0;
+    g_hinst = instance;
+    g_gui_hwnd = owner;
+    g_gui_thread = owner ? GetCurrentThreadId() : 0;
+    gen_token();
+    if (!http_start(&port)) { asb_api_stop(); return FALSE; }
+    g_api_subscription = asb_events_subscribe(api_event, NULL);
+    if (!g_api_subscription) { asb_api_stop(); return FALSE; }
+    g_server_thread = CreateThread(NULL, 0, api_thread, NULL, 0, NULL);
+    if (!g_server_thread) { asb_api_stop(); return FALSE; }
+    if (!write_discovery(port)) { asb_api_stop(); return FALSE; }
+    return TRUE;
+}
+
+void asb_api_stop(void)
+{
+    if (!g_api_initialized) return;
+    InterlockedExchange(&g_stop_all, 1);
+    asb_events_unsubscribe(g_api_subscription);
+    g_api_subscription = 0;
+    EnterCriticalSection(&g_ev_cs);
+    WakeAllConditionVariable(&g_ev_cv);
+    LeaveCriticalSection(&g_ev_cs);
+    delete_discovery();
+    if (g_req_queue) HttpShutdownRequestQueue(g_req_queue);
+    if (g_server_thread) {
+        while (WaitForSingleObject(g_server_thread, 10) == WAIT_TIMEOUT) {
+            MSG msg;
+            while (PeekMessageW(&msg, g_gui_hwnd, WM_ASB_API_REQUEST, WM_ASB_API_REQUEST, PM_REMOVE))
+                DispatchMessageW(&msg);
+        }
+        CloseHandle(g_server_thread); g_server_thread = NULL;
+    }
+    EnterCriticalSection(&g_ev_cs);
+    while (g_sse_count) SleepConditionVariableCS(&g_ev_cv, &g_ev_cs, INFINITE);
+    LeaveCriticalSection(&g_ev_cs);
+    if (g_url_group) { HttpCloseUrlGroup(g_url_group); g_url_group = 0; }
+    if (g_req_queue) { HttpCloseRequestQueue(g_req_queue); g_req_queue = NULL; }
+    if (g_session) { HttpCloseServerSession(g_session); g_session = 0; }
+    HttpTerminate(HTTP_INITIALIZE_SERVER, NULL);
+    for (int i = 0; i < ASB_MAX_VMS; ++i) display_drop(&g_displays[i]);
+}
+
 /* ---- Entry ---- */
 
 int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
 {
     HANDLE mtx, bt;
-    int port = 0, stop = 0;
-    PHTTP_REQUEST req;
-    ULONG req_buf_len = sizeof(HTTP_REQUEST) + 16384;
 
     (void)cmdline;
     open_log();
     InitializeCriticalSection(&g_ev_cs);
     InitializeConditionVariable(&g_ev_cv);
+    g_api_initialized = TRUE;
     hlog(L"=== appsandbox --headless starting (pid %lu) ===", GetCurrentProcessId());
 
     /* ---- Fail fast (with a clear CLI message) if prerequisites aren't met ---- */
@@ -1307,64 +1518,16 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
 
     asb_set_hinstance(hInst);
     g_hinst = hInst;
-    asb_set_log_callback(core_log_cb, NULL);
-    asb_set_state_callback(state_cb, NULL);
-    asb_set_progress_callback(progress_cb, NULL);
-    asb_set_alert_callback(alert_cb, NULL);
 
     bt = CreateThread(NULL, 0, bootstrap_thread, NULL, 0, NULL);
     if (!bt) { hlog(L"FATAL: bootstrap thread failed."); return 1; }
     while (!g_init_done) Sleep(25);
     hlog(L"core initialized + reconnected (%d VMs).", asb_vm_count());
 
-    gen_token();
-    if (!http_start(&port)) { asb_cleanup(); return 1; }
-    write_discovery(port);
+    if (!asb_api_start(hInst, NULL)) { asb_cleanup(); return 1; }
+    WaitForSingleObject(g_server_thread, INFINITE);
+    asb_api_stop();
 
-    req = (PHTTP_REQUEST)malloc(req_buf_len);
-    if (!req) { hlog(L"OOM"); delete_discovery(); asb_cleanup(); return 1; }
-
-    hlog(L"entering request loop.");
-    while (!stop) {
-        HTTP_REQUEST_ID reqId; ULONG bytes = 0, r;
-        HTTP_SET_NULL_ID(&reqId);
-        r = HttpReceiveHttpRequest(g_req_queue, reqId, 0, req, req_buf_len, &bytes, NULL);
-        if (r == NO_ERROR) {
-            stop = handle_request(req);
-        } else if (r == ERROR_MORE_DATA) {
-            PHTTP_REQUEST grown;
-            req_buf_len = bytes;
-            grown = (PHTTP_REQUEST)realloc(req, req_buf_len);
-            if (!grown) break;
-            req = grown;
-        } else if (r == ERROR_OPERATION_ABORTED) {
-            break;
-        } else {
-            hlog(L"HttpReceiveHttpRequest error %lu", r);
-            break;
-        }
-    }
-
-    g_stop_all = 1;
-    WakeAllConditionVariable(&g_ev_cv);   /* wake SSE threads so they exit */
-    hlog(L"stopping: removing url, deleting discovery, terminating VMs.");
-    delete_discovery();
-    HttpRemoveUrlFromUrlGroup(g_url_group, NULL, HTTP_URL_FLAG_REMOVE_ALL);
-    HttpCloseUrlGroup(g_url_group);
-    HttpCloseRequestQueue(g_req_queue);
-    HttpCloseServerSession(g_session);
-    HttpTerminate(HTTP_INITIALIZE_SERVER, NULL);
-    free(req);
-
-    { int i; for (i = 0; i < ASB_MAX_VMS; i++) display_drop(&g_displays[i]); }   /* close display windows */
-
-    /* The daemon OWNS its VMs: exit terminates them (asb_cleanup stops the
-       per-VM monitor/agent/ssh-proxy threads, hcs_terminate_vm's every running
-       VM, and closes the handles) -- the same teardown the GUI runs on
-       WM_DESTROY. asb_detach (leave VMs running) is deliberately NOT used:
-       an unowned VM would have no callbacks, no agent channel, and the next
-       daemon start would rip its HCN network out from under it
-       (hcn_cleanup_stale_networks in asb_init). */
     asb_cleanup();
     hlog(L"cleaned up (VMs terminated). exit 0.");
     if (g_log) { fclose(g_log); g_log = NULL; }

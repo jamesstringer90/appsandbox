@@ -18,6 +18,7 @@ void vm_display_destroy(VmDisplay *display);
 
 /* Check if the display window is still open. */
 BOOL vm_display_is_open(VmDisplay *display);
+UINT_PTR vm_display_token(VmDisplay *display);
 
 /* Disconnect the RDP session and terminate the pipe connector.
    Call when the VM is exiting so the RDP session doesn't block shutdown. */

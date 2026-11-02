@@ -20,7 +20,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     /* Headless daemon mode: appsandbox.exe --headless
        (normal launches pass no args, so the GUI path below is unaffected). */
-    if (pCmdLine && wcsstr(pCmdLine, L"--headless")) {
+    if (pCmdLine && wcsstr(pCmdLine, L"-headless")) {
         int rc = run_headless(hInstance, pCmdLine);
         OleUninitialize();
         return rc;

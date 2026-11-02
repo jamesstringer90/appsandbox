@@ -10,12 +10,14 @@
 #define ASB_CORE_MAC_H
 
 #import <Foundation/Foundation.h>
+#include "asb_vm_id.h"
 
 @class VzVm, VzDisplayWindow, VmAgentMac, VmSshProxyMac;
 
 #define ASB_MAX_VMS 32
 
 typedef struct {
+    AsbVmId unique_id;
     char    name[256];
     char    os_type[32];
     char    disk_directory[1024];  /* Optional disk parent; metadata stays in Application Support. */
@@ -30,12 +32,18 @@ typedef struct {
     BOOL    test_mode;             /* Windows guest: Secure Boot off + test-signing on. Set at create,
                                       persisted, read at start. Our guest drivers are test-signed, so a
                                       Windows-on-Mac VM normally needs this — but it is NOT forced. */
+    BOOL    is_template;
+    BOOL    template_ready;
+    BOOL    template_cancelled;
+    AsbVmId template_source;
     BOOL    running;
+    BOOL    starting;
+    uint64_t run_id;
     BOOL    shutting_down;
-    BOOL    install_complete;      /* "guest provisioned" — the agent has connected at least once
-                                      (mirrors Windows install_complete). macOS sets this at build-end
-                                      (no first-boot install phase); Windows sets it on first agent-
-                                      online, so the first-boot window shows "installing". */
+    BOOL    display_suppressed;
+    BOOL    install_complete;
+    BOOL    mac_provisioning_pending;
+
     BOOL    disk_built;            /* disk is built + bootable — gates start (asb_mac_vm_start). Set at
                                       build/stage end for BOTH OSes, distinct from install_complete so a
                                       Windows VM can boot while its first boot is still "installing". */
@@ -65,10 +73,16 @@ void asb_mac_cleanup(void);
 int          asb_mac_vm_count(void);
 AsbVmMac    *asb_mac_vm_get(int index);
 AsbVmMac    *asb_mac_vm_find(const char *name);
+AsbVmMac    *asb_mac_vm_find_by_id(AsbVmId vm_id);
+BOOL asb_mac_vm_is_building(const AsbVmMac *vm);
+const char *asb_mac_vm_state(const AsbVmMac *vm);
+NSDictionary *asb_mac_vm_snapshot(const AsbVmMac *vm);
+NSArray<NSDictionary *> *asb_mac_templates(void);
 
 NSString *asb_mac_validate_username(NSString *os_type, id username, NSString *vm_name);
 
 NSString *asb_mac_validate_password(NSString *os_type, id password);
+BOOL asb_mac_nested_virtualization_supported(const char *os_type);
 
 int  asb_mac_vm_create(const char *name, const char *os_type,
                         int ram_mb, int hdd_gb, int cpu_cores,
@@ -79,28 +93,27 @@ int  asb_mac_vm_create(const char *name, const char *os_type,
                         const char *admin_pass,
                         BOOL ssh_enabled,
                         BOOL ssh_deploy_key,
-                        BOOL test_mode);
-int  asb_mac_vm_start(const char *name);
-int  asb_mac_vm_stop(const char *name, int force);
-int  asb_mac_vm_delete(const char *name);
-int  asb_mac_vm_edit(const char *name, const char *field, const char *value);
+                        BOOL test_mode,
+                        BOOL is_template,
+                        AsbVmId template_id,
+                        const char *template_name);
+int  asb_mac_vm_start(AsbVmId vm_id);
+int  asb_mac_vm_stop(AsbVmId vm_id, int force);
+int  asb_mac_vm_delete(AsbVmId vm_id);
+int  asb_mac_vm_edit(AsbVmId vm_id, const char *field, const char *value);
 
 void asb_mac_save(void);
 
 /* Send a mute/unmute command to the VM's guest agent. Called from the
  * display window's open/close hooks so the guest stops/starts driving
  * audio when nobody is watching. No-op if the agent isn't online. */
-void asb_mac_vm_set_audio_muted(const char *name, BOOL muted);
+void asb_mac_vm_set_audio_muted(AsbVmId vm_id, BOOL muted);
 
 /* Toggle per-VM clipboard syncing. The display window flips this on
  * becomeKey / resignKey so host clipboard data is only shared with the
  * guest while the user is actually using the VM — avoids background
  * leakage when the user is working in other apps on the host. */
-void asb_mac_vm_set_clipboard_sync(const char *name, BOOL enabled);
-
-typedef void (*AsbMacEventCallback)(int type, const char *vm_name,
-                                     int int_value, const char *str_value);
-void asb_mac_set_event_cb(AsbMacEventCallback cb);
+void asb_mac_vm_set_clipboard_sync(AsbVmId vm_id, BOOL enabled);
 
 /* Headless mode -- call BEFORE asb_mac_init / any VM start. Gates the parts of
  * the core that need a GUI login session:
@@ -131,10 +144,11 @@ BOOL asb_mac_have_gui_session(void);
  * BACKEND_ERR_NOT_RUNNING, BACKEND_ERR_NOT_READY (agent not online yet). macOS
  * binds the in-process framebuffer directly (no frame channel / display driver),
  * so readiness is simply running && agent_online -- nothing to probe. */
-int  asb_mac_open_display(const char *name);
+int  asb_mac_open_display(AsbVmId vm_id);
 
 /* Close the VM's display window if open (no-op otherwise). */
-void asb_mac_close_display(const char *name);
+void asb_mac_close_display(AsbVmId vm_id);
+void asb_mac_display_did_close(AsbVmId vm_id, id controller);
 
 /* Path of the AppSandbox SSH private key (~/Library/Application Support/
  * AppSandbox/ssh/id_appsandbox); pair .pub is deployed into guests created

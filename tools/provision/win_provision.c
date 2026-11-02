@@ -129,9 +129,9 @@ static int xml_escape_text(const char *text, char *out, size_t capacity) {
     return 1;
 }
 
-int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const char *pass,
+static int write_unattend(FILE *f, const char *vm_name, const char *user, const char *pass,
                            const char *arch, int test_mode, int is_arm64, const char *lang,
-                           const char *input_locale) {
+                           const char *input_locale, int template_mode) {
     if (!f) return -1;
     char user_xml[1024];
     if (!xml_escape_text(user, user_xml, sizeof user_xml)) return -1;
@@ -173,12 +173,14 @@ int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const
         "                   processorArchitecture=\"%s\"\n"
         "                   publicKeyToken=\"31bf3856ad364e35\"\n"
         "                   language=\"neutral\" versionScope=\"nonSxS\">\n"
+        "%s"
         "            <RunSynchronous>\n"
         "                <RunSynchronousCommand wcm:action=\"add\">\n"
         "                    <Order>1</Order>\n"
         "                    <Path>reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path>\n"
         "                </RunSynchronousCommand>\n",
-        arch, comp, arch);
+        arch, comp, arch,
+        template_mode == 2 ? "            <ExtendOSPartition><Extend>true</Extend></ExtendOSPartition>\n" : "");
     {
         int order = 2;
         fprintf(f,
@@ -198,6 +200,15 @@ int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const
                 "                    <Path>bcdedit /set testsigning on</Path>\n"
                 "                </RunSynchronousCommand>\n", order++);
         }
+        if (template_mode == 2) {
+            fprintf(f,
+                "<RunSynchronousCommand wcm:action=\"add\"><Order>%d</Order>"
+                "<Path>cmd /c mkdir C:\\Windows\\Setup\\Scripts</Path></RunSynchronousCommand>\n"
+                "<RunSynchronousCommand wcm:action=\"add\"><Order>%d</Order>"
+                "<Path>cmd /c for %%d in (D E F G H I J) do @if exist %%d:\\SetupComplete.cmd copy /Y %%d:\\SetupComplete.cmd C:\\Windows\\Setup\\Scripts\\</Path>"
+                "</RunSynchronousCommand>\n", order, order + 1);
+            order += 2;
+        }
         if (is_arm64) {
             static const char *const keys[] = {
                 "BypassTPMCheck", "BypassSecureBootCheck", "BypassRAMCheck",
@@ -211,6 +222,25 @@ int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const
                     "                </RunSynchronousCommand>\n",
                     order++, keys[i]);
         }
+
+    }
+    if (template_mode == 1) {
+        fprintf(f,
+            "</RunSynchronous></component>\n"
+            "<component name=\"Microsoft-Windows-SecureStartup-FilterDriver\" processorArchitecture=\"%s\" "
+            "publicKeyToken=\"31bf3856ad364e35\" language=\"neutral\" versionScope=\"nonSxS\">"
+            "<PreventDeviceEncryption>true</PreventDeviceEncryption></component></settings>\n"
+            "<settings pass=\"oobeSystem\"><component name=\"Microsoft-Windows-Deployment\" processorArchitecture=\"%s\" "
+            "publicKeyToken=\"31bf3856ad364e35\" language=\"neutral\" versionScope=\"nonSxS\">"
+            "<Reseal><Mode>Audit</Mode></Reseal></component></settings>\n"
+            "<settings pass=\"auditUser\"><component name=\"Microsoft-Windows-Deployment\" processorArchitecture=\"%s\" "
+            "publicKeyToken=\"31bf3856ad364e35\" language=\"neutral\" versionScope=\"nonSxS\">"
+            "<RunSynchronous><RunSynchronousCommand wcm:action=\"add\"><Order>1</Order>"
+            "<Description>Generalize VM and shut down for templating</Description>"
+            "<Path>C:\\Windows\\System32\\Sysprep\\sysprep.exe /generalize /oobe /shutdown /mode:vm</Path>"
+            "</RunSynchronousCommand></RunSynchronous></component></settings></unattend>\n",
+            arch, arch, arch);
+        return ferror(f) ? -1 : 0;
     }
     fprintf(f,
         "            </RunSynchronous>\n"
@@ -254,15 +284,34 @@ int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const
         "                <SynchronousCommand wcm:action=\"add\">\n"
         "                    <Order>1</Order>\n"
         "                    <Description>Run AppSandbox setup</Description>\n"
-        "                    <CommandLine>C:\\Windows\\AppSandbox\\setup.cmd</CommandLine>\n"
+        "                    <CommandLine>%s</CommandLine>\n"
         "                    <RequiresUserInput>false</RequiresUserInput>\n"
         "                </SynchronousCommand>\n"
         "            </FirstLogonCommands>\n"
         "        </component>\n"
         "    </settings>\n"
         "</unattend>\n",
-        arch, loc, lang, lang, lang, arch, user_xml, b64, user_xml, b64);
-    return 0;
+        arch, loc, lang, lang, lang, arch, user_xml, b64, user_xml, b64,
+        template_mode == 2 ? "cmd /c \"for %d in (D E F G H I J) do @if exist %d:\\setup.cmd call %d:\\setup.cmd\""
+                           : "C:\\Windows\\AppSandbox\\setup.cmd");
+    return ferror(f) ? -1 : 0;
+}
+
+int asb_provision_unattend(FILE *f, const char *vm_name, const char *user, const char *pass,
+                           const char *arch, int test_mode, int is_arm64, const char *lang,
+                           const char *input_locale) {
+    return write_unattend(f, vm_name, user, pass, arch, test_mode, is_arm64, lang, input_locale, 0);
+}
+
+int asb_provision_unattend_template(FILE *f, const char *vm_name, const char *arch,
+                                    int test_mode, int is_arm64) {
+    return write_unattend(f, vm_name, "", "", arch, test_mode, is_arm64, "en-US", NULL, 1);
+}
+
+int asb_provision_unattend_instance(FILE *f, const char *vm_name, const char *user, const char *pass,
+                                    const char *arch, int test_mode, int is_arm64, const char *lang,
+                                    const char *input_locale) {
+    return write_unattend(f, vm_name, user, pass, arch, test_mode, is_arm64, lang, input_locale, 2);
 }
 
 int asb_provision_login_setup(FILE *f) {
@@ -277,31 +326,83 @@ int asb_provision_login_setup(FILE *f) {
     return ferror(f) ? -1 : 0;
 }
 
-int asb_provision_setup_cmd(FILE *f) {
+int asb_provision_nat_setup(FILE *f) {
+    if (!f) return -1;
+    fputs(
+        "echo [NET] Configuring the AppSandbox NAT network... >> \"%LOG%\"\r\n"
+        "powershell.exe -NoProfile -NonInteractive -Command \""
+        "$ErrorActionPreference = 'Stop'; "
+        "for ($attempt = 0; $attempt -lt 60; $attempt++) { "
+        "$adapters = @(Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { "
+        "$_.IPEnabled -and $_.ServiceName -in @('netkvm', 'netvsc') -and $_.DefaultIPGateway -and "
+        "@($_.IPAddress | Where-Object { $_ -notlike '*:*' -and $_ -notlike '169.254.*' -and $_ -ne '0.0.0.0' }).Count }); "
+        "$profiles = @($adapters | ForEach-Object { "
+        "Get-NetConnectionProfile -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue } | "
+        "Where-Object { $_.IPv4Connectivity -notin @('Disconnected', 'NoTraffic') }); "
+        "if ($profiles.Count -gt 0 -and $profiles.Count -eq $adapters.Count) { "
+        "$profiles | Set-NetConnectionProfile -NetworkCategory Private; "
+        "Set-NetFirewallRule -Name 'FPS-ICMP4-ERQ-In' -Profile Private -RemoteAddress LocalSubnet4 -Enabled True; "
+        "$profiles | ForEach-Object { Get-NetConnectionProfile -InterfaceIndex $_.InterfaceIndex } | "
+        "Format-Table InterfaceAlias, NetworkCategory; "
+        "Write-Output 'AppSandbox NAT: Private; Windows echo-request rule enabled for Private/LocalSubnet4.'; exit 0 }; "
+        "Start-Sleep -Seconds 1 }; "
+        "throw 'AppSandbox NAT adapter or network profile did not become ready'\" >> \"%LOG%\" 2>&1\r\n"
+        "if errorlevel 1 exit /b 1\r\n",
+        f);
+    return ferror(f) ? -1 : 0;
+}
+
+int asb_provision_setup_cmd(FILE *f, int nat_network, int from_media) {
     if (!f) return -1;
     fputs(
         "@echo off\r\n"
-        "set LOG=%SystemRoot%\\AppSandbox\\setup.log\r\n"
-        "echo === setup.cmd started === >> \"%LOG%\"\r\n",
+        "set LOG=%SystemRoot%\\AppSandbox\\setup.log\r\n",
         f);
+    if (from_media) fputs("mkdir \"%SystemRoot%\\AppSandbox\" 2>nul\r\n", f);
+    fputs("echo === setup.cmd started === >> \"%LOG%\"\r\n", f);
     if (asb_provision_login_setup(f) != 0) return -1;
+    if (from_media) {
+        fputs(
+            "if exist \"%~dp0appsandbox-agent.exe\" (\r\n"
+            "    copy /Y \"%~dp0appsandbox-agent.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
+            "    if exist \"%~dp0appsandbox-input.exe\" copy /Y \"%~dp0appsandbox-input.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
+            "    if exist \"%~dp0appsandbox-displays.exe\" copy /Y \"%~dp0appsandbox-displays.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
+            "    if exist \"%~dp0appsandbox-clipboard.exe\" copy /Y \"%~dp0appsandbox-clipboard.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
+            "    if exist \"%~dp0appsandbox-clipboard-reader.exe\" copy /Y \"%~dp0appsandbox-clipboard-reader.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
+            "    if exist \"%~dp0appsandbox-audio.exe\" copy /Y \"%~dp0appsandbox-audio.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
+            "    \"%SystemRoot%\\AppSandbox\\appsandbox-agent.exe\" --install >> \"%LOG%\" 2>&1\r\n"
+            ")\r\n", f);
+    } else {
+        fputs(
+            "REM Agent already staged at C:\\Windows\\AppSandbox\\ by the disk builder\r\n"
+            "\"%SystemRoot%\\AppSandbox\\appsandbox-agent.exe\" --install >> \"%LOG%\" 2>&1\r\n",
+            f);
+    }
+    if (nat_network && asb_provision_nat_setup(f) != 0) return -1;
     fputs(
-        "REM Agent already staged at C:\\Windows\\AppSandbox\\ by the disk builder\r\n"
-        "\"%SystemRoot%\\AppSandbox\\appsandbox-agent.exe\" --install >> \"%LOG%\" 2>&1\r\n"
         "echo === setup.cmd finished === >> \"%LOG%\"\r\n",
         f);
-    return 0;
+    return ferror(f) ? -1 : 0;
 }
 
-int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name) {
+int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name, int from_media) {
     if (!f) return -1;
     fputs(
         "@echo off\r\n"
         "set LOG=%SystemRoot%\\AppSandbox\\setup.log\r\n"
         "mkdir \"%SystemRoot%\\AppSandbox\" 2>nul\r\n"
         "echo === SetupComplete.cmd started === >> \"%LOG%\"\r\n"
-        "\r\n"
-        "set DRVDIR=%SystemRoot%\\AppSandbox\\drivers\r\n"
+        "\r\n", f);
+    if (from_media) {
+        fputs(
+            "set ISODRV=\r\n"
+            "for %%d in (D E F G H I J) do @if exist %%d:\\drivers\\AppSandboxVDD.inf set ISODRV=%%d:\r\n"
+            "if \"%ISODRV%\"==\"\" goto :done\r\n"
+            "set DRVDIR=%ISODRV%\\drivers\r\n", f);
+    } else {
+        fputs("set DRVDIR=%SystemRoot%\\AppSandbox\\drivers\r\n", f);
+    }
+    fputs(
         "if not exist \"%DRVDIR%\\AppSandboxVDD.inf\" goto :done\r\n"
         "\r\n"
         "echo [SETUP] Enabling test signing... >> \"%LOG%\"\r\n"
@@ -360,9 +461,9 @@ int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name) {
         f);
 
     if (ssh_msi_name && ssh_msi_name[0]) {
+        fputs("REM Install OpenSSH Server\r\n", f);
+        fputs(from_media ? "set SSHDIR=%ISODRV%\r\n" : "set SSHDIR=%SystemRoot%\\AppSandbox\r\n", f);
         fprintf(f,
-            "REM Install OpenSSH Server\r\n"
-            "set SSHDIR=%%SystemRoot%%\\AppSandbox\r\n"
             "if exist \"%%SSHDIR%%\\%s\" (\r\n"
             "    echo [SSH] Installing OpenSSH Server... >> \"%%LOG%%\"\r\n"
             "    msiexec /i \"%%SSHDIR%%\\%s\" /qn /norestart >> \"%%LOG%%\" 2>&1\r\n"

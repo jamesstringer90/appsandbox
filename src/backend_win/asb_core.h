@@ -11,6 +11,7 @@
 #define ASB_CORE_H
 
 #include <windows.h>
+#include "asb_vm_id.h"
 
 #ifdef ASB_BUILDING_DLL
 #define ASB_API __declspec(dllexport)
@@ -129,6 +130,7 @@ ASB_API void asb_set_vm_removed_callback(AsbVmRemovedCallback cb, void *user_dat
    On success, returns S_OK and the new VM is added to the internal list.
    Depending on config, this may start a background VHDX creation thread. */
 ASB_API HRESULT asb_vm_create(const AsbVmConfig *config);
+ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *created_id);
 
 ASB_API const wchar_t *asb_validate_username(const wchar_t *os_type,
     const wchar_t *username, const wchar_t *vm_name, BOOL is_template);
@@ -179,6 +181,7 @@ ASB_API BOOL    asb_vm_agent_online(AsbVm vm);
    would itself become the single consumer and blank the display. Poll it on an interval
    (it disturbs nothing) and gate display-open on it. */
 ASB_API BOOL    asb_vm_idd_ready(AsbVm vm);
+ASB_API void    asb_vm_set_display_suppressed(AsbVm vm, BOOL suppressed);
 ASB_API BOOL    asb_vm_is_building(AsbVm vm);
 ASB_API DWORD   asb_vm_ram_mb(AsbVm vm);
 ASB_API DWORD   asb_vm_hdd_gb(AsbVm vm);

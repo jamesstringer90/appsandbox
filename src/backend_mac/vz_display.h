@@ -13,8 +13,9 @@
    live one without touching AppKit off the main thread. The headless daemon reads
    it to report displayOpen and to reap a self-closed window before reopening. */
 @property (nonatomic) BOOL userClosed;
+@property (nonatomic, readonly) uint64_t vmId;
 
-- (instancetype)initWithVzVm:(VzVm *)vm;
+- (instancetype)initWithVzVm:(VzVm *)vm vmId:(uint64_t)vmId;
 - (void)showDisplay;
 
 @end

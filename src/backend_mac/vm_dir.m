@@ -6,27 +6,28 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+static struct passwd *invoking_user(void) {
+    uid_t uid = getuid();
+    if (uid != 0) return getpwuid(uid);
+    const char *sudoUser = getenv("SUDO_USER");
+    return sudoUser && *sudoUser ? getpwnam(sudoUser) : getpwuid(uid);
+}
+
 @implementation VmDir
+
++ (uid_t)ownerUID { struct passwd *p = invoking_user(); return p ? p->pw_uid : getuid(); }
++ (gid_t)ownerGID { struct passwd *p = invoking_user(); return p ? p->pw_gid : getgid(); }
 
 + (NSURL *)vmsRootDirectory {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSURL *appSupport = nil;
 
-    /* Under sudo (the headless daemon's required launch mode), NSUserDomainMask
-     * resolves to root's home (/var/root) -- a DIFFERENT VM registry and a
-     * cold restore-image cache than the user's GUI. Resolve the INVOKING
-     * user's real home instead (SUDO_USER -> passwd), so `sudo AppSandbox
-     * --headless` manages the same VMs the user sees in the app. Dormant in
-     * the GUI (never runs as root). */
-    const char *sudo_user = getenv("SUDO_USER");
-    if (geteuid() == 0 && sudo_user && *sudo_user) {
-        struct passwd *pw = getpwnam(sudo_user);
-        if (pw && pw->pw_dir && pw->pw_dir[0]) {
+    if (geteuid() == 0) {
+        struct passwd *pw = invoking_user();
+        if (pw && pw->pw_dir && pw->pw_dir[0])
             appSupport = [NSURL fileURLWithPath:
-                [[NSString stringWithUTF8String:pw->pw_dir]
-                    stringByAppendingPathComponent:@"Library/Application Support"]
-                                    isDirectory:YES];
-        }
+                [@(pw->pw_dir) stringByAppendingPathComponent:@"Library/Application Support"]
+                isDirectory:YES];
     }
     if (!appSupport) {
         appSupport = [fm URLForDirectory:NSApplicationSupportDirectory
