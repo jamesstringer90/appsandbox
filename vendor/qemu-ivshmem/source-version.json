@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/jamesstringer90/asb-qemu.git",
+  "branch": "asb-ivshmem-11.1.3",
+  "upstreamTag": "v11.1.3",
+  "revision": "40311b7ce891804996c2607f46ea2767bef09601",
+  "dependencies": {
+    "glib": "2.90.1",
+    "gettext": "1.0",
+    "pcre2": "10.49"
+  }
+}

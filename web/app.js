@@ -15,8 +15,8 @@ let diskSpaceRequestId = 0;
 let diskSpaceTimer = null;
 let diskSpacePending = false;
 let diskDirectoryBeforeEdit = null;
-let rowCache = {};          /* vm.name -> <tr> — persistent rows so the status spinner doesn't reset on every update */
-let rowSigCache = {};       /* vm.name -> last render signature; skip rebuild when unchanged */
+let rowCache = {};
+let rowSigCache = {};
 
 /* ---- Collapsible sections ---- */
 function toggleSection(id) {
@@ -68,14 +68,12 @@ var hostBridge = (function() {
     return { send: send, isWebView2: isWebView2, isWKWebView: isWKWebView, isMac: isWKWebView };
 })();
 
-function sendCmd(action, data) { hostBridge.send(action, data); }
+function sendCmd(action, data) {
+    if (data && data.vmId && vmIndexById(data.vmId) < 0) return;
+    if (data && data.templateId && !currentTemplates.some(function(t) { return t.id === data.templateId; })) return;
+    hostBridge.send(action, data);
+}
 
-/* On a macOS host, hide the Windows-*host*-only features (templates, snapshots,
- * test-mode, build-template — none supported when the host is a Mac) and the
- * dormant Linux-version row. The OS-type dropdown stays ENABLED so the user can
- * pick Windows (built from a Microsoft ISO via QEMU) or macOS (VZ restore image).
- * Per-OS field visibility — including the .needs-iso picker — is driven by
- * applyOsTypeUI(), which runs on both hosts. */
 if (hostBridge.isMac) {
     var hide = document.querySelectorAll('.win-only, .windows-host-only, .needs-linux-version');
     for (var i = 0; i < hide.length; i++) hide[i].style.display = 'none';
@@ -97,7 +95,12 @@ function applyOsTypeUI() {
     var osType = document.getElementById('os-type').value;
     var isWindows = osType === 'Windows';
     var isLinux = osType === 'Linux';
-    if (!isWindows || hostBridge.isMac) selectTemplate('', templateDefaultLabel());
+    var selected = currentTemplates.find(function(t) { return t.name === document.getElementById('template-select').value; });
+    if (selected && selected.osType !== osType) selectTemplate('', templateDefaultLabel());
+    modal.querySelectorAll('.templates-supported').forEach(function(el) {
+        el.style.display = (isWindows || osType === 'macOS') ? '' : 'none';
+    });
+    populateTemplates(currentTemplates);
     var winOnly = modal.querySelectorAll('.win-only');
     var needsIso = modal.querySelectorAll('.needs-iso');
     var needsWindows = modal.querySelectorAll('.needs-windows');
@@ -110,7 +113,8 @@ function applyOsTypeUI() {
        guest on EITHER host (a Windows-on-Mac VM uses it too), hidden otherwise. */
     for (var w = 0; w < needsWindows.length; w++) needsWindows[w].style.display = isWindows ? '' : 'none';
     /* ISO picker shows for both Windows and Linux now. */
-    for (var j = 0; j < needsIso.length; j++) needsIso[j].style.display = (isWindows || isLinux) ? '' : 'none';
+    for (var j = 0; j < needsIso.length; j++) needsIso[j].style.display = (isWindows || isLinux || osType === 'macOS') ? '' : 'none';
+    document.getElementById('image-path').placeholder = osType === 'macOS' ? 'Latest macOS restore image (or select IPSW)...' : 'Path to ISO...';
     /* Linux distribution dropdown is dormant — kept in the DOM but always
        hidden so the cloud-image code path can be revived without
        re-adding the markup. */
@@ -137,7 +141,7 @@ window.onHostMessage = function(msg) {
         case 'fullState':     onFullState(msg); break;
         case 'vmListChanged': updateVmList(msg.vms); renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); break;
         case 'vmStateChanged': onVmStateChanged(msg); break;
-        case 'snapListChanged': break; /* snapshots now inline in vmListChanged */
+        case 'snapListChanged': break;
         case 'log':           appendLog(msg.message); break;
         case 'hostInfo':      updateHostInfo(msg); break;
         case 'browseResult':  onBrowseResult(msg.path); break;
@@ -191,8 +195,9 @@ function applySmartDefaults(info) {
 }
 
 function onVmStateChanged(msg) {
-    if (msg.vmIndex >= 0 && msg.vmIndex < vms.length) {
-        Object.assign(vms[msg.vmIndex], msg);
+    var index = vmIndexById(msg.id);
+    if (index >= 0) {
+        Object.assign(vms[index], msg);
     }
     renderVmTable();
     if (msg.hostInfo) updateHostInfo(msg.hostInfo);
@@ -338,9 +343,15 @@ function populateAdapters(adapters, defaultIdx) {
 /* ---- Templates ---- */
 
 var currentTemplates = [];
+var selectedTemplateId = null;
+
+function templatesForSelectedOS() {
+    var osType = document.getElementById('os-type').value;
+    return currentTemplates.filter(function(t) { return t.osType === osType; });
+}
 
 function templateDefaultLabel() {
-    var n = currentTemplates.length;
+    var n = templatesForSelectedOS().length;
     if (n === 0) return '(None)';
     return '(' + n + ' template' + (n === 1 ? '' : 's') + ' available)';
 }
@@ -358,7 +369,7 @@ function populateTemplates(templates) {
     noneItem.addEventListener('click', function() { selectTemplate('', templateDefaultLabel()); });
     list.appendChild(noneItem);
 
-    currentTemplates.forEach(function(t) {
+    templatesForSelectedOS().forEach(function(t) {
         var item = document.createElement('div');
         item.className = 'template-dropdown-item';
 
@@ -374,7 +385,7 @@ function populateTemplates(templates) {
         delBtn.addEventListener('click', function(e) {
             e.stopPropagation();
             closeTemplateDropdown();
-            onDeleteTemplate(t.name);
+            onDeleteTemplate(t.name, t.id);
         });
         item.appendChild(delBtn);
 
@@ -386,7 +397,9 @@ function populateTemplates(templates) {
 
     /* If the currently selected template was deleted, reset */
     if (hidden.value !== '') {
-        var found = currentTemplates.some(function(t) { return t.name === hidden.value; });
+        var found = currentTemplates.some(function(t) {
+            return selectedTemplateId ? t.id === selectedTemplateId : t.name === hidden.value;
+        });
         if (!found) selectTemplate('', templateDefaultLabel());
     } else {
         /* No template selected — update default label in case count changed */
@@ -401,6 +414,12 @@ function selectTemplate(value, label) {
     closeTemplateDropdown();
     if (value !== '') {
         document.getElementById('image-path').value = '';
+    }
+    var template = currentTemplates.find(function(t) { return t.name === value; });
+    selectedTemplateId = template ? template.id || null : null;
+    var disk = document.getElementById('hdd-size');
+    if (template && template.hddGb) {
+        disk.value = Math.max(Number(disk.value), template.hddGb);
     }
     updateCreateButtons();
 }
@@ -420,14 +439,14 @@ document.addEventListener('click', function(e) {
     }
 });
 
-function onDeleteTemplate(name) {
+function onDeleteTemplate(name, id) {
     showModal(
         'Confirm Delete',
         'Are you sure you want to delete template "' + name + '"?\n\nThis will permanently delete the template disk image.',
         'Delete'
     ).then(function(confirmed) {
         if (confirmed) {
-            sendCmd('deleteTemplate', { name: name });
+            sendCmd('deleteTemplate', { name: name, templateId: id });
         }
     });
 }
@@ -512,8 +531,10 @@ document.getElementById('disk-location-overlay').addEventListener('click', funct
 
 function createValidationError(isTemplate) {
     var osType = document.getElementById('os-type').value;
-    if (isTemplate && (hostBridge.isMac || osType !== 'Windows'))
-        return 'Templates require a Windows guest on a Windows host.';
+    if (isTemplate && osType !== 'Windows' && osType !== 'macOS')
+        return 'Templates require a Windows or macOS guest.';
+    if (isTemplate && document.getElementById('template-select').value)
+        return 'Select an OS image to build a new template.';
     var error = validateVmName(document.getElementById('vm-name').value.trim()) ||
         validateDiskDirectory(document.getElementById('disk-directory').value.trim()) ||
         validateUsername(document.getElementById('admin-user').value.trim(), isTemplate) ||
@@ -538,9 +559,9 @@ function createValidationError(isTemplate) {
     if (diskSpacePending && !diskKnown) return 'Checking disk folder...';
 
     var hasImage = document.getElementById('image-path').value.trim() !== '';
-    var hasTemplate = !hostBridge.isMac && osType === 'Windows' &&
+    var hasTemplate = (osType === 'Windows' || osType === 'macOS') &&
         document.getElementById('template-select').value !== '';
-    if ((isTemplate || osType !== 'macOS') && !hasImage && (isTemplate || !hasTemplate))
+    if (osType !== 'macOS' && !hasImage && (isTemplate || !hasTemplate))
         return 'Select an OS image or an available template.';
     return null;
 }
@@ -641,8 +662,8 @@ function gatherConfig() {
         diskDirectory: document.getElementById('disk-directory').value.trim() ===
             (lastHostInfo && lastHostInfo.defaultDiskDirectory) ? '' :
             document.getElementById('disk-directory').value.trim(),
-        templateName: (!hostBridge.isMac && osType === 'Windows') ?
-            document.getElementById('template-select').value : '',
+        templateName: document.getElementById('template-select').value,
+        templateId: selectedTemplateId || undefined,
         hddGb:       document.getElementById('hdd-size').valueAsNumber,
         ramMb:       alignRamMb(document.getElementById('ram-size').valueAsNumber),
         cpuCores:    document.getElementById('cpu-cores').valueAsNumber,
@@ -928,7 +949,11 @@ function updateStatusCell(td, vm) {
     var label = '';
     var className = '';
 
-    if (vm.buildingVhdx) {
+    if (vm.starting) {
+        needsSpinner = true;
+        label = 'Starting';
+        className = 'status-building';
+    } else if (vm.buildingVhdx) {
         needsSpinner = true;
         label = vm.vhdxStaging ? 'Staging files... ' : 'Building Disk (' + (vm.vhdxProgress || 0) + '%) ';
         className = 'status-building';
@@ -1004,10 +1029,10 @@ function buildRowCells(vm, i, statusTd) {
                 ? 'In-VM agent is connected — host can manage the guest'
                 : 'In-VM agent is not connected'));
 
-    var bld = vm.buildingVhdx;
+    var bld = vm.buildingVhdx || vm.starting;
 
     var sshActive = vm.sshEnabled && (vm.sshState === 2 || vm.sshState === 4) && vm.running && !bld;
-    var sshCell = makeIconCell('ssh', '>_', sshActive, (function(idx) { return function() { sendCmd('sshConnect', {vmIndex: idx}); }; })(i), !vm.sshEnabled ? 'hidden' : '');
+    var sshCell = makeIconCell('ssh', '>_', sshActive, function() { sendCmd('sshConnect', {vmId: vm.id}); }, !vm.sshEnabled ? 'hidden' : '');
     if (vm.sshEnabled) {
         var sshBtn = sshCell.querySelector('.icon-btn');
         if (vm.sshState === 1) sshBtn.title = 'Installing OpenSSH in the guest...';
@@ -1029,19 +1054,19 @@ function buildRowCells(vm, i, statusTd) {
             hostBridge.isMac && vm.osType === 'Windows'
                 ? 'Windows software rendering (WARP) on the CPU'
                 : 'GPU passed through to the VM via GPU-PV, or None'),
-        makeCell(hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None'),
+        makeCell(netNames[vm.networkMode] || 'None',
             hostBridge.isMac ? 'NAT (shared networking)'
                 : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
     ];
     if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
     cells.push(
-        makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() { onStartVm(i); }, '', 'Start the VM (boots from the selected snapshot/branch)'),
-        makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }, '', 'Open the VM display window (IDD virtual monitor)'),
+        makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() { onStartVm(vmIndexById(vm.id)); }, '', 'Start the VM (boots from the selected snapshot/branch)'),
+        makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmId: vm.id}); }, '', 'Open the VM display window (IDD virtual monitor)'),
         sshCell,
-        makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
-        makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
-        makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
-        makeIconCell('edit', '\u270F\uFE0F', !vm.running && !bld, function() { openEditVmModal(i); }, '', 'Edit VM configuration — VM must be stopped'),
+        makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmId: vm.id}); }, '', 'Request a graceful shutdown from the guest OS'),
+        makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(vmIndexById(vm.id)); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
+        makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(vmIndexById(vm.id)); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
+        makeIconCell('edit', '\u270F\uFE0F', !vm.running && !bld, function() { openEditVmModal(vmIndexById(vm.id)); }, '', 'Edit VM configuration — VM must be stopped'),
     );
     return cells;
 }
@@ -1071,7 +1096,7 @@ function renderVmTable() {
 
     /* Drop cached rows for VMs that no longer exist. */
     var seen = {};
-    vms.forEach(function(vm) { seen[vm.name] = true; });
+    vms.forEach(function(vm) { seen[vm.id] = true; });
     Object.keys(rowCache).forEach(function(name) {
         if (!seen[name]) {
             var stale = rowCache[name];
@@ -1092,24 +1117,24 @@ function renderVmTable() {
     /* Skip the cell rebuild when button-relevant fields are unchanged; the
      * install progress tick would otherwise destroy the button DOM mid-click. */
     vms.forEach(function(vm, i) {
-        var tr = rowCache[vm.name];
+        var tr = rowCache[vm.id];
         var firstBuild = !tr;
         if (!tr) {
             tr = document.createElement('tr');
-            rowCache[vm.name] = tr;
+            rowCache[vm.id] = tr;
         }
 
         var statusTd = tr.children[2] || document.createElement('td');
         updateStatusCell(statusTd, vm);
 
         var sig = [
-            i, i === selectedVm,
-            vm.running, vm.buildingVhdx, vm.shuttingDown, vm.agentOnline,
+            i, i === selectedVm, vm.name,
+            vm.running, vm.starting, vm.buildingVhdx, vm.shuttingDown, vm.agentOnline,
             vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort,
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode,
-            selectedSnap.get(vm.name) || 'current',
+            selectedSnap.get(vm.id) || 'current',
             /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
                so makeSnapCell re-runs. These fields only change on user snapshot
                actions (never on install-progress ticks — a VM can't be snapshotted
@@ -1118,20 +1143,20 @@ function renderVmTable() {
             JSON.stringify(vm.snapshots || []), JSON.stringify(vm.baseBranches || [])
         ].join('|');
 
-        if (!firstBuild && rowSigCache[vm.name] === sig) {
+        if (!firstBuild && rowSigCache[vm.id] === sig) {
             if (tbody.children[i] !== tr) {
                 tbody.insertBefore(tr, tbody.children[i] || null);
             }
             return;
         }
-        rowSigCache[vm.name] = sig;
+        rowSigCache[vm.id] = sig;
 
         tr.className = (i === selectedVm ? 'selected ' : '') +
                        (vm.running ? 'running' : 'stopped');
         tr.onclick = function(e) {
             if (e.target.closest('.icon-btn')) return;
             if (e.target.closest('.snap-cell')) return;
-            selectVm(i);
+            selectVm(vmIndexById(vm.id));
         };
 
         var cells = buildRowCells(vm, i, statusTd);
@@ -1174,29 +1199,32 @@ function makeIconCell(cls, icon, active, handler, extraClass, title) {
 /* ---- VM Selection ---- */
 
 function selectVm(idx) {
+    if (!vms[idx]) return;
     selectedVm = idx;
     renderVmTable();
-    sendCmd('selectVm', { vmIndex: idx });
+    sendCmd('selectVm', { vmId: vms[idx].id });
 }
 
 function updateVmList(next) {
-    selectedSnap.forEach(function(value, name) {
-        var before = vms.find(function(vm) { return vm.name === name; });
-        var after = next.find(function(vm) { return vm.name === name; });
+    var selectedId = vms[selectedVm] && vms[selectedVm].id;
+    selectedSnap.forEach(function(value, id) {
+        var before = vms.find(function(vm) { return vm.id === id; });
+        var after = next.find(function(vm) { return vm.id === id; });
         if (!before || !after || snapshotTreeSignature(before) !== snapshotTreeSignature(after))
-            selectedSnap.delete(name);
+            selectedSnap.delete(id);
     });
     vms = next;
+    selectedVm = selectedId ? vmIndexById(selectedId) : -1;
 }
 
-function vmIndexByName(name) {
-    return vms.findIndex(function(vm) { return vm.name === name; });
+function vmIndexById(id) {
+    return vms.findIndex(function(vm) { return vm.id === id; });
 }
 
 function openEditVmModal(idx) {
     var vm = vms[idx];
     if (!vm || vm.running || vm.buildingVhdx) return;
-    editVmState = { name: vm.name, initial: Object.assign({}, vm), previousFocus: rowCache[vm.name].querySelector('.edit') };
+    editVmState = { id: vm.id, name: vm.name, initial: Object.assign({}, vm), previousFocus: rowCache[vm.id].querySelector('.edit') };
     document.getElementById('edit-vm-title').textContent = 'Edit ' + vm.name;
     document.getElementById('edit-ram-size').value = vm.ramMb;
     document.getElementById('edit-ram-size').min = hostBridge.isMac ? 512 : 4000;
@@ -1218,7 +1246,7 @@ function restoreVmModalFocus(state, selector) {
     if (!state) return;
     var target = state.previousFocus;
     if (!target || !target.isConnected || target.disabled) {
-        var row = rowCache[state.name];
+        var row = rowCache[state.id];
         target = row && row.querySelector(selector);
     }
     if (!target || !target.isConnected || target.disabled) target = document.getElementById('btn-new-sandbox');
@@ -1249,14 +1277,38 @@ function editVmValidationError(values) {
 
 function updateEditVmModal() {
     if (!editVmState) return;
-    var vm = vms[vmIndexByName(editVmState.name)];
+    var vm = vms[vmIndexById(editVmState.id)];
     if (!vm) { closeEditVmModal(); return; }
-    var disabled = vm.running || vm.buildingVhdx;
+    document.getElementById("edit-vm-title").textContent = "Edit " + vm.name;
+    var values = editVmValues();
+    var conflict = false;
+    var fields = { ramMb: 'edit-ram-size', cpuCores: 'edit-cpu-cores' };
+    if (!hostBridge.isMac) fields.networkMode = 'edit-net-mode';
+    Object.keys(fields).forEach(function(field) {
+        if (vm[field] === editVmState.initial[field]) return;
+        if (values[field] !== editVmState.initial[field] && values[field] !== vm[field]) {
+            conflict = true;
+            return;
+        }
+        document.getElementById(fields[field]).value = vm[field];
+        editVmState.initial[field] = vm[field];
+    });
+    if (!hostBridge.isMac && gpuSelectionValue(vm) !== gpuSelectionValue(editVmState.initial)) {
+        if (gpuSelectionValue(values) !== gpuSelectionValue(editVmState.initial) &&
+            gpuSelectionValue(values) !== gpuSelectionValue(vm)) conflict = true;
+        else {
+            setGpuSelection('edit-gpu-mode', vm);
+            editVmState.initial.gpuMode = vm.gpuMode;
+            editVmState.initial.gpuId = vm.gpuId;
+        }
+    }
+    var disabled = vm.running || vm.buildingVhdx || vm.starting;
     document.querySelectorAll('#edit-vm-overlay input, #edit-vm-overlay select').forEach(function(el) {
         el.disabled = !!disabled;
     });
     var values = editVmValues();
-    var error = disabled ? 'Stop the VM before editing its configuration.' : editVmValidationError(values);
+    var error = disabled ? 'Stop the VM before editing its configuration.' :
+        conflict ? 'These settings changed in another interface. Reopen this editor to review the latest values.' : editVmValidationError(values);
     document.getElementById('edit-vm-warn').textContent = error;
     document.getElementById('btn-save-edit-vm').disabled = !!error;
 }
@@ -1265,7 +1317,7 @@ function saveEditVm() {
     if (!editVmState) return;
     updateEditVmModal();
     if (!editVmState || document.getElementById('btn-save-edit-vm').disabled) return;
-    var idx = vmIndexByName(editVmState.name);
+    var idx = vmIndexById(editVmState.id);
     var values = editVmValues();
     if (values.ramMb !== editVmState.initial.ramMb) values.ramMb = alignRamMb(values.ramMb);
     var gpuChanged = !hostBridge.isMac &&
@@ -1277,10 +1329,10 @@ function saveEditVm() {
     });
     closeEditVmModal();
     fields.forEach(function(field) {
-        sendCmd('editVm', { vmIndex: idx, field: field, value: String(values[field]) });
+        sendCmd('editVm', { vmId: vms[idx].id, field: field, value: String(values[field]) });
     });
     if (gpuChanged)
-        sendCmd('editVm', { vmIndex: idx, field: 'gpuMode', value: String(values.gpuMode), gpuId: values.gpuId });
+        sendCmd('editVm', { vmId: vms[idx].id, field: 'gpuMode', value: String(values.gpuMode), gpuId: values.gpuId });
 }
 
 document.getElementById('edit-vm-overlay').addEventListener('input', updateEditVmModal);
@@ -1315,13 +1367,13 @@ function onStopVm(idx) {
             'Stop & Delete'
         ).then(function(confirmed) {
             if (confirmed) {
-                sendCmd('stopVm', { vmIndex: idx });
-                sendCmd('deleteVm', { vmIndex: idx });
+                sendCmd('stopVm', { vmId: vm.id });
+                sendCmd('deleteVm', { vmId: vm.id });
             }
         });
     } else {
         if (localStorage.getItem('suppress_force_stop_warn') === '1') {
-            sendCmd('stopVm', { vmIndex: idx });
+            sendCmd('stopVm', { vmId: vm.id });
         } else {
             showForceStopModal(idx);
         }
@@ -1329,6 +1381,8 @@ function onStopVm(idx) {
 }
 
 function showForceStopModal(idx) {
+    var vm = vms[idx];
+    if (!vm) return;
     document.getElementById('modal-title').textContent = 'Force Stop';
     document.getElementById('modal-message').textContent =
         'Force Stop will immediately power-off "' + vms[idx].name + '" which may result in corruption of its data.';
@@ -1341,7 +1395,7 @@ function showForceStopModal(idx) {
     pendingConfirm = { resolve: function(confirmed) {
         if (confirmed) {
             if (cb && cb.checked) localStorage.setItem('suppress_force_stop_warn', '1');
-            sendCmd('stopVm', { vmIndex: idx });
+            sendCmd('stopVm', { vmId: vm.id });
         }
         if (cb) cb.parentElement.style.display = 'none';
     }};
@@ -1358,7 +1412,7 @@ function onDeleteVm(idx) {
         'Delete'
     ).then(function(confirmed) {
         if (confirmed) {
-            sendCmd('deleteVm', { vmIndex: idx });
+            sendCmd('deleteVm', { vmId: vm.id });
         }
     });
 }
@@ -1408,10 +1462,10 @@ function makeSnapCell(vm, vmIdx) {
     td.className = 'snap-cell';
     var button = document.createElement('button');
     button.className = 'snap-open';
-    button.textContent = vm.hasSnapshots ? snapshotPath(vm, selectedSnap.get(vm.name) || 'current') : 'No snapshots';
+    button.textContent = vm.hasSnapshots ? snapshotPath(vm, selectedSnap.get(vm.id) || 'current') : 'No snapshots';
     button.title = 'Snapshots — ' + button.textContent;
     button.setAttribute('aria-haspopup', 'dialog');
-    button.onclick = function(e) { e.stopPropagation(); openSnapshotModal(vmIdx); };
+    button.onclick = function(e) { e.stopPropagation(); openSnapshotModal(vmIndexById(vm.id)); };
     td.appendChild(button);
     return td;
 }
@@ -1419,14 +1473,14 @@ function makeSnapCell(vm, vmIdx) {
 function openSnapshotModal(idx) {
     var vm = vms[idx];
     if (!vm || hostBridge.isMac) return;
-    var value = selectedSnap.get(vm.name) || 'current';
+    var value = selectedSnap.get(vm.id) || 'current';
     snapshotModal = {
-        name: vm.name,
+        id: vm.id, name: vm.name,
         currentRow: snapshotRowValue(vm, value),
         currentPath: snapshotPath(vm, value),
         selectedValue: null,
         treeSignature: snapshotTreeSignature(vm),
-        previousFocus: rowCache[vm.name].querySelector('.snap-open'),
+        previousFocus: rowCache[vm.id].querySelector('.snap-open'),
         signature: null
     };
     document.getElementById('snapshot-title').textContent = 'Snapshots — ' + vm.name;
@@ -1445,9 +1499,10 @@ function closeSnapshotModal() {
 
 function renderSnapshotModal() {
     if (!snapshotModal) return;
-    var vm = vms[vmIndexByName(snapshotModal.name)];
+    var vm = vms[vmIndexById(snapshotModal.id)];
     if (!vm) { closeSnapshotModal(); return; }
-    var value = selectedSnap.get(vm.name) || 'current';
+    document.getElementById("snapshot-title").textContent = "Snapshots — " + vm.name;
+    var value = selectedSnap.get(vm.id) || 'current';
     var disabled = !!(vm.running || vm.buildingVhdx);
     var treeSignature = snapshotTreeSignature(vm);
     if (treeSignature !== snapshotModal.treeSignature) {
@@ -1485,7 +1540,7 @@ function renderSnapshotModal() {
         choice.disabled = disabled;
         choice.onclick = function() {
             snapshotModal.selectedValue = val;
-            selectedSnap.set(vm.name, vm.hasSnapshots ? val : 'current');
+            selectedSnap.set(vm.id, vm.hasSnapshots ? val : 'current');
             document.getElementById('snapshot-warn').textContent = '';
             renderVmTable();
         };
@@ -1536,15 +1591,15 @@ function renderSnapshotModal() {
 
 function snapshotActionContext() {
     if (!snapshotModal) return null;
-    var vm = vms[vmIndexByName(snapshotModal.name)];
+    var vm = vms[vmIndexById(snapshotModal.id)];
     if (!vm || vm.running || vm.buildingVhdx) return null;
-    return { modal: snapshotModal, name: vm.name, value: selectedSnap.get(vm.name) || 'current',
+    return { modal: snapshotModal, id: vm.id, name: vm.name, value: selectedSnap.get(vm.id) || 'current',
         tree: snapshotTreeSignature(vm), vm: vm };
 }
 
 function snapshotActionIndex(context) {
     if (snapshotModal !== context.modal) return -1;
-    var idx = vmIndexByName(context.name);
+    var idx = vmIndexById(context.id);
     var vm = vms[idx];
     if (!vm || vm.running || vm.buildingVhdx) return -1;
     if (context.tree !== snapshotTreeSignature(vm)) {
@@ -1563,7 +1618,7 @@ function takeSnapshot() {
     }).then(function(result) {
         if (result === false) return;
         var idx = snapshotActionIndex(context);
-        if (idx >= 0) sendCmd('snapTake', { vmIndex: idx, name: result });
+        if (idx >= 0) sendCmd('snapTake', { vmId: vms[idx].id, name: result });
     });
 }
 
@@ -1580,7 +1635,7 @@ function renameSnapshot() {
         if (result === false || result === target.name) return;
         var idx = snapshotActionIndex(context);
         if (idx < 0) return;
-        var cmd = { vmIndex: idx, snapIndex: p.snapIndex, name: result };
+        var cmd = { vmId: vms[idx].id, snapIndex: p.snapIndex, name: result };
         if (p.branchIndex >= 0) cmd.branchIndex = p.branchIndex;
         sendCmd('snapRename', cmd);
     });
@@ -1599,17 +1654,17 @@ function deleteSnapshot() {
         if (!confirmed) return;
         var idx = snapshotActionIndex(context);
         if (idx < 0) return;
-        selectedSnap.delete(context.name);
-        if (p.branch) sendCmd('snapDeleteBranch', { vmIndex: idx, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
-        else sendCmd('snapDelete', { vmIndex: idx, snapIndex: p.snapIndex });
+        selectedSnap.delete(context.id);
+        if (p.branch) sendCmd('snapDeleteBranch', { vmId: vms[idx].id, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
+        else sendCmd('snapDelete', { vmId: vms[idx].id, snapIndex: p.snapIndex });
     });
 }
 
 function onStartVm(idx) {
     var vm = vms[idx];
     if (!vm || vm.running || vm.buildingVhdx) return;
-    var name = vm.name;
-    var p = parseSnapValue(selectedSnap.get(name) || 'current');
+    var id = vm.id;
+    var p = parseSnapValue(selectedSnap.get(id) || 'current');
     if ((p.snapIndex >= 0 || p.snapIndex === -2) && p.branchIndex < 0) {
         var tree = snapshotTreeSignature(vm);
         var parentName = p.snapIndex === -2 ? 'Base' : vm.snapshots[p.snapIndex].name;
@@ -1620,18 +1675,18 @@ function onStartVm(idx) {
             confirmClass: 'primary', input: { label: 'Branch name:', value: defaultName }
         }).then(function(result) {
             if (result === false) return;
-            var currentIdx = vmIndexByName(name);
+            var currentIdx = vmIndexById(id);
             var current = vms[currentIdx];
             if (!current || current.running || current.buildingVhdx) return;
             if (tree !== snapshotTreeSignature(current)) {
                 showModal('Snapshots Changed', 'Select the disk again before starting the VM.', 'OK', { confirmClass: 'primary' });
                 return;
             }
-            selectedSnap.delete(name);
-            sendCmd('startVm', { vmIndex: currentIdx, snapIndex: p.snapIndex, branchIndex: p.branchIndex, branchName: result });
+            selectedSnap.delete(id);
+            sendCmd('startVm', { vmId: current.id, snapIndex: p.snapIndex, branchIndex: p.branchIndex, branchName: result });
         });
     } else {
-        sendCmd('startVm', { vmIndex: idx, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
+        sendCmd('startVm', { vmId: vms[idx].id, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
     }
 }
 

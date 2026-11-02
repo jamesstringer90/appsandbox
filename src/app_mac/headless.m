@@ -1,34 +1,3 @@
-/*
- * headless.m -- AppSandbox headless daemon (AppSandbox --headless), macOS.
- *
- * Port of src/app_win/headless.c: hosts the core for the process lifetime and
- * serves the SAME Docker-style local HTTP/JSON API over loopback. A discovery
- * file (~/Library/Application Support/AppSandbox/host.json) gives clients the
- * port + bearer token, so asb.py's connect() works unchanged.
- *
- * Platform differences (capability-gated, not interface-changed):
- *   - capabilities: {snapshots:false, templates:false} -> those routes 501.
- *   - "building" is always false (macOS has no host-side disk-build phase;
- *     the whole create is "installing" until the agent stage completes).
- *   - The daemon owns its VMs: VZ VMs live in-process, so daemon exit
- *     terminates them (the same contract the Windows daemon now has).
- *
- * Threading:
- *   - The MAIN thread runs CFRunLoopRun(): it drains the main dispatch queue,
- *     which is where every VZ operation and every core mutation happens
- *     (asb_core_mac marshals via run_on_main; the agent/proxy callbacks are
- *     main-queue). No NSApplication and no window server -- iso-patch-mac
- *     proves VZ runs fine under a bare CFRunLoop, so this daemon works from
- *     a pure SSH session.
- *   - The HTTP accept loop runs on ONE background thread and handles one
- *     request to completion before the next -> all core calls are serialized,
- *     marshalled onto the main queue with dispatch_sync (reads) or
- *     dispatch_async (the create, so an admin-authorization prompt can't
- *     wedge the API). SSE clients get a detached thread each (write-only).
- *
- * Diagnostics go to headless.log next to vms.cfg, and to stderr (the daemon
- * is launched from a terminal).
- */
 
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>           /* NSApplication run loop (display windows in a GUI session) */
@@ -39,10 +8,15 @@
 #import "host_info.h"
 #import "vm_dir.h"
 #include "headless.h"
+#import "AppDelegate.h"
 #include "asb_types.h"
+#include "asb_events.h"
+#include <stdatomic.h>
 
 #include <sys/socket.h>
 #include <sys/file.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <pwd.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
@@ -136,12 +110,17 @@ static NSArray<NSString *> *g_chown_disk_paths;  /* snapshot, owned by g_chown_q
  * unresolvable (the daemon must not silently operate on the wrong tree). */
 static BOOL resolve_sudo_user(void) {
     const char *u = getenv("SUDO_USER");
-    if (!u || !*u) return YES;   /* true root: g_user_uid stays 0 (warned at startup) */
-    struct passwd *pw = getpwnam(u);
-    if (!pw) return NO;
-    g_user_uid = pw->pw_uid;
-    g_user_gid = pw->pw_gid;
+    if (getuid() == 0 && u && *u && !getpwnam(u)) return NO;
+    g_user_uid = [VmDir ownerUID];
+    g_user_gid = [VmDir ownerGID];
     return YES;
+}
+
+int asb_host_prepare_user(void) {
+    if (geteuid() != 0 || !resolve_sudo_user()) return 0;
+    if (!g_chown_q)
+        g_chown_q = dispatch_queue_create("com.appsandbox.core.ownership", DISPATCH_QUEUE_SERIAL);
+    return 1;
 }
 
 static void chown_to_user(NSString *path) {
@@ -201,7 +180,29 @@ static pthread_mutex_t g_ev_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_ev_cv = PTHREAD_COND_INITIALIZER;
 static char           *g_ev_ring[EV_CAP];
 static long             g_ev_seq = 0;
-static volatile int     g_stop_all = 0;
+static _Atomic int      g_stop_all = 0;
+static _Atomic int      g_server_done = 1;
+static pthread_t        g_server_thread;
+static BOOL             g_api_started = NO;
+static BOOL             g_gui_mode = NO;
+static AppDelegate     *g_headless_delegate;
+static unsigned         g_api_subscription;
+
+typedef struct ApiClient { int fd; struct ApiClient *next; } ApiClient;
+static ApiClient *g_clients, *g_serving_client;
+static pthread_mutex_t g_clients_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_clients_cv = PTHREAD_COND_INITIALIZER;
+
+static void client_close(ApiClient *client) {
+    pthread_mutex_lock(&g_clients_mu);
+    ApiClient **p = &g_clients;
+    while (*p && *p != client) p = &(*p)->next;
+    if (*p) *p = client->next;
+    close(client->fd);
+    free(client);
+    pthread_cond_broadcast(&g_clients_cv);
+    pthread_mutex_unlock(&g_clients_mu);
+}
 
 static void broadcast_event(NSString *json) {
     pthread_mutex_lock(&g_ev_mu);
@@ -223,23 +224,28 @@ static NSString *json_str(id obj) {
  * flag / ssh state / proxy event), so the daemon never interprets it -- GET
  * reads the live core fields instead; SSE forwards the same three event kinds
  * the Windows daemon emits (state/progress/alert). */
-static void headless_event_cb(int type, const char *vm_name,
-                              int int_value, const char *str_value) {
+static void headless_event_cb(const CoreVmEvent *event, void *context) {
+    (void)context;
+    if (g_stop_all) return;
+    int type = event->type, int_value = event->int_value;
+    const char *vm_name = event->vm_name, *str_value = event->str_value;
     NSString *name = vm_name ? @(vm_name) : @"";
+    char idText[ASB_VM_ID_TEXT_SIZE];
+    asb_vm_id_format(event->vm_id, idText);
     switch (type) {
     case CORE_VM_EVENT_STATE_CHANGED:
         hlog(@"[event] state    : %-20s running=%d", vm_name ?: "", int_value);
-        broadcast_event(json_str(@{ @"event": @"vmStateChanged", @"name": name,
+        broadcast_event(json_str(@{ @"event": @"vmStateChanged", @"id": @(idText), @"name": name,
                                     @"running": int_value ? @YES : @NO }));
-        fix_tree_ownership_soon();
+        dispatch_async(dispatch_get_main_queue(), ^{ if (!g_stop_all) fix_tree_ownership_soon(); });
         break;
     case CORE_VM_EVENT_LIST_CHANGED:
-        /* create/delete/save just touched the tree -- hand it back to the user */
-        fix_tree_ownership_soon();
+        broadcast_event(@"{\"event\":\"vmListChanged\"}");
+        dispatch_async(dispatch_get_main_queue(), ^{ if (!g_stop_all) fix_tree_ownership_soon(); });
         break;
     case CORE_VM_EVENT_PROGRESS:
         hlog(@"[event] progress : %-20s %3d%%", vm_name ?: "", int_value);
-        broadcast_event(json_str(@{ @"event": @"vmProgress", @"name": name,
+        broadcast_event(json_str(@{ @"event": @"vmProgress", @"id": @(idText), @"name": name,
                                     @"progress": @(int_value), @"staging": @NO }));
         break;
     case CORE_VM_EVENT_ALERT:
@@ -291,55 +297,6 @@ static void delete_discovery(void) {
     [[NSFileManager defaultManager] removeItemAtPath:discovery_path() error:nil];
 }
 
-/* ---- Derived state (macOS) ---- */
-
-static const char *derive_state(const AsbVmMac *v) {
-    if (!v->disk_built && v->install_progress >= 0)       return "installing";  /* host building the disk */
-    if (!v->running)                                      return "stopped";
-    if (v->shutting_down)                                 return "stopping";
-    if (!v->install_complete)                             return "installing";  /* guest first-boot install
-                                                                                   (Windows: until the agent
-                                                                                   connects). macOS sets
-                                                                                   install_complete at build,
-                                                                                   so it never lands here. */
-    if (!v->agent_online)                                 return "booting";
-    return "online";
-}
-
-/* TRUE while the guest OS install/stage is in flight -- the macOS analogue of
-   Windows' building_vhdx for the "don't tear the daemon down under it" guard
-   (an exit mid-install orphans the iso-patch-mac child + half-built disk). */
-static BOOL vm_installing(const AsbVmMac *v) {
-    return !v->disk_built && v->install_progress >= 0;
-}
-
-/* Cheap per-VM status object -- field-for-field the Windows daemon's
-   append_vm_json, plus installStatus (macOS exposes a phase string). */
-static NSDictionary *vm_status_dict(const AsbVmMac *v) {
-    return @{
-        @"name":            @(v->name),
-        @"osType":          @(v->os_type),
-        @"diskDirectory":   [VmDir diskDirectoryForVm:@(v->name)].URLByDeletingLastPathComponent.path,
-        @"state":           @(derive_state(v)),
-        @"running":         v->running ? @YES : @NO,
-        @"agentOnline":     v->agent_online ? @YES : @NO,
-        @"installComplete": v->install_complete ? @YES : @NO,
-        @"building":        @NO,
-        @"progress":        @(v->install_progress < 0 ? 0 : v->install_progress),
-        @"installStatus":   @(v->install_status),
-        @"sshState":        @((v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state),
-        @"sshPort":         @(v->ssh_port),
-        @"ramMb":           @(v->ram_mb),
-        @"hddGb":           @(v->hdd_gb),
-        @"cpuCores":        @(v->cpu_cores),
-        @"gpuMode":         @(v->gpu_mode),
-        @"networkMode":     @(v->network_mode),
-        /* Live window state: nil ref or a user-(X)-closed one both read false,
-           mirroring the Windows daemon's is_open. */
-        @"displayOpen":     (v->display != nil && !v->display.userClosed) ? @YES : @NO,
-    };
-}
-
 /* ---- Create-input validation ----
  * Mirrors web/app.js validateVmName/validateUsername/validatePassword exactly
  * as they apply on a macOS host. osType may be "macOS" or "Windows" (anything
@@ -347,7 +304,7 @@ static NSDictionary *vm_status_dict(const AsbVmMac *v) {
  * templates), plus the numeric rules the Windows daemon enforces, so the API
  * rejects exactly what the UI would. Returns an English error (nil = valid). */
 static NSString *validate_create_mac(NSString *name, NSString *os,
-                                     id user, id password, BOOL is_template,
+                                     id user, id password,
                                      int ram_mb, int hdd_gb, int cpu_cores,
                                      int gpu_mode, int net_mode,
                                      NSString *disk_directory) {
@@ -355,8 +312,6 @@ static NSString *validate_create_mac(NSString *name, NSString *os,
     BOOL is_win = [os.lowercaseString isEqualToString:@"windows"];
     if (!is_mac && !is_win)
         return @"Only macOS and Windows guests are supported on a macOS host.";
-    if (is_template)
-        return @"Templates are not yet supported for Windows-on-Mac (use a direct ISO install).";
 
     if (!name.length) return @"VM name is required.";
     if (is_win) {
@@ -393,7 +348,7 @@ static NSString *validate_create_mac(NSString *name, NSString *os,
     if (hdd_gb != 0 && hdd_gb < 1)       return @"Disk size must be at least 1 GB.";
     if (cpu_cores != 0 && cpu_cores < 1) return @"CPU cores must be at least 1.";
     if (gpu_mode < 0 || gpu_mode > 1)    return @"gpuMode must be 0 (None) or 1 (Default).";
-    if (net_mode < 0 || net_mode > 3)    return @"networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal).";
+    if (net_mode != 1) return @"networkMode must be 1 (NAT) on macOS; other modes are not implemented.";
 
     return [VmDir validationErrorForDiskDirectory:disk_directory vmName:name];
 }
@@ -446,19 +401,21 @@ static void send_err(int fd, int status, const char *reason,
    BACKEND_* codes map to the same HTTP statuses the Windows daemon produces:
    success and idempotent no-ops -> 202; unknown VM -> 404; bad input -> 400;
    anything else -> 500 (details arrive via the alert event, as on Windows). */
-static void send_rc(int fd, const char *action, NSString *name, int rc) {
+static void send_rc(int fd, const char *action, NSString *name, AsbVmId vm_id, int rc) {
+    char idText[ASB_VM_ID_TEXT_SIZE];
+    asb_vm_id_format(vm_id, idText);
     if (rc == BACKEND_OK || rc == BACKEND_ERR_ALREADY_RUNNING ||
         rc == BACKEND_ERR_NOT_RUNNING) {
         send_json(fd, 202, "Accepted",
                   json_str(@{ @"ok": @YES, @"accepted": @YES,
-                              @"action": @(action), @"name": name }));
+                              @"action": @(action), @"id": @(idText), @"name": name }));
     } else if (rc == BACKEND_ERR_NOT_FOUND) {
         send_err(fd, 404, "Not Found", @"not_found", @"no such VM");
     } else if (rc == BACKEND_ERR_INVALID_ARG) {
         send_err(fd, 400, "Bad Request", @"invalid_arg", @"invalid argument");
     } else {
         send_json(fd, 500, "Internal Server Error",
-                  json_str(@{ @"ok": @NO, @"action": @(action), @"name": name,
+                  json_str(@{ @"ok": @NO, @"action": @(action), @"id": @(idText), @"name": name,
                               @"error": @{ @"rc": @(rc) } }));
     }
 }
@@ -537,14 +494,24 @@ static int auth_ok(const HttpReq *r) {
 
 /* Run a block synchronously on the main queue (where the core lives). */
 static void on_main(dispatch_block_t block) {
-    if ([NSThread isMainThread]) block();
-    else dispatch_sync(dispatch_get_main_queue(), block);
+    if ([NSThread isMainThread]) {
+        if (!g_stop_all) block();
+        return;
+    }
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
+        if (!g_stop_all) block();
+        dispatch_semaphore_signal(done);
+    });
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
 }
 
 /* ---- SSE client thread (write-only; never touches the core) ---- */
 
 static void *sse_thread(void *param) {
-    int fd = (int)(intptr_t)param;
+    ApiClient *client = param;
+    int fd = client->fd;
     pthread_detach(pthread_self());
 
     struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
@@ -597,7 +564,7 @@ static void *sse_thread(void *param) {
         }
         for (int i = 0; i < nframes; i++) free(frames[i]);
     }
-    close(fd);
+    client_close(client);
     return NULL;
 }
 
@@ -612,11 +579,8 @@ static void cleanup_and_exit(int code) {
     static int done = 0;
     if (done) return;
     done = 1;
-    g_stop_all = 1;
-    pthread_cond_broadcast(&g_ev_cv);
-    hlog(@"stopping: deleting discovery, cleaning up (VMs terminate with the daemon).");
-    delete_discovery();
-    if (g_listen_fd >= 0) close(g_listen_fd);
+    asb_api_stop();
+    hlog(@"stopping: cleaning up (VMs terminate with the application).");
     /* Orderly teardown of agent/proxy/clipboard threads; the VZ VMs themselves
        are in-process and terminate with us -- the daemon owns its VMs. */
     NSArray<NSString *> *diskPaths = vm_disk_ownership_paths();
@@ -637,15 +601,13 @@ static int handle_request(int fd, HttpReq *r) {
     BOOL isGET    = strcmp(r->method, "GET") == 0;
     BOOL isPOST   = strcmp(r->method, "POST") == 0;
     BOOL isPUT    = strcmp(r->method, "PUT") == 0;
-    /* (no bare DELETE routes on macOS -- snapshots/templates 501 before the
-       method matters, and VM delete is POST /vms/{name}/delete.) */
 
     /* /v1/version is open; everything else requires the token. */
     if (isGET && [path isEqualToString:@"/v1/version"]) {
         send_json(fd, 200, "OK", json_str(@{
             @"product": @"AppSandbox", @"version": product_version(),
             @"apiVersion": @ASB_API_VERSION, @"hostOs": @"macOS",
-            @"capabilities": @{ @"snapshots": @NO, @"templates": @NO } }));
+            @"capabilities": @{ @"snapshots": @NO, @"templates": @YES } }));
         return 0;
     }
     if (!auth_ok(r)) {
@@ -657,14 +619,14 @@ static int handle_request(int fd, HttpReq *r) {
     /* SSE event stream -- handed to a dedicated thread. */
     if (isGET && [path isEqualToString:@"/v1/events"]) {
         pthread_t t;
-        if (pthread_create(&t, NULL, sse_thread, (void *)(intptr_t)fd) == 0)
+        if (pthread_create(&t, NULL, sse_thread, g_serving_client) == 0)
             return 2;   /* socket ownership moved to the SSE thread */
         send_err(fd, 500, "Internal Server Error", @"thread", @"spawn failed");
         return 0;
     }
 
     if (isGET && [path isEqualToString:@"/v1/host"]) {
-        __block NSDictionary *info;
+        __block NSDictionary *info = nil;
         on_main(^{
             int vmCores = 0, vmRamMb = 0, vmHddGb = 0;
             int count = asb_mac_vm_count();
@@ -685,9 +647,24 @@ static int handle_request(int fd, HttpReq *r) {
         return 0;
     }
 
-    /* ---- Templates: not a macOS feature (capabilities.templates=false) ---- */
-    if ([path hasPrefix:@"/v1/templates"]) {
-        send_501(fd, @"templates");
+    if (isGET && [path isEqualToString:@"/v1/templates"]) {
+        __block NSArray *templates;
+        on_main(^{ templates = asb_mac_templates(); });
+        send_json(fd, 200, "OK", json_str(@{ @"templates": templates }));
+        return 0;
+    }
+    if (strcmp(r->method, "DELETE") == 0 && [path hasPrefix:@"/v1/templates/"]) {
+        NSString *name = [path substringFromIndex:14];
+        __block int rc = BACKEND_ERR_NOT_FOUND;
+        __block AsbVmId identity = 0;
+        on_main(^{
+            AsbVmMac *vm = asb_mac_vm_find(name.UTF8String);
+            if (vm && vm->template_ready) {
+                identity = vm->unique_id;
+                rc = asb_mac_vm_delete(identity);
+            }
+        });
+        send_rc(fd, "deleteTemplate", name, identity, rc);
         return 0;
     }
 
@@ -699,7 +676,7 @@ static int handle_request(int fd, HttpReq *r) {
                 int count = asb_mac_vm_count();
                 for (int i = 0; i < count; i++) {
                     AsbVmMac *v = asb_mac_vm_get(i);
-                    if (v) [vms addObject:vm_status_dict(v)];
+                    if (v && !v->template_ready) [vms addObject:asb_mac_vm_snapshot(v)];
                 }
             });
             send_json(fd, 200, "OK", json_str(@{ @"vms": vms }));
@@ -721,72 +698,79 @@ static int handle_request(int fd, HttpReq *r) {
             NSString *pass = b[@"adminPass"];
             int ram = [b[@"ramMb"] intValue], hdd = [b[@"hddGb"] intValue];
             int cpu = [b[@"cpuCores"] intValue], gpu = [b[@"gpuMode"] intValue];
-            int net = [b[@"networkMode"] intValue];
+            int net = b[@"networkMode"] ? [b[@"networkMode"] intValue] : 1;
             BOOL sshEnabled = [b[@"sshEnabled"] boolValue];
             BOOL sshDeploy  = [b[@"sshDeployKey"] boolValue];
             BOOL testMode   = [b[@"testMode"] boolValue];
             BOOL isTemplate = [b[@"isTemplate"] boolValue];
+            NSString *templateName = [b[@"templateName"] isKindOfClass:[NSString class]] ? b[@"templateName"] : @"";
+            NSString *templateId = [b[@"templateId"] isKindOfClass:[NSString class]] ? b[@"templateId"] : @"";
+            AsbVmId templateIdentity = asb_vm_id_parse(templateId.UTF8String);
+            if (templateId.length && !templateIdentity) {
+                send_err(fd, 400, "Bad Request", @"invalid_arg", @"Invalid template ID.");
+                return 0;
+            }
 
             if (sshDeploy && !sshEnabled) {
                 send_err(fd, 400, "Bad Request", @"invalid_arg",
                          @"sshDeployKey requires sshEnabled");
                 return 0;
             }
-            __block NSString *verr;
+            __block NSString *verr = nil;
             on_main(^{
-                verr = validate_create_mac(name, os, user, pass, isTemplate,
+                verr = validate_create_mac(name, os, user, pass,
                                            ram, hdd, cpu, gpu, net, diskDirectory);
             });
             if (verr) {
                 send_err(fd, 400, "Bad Request", @"invalid_arg", verr);
                 return 0;
             }
-            /* Windows-on-Mac is a from-scratch ISO install: the ISO is mandatory. */
-            if ([os.lowercaseString isEqualToString:@"windows"] && img.length == 0) {
+            if ([os.lowercaseString isEqualToString:@"windows"] && img.length == 0 && !templateName.length && !templateIdentity) {
                 send_err(fd, 400, "Bad Request", @"invalid_arg",
                          @"A Windows ISO (imagePath) is required to create a Windows VM.");
                 return 0;
             }
 
-            /* Async create (202 then events/status), like Windows -- and the
-               admin-authorization prompt inside create must not block the
-               request loop, so this is dispatch_async, not sync. A sync
-               failure (auth denied, dir create, ...) surfaces as an alert
-               event + the VM never appearing, exactly the async-create
-               contract clients already handle. */
-            dispatch_async(dispatch_get_main_queue(), ^{
-                int rc = asb_mac_vm_create(name.UTF8String, os.UTF8String,
-                                           ram, hdd, cpu, gpu, net,
-                                           img.length ? img.UTF8String : NULL,
-                                           diskDirectory.UTF8String,
-                                           user.UTF8String, pass.UTF8String,
-                                           sshEnabled, sshDeploy, testMode);
-                if (rc != BACKEND_OK)
-                    hlog(@"create '%@' failed rc=%d (alert event posted)", name, rc);
+            __block int rc = BACKEND_ERR_FAILED;
+            __block AsbVmId vm_id = 0;
+            on_main(^{
+                if (g_stop_all) return;
+                rc = asb_mac_vm_create(name.UTF8String, os.UTF8String,
+                                       ram, hdd, cpu, gpu, net,
+                                       img.length ? img.UTF8String : NULL,
+                                       diskDirectory.UTF8String,
+                                       user.UTF8String, pass.UTF8String,
+                                       sshEnabled, sshDeploy, testMode, isTemplate, templateIdentity,
+                                       templateName.UTF8String);
+                AsbVmMac *vm = rc == BACKEND_OK ? asb_mac_vm_find(name.UTF8String) : NULL;
+                if (vm) vm_id = vm->unique_id;
             });
-            send_json(fd, 202, "Accepted",
-                      json_str(@{ @"ok": @YES, @"accepted": @YES,
-                                  @"action": @"createVm", @"name": name }));
+            send_rc(fd, "createVm", name, vm_id, rc);
             return 0;
         }
     }
 
-    /* ---- /v1/vms/{name}[/sub] ---- */
-    if ([path hasPrefix:@"/v1/vms/"]) {
-        NSString *rest = [path substringFromIndex:8];
+    if ([path hasPrefix:@"/v1/vms/"] || [path hasPrefix:@"/v1/vm-ids/"]) {
+        BOOL byID = [path hasPrefix:@"/v1/vm-ids/"];
+        NSString *rest = [path substringFromIndex:byID ? 11 : 8];
         NSRange slash = [rest rangeOfString:@"/"];
-        NSString *name = (slash.location == NSNotFound)
+        NSString *target = (slash.location == NSNotFound)
                              ? rest : [rest substringToIndex:slash.location];
         NSString *sub  = (slash.location == NSNotFound)
                              ? nil  : [rest substringFromIndex:slash.location + 1];
-        if (name.length == 0 || name.length > 255) {
+        if (target.length == 0 || target.length > 255) {
             send_err(fd, 400, "Bad Request", @"invalid_arg", @"bad VM name");
             return 0;
         }
 
-        __block BOOL exists = NO;
-        on_main(^{ exists = asb_mac_vm_find(name.UTF8String) != NULL; });
-        if (!exists) {
+        __block AsbVmId vm_id = 0;
+        __block NSString *name = target;
+        on_main(^{
+            AsbVmMac *v = byID ? asb_mac_vm_find_by_id(asb_vm_id_parse(target.UTF8String))
+                              : asb_mac_vm_find(target.UTF8String);
+            if (v) { vm_id = v->unique_id; name = @(v->name); }
+        });
+        if (!vm_id) {
             send_err(fd, 404, "Not Found", @"not_found", @"no such VM");
             return 0;
         }
@@ -795,8 +779,8 @@ static int handle_request(int fd, HttpReq *r) {
             if (isGET) {
                 __block NSDictionary *st = nil;
                 on_main(^{
-                    AsbVmMac *v = asb_mac_vm_find(name.UTF8String);
-                    if (v) st = vm_status_dict(v);
+                    AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
+                    if (v) st = asb_mac_vm_snapshot(v);
                 });
                 if (!st) send_err(fd, 404, "Not Found", @"not_found", @"no such VM");
                 else     send_json(fd, 200, "OK", json_str(st));
@@ -806,8 +790,8 @@ static int handle_request(int fd, HttpReq *r) {
                 NSDictionary *b = parse_body(r);
                 __block int conflict = 0;
                 on_main(^{
-                    AsbVmMac *v = asb_mac_vm_find(name.UTF8String);
-                    if (v && vm_installing(v)) conflict = 2;
+                    AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
+                    if (v && asb_mac_vm_is_building(v)) conflict = 2;
                     else if (v && v->running)  conflict = 1;
                 });
                 if (conflict == 2) {
@@ -843,9 +827,9 @@ static int handle_request(int fd, HttpReq *r) {
                 }
                 if (b[@"networkMode"]) {
                     int iv = [b[@"networkMode"] intValue];
-                    if (iv < 0 || iv > 3) {
+                    if (iv != 1) {
                         send_err(fd, 400, "Bad Request", @"invalid_arg",
-                                 @"networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal)");
+                                 @"networkMode must be 1 (NAT) on macOS; other modes are not implemented");
                         return 0;
                     }
                 }
@@ -855,15 +839,15 @@ static int handle_request(int fd, HttpReq *r) {
                     for (NSString *field in @[@"ramMb", @"cpuCores", @"gpuMode", @"networkMode"]) {
                         if (!b[field]) continue;
                         NSString *val = [NSString stringWithFormat:@"%d", [b[field] intValue]];
-                        int frc = asb_mac_vm_edit(name.UTF8String, field.UTF8String, val.UTF8String);
+                        int frc = asb_mac_vm_edit(vm_id, field.UTF8String, val.UTF8String);
                         if (frc != BACKEND_OK) rc = frc;
                     }
                     asb_mac_save();
-                    AsbVmMac *v = asb_mac_vm_find(name.UTF8String);
-                    if (v) st = vm_status_dict(v);
+                    AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
+                    if (v) st = asb_mac_vm_snapshot(v);
                 });
                 if (rc == BACKEND_OK && st) send_json(fd, 200, "OK", json_str(st));
-                else                        send_rc(fd, "editVm", name, rc);
+                else                        send_rc(fd, "editVm", name, vm_id, rc);
                 return 0;
             }
             send_err(fd, 405, "Method Not Allowed", @"method", @"unsupported method");
@@ -875,30 +859,30 @@ static int handle_request(int fd, HttpReq *r) {
             /* snapIndex/branchIndex bodies are a snapshot feature -> ignored
                (capabilities.snapshots=false; the GUI has no snapshot UI on
                macOS either). A plain start boots the current disk. */
-            __block int rc;
-            on_main(^{ rc = asb_mac_vm_start(name.UTF8String); });
-            send_rc(fd, "start", name, rc);
+            __block int rc = BACKEND_ERR_FAILED;
+            on_main(^{ rc = asb_mac_vm_start(vm_id); });
+            send_rc(fd, "start", name, vm_id, rc);
             return 0;
         }
         if (isPOST && [sub isEqualToString:@"shutdown"]) {
-            __block int rc;
-            on_main(^{ rc = asb_mac_vm_stop(name.UTF8String, 0); });
-            send_rc(fd, "shutdown", name, rc);
+            __block int rc = BACKEND_ERR_FAILED;
+            on_main(^{ rc = asb_mac_vm_stop(vm_id, 0); });
+            send_rc(fd, "shutdown", name, vm_id, rc);
             return 0;
         }
         if (isPOST && [sub isEqualToString:@"stop"]) {
-            __block int rc;
-            on_main(^{ rc = asb_mac_vm_stop(name.UTF8String, 1); });
-            send_rc(fd, "stop", name, rc);
+            __block int rc = BACKEND_ERR_FAILED;
+            on_main(^{ rc = asb_mac_vm_stop(vm_id, 1); });
+            send_rc(fd, "stop", name, vm_id, rc);
             return 0;
         }
         if (isPOST && [sub isEqualToString:@"delete"]) {
             __block int conflict = 0;
             __block int rc = BACKEND_OK;
             on_main(^{
-                AsbVmMac *v = asb_mac_vm_find(name.UTF8String);
-                if (v && vm_installing(v)) conflict = 1;   /* iso-patch-mac owns the disk */
-                else rc = asb_mac_vm_delete(name.UTF8String);
+                AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
+                if (v && asb_mac_vm_is_building(v)) conflict = 1;   /* iso-patch-mac owns the disk */
+                else rc = asb_mac_vm_delete(vm_id);
             });
             if (conflict) {
                 send_err(fd, 409, "Conflict", @"vm_building",
@@ -906,14 +890,14 @@ static int handle_request(int fd, HttpReq *r) {
                          @"wait for the install to finish, then delete");
                 return 0;
             }
-            send_rc(fd, "delete", name, rc);
+            send_rc(fd, "delete", name, vm_id, rc);
             return 0;
         }
 
         if (isGET && [sub isEqualToString:@"sshInfo"]) {
             __block NSDictionary *info = nil;
             on_main(^{
-                AsbVmMac *v = asb_mac_vm_find(name.UTF8String);
+                AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
                 if (!v) return;
                 info = @{ @"host": @"127.0.0.1",
                           @"port": @(v->ssh_port),
@@ -931,7 +915,7 @@ static int handle_request(int fd, HttpReq *r) {
             BOOL isDELETE = strcmp(r->method, "DELETE") == 0;
             if (isPOST) {   /* open (or focus) the display window */
                 __block int rc = BACKEND_OK;
-                on_main(^{ rc = asb_mac_open_display(name.UTF8String); });
+                on_main(^{ rc = asb_mac_open_display(vm_id); });
                 if (rc == BACKEND_OK)
                     send_json(fd, 200, "OK",
                               json_str(@{ @"ok": @YES, @"displayOpen": @YES }));
@@ -953,7 +937,7 @@ static int handle_request(int fd, HttpReq *r) {
                 return 0;
             }
             if (isDELETE) {   /* close the window (no-op if already closed) */
-                on_main(^{ asb_mac_close_display(name.UTF8String); });
+                on_main(^{ asb_mac_close_display(vm_id); });
                 send_json(fd, 200, "OK",
                           json_str(@{ @"ok": @YES, @"displayOpen": @NO }));
                 return 0;
@@ -965,7 +949,7 @@ static int handle_request(int fd, HttpReq *r) {
                    driver is up (idd_ready) -- matching the open precondition (asb_mac_open_display). */
                 __block BOOL open = NO, ready = NO;
                 on_main(^{
-                    AsbVmMac *v = asb_mac_vm_find(name.UTF8String);
+                    AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
                     if (!v) return;
                     BOOL is_win = (strcasecmp(v->os_type, "Windows") == 0);
                     open  = (v->display != nil && !v->display.userClosed);
@@ -1000,7 +984,7 @@ static int handle_request(int fd, HttpReq *r) {
             int count = asb_mac_vm_count();
             for (int i = 0; i < count; i++) {
                 AsbVmMac *v = asb_mac_vm_get(i);
-                if (v && (v->running || vm_installing(v)))
+                if (v && (v->running || v->starting || asb_mac_vm_is_building(v)))
                     [active addObject:@(v->name)];
             }
         });
@@ -1027,28 +1011,51 @@ static int handle_request(int fd, HttpReq *r) {
 static void *server_thread(void *param) {
     (void)param;
     while (!g_stop_all) {
+        struct pollfd listener = { .fd = g_listen_fd, .events = POLLIN };
+        int ready = poll(&listener, 1, 100);
+        if (g_stop_all) break;
+        if (ready < 0) { if (errno == EINTR) continue; break; }
+        if (!ready) continue;
+        if (!(listener.revents & POLLIN)) break;
         int fd = accept(g_listen_fd, NULL, NULL);
         if (fd < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             break;   /* listener closed -> shutting down */
         }
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) { close(fd); continue; }
         struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
+        ApiClient *client = calloc(1, sizeof(*client));
+        if (!client) { close(fd); continue; }
+        client->fd = fd;
+        pthread_mutex_lock(&g_clients_mu);
+        client->next = g_clients; g_clients = client;
+        if (g_stop_all) shutdown(fd, SHUT_RDWR);
+        pthread_mutex_unlock(&g_clients_mu);
+        g_serving_client = client;
         HttpReq req;
-        if (read_request(fd, &req) != 0) { close(fd); continue; }
+        if (read_request(fd, &req) != 0 || g_stop_all) { client_close(client); continue; }
 
         int rc;
         @autoreleasepool { rc = handle_request(fd, &req); }
-        if (rc != 2) close(fd);          /* 2 = SSE thread owns the socket */
+        if (rc != 2) client_close(client);          /* 2 = SSE thread owns the socket */
         if (rc == 1) {                   /* POST /v1/shutdown accepted */
-            dispatch_async(dispatch_get_main_queue(), ^{ cleanup_and_exit(0); });
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (g_gui_mode) {
+                    asb_api_stop();
+                    asb_mac_cleanup();
+                    [NSApp terminate:nil];
+                } else cleanup_and_exit(0);
+            });
             break;
         }
     }
+    g_server_done = 1;
     return NULL;
 }
 
@@ -1065,6 +1072,8 @@ static int http_start(int *out_port) {
         a.sin_port = htons((uint16_t)port);
         if (bind(fd, (struct sockaddr *)&a, sizeof(a)) == 0 &&
             listen(fd, 16) == 0) {
+            int flags = fcntl(fd, F_GETFL, 0);
+            if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { close(fd); continue; }
             g_listen_fd = fd;
             *out_port = port;
             hlog(@"listening on http://127.0.0.1:%d/", port);
@@ -1075,6 +1084,56 @@ static int http_start(int *out_port) {
     }
     hlog(@"FATAL: no free port in %d..%d.", DEFAULT_PORT, DEFAULT_PORT + PORT_TRIES - 1);
     return 0;
+}
+
+int asb_api_start(int with_gui) {
+    if (g_api_started) return 1;
+    if (!asb_host_prepare_user()) return 0;
+    g_gui_mode = with_gui != 0;
+    g_stop_all = 0;
+    signal(SIGPIPE, SIG_IGN);
+    if (!g_log) open_log();
+    chown_to_user([support_dir() stringByAppendingPathComponent:@"headless.log"]);
+    chown_to_user([support_dir() stringByAppendingPathComponent:@"instance.lock"]);
+    fix_tree_ownership_soon();
+    gen_token();
+    int port = 0;
+    if (!http_start(&port)) return 0;
+    g_api_subscription = asb_events_subscribe(headless_event_cb, NULL);
+    if (!g_api_subscription) { close(g_listen_fd); g_listen_fd = -1; return 0; }
+    g_server_done = 0;
+    if (pthread_create(&g_server_thread, NULL, server_thread, NULL) != 0) {
+        g_server_done = 1;
+        asb_events_unsubscribe(g_api_subscription);
+        close(g_listen_fd); g_listen_fd = -1;
+        return 0;
+    }
+    g_api_started = YES;
+    write_discovery(port);
+    return 1;
+}
+
+void asb_api_stop(void) {
+    if (!g_api_started) return;
+    g_api_started = NO;
+    g_stop_all = 1;
+    asb_events_unsubscribe(g_api_subscription);
+    delete_discovery();
+    shutdown(g_listen_fd, SHUT_RDWR);
+    pthread_mutex_lock(&g_ev_mu);
+    pthread_cond_broadcast(&g_ev_cv);
+    pthread_mutex_unlock(&g_ev_mu);
+    pthread_mutex_lock(&g_clients_mu);
+    for (ApiClient *c = g_clients; c; c = c->next) shutdown(c->fd, SHUT_RDWR);
+    pthread_mutex_unlock(&g_clients_mu);
+    while (!g_server_done)
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
+    pthread_join(g_server_thread, NULL);
+    close(g_listen_fd); g_listen_fd = -1;
+    pthread_mutex_lock(&g_clients_mu);
+    while (g_clients) pthread_cond_wait(&g_clients_cv, &g_clients_mu);
+    pthread_mutex_unlock(&g_clients_mu);
+    fix_tree_ownership_now(vm_disk_ownership_paths());
 }
 
 /* ---- Entry ---- */
@@ -1094,7 +1153,7 @@ int run_headless(int argc, const char *argv[]) {
        protects the GUI, so we must check it ourselves. */
     {
         NSString *minStr = [NSBundle mainBundle].infoDictionary[@"LSMinimumSystemVersion"];
-        if (!minStr.length) minStr = @"26.0";
+        if (!minStr.length) minStr = @"27.0";
         NSArray<NSString *> *p = [minStr componentsSeparatedByString:@"."];
         NSOperatingSystemVersion minV = {0};
         if (p.count > 0) minV.majorVersion = [p[0] integerValue];
@@ -1109,12 +1168,6 @@ int run_headless(int argc, const char *argv[]) {
         }
     }
 
-    /* (2) Virtualization capability -- the runtime analogue of Windows'
-       VirtualMachinePlatform check. False on Intel Macs (no Apple-silicon VM
-       support) or where the hypervisor/entitlement is unavailable. This also
-       supersedes the old compile-time __arm64__ guard (an arm64 binary can't
-       even launch on Intel, so the meaningful gate is the capability, not the
-       arch). */
     if (![VZVirtualMachine isSupported]) {
         fprintf(stderr, "AppSandbox --headless: Virtualization is not supported on "
                 "this Mac (Apple silicon + the Hypervisor entitlement are required).\n");
@@ -1171,14 +1224,10 @@ int run_headless(int argc, const char *argv[]) {
     /* Headless BEFORE init/any start: gates the display window, clipboard,
        and VM audio devices (see asb_mac_set_headless). */
     asb_mac_set_headless(YES);
-    asb_mac_set_event_cb(headless_event_cb);
     asb_mac_init();
     hlog(@"core initialized (%d VMs).", asb_mac_vm_count());
 
-    gen_token();
-    int port = 0;
-    if (!http_start(&port)) { asb_mac_cleanup(); return 1; }
-    write_discovery(port);
+    if (!asb_api_start(0)) { asb_mac_cleanup(); return 1; }
 
     /* SIGINT/SIGTERM -> clean exit (delete discovery, terminate VMs). */
     signal(SIGINT, SIG_IGN);
@@ -1193,14 +1242,6 @@ int run_headless(int argc, const char *argv[]) {
     dispatch_source_set_event_handler(s_term, ^{ cleanup_and_exit(0); });
     dispatch_resume(s_term);
 
-    pthread_t server;
-    if (pthread_create(&server, NULL, server_thread, NULL) != 0) {
-        hlog(@"FATAL: server thread failed.");
-        delete_discovery();
-        asb_mac_cleanup();
-        return 1;
-    }
-
     /* Main run loop. Both [NSApp run] and CFRunLoopRun drain the MAIN DISPATCH
        QUEUE -- where every VZ op, agent callback, and core mutation runs -- so
        the daemon behaves identically either way (and the SIGINT/SIGTERM dispatch
@@ -1214,6 +1255,9 @@ int run_headless(int argc, const char *argv[]) {
         hlog(@"entering AppKit run loop (console GUI session -- display windows available).");
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        g_headless_delegate = [[AppDelegate alloc] init];
+        g_headless_delegate.headlessQuitHandler = ^{ cleanup_and_exit(0); };
+        [NSApp setDelegate:g_headless_delegate];
         [NSApp run];
     } else {
         hlog(@"entering bare CFRunLoop (no GUI session -- display unavailable).");

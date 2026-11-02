@@ -450,6 +450,7 @@ void hcs_set_monitor_hwnd(HWND hwnd)
 static DWORD WINAPI vm_monitor_thread_proc(LPVOID param)
 {
     VmInstance *inst = (VmInstance *)param;
+    BOOL detected_exit = FALSE;
 
     hcs_cb_log(L"Monitor: started for \"%s\"", inst->name);
 
@@ -492,11 +493,10 @@ static DWORD WINAPI vm_monitor_thread_proc(LPVOID param)
                     hcs_cb_log(L"Monitor: props query failed 0x%08X for \"%s\"",
                                hr, inst->name);
                     /* If callbacks are dead and query fails, VM is likely gone */
-                    if (inst->callbacks_dead && inst->running && g_monitor_hwnd) {
+                    if (inst->callbacks_dead && inst->running) {
                         hcs_cb_log(L"Monitor: forcing cleanup for \"%s\" "
                                    L"(callbacks dead + query failed)", inst->name);
-                        PostMessageW(g_monitor_hwnd, WM_VM_MONITOR_DETECTED,
-                                     0, (LPARAM)inst);
+                        detected_exit = TRUE;
                         break;
                     }
                 } else if (result_doc) {
@@ -506,9 +506,7 @@ static DWORD WINAPI vm_monitor_thread_proc(LPVOID param)
                         hcs_cb_log(L"Monitor: VM \"%s\" stopped (callback missed). "
                                    L"State: %.200s", inst->name, result_doc);
                         LocalFree(result_doc);
-                        if (g_monitor_hwnd)
-                            PostMessageW(g_monitor_hwnd, WM_VM_MONITOR_DETECTED,
-                                         0, (LPARAM)inst);
+                        detected_exit = TRUE;
                         break;
                     }
                     LocalFree(result_doc);
@@ -533,7 +531,7 @@ static DWORD WINAPI vm_monitor_thread_proc(LPVOID param)
                 hcs_cb_log(L"Monitor: shutdown watchdog for \"%s\" "
                            L"(%llu seconds)", inst->name, elapsed);
                 PostMessageW(g_monitor_hwnd, WM_VM_SHUTDOWN_TIMEOUT,
-                             (WPARAM)elapsed, (LPARAM)inst);
+                             (WPARAM)elapsed, (LPARAM)inst->unique_id);
             } else if (elapsed > 30) {
                 hcs_cb_log(L"Monitor: waiting for shutdown of \"%s\" "
                            L"(%llu seconds)...", inst->name, elapsed);
@@ -542,6 +540,8 @@ static DWORD WINAPI vm_monitor_thread_proc(LPVOID param)
     }
 
     hcs_cb_log(L"Monitor: exiting for \"%s\"", inst->name);
+    if (detected_exit && g_state_callback)
+        g_state_callback(inst, HCS_NOTIFY_SYSTEM_EXITED);
     return 0;
 }
 
@@ -573,7 +573,8 @@ void hcs_stop_monitor(VmInstance *instance)
     instance->monitor_stop = TRUE;
     if (instance->monitor_stop_event)
         SetEvent(instance->monitor_stop_event);
-    WaitForSingleObject(instance->monitor_thread, 5000);
+    if (GetThreadId(instance->monitor_thread) != GetCurrentThreadId())
+        WaitForSingleObject(instance->monitor_thread, 5000);
     CloseHandle(instance->monitor_thread);
     instance->monitor_thread = NULL;
     if (instance->monitor_stop_event) {

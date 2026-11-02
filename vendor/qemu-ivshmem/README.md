@@ -1,19 +1,25 @@
 # QEMU + ivshmem (macOS/HVF)
 
 The patched QEMU that gives a Windows guest a shared-memory BAR (ivshmem-plain) on macOS/HVF,
-vendored and embedded into AppSandbox.app.
+vendored and embedded into AppSandbox.app for Mac hosts.
 
 ## Source of truth
-The QEMU source is our fork **github.com/jamesstringer90/asb-qemu**, branch
-**`asb-ivshmem-11.0.1`** = upstream tag `v11.0.1` + 3 ivshmem commits (Kconfig LINUX gate, meson
-eventfd gate, `event_notifier_init_fd` unconditional). The fork is our GPL corresponding-source;
-there are no local patch files (the changes live as commits on the branch).
+The QEMU source is our public [asb-qemu fork](https://github.com/jamesstringer90/asb-qemu),
+branch **`asb-ivshmem-11.1.3`**, based on upstream **`v11.1.3`**. The exact commit is pinned in
+[source-version.json](source-version.json). The fork preserves four ivshmem changes:
+
+- Build the device on hosts without eventfd, including macOS.
+- Provide `event_notifier_init_fd` on those hosts.
+- Remove the device's Linux-only Kconfig restriction.
+- Keep the optional `x-device-id` override for a second ivshmem device.
+
+The fork is our GPL corresponding source; changes live as commits on the branch.
 
 ## Pipeline
 ```
-RARE, manual (needs brew/meson/ninja):
-  ./build-qemu.sh    # clone the fork @ asb-ivshmem-11.0.1, minimal raw-hypervisor configure, ninja
-                     #   -> <asb-win-on-mac>/runtime/qemu/bin/qemu-system-aarch64-ivshmem
+RARE, manual (needs meson, ninja, pkg-config and glib):
+  ./build-qemu.sh    # build the pinned fork commit, with two compiler jobs by default
+                     #   -> qemu-build/qemu/bin/qemu-system-aarch64-ivshmem
   ./stage.sh         # gather binary + dylib closure into dist/, rewrite install-names to
                      #   @loader_path/../lib, codesign with qemu.entitlements (HVF!), gzip firmware
                      #   -> dist/  (committed)
@@ -21,6 +27,10 @@ RARE, manual (needs brew/meson/ninja):
 EVERY Xcode build (the only script Xcode runs):
   embed-into-bundle.sh   # "Embed QEMU" build phase: copies dist/ -> AppSandbox.app/.../Resources/qemu
 ```
+
+Set `ASB_QEMU_BUILD_JOBS` to change build parallelism. The build refuses to overwrite source
+edits. Update the source pin and rebuild/stage together when upgrading; `dist/VERSIONS.txt`
+records the revision that produced the bundled binary.
 
 ## Files (committed)
 - `build-qemu.sh` — build QEMU from the fork (rare; needs the toolchain).

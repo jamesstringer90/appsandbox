@@ -23,7 +23,7 @@ Windows features:
 
 Mac features:
 - macOS or Windows 11 ARM VM support
-- Zero touch install for Windows 11, macOS has 3 unskippable onboarding steps
+- Zero touch install for Windows 11 and macOS
 - Copy and Paste
 - 2 Channel Audio
 - macOS: GPU Acceleration via Paravirtualization with support for Metal, Windows: No GPU Acceleration
@@ -33,7 +33,7 @@ Mac features:
 - Headless mode: the same scriptable local HTTP/JSON API + Python SDK (`asb.py`) as on Windows, for driving macOS and Windows 11 VMs programmatically
 
 Requirements:
-Windows 11 with an x64 Processor or macOS Tahoe (M Series)
+Windows 11 with an x64 Processor or macOS 27 or newer (M Series)
 
 ## About App Sandbox
 
@@ -41,7 +41,7 @@ App Sandbox creates and runs full desktop virtual machines — Windows 11, Ubunt
 macOS. It is free and open-source (MIT), distributed as prebuilt binaries (EV-signed on
 Windows, Apple-Developer-signed on macOS) on its
 [Releases](https://github.com/jamesstringer90/appsandbox/releases) page. It is driven two
-ways: from a graphical UI, or programmatically through a headless daemon with a
+ways: from a graphical UI, or programmatically through the local API with a
 dependency-free Python SDK (`asb.py`). Either way you pick an OS, point it at an installer
 image, and App Sandbox provisions the disk, runs an unattended install, and boots the
 guest. You supply a Windows or Ubuntu ISO; macOS guests download their restore image
@@ -67,18 +67,18 @@ Virtual Machine Platform is the same Windows feature WSL2 uses.
 - Scripting the VM lifecycle from code — create, snapshot, branch, SSH into, and delete
   GPU-accelerated VMs — with the Python SDK.
 
-**Headless API.** 
-`appsandbox.exe --headless` 
-(or `sudo /Appsandbox.app/Contents/MacOS/AppSandbox --headless` on macOS) starts a
-single-owner daemon that hosts the same core as the GUI and exposes it as a Docker-style
-local HTTP/JSON API on `127.0.0.1`, identical on both platforms. The stdlib-only Python SDK
+**Headless API.** The GUI automatically exposes the local HTTP/JSON API on `127.0.0.1`.
+`appsandbox.exe --headless` (or
+`sudo /Applications/AppSandbox.app/Contents/MacOS/AppSandbox --headless` on macOS)
+runs the same core without the management UI or automatic viewers. `-headless` is
+also supported; only one core process can run at a time. The stdlib-only Python SDK
 (`asb.py`) wraps it: create GPU-accelerated VMs (GPU-PV is a `gpuMode` create option), SSH
 in over an auto-deployed key (Windows, Ubuntu, or macOS guests), snapshot and branch them,
 open the live display, and run several at once — how many run concurrently is bounded by host
 CPU, RAM, and GPU memory, not by a fixed limit. The daemon is single-host — it drives VMs on
 the machine it runs on and does not provision cloud VMs; for CI, run it on a self-hosted
-runner. Provisioning a VM runs a full unattended install; snapshots, branches, and templates
-(Windows-only) start a new VM from a provisioned state instead of reinstalling. A VM persists
+runner. Snapshots and branches are Windows-host-only. Templates support Windows guests
+on both hosts and macOS guests on Mac hosts, avoiding a fresh OS installation. A VM persists
 until deleted. A snapshot is a disk-state checkpoint taken with the VM stopped, and a branch
 forks a writable disk from it to run divergent actions. The full API reference and runnable
 examples are in [`tools/headless-api/`](tools/headless-api/).
@@ -98,6 +98,13 @@ Sandbox uses Apple's **Virtualization.framework** (`VZVirtualMachine`, `VZMacOSI
 over **virtio-vsock**. On Windows, Linux (Ubuntu) guests reach the GPU through a custom
 DRM/KMS kernel module (`asb_drm`), Microsoft's WSL2 `dxgkrnl`, and a custom Mesa build. The
 apps are native C / Objective-C with an HTML/JS UI (WebView2 on Windows, WKWebView on macOS).
+
+Windows guests on macOS use **QEMU 11.1.3** with HVF acceleration, built from our
+public [asb-qemu fork](https://github.com/jamesstringer90/asb-qemu/tree/asb-ivshmem-11.1.3).
+It preserves our four ivshmem changes, including support on macOS and the optional
+`x-device-id` override. QEMU, its libraries, and firmware ship inside the macOS app.
+See the [QEMU build notes](vendor/qemu-ivshmem/README.md) for the pinned source and
+rebuild instructions.
 
 # Tips:
 The default username is `user` and the default password is `test123`

@@ -12,6 +12,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 QEMU_BIN="$HERE/qemu-build/qemu/bin/qemu-system-aarch64-ivshmem"   # build-qemu.sh output (in-repo)
 FW_DIR="$HERE/firmware"                                   # vendored gzipped EDK2 firmware (in-repo)
 DIST="$HERE/dist"
+REVISION="$(plutil -extract revision raw -o - "$HERE/source-version.json")"
+BRANCH="$(plutil -extract branch raw -o - "$HERE/source-version.json")"
+UPSTREAM="$(plutil -extract upstreamTag raw -o - "$HERE/source-version.json")"
+BUILT_REVISION="$(cat "$HERE/qemu-build/qemu/SOURCE_REVISION" 2>/dev/null || true)"
+[ "$BUILT_REVISION" = "$REVISION" ] || { echo "ERROR: rebuild QEMU at the pinned source revision before staging" >&2; exit 1; }
+
+# Refuse to silently bundle different dependencies than the corresponding source/notice pins.
+for dependency in glib gettext pcre2; do
+  expected="$(plutil -extract "dependencies.$dependency" raw -o - "$HERE/source-version.json")"
+  actual="$(python3 -c 'import os,sys; print(os.path.basename(os.path.realpath(sys.argv[1])))' "/opt/homebrew/opt/$dependency")"
+  [ "$actual" = "$expected" ] || { echo "ERROR: $dependency version $actual differs from pinned $expected" >&2; exit 1; }
+done
 
 [ -x "$QEMU_BIN" ] || { echo "ERROR: build the fork qemu first (./build-qemu.sh)"; exit 1; }
 for f in edk2-aarch64-code.fd.gz edk2-arm-vars.fd.gz; do
@@ -68,9 +80,9 @@ cp "$FW_DIR/edk2-aarch64-code.fd.gz" "$DIST/share/qemu/edk2-aarch64-code.fd.gz"
 cp "$FW_DIR/edk2-arm-vars.fd.gz"     "$DIST/share/qemu/edk2-arm-vars.fd.gz"
 
 # Record exact shipped versions for license/source traceability (../source-mirror + ../LICENSES).
-GLIB_V="$(basename "$(ls -d /opt/homebrew/Cellar/glib/* 2>/dev/null | head -1)")"
-GETTEXT_V="$(basename "$(ls -d /opt/homebrew/Cellar/gettext/* 2>/dev/null | head -1)")"
-PCRE2_V="$(basename "$(ls -d /opt/homebrew/Cellar/pcre2/* 2>/dev/null | head -1)")"
+GLIB_V="$(plutil -extract dependencies.glib raw -o - "$HERE/source-version.json")"
+GETTEXT_V="$(plutil -extract dependencies.gettext raw -o - "$HERE/source-version.json")"
+PCRE2_V="$(plutil -extract dependencies.pcre2 raw -o - "$HERE/source-version.json")"
 QEMU_V="$("$DIST/bin/qemu-system-aarch64" --version 2>/dev/null | head -1)"
 cat > "$DIST/VERSIONS.txt" <<EOF
 AppSandbox bundled QEMU + dependencies — exact versions shipped in this dist/.
@@ -78,8 +90,9 @@ Corresponding source: ../source-mirror/ (run fetch-sources.sh) and the asb-qemu 
 Licenses + notices: ../LICENSES/ ; written offer: ../WRITTEN_OFFER.txt
 
 $QEMU_V
-  GPL-2.0   source: github.com/jamesstringer90/asb-qemu @ asb-ivshmem-11.0.1 (v11.0.1 + 3 ivshmem commits)
-glib     $GLIB_V   LGPL-2.1   source: glib-2.88.1.tar.xz + glib-2.88.1-homebrew-hardcoded-paths.diff
+  GPL-2.0   source: https://github.com/jamesstringer90/asb-qemu/tree/$REVISION
+  branch: $BRANCH; upstream: $UPSTREAM; four ivshmem changes retained
+glib     $GLIB_V   LGPL-2.1   source: glib-2.90.1.tar.xz + glib-2.90.1-homebrew-hardcoded-paths.diff
 gettext  $GETTEXT_V   LGPL-2.1   source: gettext-1.0.tar.gz  (libintl runtime only; not the GPL tools)
 pcre2    $PCRE2_V  BSD        notice only (LICENSES/pcre2-LICENCE.txt)
 edk2     AAVMF  BSD-2-Clause-Patent   notice only (LICENSES/EDK2-licenses.txt)

@@ -14,6 +14,7 @@
                                                      backing:NSBackingStoreBuffered
                                                        defer:NO];
     window.title = @"App Sandbox";
+    window.releasedWhenClosed = NO;
     [window center];
 
     self = [super initWithWindow:window];

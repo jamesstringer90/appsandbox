@@ -1424,6 +1424,9 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "          && echo \"OK: install $unit\" || echo \"FAIL: install $unit\"\n"
         "    fi\n"
         "done\n"
+        "install -d /etc/systemd/system/appsandbox-agent.service.d\n"
+        "printf '%s\\n' '[Unit]' 'After=NetworkManager.service systemd-networkd.service' \\\n"
+        "    > /etc/systemd/system/appsandbox-agent.service.d/10-network-renderer.conf\n"
         "# Clipboard is a user-level unit (graphical-session.target).\n"
         "if [ -f \"$EXTRAS/systemd/appsandbox-clipboard.service\" ]; then\n"
         "    install -d /etc/systemd/user\n"
@@ -2023,8 +2026,13 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
     {
         sqfs_ctx_t *peek = sqfs_open(sqfs_path);
         if (peek) {
-            est_inodes = sqfs_sb(peek)->inode_count + 4096;
+            uint64_t count = (uint64_t)sqfs_sb(peek)->inode_count * 2 + 4096;
             sqfs_close(peek);
+            if (count > UINT32_MAX) {
+                log_err(L"Ubuntu image requires too many filesystem inodes");
+                goto cleanup;
+            }
+            est_inodes = (uint32_t)count;
         }
     }
 

@@ -3,18 +3,26 @@ class Glib < Formula
 
   desc "Core application library for C"
   homepage "https://docs.gtk.org/glib/"
-  url "https://download.gnome.org/sources/glib/2.88/glib-2.88.1.tar.xz"
-  sha256 "51ab804c56f6eab3e5045c774d1290ac5e4c923d4f9a3d8e33123bee45c1840e"
+  url "https://download.gnome.org/sources/glib/2.90/glib-2.90.1.tar.xz"
+  sha256 "93c941aa17d5eb1d53fe838365f29a8b4e539c222a256d974ec8f30fc413e396"
   license "LGPL-2.1-or-later"
   compatibility_version 1
+
+  # This regex is intended to avoid the `Gnome` strategy's version filtering
+  # logic while maintaining the "even-numbered minor is stable" behavior, as
+  # minor versions >= 90 are still stable in this case.
+  livecheck do
+    url :stable
+    regex(/glib[._-]v?(\d+\.\d*[02468](?:\.\d+)*)\.t/i)
+  end
 
   depends_on "bison" => :build # for gobject-introspection
   depends_on "gettext" => :build
   depends_on "meson" => :build
   depends_on "ninja" => :build
-  depends_on "pkgconf" => :build
+  depends_on "pkgconf" => [:build, :test]
   depends_on "python-setuptools" => :build # for gobject-introspection
-  depends_on "python@3.14" => :build
+  depends_on "python@3.15" => :build
   depends_on "pcre2"
 
   uses_from_macos "flex" => :build # for gobject-introspection
@@ -51,17 +59,14 @@ class Glib < Formula
 
   # replace several hardcoded paths with homebrew counterparts
   patch do
-    url "https://raw.githubusercontent.com/Homebrew/homebrew-core/1cf441a0/Patches/glib/hardcoded-paths.diff"
-    sha256 "d846efd0bf62918350da94f850db33b0f8727fece9bfaf8164566e3094e80c97"
+    file "Patches/glib/hardcoded-paths.diff"
   end
+
+  deny_network_access!
 
   def install
     # Avoid the sandbox violation when an empty directory is created outside of the formula prefix.
     inreplace "gio/meson.build", "install_emptydir(glib_giomodulesdir)", ""
-
-    # build patch for `ld: missing LC_LOAD_DYLIB (must link with at least libSystem.dylib) \
-    # in ../gobject-introspection-1.80.1/build/tests/offsets/liboffsets-1.0.1.dylib`
-    ENV.append "LDFLAGS", "-Wl,-ld_classic" if OS.mac? && MacOS.version == :ventura
 
     # Disable dtrace; see https://trac.macports.org/ticket/30413
     # and https://gitlab.gnome.org/GNOME/glib/-/issues/653
@@ -69,7 +74,7 @@ class Glib < Formula
       --localstatedir=#{var}
       -Dgio_module_dir=#{HOMEBREW_PREFIX}/lib/gio/modules
       -Dbsymbolic_functions=false
-      -Ddtrace=false
+      -Ddtrace=disabled
       -Druntime_dir=#{var}/run
       -Dtests=false
     ]
@@ -79,21 +84,20 @@ class Glib < Formula
     # `glib` is a dependency of `gobject-introspection`.
     # Ref: https://discourse.gnome.org/t/dealing-with-glib-and-gobject-introspection-circular-dependency/18701
     staging_dir = buildpath/"staging"
-    staging_meson_args = std_meson_args.map { |s| s.sub prefix, staging_dir }
-    system "meson", "setup", "build_staging", "-Dintrospection=disabled", *args, *std_meson_args
+    staging_meson_args = std_meson_args(prefix: staging_dir)
+    system "meson", "setup", "build_staging", "-Dintrospection=disabled", *args, *staging_meson_args
     system "meson", "compile", "-C", "build_staging", "--verbose"
     system "meson", "install", "-C", "build_staging"
-    ENV.append_path "PKG_CONFIG_PATH", lib/"pkgconfig"
-    ENV.append_path "LD_LIBRARY_PATH", lib if OS.linux?
 
-    resource("gobject-introspection").stage do
-      system "meson", "setup", "build", "-Dcairo=disabled", "-Ddoctool=disabled", *staging_meson_args
-      system "meson", "compile", "-C", "build", "--verbose"
-      system "meson", "install", "-C", "build"
-    end
     ENV.append_path "PKG_CONFIG_PATH", staging_dir/"lib/pkgconfig"
     ENV.append_path "LD_LIBRARY_PATH", staging_dir/"lib" if OS.linux?
     ENV.append_path "PATH", staging_dir/"bin"
+
+    resource("gobject-introspection").stage do
+      system "meson", "setup", "build", "-Dcairo=disabled", "-Ddoctool=disabled", "-Dtests=false", *staging_meson_args
+      system "meson", "compile", "-C", "build", "--verbose"
+      system "meson", "install", "-C", "build"
+    end
 
     system "meson", "setup", "build", "--default-library=both", "-Dintrospection=enabled", *args, *std_meson_args
     system "meson", "compile", "-C", "build", "--verbose"
@@ -106,23 +110,21 @@ class Glib < Formula
               "giomoduledir=#{HOMEBREW_PREFIX}/lib/gio/modules",
               "giomoduledir=${libdir}/gio/modules"
 
-    (buildpath/"gio/completion/.gitignore").unlink
-    bash_completion.install (buildpath/"gio/completion").children
+    bash_completion.install (share/"bash-completion/completions").children
     return unless OS.mac?
 
     # `pkg-config --libs glib-2.0` includes -lintl, and gettext itself does not
     # have a pkgconfig file, so we add gettext lib and include paths here.
-    gettext = Formula["gettext"]
     inreplace lib/"pkgconfig/glib-2.0.pc" do |s|
       s.gsub! "Libs: -L${libdir} -lglib-2.0 -lintl",
-              "Libs: -L${libdir} -lglib-2.0 -L#{gettext.opt_lib} -lintl"
+              "Libs: -L${libdir} -lglib-2.0 -L#{formula_opt_lib("gettext")} -lintl"
       s.gsub! "Cflags: -I${includedir}/glib-2.0 -I${libdir}/glib-2.0/include",
-              "Cflags: -I${includedir}/glib-2.0 -I${libdir}/glib-2.0/include -I#{gettext.opt_include}"
+              "Cflags: -I${includedir}/glib-2.0 -I${libdir}/glib-2.0/include -I#{formula_opt_include("gettext")}"
     end
   end
 
   post_install_steps do
-    mkdir_p "lib/gio/modules", base: :homebrew_prefix
+    mkdir_p "{{HOMEBREW_PREFIX}}/lib/gio/modules"
   end
 
   test do
@@ -141,8 +143,9 @@ class Glib < Formula
           return (strcmp(str, result_2) == 0) ? 0 : 1;
       }
     C
-    system ENV.cc, "-o", "test", "test.c", "-I#{include}/glib-2.0",
-                   "-I#{lib}/glib-2.0/include", "-L#{lib}", "-lglib-2.0"
+
+    flags = shell_output("pkgconf --cflags --libs glib-2.0").chomp.split
+    system ENV.cc, "-o", "test", "test.c", *flags
     system "./test"
 
     assert_match "This file is generated by glib-mkenum", shell_output(bin/"glib-mkenums")

@@ -52,12 +52,6 @@ typedef struct {
 
 /* Runtime state of a VM */
 typedef struct {
-    /* Monotonically-increasing per-VM ID, assigned on creation, never
-       reused. Long-lived background threads (agent, IDD probe) cache
-       this instead of a VmInstance* so they survive compaction of the
-       g_vms[] array (e.g. when a template at a lower index is removed,
-       higher-index entries shift down -- their old slots get zeroed but
-       the new locations are findable by ID). 0 means "not assigned". */
     UINT64      unique_id;
     HCS_SYSTEM  handle;
     wchar_t     name[256];
@@ -78,6 +72,9 @@ typedef struct {
     GUID        runtime_id;           /* VM RuntimeId for AF_HYPERV connections */
     wchar_t     resources_iso_path[MAX_PATH];
     BOOL        running;
+    BOOL        starting;
+    BOOL        display_suppressed;
+    HANDLE      start_thread;
     BOOL        network_cleaned;  /* TRUE after network teardown (idempotent guard) */
     BOOL        agent_online;     /* TRUE when persistent agent connection is active */
     BOOL        idd_ready;        /* TRUE once the agent reports the display driver is up (idd_status:ok) */
