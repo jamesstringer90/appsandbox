@@ -7,6 +7,8 @@ test data are preserved from the fixtures used for Mac-host validation.
 
 The [compatibility chart](../../docs/accessibility-validation/SUPPORT.md) records
 observed results, known failures and remaining coverage for both guest platforms.
+The [public tree reader](reader/README.md) captures native and viewer AX trees and
+compares declared controls or complete subtrees without computer use.
 
 ## Windows
 
@@ -62,7 +64,8 @@ work from disk without a server or network access. Reload to reset their state.
 | HTML table | Accommodation table has three rows including its header, and three columns. Compare cell contents, indices and header relationships. |
 | HTML stress | Check for all targets `00001` through `01000`; activate **STRESS TARGET 01000** and read `STRESS RESULT 01000`. |
 
-These are manual fixtures, not a pass/fail runner. A control can expose a pattern
+The fixtures can be exercised manually; the reader provides read-only comparisons.
+A control can expose a pattern
 that its native provider fails to execute: the Windows stepper and popup completion
 have shown this in direct tests. Check the native baseline before attributing a
 failure to the proxy. Native text formatting is the reference case; HTML slider and

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "fixture tabs and active page",
+      "match": {"AXRole": "AXTabGroup"},
+      "subtree": true,
+      "attributes": ["AXRole", "AXSubrole", "AXTitle", "AXDescription", "AXValue", "AXEnabled", "@actions", "@queries"]
+    }
+  ]
+}

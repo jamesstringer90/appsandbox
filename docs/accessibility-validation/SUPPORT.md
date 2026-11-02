@@ -2,7 +2,7 @@
 
 **Canonical support chart for macOS and Windows guests.** Reference this file for support claims, known failures and testing priorities. Update this same file after relevant testing, attribution or implementation changes.
 
-Last updated: **2026-10-31**. Branch: `mac-accessibility`. Latest scoped production test: `f23d89fe0872686e4b74533e5a27596dfafbbc9c`. Earlier broad source audit: `a0d0960a61f653804233b812de2b451ca199ffc6`.
+Last updated: **2026-11-02 UTC**. Branch: `mac-accessibility`. Latest scoped production workflow test: `f23d89fe0872686e4b74533e5a27596dfafbbc9c`; read-only tree and viewer lifecycle test: `e930e98`. Earlier broad source audit: `a0d0960a61f653804233b812de2b451ca199ffc6`.
 
 **Release qualification: NOT VALIDATED on either platform.** Common interactions have observed passes, but complete accessibility support and Mac/Windows parity are not established. Small trees can also fail. There is no defensible percentage of all realistic application support.
 
@@ -10,7 +10,36 @@ The capability chart is the current assessment. The workflow table preserves the
 
 Both guest columns describe tests through a **macOS host**. **Windows-to-Windows is not validated**; the Windows host UIA proxy is separate work. The [test fixtures](../../tools/accessibility-fixtures/README.md) are available for that testing.
 
-This chart is tracked. Raw captures, test harnesses and local reports are not published. Evidence references below identify those local artifacts without linking to absent repository files.
+This chart and the [public tree reader](../../tools/accessibility-fixtures/reader/README.md) are tracked. Historical raw captures, diagnostic harnesses and local reports are not published. Evidence references below identify those local artifacts without linking to absent repository files.
+
+## Public tree reader comparison, 2026-11-02 UTC
+
+The initial reader run used the signed `c31a32b` host build, the real `ax-test-macos` VM
+started through the headless API, and that build's guest helper installed by the
+existing firstboot script under `com.appsandbox.accessibility`. The baseline ran
+the exact fixture binary copied from the guest. Host macOS was 27.2; guest macOS
+was 26.5.2, so provider-version differences remain possible. Reads used the host's
+public AX tree, not a guest socket dump.
+
+| Check | Direct reader result | Relationship to the computer-use audit |
+|---|---|---|
+| 13 selected control/property checks | 10 matched; button, disabled button and checkbox differed only in the compared `AXEnabled` type: native boolean versus proxy integer 0/1. | Earlier raw probes already contain this difference. Their state checker accepted boolean and 0/1 representations; the saved client tree correctly marked **Unavailable** disabled. Historical functional outcomes are unchanged. |
+| Active tab subtree | All 36 nodes and ordered child edges matched. Strict attribute comparison differed in enabled representation/availability and unsupported-versus-no-value errors. | Exposes details omitted by the client tree; does not establish an interaction failure. |
+| Observation time | Viewer reads took 67–75 ms; each paired comparison completed in under 300 ms. | Two saved combined computer-use captures took 84 ms and 453 ms. Different runs and scope; no controlled speedup claim. Automatic comparison removes manual review work. |
+
+The signed `e930e98` headless merge and its bundled guest helper reproduced the
+same 10 matches and three type differences using `--vm ax-test-macos`. After the user
+reported possible interruption, a passive-monitor repeat recorded no input events,
+held input or counter changes. Viewer reads took 75–77 ms. Focusing the existing
+viewer kept the same presenter; closing stopped it; reopening created a new
+presenter and restored the identical 36-node subtree, first observed at 3.38 seconds.
+Earlier timing observations are retained as potentially interrupted. Cold-start
+and helper-installation captures with unavailable trees remain INCOMPLETE; no
+automatic retry promoted them to passes.
+
+These are initial-state read-only comparisons, not repeats of the 51 workflows.
+Supported actions/queries are metadata, not proof of successful execution.
+Local captures and provenance: `docs/accessibility-validation/runs/20261102-public-tree-reader/`.
 
 ## Reading the status
 
@@ -199,7 +228,7 @@ Completed tested cases: **I01 checkbox update — PASS on both platforms**, thre
 
 The checkbox-update row and four native text workflows have passing observations on **both** guest platforms. The original HTML table now has paired passing evidence for counts, contents, nine cell queries, indices, spans, headers, aliases and containing-table relationships. Query error loss is proven on both guest paths. The active goal is to fill remaining chart gaps; more table variants, bounds, query families and unresolved failures take priority over repeating known passes. Do not keep retesting a passing row instead of advancing coverage.
 
-Reuse the existing fixtures, native observers, suite plan and result schema. The [recorder][HARNESS] preserves command output, exact code/tool bytes, binary identities, bounded scheduled reads and input/focus evidence; its checkers derive scoped results from raw artifacts. OpenAI computer use remains the scored workflow driver. Independent native/public AX observations establish bridge fidelity; matched native diagnostic actions establish attribution and never count as client activation passes.
+Reuse the existing fixtures, native observers, suite plan and result schema. The [public tree reader](../../tools/accessibility-fixtures/reader/README.md) provides direct host AX snapshots and like-for-like comparisons without computer use. Its read-only results are separate from the historical workflow verdicts, which used OpenAI computer use. The [recorder][HARNESS] preserves command output, exact code/tool bytes, binary identities, bounded scheduled reads and input/focus evidence; its checkers derive scoped results from raw artifacts. Matched native diagnostic actions establish attribution and never count as client activation passes.
 
 | Order | Harness or testing work | Required result |
 |---|---|---|
@@ -276,7 +305,7 @@ The [capability catalog][CATALOG] defines **45 families and 169 mandatory assert
 5. **Keep the inventories visible.** Add equivalent Mac/Windows results as a new dated run section and preserve prior run tables. Record applicability with evidence. Never remove failed first attempts, blocked cases or exclusions to improve totals.
 6. **Use percentages only for a frozen, explicitly named contract.** Keep unrun and unresolved coverage in the accounting; distinguish native unsupported, client blocked and implemented-but-unverified. Do not call workflow pass rate real-world accessibility support.
 7. **Append change history and verify.** Check case counts against linked summaries, local links, platform scope and absence of secrets. Reference this file in subsequent status reports.
-8. **Retain operational preferences.** Built-in OpenAI computer use drives scored workflows; independent native observations establish attribution. Production fixes remain general purpose. When switching VMs, position the viewer on the right half of the host screen so the terminal stays visible; account for any later user resize in the next observation. This chart does not require VM shutdown, production edits or committing diagnostics.
+8. **Retain operational preferences.** Use the public tree reader for read-only comparisons; record action method and evidence separately for interaction workflows. Historical computer-use verdicts remain unchanged. Production fixes remain general purpose. When switching VMs, position the viewer on the right half of the host screen so the terminal stays visible; account for any later user resize in the next observation. This chart does not require VM shutdown or production edits.
 
 ## Change history
 

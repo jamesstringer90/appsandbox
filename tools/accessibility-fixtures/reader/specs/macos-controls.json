@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "button",
+      "match": {"AXRole": "AXButton", "AXTitle": "Count press"},
+      "attributes": ["AXRole", "AXTitle", "AXEnabled", "@actions"],
+      "expected": {"AXEnabled": true}
+    },
+    {
+      "name": "disabled button",
+      "match": {"AXRole": "AXButton", "AXTitle": "Unavailable"},
+      "attributes": ["AXRole", "AXTitle", "AXEnabled", "@actions"],
+      "expected": {"AXEnabled": false}
+    },
+    {
+      "name": "checkbox",
+      "match": {"AXRole": "AXCheckBox", "AXTitle": "Meal included"},
+      "attributes": ["AXRole", "AXTitle", "AXEnabled", "AXValue", "@actions"],
+      "expected": {"AXValue": 0}
+    },
+    {
+      "name": "switch",
+      "match": {"AXSubrole": "AXSwitch", "AXDescription": "Notifications"},
+      "attributes": ["AXRole", "AXSubrole", "AXDescription", "AXValue", "@actions"],
+      "expected": {"AXValue": 0}
+    },
+    {
+      "name": "selected radio",
+      "match": {"AXRole": "AXRadioButton", "AXTitle": "Window seat"},
+      "attributes": ["AXRole", "AXTitle", "AXValue", "@actions"],
+      "expected": {"AXValue": 1}
+    },
+    {
+      "name": "unselected radio",
+      "match": {"AXRole": "AXRadioButton", "AXTitle": "Aisle seat"},
+      "attributes": ["AXRole", "AXTitle", "AXValue", "@actions"],
+      "expected": {"AXValue": 0}
+    },
+    {
+      "name": "slider",
+      "match": {"AXRole": "AXSlider", "AXDescription": "Volume"},
+      "attributes": ["AXRole", "AXValue", "AXMinValue", "AXMaxValue", "@actions"],
+      "expected": {"AXValue": 4, "AXMinValue": 0, "AXMaxValue": 10}
+    },
+    {
+      "name": "stepper",
+      "match": {"AXRole": "AXIncrementor", "AXDescription": "Travelers"},
+      "attributes": ["AXRole", "AXValue", "AXMinValue", "AXMaxValue", "@actions"],
+      "expected": {"AXValue": 2}
+    },
+    {
+      "name": "popup",
+      "match": {"AXRole": "AXPopUpButton", "AXDescription": "Destination"},
+      "attributes": ["AXRole", "AXValue", "@actions"],
+      "expected": {"AXValue": "Gore"}
+    },
+    {
+      "name": "combo box",
+      "match": {"AXRole": "AXComboBox", "AXDescription": "Activity"},
+      "attributes": ["AXRole", "AXValue", "@actions"],
+      "expected": {"AXValue": "Art gallery"}
+    },
+    {
+      "name": "progress",
+      "match": {"AXRole": "AXProgressIndicator", "AXDescription": "Download progress"},
+      "attributes": ["AXRole", "AXValue", "AXMinValue", "AXMaxValue"],
+      "expected": {"AXValue": 0.65}
+    },
+    {
+      "name": "level",
+      "match": {"AXRole": "AXLevelIndicator", "AXDescription": "Disk usage"},
+      "attributes": ["AXRole", "AXValue", "AXMinValue", "AXMaxValue"],
+      "expected": {"AXValue": 40}
+    },
+    {
+      "name": "status",
+      "match": {"AXIdentifier": "lab-status"},
+      "attributes": ["AXRole", "AXValue"],
+      "expected": {"AXValue": "Last action: none"}
+    }
+  ]
+}
