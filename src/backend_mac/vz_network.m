@@ -1,11 +1,15 @@
 #import "vz_network.h"
+#import "asb_network_mac.h"
 
 @implementation VzNetwork
 
-+ (VZVirtioNetworkDeviceConfiguration *)natConfigurationWithMACAddress:(VZMACAddress *)macAddress {
++ (VZVirtioNetworkDeviceConfiguration *)natConfigurationWithMACAddress:(VZMACAddress *)macAddress
+                                                               error:(NSError **)error {
+    AsbNatNetwork *network = [AsbNatNetwork sharedNetworkWithError:error];
+    if (!network) return nil;
     VZVirtioNetworkDeviceConfiguration *net = [[VZVirtioNetworkDeviceConfiguration alloc] init];
     net.MACAddress = macAddress;
-    net.attachment = [[VZNATNetworkDeviceAttachment alloc] init];
+    net.attachment = [[VZVmnetNetworkDeviceAttachment alloc] initWithNetwork:network.network];
     return net;
 }
 

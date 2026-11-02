@@ -1,13 +1,13 @@
 # AppSandbox headless SDK (`asb.py`)
 
 A small, dependency-free Python client for driving AppSandbox programmatically —
-create, configure, snapshot, and run GPU-enabled VMs without the GUI. This README
+create, configure, snapshot, and run GPU-enabled VMs with or without the GUI. This README
 is the usage/API reference.
 
 ```python
 import asb
 
-c = asb.connect()                      # auto-discovers the running daemon
+c = asb.connect()                      # auto-discovers the GUI or headless host
 c.create(name="dev", osType="Linux", imagePath=r"C:\ISOs\ubuntu.iso",
          ramMb=4096, cpuCores=2, adminUser="user", adminPass="test123")
 c.wait_online("dev")                   # blocks through build + install + boot
@@ -20,17 +20,15 @@ c.delete_vm("dev")
 
 ## How it works
 
+The GUI automatically hosts the local API; `asb.connect()` uses that same core.
 `appsandbox.exe --headless` (Windows) or
-`sudo AppSandbox.app/Contents/MacOS/AppSandbox --headless` (macOS) starts a
-**single-owner daemon**. It hosts the AppSandbox core (`appsandbox_core.dll` /
-`AppSandboxCore.framework`) for the lifetime of the process and exposes the
-SAME Docker-style local HTTP/JSON API on both platforms. The daemon *owns* the
-VMs: they run as long as it runs (exit terminates them), and the API is just a
-remote control for the same core the GUI drives.
+`sudo AppSandbox.app/Contents/MacOS/AppSandbox --headless` (macOS) runs it without
+the management UI or automatic viewers. `-headless` is also supported. GUI and API
+controls share VM state and viewers. Exiting the host terminates its VMs.
 
 - **Loopback only.** The listener binds `http://127.0.0.1:<port>` (`http.sys`
   on Windows; a plain BSD socket on macOS). Nothing is exposed off-box.
-- **Discovery file.** On startup the daemon writes `host.json`
+- **Discovery file.** On startup the GUI or headless host writes `host.json`
   (`%ProgramData%\AppSandbox\` on Windows;
   `~/Library/Application Support/AppSandbox/` on macOS) with the endpoint,
   port, and a random per-run bearer token. `asb.connect()` reads it, so you
@@ -38,11 +36,10 @@ remote control for the same core the GUI drives.
 - **Single instance.** A global mutex (Windows) / `flock` (macOS) guarantees
   one AppSandbox at a time — GUI or daemon (a second `--headless` exits with
   status 2). One owner, one source of truth.
-- **Serialized core.** The HTTP receive loop *is* the single command thread:
-  one request runs to completion before the next, so all core calls are
-  serialized — no interleaving, no races against the core.
+- **Serialized core.** API commands run on the GUI thread in GUI mode, the main
+  queue on macOS, or the API command thread in Windows standalone headless mode.
 - **Capabilities, not API forks.** `version()["capabilities"]` advertises what
-  the host supports (snapshots/templates are Windows-only); unsupported routes
+  the host supports (snapshots are Windows-host-only; templates work on both hosts); unsupported routes
   return `501`. Everything else — status model, validation, SSE, SSH key
   deploy — is identical.
 
@@ -73,7 +70,7 @@ in create-validation (wrong `osType` → `400`); the host-feature row mirrors
 | **Linux guest** (Ubuntu) | ✅ | ❌ |
 | **macOS guest** | ❌ | ✅ (Apple silicon) |
 | Snapshots & branches | ✅ | ❌ `501` |
-| Templates (`isTemplate`, create-from-template) | ✅ | ❌ `501` |
+| Templates (`isTemplate`, create-from-template) | ✅ Windows guests | ✅ Windows and macOS guests |
 | Display window (`/vms/{n}/display`) | ✅ | ✅ (daemon in a console GUI session) |
 | GPU, NAT/network modes, SSH server, SSH-key auto-deploy, SSE events | ✅ | ✅ |
 
@@ -115,7 +112,7 @@ clear message** and a non-zero exit — it never half-starts:
 
 ## Getting started
 
-1. **Start the daemon**:
+1. **Open the GUI**, or start the headless host:
    ```
    # Windows (elevated shell)
    appsandbox.exe --headless
@@ -176,6 +173,8 @@ building → stopped → installing → booting → online → stopping → stop
 
 `connect()` returns a `Client`. Query methods return parsed JSON; lifecycle
 methods return `(http_status, body)` so you can branch on the status code.
+VM arguments accept name strings or persistent `asb.VmId` values. Use `c.vm_id(name)`
+to retain an identity across requests; plain strings remain names.
 
 ### Queries
 | Method | Returns |
@@ -185,11 +184,11 @@ methods return `(http_status, body)` so you can branch on the status code.
 | `list()` | list of VM status objects |
 | `status(name)` | one VM's status (raises `KeyError` on 404) |
 | `ssh_info(name)` | `{host, port, user, sshState, enabled, keyDeployed}` (loopback-forwarded SSH; `sshState 4` = ready + key deployed) |
-| `templates()` | `[{name, osType}, …]` |
+| `templates()` | `[{name, osType}, …]`; Mac records also include `id` and `hddGb` |
 | `snapshots(name)` | list of `{index, name, branchCount, branches:[…]}` |
 | `snapshots_full(name)` | the above **plus** `current: {snapIndex, branchIndex}` |
 
-A **status object** has: `name, osType, state, running, agentOnline,
+A **status object** has: `id, name, osType, state, running, agentOnline,
 installComplete, building, progress, sshState, sshPort, ramMb, hddGb, cpuCores,
 gpuMode, networkMode, displayOpen`.
 
@@ -202,8 +201,8 @@ gpuMode, networkMode, displayOpen`.
 | `shutdown(name)` | graceful ACPI power-off |
 | `stop(name)` | force power-off (pull the plug) |
 | `delete_vm(name)` | remove the VM and its disk (refused 409 while building) |
-| `delete_template(name)` | remove a template |
-| `shutdown_daemon(force=False)` | stop the daemon (refused 409 if VMs are active unless `force=True`) |
+| `delete_template(name)` | remove a template; Windows refuses deletion while an older VM or active copy depends on it |
+| `shutdown_daemon(force=False)` | stop the GUI or headless host (refused 409 if VMs are active unless `force=True`) |
 
 ### Snapshots & branches *(return `(status, body)`)*
 | Method | Effect |
@@ -230,8 +229,8 @@ refused (deleting the base disk is "delete the VM"); only its branches delete.
 **blocks** — run it in a thread. Event shapes:
 
 ```json
-{"event": "vmStateChanged", "name": "dev", "running": true}
-{"event": "vmProgress",     "name": "dev", "progress": 42, "staging": false}
+{"event": "vmStateChanged", "id": "vm-0123456789abcdef", "name": "dev", "running": true}
+{"event": "vmProgress",     "id": "vm-0123456789abcdef", "name": "dev", "progress": 42, "staging": false}
 {"event": "alert",          "message": "..."}
 ```
 
@@ -249,8 +248,8 @@ connection can never make you miss a transition.
 ### Display
 
 Open the VM's **display window** — the same IDD/Connect view the GUI shows — on
-the **daemon's local desktop**. It renders on demand; the daemon never auto-opens
-it (good in the GUI, wrong for a CLI).
+the **host's local desktop**. GUI and API controls share the same viewer;
+standalone headless mode opens it only on explicit request.
 
 | Method | Returns |
 |---|---|
@@ -275,7 +274,7 @@ c.close_display("dev")              # or the user just closes it with the [X]
   driver is up (`idd_status:ok`) — a latched flag, **not** a probe: reading it touches no
   window and no frame channel, so polling can't disturb the display. (Connecting to the
   frame channel to "check" would itself become the display's single consumer.) On
-  **macOS** there is no frame channel or display driver — the view binds the in-process
+  **macOS guests** there is no frame channel or display driver — the view binds the in-process
   VM framebuffer directly — so `ready` is simply `running && agentOnline`, with nothing
   to probe. Either way, opening before `ready` would show a black window, so
   `open_display` returns `409 display_not_ready`.
@@ -304,20 +303,20 @@ rather than forwarding bad input to the core.
 |---|---|
 | `name` | guest hostname; **set at create, not editable later**. Letters/digits/hyphens; not all-digits; no leading/trailing hyphen. Windows ≤15 chars (NetBIOS); Linux ≤63 and lowercase. Must be unique across VMs *and* templates. |
 | `osType` | `"Linux"` or `"Windows"` on a Windows host; `"macOS"` or `"Windows"` on a macOS host. |
-| `imagePath` | path to an install ISO — **required unless** `templateName` is given |
-| `templateName` | create from a Windows template instead of an ISO |
+| `imagePath` | Windows/Linux ISO, required unless using a template; macOS 27+ restore image, downloaded if omitted |
+| `templateName` / `templateId` | create from a ready template of the same guest OS; `templateId` is Mac-host-only |
 | `ramMb` | ≥512, **2 MB-aligned** (even). The SDK rounds down to even for you. |
-| `hddGb` | ≥1 |
+| `hddGb` | ≥1; template instances cannot be smaller than their base |
 | `cpuCores` | ≥1 |
-| `gpuMode` | `0` None · `1` Default (paravirtual) · `2` Try all |
-| `networkMode` | `0` None · `1` NAT · `2` External · `3` Internal |
+| `gpuMode` | `0` None · `1` Default (paravirtual) |
+| `networkMode` | Windows: `0` None · `1` NAT · `2` External · `3` Internal; Mac: `1` NAT only |
 | `netAdapter` | host adapter name (for External mode) |
 | `adminUser` | required for a normal create. Linux: ≤32, starts `[a-z_]`, body `[a-z0-9_-]`. Windows: ≤20, none of `"\/[]:;|=,+*?<>`, no trailing `.`, not a reserved name (CON, PRN, …). |
-| `adminPass` | required on Linux (≤255 bytes); optional on Windows |
+| `adminPass` | required; Linux ≥6 characters, ≤255 UTF-8 bytes; Windows ≤127 UTF-16 code units; macOS ≥4 characters, ≤127 UTF-8 bytes |
 | `testMode` | skip interactive setup where supported |
 | `sshEnabled` | provision SSH + forward a loopback port |
 | `sshDeployKey` | deploy the AppSandbox public key for password-less login (**requires `sshEnabled`**; rejected `400` otherwise) |
-| `isTemplate` | build a template (Windows only; can't be built from another template) |
+| `isTemplate` | build a Windows template on either host or a macOS template on Mac; cannot use another template |
 
 `edit()` accepts `ramMb`, `cpuCores`, `gpuMode`, `networkMode` with the same
 range rules, and **only while the VM is stopped**. `name` cannot be changed.
@@ -358,7 +357,7 @@ subprocess.run(["ssh", "-i", asb.key_path(), "-p", str(i["port"]),
 | `405 Method Not Allowed` | wrong verb for the route |
 | `409 Conflict` | state conflict: edit/snapshot while running (`vm_running`), delete while building (`vm_building`), daemon shutdown with active VMs (`vms_active`, lists them), or open-display refused (`no_display` no interactive desktop · `not_running` · `display_not_ready` agent hasn't reported the display driver up yet) |
 | `500 Internal Server Error` | the core returned a failure (`error.hr` on Windows, `error.rc` on macOS) |
-| `501 Not Implemented` | the feature doesn't exist on this host platform (`not_supported`) — snapshots/templates on macOS; mirror of `capabilities` |
+| `501 Not Implemented` | the feature doesn't exist on this host platform (`not_supported`) — snapshots/branches on macOS; mirror of `capabilities` |
 
 ---
 
@@ -395,8 +394,8 @@ python tests\run_all.py
 `run_all.py` runs the no-VM static checks once (`test_host_and_validation.py`:
 host reporting vs the real machine + create-validation rejections), then spawns
 the full per-VM lifecycle (`vm_lifecycle.py`) **concurrently** across specs —
-Linux and Windows at the same time — so multi-VM concurrency and every code path
-are proven on both OSes simultaneously. The per-VM lifecycle also covers SSH key
+Linux and Windows at the same time — to exercise concurrent VM lifecycles.
+The per-VM lifecycle also covers SSH key
 auto-deploy: each VM is built with `sshDeployKey` and, once online, the suite
 asserts `keyDeployed`/`sshState 4` and performs a key-only SSH login (no
 password). `test_windows_template.py` covers the Windows template build →

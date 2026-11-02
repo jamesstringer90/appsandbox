@@ -29,12 +29,13 @@
    headless daemon reads it (via the VzDisplayWindow-typed g_vms[].display) to
    report displayOpen and to reap a self-closed window before reopening. */
 @property (nonatomic) BOOL userClosed;
+@property (nonatomic, readonly) uint64_t vmId;
 
 /* `transport` is the VM's ivshmem transport (QemuVm.transport), available once the
    VM is Running. `name` titles the window. The controller starts a ch2 reader
    thread that connects + reconstructs frames, and writes ch3 input on demand. */
 - (instancetype)initWithName:(NSString *)name
-                   transport:(AsbIvshmemTransport *)transport;
+                   transport:(AsbIvshmemTransport *)transport vmId:(uint64_t)vmId;
 - (void)showDisplay;
 
 @end

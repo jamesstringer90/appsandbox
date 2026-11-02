@@ -1,57 +1,54 @@
-/*
- * iso-patch-mac -- Host-side CLI for preparing a macOS VM disk image.
- *
- * Mirrors tools/iso-patch/iso-patch.c on Windows. Responsibilities:
- *   - "stage": mount the APFS Data volume of a VZ disk image, copy files
- *     per a TSV manifest, fix ownership/permissions, then detach.
- *   - IPSW fetch + VZMacOSInstaller orchestration (analogue of
- *     iso-patch's --to-vhdx mode).
- *
- * Privilege model: invoked by the host via AuthorizationExecuteWithPrivileges,
- * so the tool runs as root. It does not escalate itself.
- *
- * Stdout protocol (read by src/backend_mac/iso_patch_mac.m):
- *   STATUS:<text>
- *   PROGRESS:<percent>:<step>
- *   LOG:<line>
- *   DONE:<disk path>
- *   ERROR:<reason>
- *
- * Manifest TSV (one file per line, tab-separated, "#" comments ignored):
- *   <host-source-path>\t<dest-relative-to-Data-volume>\t<mode-octal>\t<owner>
- * Example:
- *   /opt/agent/appsandbox-agent\tLibrary/AppSandbox/appsandbox-agent\t0755\troot:wheel
- */
 
 #import <Foundation/Foundation.h>
 #import <Virtualization/Virtualization.h>
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <sys/xattr.h>
 #include <pwd.h>
 #include <grp.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <signal.h>
+#include <pthread.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <crt_externs.h>
 #include <stdio.h>
 #include <string.h>
-#include <CommonCrypto/CommonKeyDerivation.h>
-#include "../transport/asb_shm_layout.h"   /* authoritative ivshmem region table + asb_shm_publish */
 #include "engine/win_disk.h"               /* from-scratch Windows-disk builder (apply WIM + stage) */
 #include "engine/wim.h"                    /* WIM XML reader -> install image's default UI language */
 #include "../provision/win_provision.h"    /* shared unattend/setup.cmd/SetupComplete.cmd generators */
-#include "../provision/mac_account_hash.h"  /* shared macOS ShadowHash + kcpassword encoders */
 
 /* ---- stdout protocol helpers ---- */
 
+static volatile sig_atomic_t g_cancelled;
+static pthread_mutex_t g_cancel_exit_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local BOOL g_cleaning_up;
+
+static void cancel_on_signal(int sig) {
+    (void)sig;
+    __atomic_store_n(&g_cancelled, 1, __ATOMIC_RELAXED);
+}
+
+static void check_cancelled(void) {
+    if (g_cleaning_up || !__atomic_load_n(&g_cancelled, __ATOMIC_RELAXED)) return;
+    pthread_mutex_lock(&g_cancel_exit_lock);
+    g_cleaning_up = YES;
+    fprintf(stdout, "ERROR:VM creation cancelled\n");
+    fflush(stdout);
+    exit(130);
+}
+
 static void emit(NSString *prefix, NSString *msg) {
+    check_cancelled();
     fprintf(stdout, "%s:%s\n", prefix.UTF8String, msg.UTF8String);
     fflush(stdout);
 }
 static void emit_status(NSString *msg)   { emit(@"STATUS",   msg); }
 static void emit_progress(int pct, NSString *step) {
+    check_cancelled();
     fprintf(stdout, "PROGRESS:%d:%s\n", pct, step.UTF8String);
     fflush(stdout);
 }
@@ -64,27 +61,65 @@ static void emit_error(NSString *msg)    { emit(@"ERROR",    msg); }
 
 static int run_tool(NSString *launchPath, NSArray<NSString *> *args,
                     NSString **stdoutStr, NSString **stderrStr) {
-    NSTask *task = [[NSTask alloc] init];
-    task.launchPath = launchPath;
-    task.arguments = args ?: @[];
-    NSPipe *outPipe = [NSPipe pipe];
-    NSPipe *errPipe = [NSPipe pipe];
-    task.standardOutput = outPipe;
-    task.standardError  = errPipe;
-
-    NSError *err = nil;
-    if (![task launchAndReturnError:&err]) {
-        if (stderrStr) *stderrStr = err.localizedDescription ?: @"launch failed";
+    check_cancelled();
+    char **argv = calloc(args.count + 2, sizeof(char *));
+    if (!argv) {
+        if (stderrStr) *stderrStr = @"Cannot allocate tool arguments";
         return -1;
     }
+    argv[0] = (char *)launchPath.fileSystemRepresentation;
+    for (NSUInteger i = 0; i < args.count; ++i) argv[i + 1] = (char *)args[i].UTF8String;
+    NSPipe *outPipe = [NSPipe pipe];
+    NSPipe *errPipe = [NSPipe pipe];
+    posix_spawn_file_actions_t actions;
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (rc != 0) {
+        free(argv);
+        if (stderrStr) *stderrStr = @(strerror(rc));
+        return -1;
+    }
+    posix_spawnattr_t attributes;
+    rc = posix_spawnattr_init(&attributes);
+    if (rc != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        free(argv);
+        if (stderrStr) *stderrStr = @(strerror(rc));
+        return -1;
+    }
+    rc = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT);
+    if (!rc) rc = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    if (!rc) rc = posix_spawn_file_actions_adddup2(&actions, outPipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO);
+    if (!rc) rc = posix_spawn_file_actions_adddup2(&actions, errPipe.fileHandleForWriting.fileDescriptor, STDERR_FILENO);
+    for (NSFileHandle *handle in @[outPipe.fileHandleForReading, outPipe.fileHandleForWriting,
+                                   errPipe.fileHandleForReading, errPipe.fileHandleForWriting]) {
+        if (!rc) rc = posix_spawn_file_actions_addclose(&actions, handle.fileDescriptor);
+    }
+    pid_t pid = -1;
+    if (!rc) rc = posix_spawn(&pid, argv[0], &actions, &attributes, argv, *_NSGetEnviron());
+    posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions);
+    free(argv);
+    [outPipe.fileHandleForWriting closeFile];
+    [errPipe.fileHandleForWriting closeFile];
+    if (rc != 0) {
+        if (stderrStr) *stderrStr = @(strerror(rc));
+        return -1;
+    }
+    __block NSData *errD = nil;
+    dispatch_group_t readers = dispatch_group_create();
+    dispatch_group_async(readers, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        errD = [errPipe.fileHandleForReading readDataToEndOfFile];
+    });
     NSData *outD = [outPipe.fileHandleForReading readDataToEndOfFile];
-    NSData *errD = [errPipe.fileHandleForReading readDataToEndOfFile];
-    [task waitUntilExit];
+    dispatch_group_wait(readers, DISPATCH_TIME_FOREVER);
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
     if (stdoutStr)
         *stdoutStr = [[NSString alloc] initWithData:outD encoding:NSUTF8StringEncoding];
     if (stderrStr)
         *stderrStr = [[NSString alloc] initWithData:errD encoding:NSUTF8StringEncoding];
-    return task.terminationStatus;
+    return waited < 0 ? -1 : WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
 
 /* ---- Mount lifecycle ---- */
@@ -393,13 +428,6 @@ static BOOL stage_entry(StageEntry e, NSString *mountPt, NSString **errOut) {
     return YES;
 }
 
-/* ---- User injection (dslocal) ---- */
-
-/* ShadowHash + kcpassword live in tools/provision/mac_account_hash.{h,m}, shared with the host
- * daemon so it can compute them in-process and hand this applier only the non-plaintext result
- * (--shadowhash-file / --kcpassword-file). The plaintext --user-password-file path remains for
- * direct CLI use, where this applier computes them itself via the same shared functions. */
-
 static BOOL write_plist(NSDictionary *plist, NSString *path,
                          uid_t uid, gid_t gid, mode_t mode,
                          NSString **errOut) {
@@ -426,254 +454,6 @@ static BOOL write_plist(NSDictionary *plist, NSString *path,
     return YES;
 }
 
-static BOOL add_user_to_admin_group(NSString *mountPt, NSString *shortname,
-                                     NSString *userUUID, NSString **errOut) {
-    NSString *adminPath = [mountPt stringByAppendingPathComponent:
-        @"private/var/db/dslocal/nodes/Default/groups/admin.plist"];
-    NSMutableDictionary *admin = [[NSDictionary dictionaryWithContentsOfFile:adminPath]
-                                   mutableCopy];
-    if (!admin) {
-        /* Some macOS installs put it under /var/db/... Try both. */
-        adminPath = [mountPt stringByAppendingPathComponent:
-            @"var/db/dslocal/nodes/Default/groups/admin.plist"];
-        admin = [[NSDictionary dictionaryWithContentsOfFile:adminPath] mutableCopy];
-    }
-    if (!admin) {
-        if (errOut) *errOut = @"admin group plist not found on disk";
-        return NO;
-    }
-
-    NSMutableArray *users   = [(admin[@"users"]        ?: @[]) mutableCopy];
-    NSMutableArray *members = [(admin[@"groupmembers"] ?: @[]) mutableCopy];
-    if (![users   containsObject:shortname]) [users   addObject:shortname];
-    if (![members containsObject:userUUID])  [members addObject:userUUID];
-    admin[@"users"]        = users;
-    admin[@"groupmembers"] = members;
-
-    return write_plist(admin, adminPath, 0, 80, 0600, errOut);
-}
-
-/* Offline account creation bypasses Open Directory's collision checks. */
-static BOOL new_user_paths_available(NSString *mountPt, NSString *shortname,
-                                     NSString **errOut) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *roots = @[@"private/var/db/dslocal/nodes/Default/users",
-                       @"var/db/dslocal/nodes/Default/users", @"Users"];
-    for (NSString *relativeRoot in roots) {
-        NSString *root = [mountPt stringByAppendingPathComponent:relativeRoot];
-        struct stat st;
-        if (lstat(root.fileSystemRepresentation, &st) != 0) {
-            if (errno == ENOENT) continue;
-            if (errOut) *errOut = [NSString stringWithFormat:
-                @"Cannot check guest account directory %@: %s", relativeRoot, strerror(errno)];
-            return NO;
-        }
-        NSError *error = nil;
-        NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:root error:&error];
-        if (!entries) {
-            if (errOut) *errOut = [NSString stringWithFormat:
-                @"Cannot check guest account directory %@: %@", relativeRoot, error.localizedDescription];
-            return NO;
-        }
-        BOOL homes = [relativeRoot isEqualToString:@"Users"];
-        for (NSString *entry in entries) {
-            if (!homes && [entry.pathExtension caseInsensitiveCompare:@"plist"] != NSOrderedSame)
-                continue;
-            NSString *entryName = homes ? entry : entry.stringByDeletingPathExtension;
-            BOOL collision = [entryName caseInsensitiveCompare:shortname] == NSOrderedSame;
-            if (!homes && !collision) {
-                NSDictionary *record = [NSDictionary dictionaryWithContentsOfFile:
-                    [root stringByAppendingPathComponent:entry]];
-                id names = record[@"name"];
-                if ([names isKindOfClass:[NSArray class]]) {
-                    for (id alias in names) {
-                        if ([alias isKindOfClass:[NSString class]] &&
-                            [alias caseInsensitiveCompare:shortname] == NSOrderedSame) {
-                            collision = YES;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (collision) {
-                if (errOut) *errOut = [NSString stringWithFormat:
-                    @"Username '%@' already exists in the guest account or home directories.", shortname];
-                return NO;
-            }
-        }
-    }
-    return YES;
-}
-
-static BOOL inject_user(NSString *mountPt,
-                        NSString *shortname, NSString *realname, int uid,
-                        NSData *shd,
-                        NSString **errOut) {
-    emit_status([NSString stringWithFormat:@"Creating user '%@'", shortname]);
-
-    if (!shd) {
-        if (errOut) *errOut = @"missing ShadowHashData";
-        return NO;
-    }
-    if (!new_user_paths_available(mountPt, shortname, errOut)) return NO;
-
-    NSString *uuidStr = [[NSUUID UUID] UUIDString];
-    NSDictionary *userPlist = @{
-        @"authentication_authority":
-            @[@";ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>"],
-        @"generateduid": @[uuidStr],
-        @"gid":          @[@"20"],
-        @"home":         @[[NSString stringWithFormat:@"/Users/%@", shortname]],
-        @"name":         @[shortname],
-        @"passwd":       @[@"********"],
-        @"realname":     @[realname],
-        @"shell":        @[@"/bin/zsh"],
-        @"uid":          @[[NSString stringWithFormat:@"%d", uid]],
-        @"ShadowHashData": @[shd],
-    };
-
-    NSString *userPlistPath = [mountPt stringByAppendingPathComponent:
-        [NSString stringWithFormat:
-         @"private/var/db/dslocal/nodes/Default/users/%@.plist", shortname]];
-    if (!write_plist(userPlist, userPlistPath, 0, 0, 0600, errOut)) {
-        /* Fall back to non-firmlinked path if private/ layout differs. */
-        userPlistPath = [mountPt stringByAppendingPathComponent:
-            [NSString stringWithFormat:
-             @"var/db/dslocal/nodes/Default/users/%@.plist", shortname]];
-        if (!write_plist(userPlist, userPlistPath, 0, 0, 0600, errOut)) return NO;
-    }
-
-    if (!add_user_to_admin_group(mountPt, shortname, uuidStr, errOut)) return NO;
-
-    /* Pre-create home dir skeleton so per-user SetupAssistant.plist persists. */
-    NSString *homePath = [mountPt stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"Users/%@", shortname]];
-    NSString *prefsPath = [homePath stringByAppendingPathComponent:@"Library/Preferences"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:prefsPath
-                                withIntermediateDirectories:YES
-                                                 attributes:nil error:nil];
-    /* Recursively chown home → uid:staff (gid 20). */
-    NSTask *t = [[NSTask alloc] init];
-    t.launchPath = @"/usr/sbin/chown";
-    t.arguments = @[@"-R",
-                    [NSString stringWithFormat:@"%d:20", uid],
-                    homePath];
-    [t launchAndReturnError:nil];
-    [t waitUntilExit];
-    chmod(homePath.fileSystemRepresentation, 0700);
-
-    return YES;
-}
-
-/* Create an empty file with given owner/mode; mkdir -p'ing the parent. */
-static BOOL touch_marker(NSString *path, uid_t uid, gid_t gid, mode_t mode,
-                         NSString **errOut) {
-    [[NSFileManager defaultManager] createDirectoryAtPath:
-        [path stringByDeletingLastPathComponent]
-                                withIntermediateDirectories:YES
-                                                 attributes:nil error:nil];
-    int fd = open(path.fileSystemRepresentation, O_CREAT|O_WRONLY|O_TRUNC, mode);
-    if (fd < 0) {
-        if (errOut) *errOut = [NSString stringWithFormat:@"touch %@: %s",
-                               path.lastPathComponent, strerror(errno)];
-        return NO;
-    }
-    close(fd);
-    chown(path.fileSystemRepresentation, uid, gid);
-    chmod(path.fileSystemRepresentation, mode);
-    return YES;
-}
-
-static BOOL skip_setup_assistant(NSString *mountPt, NSString *shortname, int uid,
-                                 NSString **errOut) {
-    emit_status(@"Skipping Setup Assistant");
-
-    /* ---- System-wide marker files ----
-     * Four flags together cover all the code paths inside the OS that
-     * decide whether to run the initial setup Buddy:
-     *   .AppleSetupDone       — the main system-level flag
-     *   .SetupRegComplete     — older receipt path, still checked
-     *   User Template/.skipbuddy — suppresses Buddy for future logins too
-     */
-    NSString *doneFile = [mountPt stringByAppendingPathComponent:
-        @"private/var/db/.AppleSetupDone"];
-    if (!touch_marker(doneFile, 0, 0, 0644, errOut)) {
-        doneFile = [mountPt stringByAppendingPathComponent:@"var/db/.AppleSetupDone"];
-        if (!touch_marker(doneFile, 0, 0, 0644, errOut)) return NO;
-    }
-
-    (void)touch_marker([mountPt stringByAppendingPathComponent:
-        @"Library/Receipts/.SetupRegComplete"], 0, 0, 0644, NULL);
-    (void)touch_marker([mountPt stringByAppendingPathComponent:
-        @"Library/User Template/English.lproj/.skipbuddy"], 0, 0, 0644, NULL);
-    (void)touch_marker([mountPt stringByAppendingPathComponent:
-        @"Library/User Template/Non_localized.lproj/.skipbuddy"], 0, 0, 0644, NULL);
-
-    /* Per-user com.apple.SetupAssistant.plist — DidSee* flags + a few
-     * MiniBuddy gate keys. On non-MDM Tahoe, this suppresses the older
-     * panes (Privacy, Siri, Screen Time, Touch ID, True Tone, Appearance,
-     * Accessibility, etc.). It does NOT suppress Apple Account, Age Range,
-     * Analytics, FileVault, or the Software Update prompt — those panes
-     * only respect the com.apple.SetupAssistant.managed domain via real
-     * MDM enrollment, which is out of scope here. The user clicks through
-     * those 5 once on first VM creation. */
-    NSDictionary *sa = @{
-        @"DidSeeAccessibility":                 @YES,
-        @"DidSeeAccessibilitySetup":            @YES,
-        @"DidSeeActivationLock":                @YES,
-        @"DidSeeAppearanceSetup":               @YES,
-        @"DidSeeAppStore":                      @YES,
-        @"DidSeeAvatarSetup":                   @YES,
-        @"DidSeeContinuity":                    @YES,
-        @"DidSeeEmergencySOS":                  @YES,
-        @"DidSeeIntelligence":                  @YES,
-        @"DidSeeLockdownMode":                  @YES,
-        @"DidSeeOSShowcase":                    @YES,
-        @"DidSeePrivacy":                       @YES,
-        @"DidSeePrivacyConsent":                @YES,
-        @"DidSeeScreenTime":                    @YES,
-        @"DidSeeSiriSetup":                     @YES,
-        @"DidSeeTerms":                         @YES,
-        @"DidSeeTermsOfAddress":                @YES,
-        @"DidSeeTOS":                           @YES,
-        @"DidSeeTouchIDSetup":                  @YES,
-        @"DidSeeTrueToneDisplay":               @YES,
-        @"DidSeeUpdateCompleted":               @YES,
-
-        /* Gate keys MiniBuddy consults alongside the DidSee flags. Setting
-         * these explicitly prevents unrelated "you haven't finished setup"
-         * prompts on subsequent boots. */
-        @"InitialAccountOnMac":                 @YES,
-        @"MiniBuddyLaunchReason":               @0,
-        @"MiniBuddyLaunchedPostMigration":      @YES,
-        @"MiniBuddyShouldLaunchToResumeSetup":  @NO,
-
-        @"SkipExpressSettingsUpdating":         @YES,
-        @"SkipFirstLoginOptimization":          @YES,
-        @"SkipFirstLoginOptIn":                 @YES,
-
-        @"GestureMovieSeen":                    @"none",
-        /* Out-of-range sentinel: prevents re-prompts after OS updates. */
-        @"LastSeenBuddyBuildVersion":           @"99.99",
-        @"LastSeenCloudProductVersion":         @"99.99",
-        @"PreviousBuildVersion":                @"99.99",
-        @"PreviousSystemVersion":               @"99.99",
-        @"RunNonInteractive":                   @YES,
-    };
-    NSString *saUserPath = [mountPt stringByAppendingPathComponent:
-        [NSString stringWithFormat:
-         @"Users/%@/Library/Preferences/com.apple.SetupAssistant.plist", shortname]];
-    if (!write_plist(sa, saUserPath, uid, 20, 0600, errOut)) return NO;
-
-    /* System-wide copy of the same plist — some code paths check the
-     * machine-scope domain in addition to the per-user one. */
-    NSString *saSysPath = [mountPt stringByAppendingPathComponent:
-        @"Library/Preferences/com.apple.SetupAssistant.plist"];
-    if (!write_plist(sa, saSysPath, 0, 0, 0644, errOut)) return NO;
-
-    return YES;
-}
-
 /* Enable the built-in OpenSSH daemon by clearing its Disabled flag in
  * launchd's override database. This works offline (disk mounted on the
  * host) and survives reboots, which `systemsetup -setremotelogin on`
@@ -697,39 +477,6 @@ static BOOL enable_ssh(NSString *mountPt, NSString **errOut) {
 
     d[@"com.openssh.sshd"] = @NO;   /* NO = not disabled */
     return write_plist(d, path, 0, 0, 0644, errOut);
-}
-
-static BOOL enable_autologin(NSString *mountPt, NSString *shortname,
-                             NSData *kc,
-                             NSString **errOut) {
-    emit_status(@"Enabling auto-login");
-
-    /* /Library/Preferences/com.apple.loginwindow.plist: autoLoginUser. */
-    NSString *lwPath = [mountPt stringByAppendingPathComponent:
-        @"Library/Preferences/com.apple.loginwindow.plist"];
-    NSMutableDictionary *lw =
-        [[NSDictionary dictionaryWithContentsOfFile:lwPath] mutableCopy]
-            ?: [NSMutableDictionary dictionary];
-    lw[@"autoLoginUser"] = shortname;
-    if (!write_plist(lw, lwPath, 0, 0, 0644, errOut)) return NO;
-
-    /* /etc/kcpassword: obfuscated password bytes (XOR cipher). */
-    if (!kc) { if (errOut) *errOut = @"missing kcpassword"; return NO; }
-    NSString *kcPath = [mountPt stringByAppendingPathComponent:@"private/etc/kcpassword"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:
-        [kcPath stringByDeletingLastPathComponent]
-                                withIntermediateDirectories:YES
-                                                 attributes:nil error:nil];
-    if (![kc writeToFile:kcPath atomically:YES]) {
-        kcPath = [mountPt stringByAppendingPathComponent:@"etc/kcpassword"];
-        if (![kc writeToFile:kcPath atomically:YES]) {
-            if (errOut) *errOut = @"kcpassword write failed";
-            return NO;
-        }
-    }
-    chown(kcPath.fileSystemRepresentation, 0, 0);
-    chmod(kcPath.fileSystemRepresentation, 0600);
-    return YES;
 }
 
 /* Drop a sidecar file with the user's chosen display name so firstboot.sh
@@ -762,57 +509,28 @@ static BOOL set_computer_name(NSString *mountPt, NSString *displayName,
     return YES;
 }
 
-/* ---- Global state for signal-safe cleanup ---- */
-
 static MountState g_mount = {0};
-static volatile sig_atomic_t g_cleaning_up = 0;
-
-static void cleanup_on_signal(int sig) {
-    (void)sig;
-    if (g_cleaning_up) _exit(130);
-    g_cleaning_up = 1;
-    unmount_and_detach(&g_mount);
-    _exit(130);
-}
 
 /* ---- "stage" subcommand ---- */
 
 static int cmd_stage(int argc, char **argv) {
     NSString *diskPath = nil;
     NSString *manifest = nil;
-    NSString *userShort = nil;
-    NSString *userReal  = nil;
-    int userUid = 501;
-    NSString *passFile = nil;
-    NSString *shadowhashFile = nil;   /* daemon-supplied precomputed ShadowHashData (no plaintext) */
-    NSString *kcpasswordFile = nil;   /* daemon-supplied precomputed /etc/kcpassword bytes */
     NSString *computerName = nil;
-    BOOL skipSA = NO;
-    BOOL autoLogin = NO;
+    NSString *waitForUser = nil;
+    uint64_t diskBytes = 0;
     BOOL sshOn = NO;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--disk") == 0 && i + 1 < argc)
             diskPath = [NSString stringWithUTF8String:argv[++i]];
+        else if (strcmp(argv[i], "--disk-gb") == 0 && i + 1 < argc)
+            diskBytes = strtoull(argv[++i], NULL, 10) * 1024 * 1024 * 1024;
         else if (strcmp(argv[i], "--manifest") == 0 && i + 1 < argc)
             manifest = [NSString stringWithUTF8String:argv[++i]];
-        else if (strcmp(argv[i], "--user-shortname") == 0 && i + 1 < argc)
-            userShort = [NSString stringWithUTF8String:argv[++i]];
-        else if (strcmp(argv[i], "--user-realname") == 0 && i + 1 < argc)
-            userReal = [NSString stringWithUTF8String:argv[++i]];
-        else if (strcmp(argv[i], "--user-uid") == 0 && i + 1 < argc)
-            userUid = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--user-password-file") == 0 && i + 1 < argc)
-            passFile = [NSString stringWithUTF8String:argv[++i]];
-        else if (strcmp(argv[i], "--shadowhash-file") == 0 && i + 1 < argc)
-            shadowhashFile = [NSString stringWithUTF8String:argv[++i]];
-        else if (strcmp(argv[i], "--kcpassword-file") == 0 && i + 1 < argc)
-            kcpasswordFile = [NSString stringWithUTF8String:argv[++i]];
         else if (strcmp(argv[i], "--computer-name") == 0 && i + 1 < argc)
             computerName = [NSString stringWithUTF8String:argv[++i]];
-        else if (strcmp(argv[i], "--skip-setup-assistant") == 0)
-            skipSA = YES;
-        else if (strcmp(argv[i], "--auto-login") == 0)
-            autoLogin = YES;
+        else if (strcmp(argv[i], "--wait-for-user") == 0 && i + 1 < argc)
+            waitForUser = [NSString stringWithUTF8String:argv[++i]];
         else if (strcmp(argv[i], "--enable-ssh") == 0)
             sshOn = YES;
     }
@@ -821,7 +539,7 @@ static int cmd_stage(int argc, char **argv) {
         return 2;
     }
     if (geteuid() != 0) {
-        emit_error(@"stage: must run as root (invoke via AEWP)");
+        emit_error(@"stage: must run through the elevated AppSandbox core");
         return 2;
     }
 
@@ -829,49 +547,29 @@ static int cmd_stage(int argc, char **argv) {
     NSArray *entries = load_manifest(manifest, &err);
     if (!entries) { emit_error(err); return 3; }
 
-    /* Resolve the account credential material. In the daemon flow the host computes the ShadowHash +
-     * kcpassword IN-PROCESS and passes them as files -- this applier never sees the plaintext (the
-     * mirror of the Windows path, where the password is encoded in the daemon, not the disk-applier).
-     * Direct CLI use passes --user-password-file instead; we then compute them here via the same
-     * shared encoders. The password buffer is wiped before exit. */
-    char passBuf[256] = {0};
-    size_t passLen = 0;
-    if (passFile) {
-        int pfd = open(passFile.fileSystemRepresentation, O_RDONLY);
-        if (pfd < 0) {
-            emit_error([NSString stringWithFormat:@"open password file: %s", strerror(errno)]);
-            return 3;
-        }
-        ssize_t n = read(pfd, passBuf, sizeof(passBuf) - 1);
-        close(pfd);
-        if (n > 0) passLen = (size_t)n;
-    }
-
-    NSData *shdData = nil, *kcData = nil;
-    if (shadowhashFile) {
-        shdData = [NSData dataWithContentsOfFile:shadowhashFile];
-        if (!shdData) { memset(passBuf, 0, sizeof(passBuf)); emit_error(@"stage: cannot read --shadowhash-file"); return 3; }
-    } else if (passLen > 0) {
-        shdData = asb_macos_shadow_hash_data(passBuf, passLen);
-    }
-    if (kcpasswordFile) {
-        kcData = [NSData dataWithContentsOfFile:kcpasswordFile];
-        if (!kcData) { memset(passBuf, 0, sizeof(passBuf)); emit_error(@"stage: cannot read --kcpassword-file"); return 3; }
-    } else if (passLen > 0) {
-        kcData = asb_macos_kcpassword(passBuf, passLen);
-    }
-
     emit_progress(5, @"Loaded manifest");
 
+    struct stat diskStat;
+    if (stat(diskPath.fileSystemRepresentation, &diskStat) != 0) {
+        emit_error([NSString stringWithFormat:@"Cannot read virtual disk size: %s", strerror(errno)]);
+        return 4;
+    }
+    if (diskBytes > (uint64_t)diskStat.st_size) {
+        emit_status(@"Expanding macOS disk");
+        NSString *resizeError = nil;
+        if (run_tool(@"/usr/sbin/diskutil", @[@"image", @"resize", @"--size",
+            [NSString stringWithFormat:@"%llu", (unsigned long long)diskBytes], diskPath], NULL, &resizeError) != 0) {
+            NSString *detail = resizeError ?: @"diskutil failed";
+            emit_error([@"Failed to expand macOS disk: " stringByAppendingString:
+                [detail stringByReplacingOccurrencesOfString:@"\n" withString:@" "]]);
+            return 4;
+        }
+    }
+
     if (!mount_disk(diskPath, &g_mount, &err)) {
-        memset(passBuf, 0, sizeof(passBuf));
         emit_error(err);
         return 4;
     }
-
-    signal(SIGINT,  cleanup_on_signal);
-    signal(SIGTERM, cleanup_on_signal);
-    signal(SIGPIPE, SIG_IGN);
 
     emit_progress(30, @"Staging files");
     int total = (int)entries.count;
@@ -884,39 +582,24 @@ static int cmd_stage(int argc, char **argv) {
                       [NSString stringWithFormat:@"Copying %@", e.destRel]);
         if (!stage_entry(e, g_mount.mountPt, &err)) {
             unmount_and_detach(&g_mount);
-            memset(passBuf, 0, sizeof(passBuf));
             emit_error(err);
             return 5;
         }
     }
 
-    /* Optional: create user, skip Setup Assistant, enable autologin. */
-    if (userShort && shdData) {
-        emit_progress(75, @"Creating user account");
-        if (!inject_user(g_mount.mountPt, userShort, userReal ?: userShort,
-                         userUid, shdData, &err)) {
-            unmount_and_detach(&g_mount);
-            memset(passBuf, 0, sizeof(passBuf));
-            emit_error(err);
-            return 6;
-        }
-    }
-    if (skipSA && userShort) {
-        emit_progress(85, @"Skipping Setup Assistant");
-        if (!skip_setup_assistant(g_mount.mountPt, userShort, userUid, &err)) {
-            unmount_and_detach(&g_mount);
-            memset(passBuf, 0, sizeof(passBuf));
-            emit_error(err);
-            return 7;
-        }
-    }
-    if (autoLogin && userShort && kcData) {
-        emit_progress(90, @"Enabling auto-login");
-        if (!enable_autologin(g_mount.mountPt, userShort, kcData, &err)) {
-            unmount_and_detach(&g_mount);
-            memset(passBuf, 0, sizeof(passBuf));
-            emit_error(err);
-            return 8;
+    if (waitForUser.length) {
+        NSString *base = [g_mount.mountPt stringByAppendingPathComponent:@"Library/AppSandbox"];
+        NSDictionary *settings = @{@"firstboot-user": waitForUser,
+                                    @"enable-ssh": sshOn ? @"1" : @"0"};
+        for (NSString *name in settings) {
+            NSString *path = [base stringByAppendingPathComponent:name];
+            if (![settings[name] writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+                unmount_and_detach(&g_mount);
+                emit_error(@"stage: cannot write first-boot settings");
+                return 6;
+            }
+            chown(path.fileSystemRepresentation, 0, 0);
+            chmod(path.fileSystemRepresentation, 0644);
         }
     }
 
@@ -928,7 +611,6 @@ static int cmd_stage(int argc, char **argv) {
         emit_progress(93, @"Enabling SSH");
         if (!enable_ssh(g_mount.mountPt, &err)) {
             unmount_and_detach(&g_mount);
-            memset(passBuf, 0, sizeof(passBuf));
             emit_error(err);
             return 9;
         }
@@ -938,7 +620,6 @@ static int cmd_stage(int argc, char **argv) {
         emit_progress(94, @"Setting computer name");
         if (!set_computer_name(g_mount.mountPt, computerName, &err)) {
             unmount_and_detach(&g_mount);
-            memset(passBuf, 0, sizeof(passBuf));
             emit_error(err);
             return 10;
         }
@@ -946,9 +627,6 @@ static int cmd_stage(int argc, char **argv) {
 
     emit_progress(95, @"Unmounting");
     unmount_and_detach(&g_mount);
-
-    /* Wipe plaintext password from RAM before we exit. */
-    memset(passBuf, 0, sizeof(passBuf));
 
     emit_progress(100, @"Done");
     emit_done(diskPath);
@@ -1205,6 +883,7 @@ static int cmd_install(int argc, char **argv) {
     NSString *name = nil, *vmDir = nil, *ipsw = nil, *diskPath = nil;
     NSString *macAddress = nil;
     int ramMb = 0, cpus = 0, diskGb = 0;
+    int networkFd = -1;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) name = @(argv[++i]);
         else if (strcmp(argv[i], "--vm-dir") == 0 && i + 1 < argc) vmDir = @(argv[++i]);
@@ -1214,11 +893,24 @@ static int cmd_install(int argc, char **argv) {
         else if (strcmp(argv[i], "--cpus") == 0 && i + 1 < argc) cpus = atoi(argv[++i]);
         else if (strcmp(argv[i], "--disk-gb") == 0 && i + 1 < argc) diskGb = atoi(argv[++i]);
         else if (strcmp(argv[i], "--mac-address") == 0 && i + 1 < argc) macAddress = @(argv[++i]);
+        else if (strcmp(argv[i], "--network-fd") == 0 && i + 1 < argc) {
+            if (strcmp(argv[++i], "0") == 0) networkFd = STDIN_FILENO;
+        }
     }
-    if (!name || !vmDir || !ipsw || ramMb <= 0 || cpus <= 0 || diskGb <= 0) {
-        emit_error(@"install: --name --vm-dir --ipsw --ram-mb --cpus --disk-gb all required");
+    if (!name || !vmDir || !ipsw || ramMb <= 0 || cpus <= 0 || diskGb <= 0 || networkFd < 0) {
+        emit_error(@"install: --name --vm-dir --ipsw --ram-mb --cpus --disk-gb --network-fd all required");
         return 2;
     }
+    int socketType = 0;
+    socklen_t typeLength = sizeof(socketType), peerLength = sizeof(struct sockaddr_storage);
+    struct sockaddr_storage peer;
+    if (getsockopt(networkFd, SOL_SOCKET, SO_TYPE, &socketType, &typeLength) != 0 ||
+        socketType != SOCK_DGRAM ||
+        getpeername(networkFd, (struct sockaddr *)&peer, &peerLength) != 0 || peer.ss_family != AF_UNIX) {
+        emit_error(@"install: a connected core-owned datagram network socket is required");
+        return 2;
+    }
+    NSFileHandle *networkHandle = [[NSFileHandle alloc] initWithFileDescriptor:networkFd closeOnDealloc:NO];
     VZMACAddress *mac = macAddress ? [[VZMACAddress alloc] initWithString:macAddress] : nil;
     if (macAddress && !mac.isUnicastAddress) {
         emit_error(@"install: invalid MAC address");
@@ -1339,10 +1031,9 @@ static int cmd_install(int argc, char **argv) {
                 config.pointingDevices  = @[[[VZMacTrackpadConfiguration alloc] init],
                                             [[VZUSBScreenCoordinatePointingDeviceConfiguration alloc] init]];
 
-                VZNATNetworkDeviceAttachment *natAtt = [[VZNATNetworkDeviceAttachment alloc] init];
                 VZVirtioNetworkDeviceConfiguration *netCfg = [[VZVirtioNetworkDeviceConfiguration alloc] init];
                 if (mac) netCfg.MACAddress = mac;
-                netCfg.attachment = natAtt;
+                netCfg.attachment = [[VZFileHandleNetworkDeviceAttachment alloc] initWithFileHandle:networkHandle];
                 config.networkDevices = @[netCfg];
 
                 config.socketDevices = @[[[VZVirtioSocketDeviceConfiguration alloc] init]];
@@ -1395,46 +1086,6 @@ static int cmd_install(int argc, char **argv) {
     return exitCode;
 }
 
-/* ---- "publish-shm" subcommand ----
- * Write the asb_transport directory (region table + slot caps) into the ivshmem backing file
- * before QEMU boots, so every guest service's asb_transport_init() sees ASB_SHM_DIR_MAGIC at start
- * and selects the ivshmem backend. The VM launcher owns the directory; the viewer/host attach as
- * consumers. The product QemuVm launcher calls asb_shm_publish() in-process from the same header;
- * this subcommand is the equivalent for the raw-QEMU dev harness (and builds via Xcode, not clang). */
-static int cmd_publish_shm(int argc, char **argv) {
-    NSString *shmPath = nil;
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--shm") == 0 && i + 1 < argc)
-            shmPath = [NSString stringWithUTF8String:argv[++i]];
-    }
-    if (!shmPath) { emit_error(@"publish-shm: --shm <path> required"); return 2; }
-
-    int fd = open(shmPath.fileSystemRepresentation, O_RDWR);
-    if (fd < 0) {
-        emit_error([NSString stringWithFormat:@"open %@: %s", shmPath, strerror(errno)]);
-        return 3;
-    }
-    struct stat st;
-    if (fstat(fd, &st) != 0) { close(fd); emit_error(@"fstat failed"); return 3; }
-    if ((uint64_t)st.st_size < ASB_P9_REGION_OFF + ASB_P9_REGION_SIZE) {
-        close(fd);
-        emit_error([NSString stringWithFormat:@"backing file too small: %lld bytes (need >= %llu)",
-                    (long long)st.st_size,
-                    (unsigned long long)(ASB_P9_REGION_OFF + ASB_P9_REGION_SIZE)]);
-        return 3;
-    }
-    void *bar = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (bar == MAP_FAILED) { close(fd); emit_error(@"mmap failed"); return 3; }
-
-    asb_shm_publish((uint8_t *)bar, (uint64_t)st.st_size);
-    msync(bar, 4096, MS_SYNC);
-    munmap(bar, (size_t)st.st_size);
-    close(fd);
-    emit_log([NSString stringWithFormat:@"published %d regions to %@", ASB_SHM_N_REGIONS, shmPath]);
-    emit_done(shmPath);
-    return 0;
-}
-
 /* ======================================================================== *
  *  "build-windows" subcommand
  *
@@ -1465,6 +1116,8 @@ static int bw_manifest_add(FILE *mf, NSString *src, const char *dest) {
 
 /* ---- ISO mount lifecycle ---- */
 typedef struct { NSString *diskDev; NSString *mountPt; NSString *shadowPath; } IsoMount;
+static IsoMount g_iso_mount;
+static NSString *g_build_tmp;
 
 /* Attach the ISO and locate the mount point that actually contains sources/install.wim (a Windows ISO
  * exposes both ISO9660 and UDF volumes).
@@ -1507,6 +1160,8 @@ static BOOL bw_mount_iso(NSString *isoPath, IsoMount *out, NSString **errOut) {
         /* No install.wim found at any mount point; detach + fail. */
         if (out->diskDev) (void)run_tool(@"/usr/bin/hdiutil", @[@"detach", @"-force", out->diskDev], NULL, NULL);
         [[NSFileManager defaultManager] removeItemAtPath:shadow error:nil];
+        out->diskDev = nil;
+        out->shadowPath = nil;
         if (errOut) *errOut = @"ISO mounted but sources/install.wim not found";
         return NO;
     }
@@ -1519,6 +1174,13 @@ static void bw_unmount_iso(IsoMount *m) {
     m->diskDev = nil; m->mountPt = nil; m->shadowPath = nil;
 }
 
+static void cleanup_worker(void) {
+    g_cleaning_up = YES;
+    unmount_and_detach(&g_mount);
+    bw_unmount_iso(&g_iso_mount);
+    if (g_build_tmp) [[NSFileManager defaultManager] removeItemAtPath:g_build_tmp error:nil];
+}
+
 /* win_disk_build progress -> PROGRESS/STATUS lines. */
 static void bw_progress(int pct, const char *msg) {
     emit_progress(pct, msg ? [NSString stringWithUTF8String:msg] : @"");
@@ -1529,9 +1191,12 @@ static int cmd_build_windows(int argc, char **argv) {
     NSString *vmName = @"WIN11-VM", *user = @"user", *pass = @"test123";
     NSString *provDir = nil;   /* host-generated unattend.xml/setup.cmd/SetupComplete.cmd (password encoded host-side) */
     NSString *lang = @"";   /* empty => auto-detect from the install.wim XML (else en-US) */
+    BOOL isTemplate = NO, resourcesOnly = NO;
     int diskGb = 64, imageIdx = 1, testMode = 1;   /* testMode optional (mirrors Windows disk builder) */
     for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--iso") == 0 && i+1 < argc) iso = @(argv[++i]);
+        if (strcmp(argv[i], "--template") == 0) isTemplate = YES;
+        else if (strcmp(argv[i], "--resources-iso") == 0) resourcesOnly = YES;
+        else if (strcmp(argv[i], "--iso") == 0 && i+1 < argc) iso = @(argv[++i]);
         else if (strcmp(argv[i], "--out") == 0 && i+1 < argc) out = @(argv[++i]);
         else if (strcmp(argv[i], "--signed-payload-zip") == 0 && i+1 < argc) signedZip = @(argv[++i]);
         else if (strcmp(argv[i], "--netkvm-zip") == 0 && i+1 < argc) netkvmZip = @(argv[++i]);
@@ -1545,7 +1210,7 @@ static int cmd_build_windows(int argc, char **argv) {
         else if (strcmp(argv[i], "--image-index") == 0 && i+1 < argc) imageIdx = atoi(argv[++i]);
         else if (strcmp(argv[i], "--test-mode") == 0 && i+1 < argc) testMode = atoi(argv[++i]);
     }
-    if (!iso || !out || !signedZip) {
+    if ((!resourcesOnly && !iso) || !out || !signedZip || (resourcesOnly && !provDir)) {
         emit_error(@"build-windows: --iso, --out and --signed-payload-zip are required");
         return 2;
     }
@@ -1554,6 +1219,7 @@ static int cmd_build_windows(int argc, char **argv) {
     /* 1) temp staging dir for the generated answer file + scripts */
     NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
                      [NSString stringWithFormat:@"asb-winbuild-%d", getpid()]];
+    g_build_tmp = tmp;
     [fm removeItemAtPath:tmp error:nil];
     NSError *mkErr = nil;
     if (![fm createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:&mkErr]) {
@@ -1598,14 +1264,15 @@ static int cmd_build_windows(int argc, char **argv) {
 
     /* Mount the ISO + locate install.wim FIRST so the OS language can be read from the
      * WIM before the answer file is generated; the mount stays live for the build below. */
+    NSString *wim = nil;
+    if (!resourcesOnly) {
     emit_progress(2, @"Mounting ISO");
-    IsoMount iso_m = {0};
     NSString *err = nil;
-    if (!bw_mount_iso(iso, &iso_m, &err)) {
+    if (!bw_mount_iso(iso, &g_iso_mount, &err)) {
         [fm removeItemAtPath:tmp error:nil];
         emit_error(err); return 4;
     }
-    NSString *wim = [iso_m.mountPt stringByAppendingPathComponent:@"sources/install.wim"];
+    wim = [g_iso_mount.mountPt stringByAppendingPathComponent:@"sources/install.wim"];
     emit_log([NSString stringWithFormat:@"install.wim: %@", wim]);
 
     /* OS language: unless an explicit --lang was given (lang non-empty), auto-detect the
@@ -1626,6 +1293,8 @@ static int cmd_build_windows(int argc, char **argv) {
         if (lang.length == 0) { lang = @"en-US"; emit_log(@"ISO language not detected; using en-US"); }
     }
 
+    }
+
     /* Provisioning files. In the daemon flow they are generated IN-PROCESS by the host (the password
      * is encoded there via the shared asb_provision_unattend and never reaches this child) and handed
      * over via --prov-dir -- the exact mirror of the Windows backend, where vhdx_create_thread
@@ -1644,7 +1313,7 @@ static int cmd_build_windows(int argc, char **argv) {
          * host re-generates unattend.xml in place before we stage it. Just verify they exist. */
         for (NSString *p in @[unattend, setupCmd, setupComplete]) {
             if (![fm fileExistsAtPath:p]) {
-                bw_unmount_iso(&iso_m);
+                bw_unmount_iso(&g_iso_mount);
                 [fm removeItemAtPath:tmp error:nil];
                 emit_error([NSString stringWithFormat:@"prov-dir missing %@", p.lastPathComponent]);
                 return 3;
@@ -1662,10 +1331,11 @@ static int cmd_build_windows(int argc, char **argv) {
             FILE *fs = fopen(setupCmd.fileSystemRepresentation, "wb");
             FILE *fc = fopen(setupComplete.fileSystemRepresentation, "wb");
             if (fu && fs && fc) {
-                asb_provision_unattend(fu, vmName.UTF8String, user.UTF8String, pass.UTF8String,
+                if (isTemplate) asb_provision_unattend_template(fu, vmName.UTF8String, "arm64", testMode, 1);
+                else asb_provision_unattend(fu, vmName.UTF8String, user.UTF8String, pass.UTF8String,
                                        "arm64", testMode, /*is_arm64=*/1, lang.UTF8String, NULL);
-                asb_provision_setup_cmd(fs);
-                asb_provision_setupcomplete(fc, sshMsiName.length ? sshMsiName.UTF8String : NULL);
+                asb_provision_setup_cmd(fs, 1, resourcesOnly);
+                asb_provision_setupcomplete(fc, sshMsiName.length ? sshMsiName.UTF8String : NULL, resourcesOnly);
                 scriptsOK = YES;
             }
             if (fu) fclose(fu);
@@ -1673,7 +1343,7 @@ static int cmd_build_windows(int argc, char **argv) {
             if (fc) fclose(fc);
         }
         if (!scriptsOK) {
-            bw_unmount_iso(&iso_m);
+            bw_unmount_iso(&g_iso_mount);
             [fm removeItemAtPath:tmp error:nil];
             emit_error(@"failed to write staging scripts"); return 3;
         }
@@ -1682,9 +1352,10 @@ static int cmd_build_windows(int argc, char **argv) {
     /* 2) build the manifest: "<host-src>\t<guest-dest>" (mirrors generate_vhdx_manifest) */
     NSString *manifest = [tmp stringByAppendingPathComponent:@"manifest.tsv"];
     FILE *mf = fopen(manifest.fileSystemRepresentation, "w");
-    if (!mf) { bw_unmount_iso(&iso_m); [fm removeItemAtPath:tmp error:nil]; emit_error(@"cannot open manifest"); return 3; }
+    if (!mf) { bw_unmount_iso(&g_iso_mount); [fm removeItemAtPath:tmp error:nil]; emit_error(@"cannot open manifest"); return 3; }
     int n = 0;
     n += bw_manifest_add(mf, unattend,      "\\Windows\\Panther\\unattend.xml");
+    if (!isTemplate) {
     n += bw_manifest_add(mf, setupCmd,      "\\Windows\\AppSandbox\\setup.cmd");
     n += bw_manifest_add(mf, setupComplete, "\\Windows\\Setup\\Scripts\\SetupComplete.cmd");
     /* agent + channel helper EXEs (existence-gated -- mirrors generate_vhdx_manifest's bin set;
@@ -1718,8 +1389,46 @@ static int cmd_build_windows(int argc, char **argv) {
     /* OpenSSH MSI (downloaded at create) -- SetupComplete.cmd installs it for SSH-over-ivshmem ch7 */
     if (sshMsiName)
         n += bw_manifest_add(mf, sshMsi, [NSString stringWithFormat:@"\\Windows\\AppSandbox\\%@", sshMsiName].UTF8String);
+    }
     fclose(mf);
     emit_log([NSString stringWithFormat:@"manifest: %d file(s) to stage", n]);
+
+    if (resourcesOnly) {
+        NSError *mediaError = nil;
+        NSString *media = [tmp stringByAppendingPathComponent:@"media"];
+        [fm createDirectoryAtPath:media withIntermediateDirectories:YES attributes:nil error:&mediaError];
+        NSString *entries = [NSString stringWithContentsOfFile:manifest encoding:NSUTF8StringEncoding error:&mediaError];
+        BOOL copied = entries != nil;
+        for (NSString *line in [entries componentsSeparatedByString:@"\n"]) {
+            if (!line.length) continue;
+            NSArray *pair = [line componentsSeparatedByString:@"\t"];
+            if (pair.count != 2) { copied = NO; break; }
+            NSString *guest = [pair[1] stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
+            NSString *relative;
+            if ([guest isEqualToString:@"/Windows/Panther/unattend.xml"]) relative = @"unattend.xml";
+            else if ([guest isEqualToString:@"/Windows/AppSandbox/setup.cmd"]) relative = @"setup.cmd";
+            else if ([guest isEqualToString:@"/Windows/Setup/Scripts/SetupComplete.cmd"]) relative = @"SetupComplete.cmd";
+            else if ([guest hasPrefix:@"/Windows/AppSandbox/"])
+                relative = [guest substringFromIndex:20];
+            else { copied = NO; break; }
+            NSString *destination = [media stringByAppendingPathComponent:relative];
+            [fm createDirectoryAtPath:destination.stringByDeletingLastPathComponent
+                 withIntermediateDirectories:YES attributes:nil error:&mediaError];
+            if (![fm copyItemAtPath:pair[0] toPath:destination error:&mediaError]) { copied = NO; break; }
+        }
+        NSString *isoError = nil;
+        int result = copied ? run_tool(@"/usr/bin/hdiutil", @[@"makehybrid", @"-iso", @"-joliet",
+            @"-default-volume-name", @"APPSETUP", @"-o", out, media], NULL, &isoError) : -1;
+        [fm removeItemAtPath:tmp error:nil];
+        if (result != 0) {
+            NSString *detail = mediaError.localizedDescription ?: isoError ?: @"Invalid staging manifest";
+            emit_error([NSString stringWithFormat:@"Failed to build instance resources ISO: %@",
+                [detail stringByReplacingOccurrencesOfString:@"\n" withString:@" "]]);
+            return 5;
+        }
+        emit_done(out);
+        return 0;
+    }
 
     /* build the disk (apply WIM image -> NTFS -> stage our files -> ESP + BCD); the ISO is
      * already mounted + install.wim located above (for language detection). Use LOG (not
@@ -1731,9 +1440,10 @@ static int cmd_build_windows(int argc, char **argv) {
                             (uint64_t)(diskGb > 0 ? diskGb : 64),
                             manifest.fileSystemRepresentation,
                             bw_progress);
+    check_cancelled();
 
     /* 5) unmount + cleanup */
-    bw_unmount_iso(&iso_m);
+    bw_unmount_iso(&g_iso_mount);
     [fm removeItemAtPath:tmp error:nil];
 
     if (rc != 0) { emit_error([NSString stringWithFormat:@"win_disk_build failed (%d)", rc]); return 5; }
@@ -1759,12 +1469,7 @@ static void print_usage(void) {
         "\n"
         "  stage --disk <path> --manifest <path>\n"
         "      Mount the VM disk image, apply TSV manifest, unmount.\n"
-        "      Must run as root (invoked via AEWP). Account credential: --shadowhash-file +\n"
-        "      --kcpassword-file (host-precomputed; no plaintext) or --user-password-file (computed here).\n"
-        "\n"
-        "  publish-shm --shm <path>\n"
-        "      Write the asb_transport directory into the ivshmem backing file\n"
-        "      before QEMU boots (launcher owns it; guest services then select ivshmem).\n"
+        "      Must run through the elevated AppSandbox core.\n"
         "\n"
         "  build-windows --iso <path> --out <disk.img> --signed-payload-zip <zip> [--netkvm-zip <zip>]\n"
         "                [--devcon <devcon.exe>] [--ssh-msi <OpenSSH .msi>] [--vm-name <n>]\n"
@@ -1778,8 +1483,26 @@ static void print_usage(void) {
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
+        if (geteuid() == 0 && setuid(0) != 0) {
+            emit_error(@"Failed to initialize worker process credentials");
+            return 1;
+        }
         if (argc < 2) { print_usage(); return 64; }
+        if (getpgrp() != getpid() && setpgid(0, 0) != 0) {
+            emit_error(@"Failed to initialize worker process group");
+            return 1;
+        }
         const char *cmd = argv[1];
+        if (strcmp(cmd, "stage") == 0 || strcmp(cmd, "build-windows") == 0) {
+            atexit(cleanup_worker);
+            struct sigaction action = {0};
+            action.sa_handler = cancel_on_signal;
+            sigemptyset(&action.sa_mask);
+            action.sa_flags = SA_RESTART;
+            sigaction(SIGTERM, &action, NULL);
+            sigaction(SIGINT, &action, NULL);
+            signal(SIGPIPE, SIG_IGN);
+        }
         if (strcmp(cmd, "stage") == 0) {
             return cmd_stage(argc - 2, argv + 2);
         }
@@ -1788,9 +1511,6 @@ int main(int argc, char *argv[]) {
         }
         if (strcmp(cmd, "install") == 0) {
             return cmd_install(argc - 2, argv + 2);
-        }
-        if (strcmp(cmd, "publish-shm") == 0) {
-            return cmd_publish_shm(argc - 2, argv + 2);
         }
         if (strcmp(cmd, "build-windows") == 0) {
             return cmd_build_windows(argc - 2, argv + 2);

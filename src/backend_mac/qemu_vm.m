@@ -1,7 +1,8 @@
 #import "qemu_vm.h"
 #import "vm_dir.h"
 #import "asb_ivshmem_transport.h"
-#import <Security/Security.h>
+#import "asb_network_mac.h"
+#import <Hypervisor/Hypervisor.h>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -15,34 +16,37 @@
 
 #include "../../tools/transport/asb_shm_layout.h"   /* asb_shm_publish + region sizing */
 
-/* ivshmem backing size — must match the -object memory-backend-file size= below and be >= the
- * published region span. 128 MiB (matches the validated dev harness). */
 #define QEMU_IVSHMEM_SIZE  (128ull * 1024 * 1024)
 
-@interface QemuVm () {
-    AuthorizationRef _authRef;     /* non-nil only on the elevated (AEWP) launch path */
-    FILE            *_elevatedPipe; /* QEMU stdout when launched via AEWP; EOF == exit */
-}
+@interface QemuVm ()
 @property (nonatomic, copy)   NSString *name;
 @property (nonatomic, strong) NSURL *vmDir;
 @property (nonatomic, assign) int ramMb;
 @property (nonatomic, assign) int cpuCores;
 @property (nonatomic, copy) NSString *macAddress;
 @property (nonatomic, assign) BOOL testMode;
+@property (nonatomic, assign) BOOL nestedVirtualization;
 @property (nonatomic, assign, readwrite) QemuVmState state;
 @property (nonatomic, strong, readwrite) AsbIvshmemTransport *transport;
 @property (nonatomic, strong) NSTask *task;          /* set only on the root NSTask path */
+@property (nonatomic, strong) AsbNatPort *networkPort;
 @property (nonatomic, assign) int monitorPort;       /* loopback HMP monitor (TCP) */
 @end
 
 @implementation QemuVm
+
++ (BOOL)nestedVirtualizationSupported {
+    bool supported = false;
+    return hv_vm_config_get_el2_supported(&supported) == HV_SUCCESS && supported;
+}
 
 - (instancetype)initWithName:(NSString *)name
                        vmDir:(NSURL *)vmDir
                        ramMb:(int)ramMb
                     cpuCores:(int)cpuCores
                   macAddress:(NSString *)macAddress
-                    testMode:(BOOL)testMode {
+                    testMode:(BOOL)testMode
+        nestedVirtualization:(BOOL)nestedVirtualization {
     if ((self = [super init])) {
         _name = [name copy];
         _vmDir = vmDir;
@@ -50,6 +54,7 @@
         _cpuCores = cpuCores > 0 ? cpuCores : 4;
         _macAddress = [macAddress copy];
         _testMode = testMode;
+        _nestedVirtualization = nestedVirtualization;
         _state = QemuVmStateStopped;
     }
     return self;
@@ -145,7 +150,7 @@
     }
     void *bar = mmap(NULL, (size_t)QEMU_IVSHMEM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (bar == MAP_FAILED) { close(fd); if (err) *err = [self posixError:@"mmap ivshmem.bin"]; return NO; }
-    asb_shm_publish((uint8_t *)bar, QEMU_IVSHMEM_SIZE);   /* same publish the dev iso-patch-mac does */
+    asb_shm_publish((uint8_t *)bar, QEMU_IVSHMEM_SIZE);
     msync(bar, 4096, MS_SYNC);
     munmap(bar, (size_t)QEMU_IVSHMEM_SIZE);
     close(fd);
@@ -205,17 +210,21 @@
     self.monitorPort = [self allocLoopbackPort];
     if (self.monitorPort <= 0) { done([self err:@"could not allocate a monitor port"]); return; }
 
-    /* argv mirrors the validated dev boot script, parameterized. No GPU; no swtpm/TPM (ARM Windows
-     * HCS exposes none, hcs_vm.c); HvSocket replaced by ivshmem-plain; -display none (the VDD is the
-     * display over ch2). Networking is vmnet-shared (Apple NAT): the guest gets a routable private IP
-     * so the host can reach it on any port AND it gets internet. vmnet needs root -> obtained either
-     * because we are the root daemon or via the elevation prompt below; there is NO fall back to
-     * user-mode NAT (see [[windows-on-mac-networking]]). The HMP monitor is loopback TCP so an
-     * unprivileged app can still control a root-owned QEMU. */
+    if (self.nestedVirtualization && ![QemuVm nestedVirtualizationSupported]) {
+        done([self err:@"This Mac does not support nested virtualization for Windows guests."]);
+        return;
+    }
+    NSString *accelerator = self.nestedVirtualization ? @"hvf,kernel-irqchip=on" : @"hvf";
+    NSString *machine = self.nestedVirtualization
+        ? @"virt,gic-version=3,highmem=on,virtualization=on"
+        : @"virt,gic-version=3,highmem=on";
+    if (self.nestedVirtualization)
+        [self logFmt:@"Nested virtualization enabled; QEMU disables SME for this CPU configuration."];
+
     NSArray<NSString *> *args = @[
         @"-name", self.name,
-        @"-accel", @"hvf", @"-cpu", @"host",
-        @"-M", @"virt,gic-version=3,highmem=on",
+        @"-accel", accelerator, @"-cpu", @"host",
+        @"-M", machine,
         @"-smp", [NSString stringWithFormat:@"%d", self.cpuCores],
         @"-m", [NSString stringWithFormat:@"%d", self.ramMb],
         @"-L", shareDir,
@@ -232,14 +241,7 @@
         @"-device", @"nvme,drive=hdd,serial=asb-nvme,bootindex=0",
         @"-drive", [NSString stringWithFormat:@"if=none,id=hdd,format=raw,file=%@",
                     [diskPath stringByReplacingOccurrencesOfString:@"," withString:@",,"]],
-        @"-netdev", @"vmnet-shared,id=net0",
-        /* NAT networking: vmnet-shared NATs the guest to the internet AND puts the host on the same
-         * private subnet (bridge100 is the gateway), so host<->guest is reachable over IP. The NIC is
-         * the standard QEMU virtio-net-pci (clean PCI, no USB stack); the guest binds the NetKVM driver
-         * (virtio-win, w11/ARM64, WHQL-signed). virtio-net-pci is used rather than usb-net/RNDIS, which
-         * Win11 ARM64 binds as a COM port instead of a NIC. Stable per-VM MAC for a consistent DHCP
-         * lease on the shared bridge.
-         * (see [[windows-on-mac-networking]].) */
+        @"-netdev", @"stream,id=net0,server=off,addr.type=fd,addr.str=0",
         @"-device", [NSString stringWithFormat:@"virtio-net-pci,netdev=net0,romfile=,mac=%@", self.macAddress],
         @"-display", @"none",
         @"-rtc", @"base=localtime",
@@ -248,47 +250,87 @@
 
     [self setStateOnMain:QemuVmStateStarting];
 
-    /* vmnet requires root. If we are already privileged (the headless daemon runs as root), launch
-     * QEMU directly via NSTask. Otherwise (GUI app, unprivileged) launch it elevated through
-     * AuthorizationExecuteWithPrivileges, which pops the macOS admin prompt. */
-    if (geteuid() == 0) {
+    if (geteuid() != 0) {
+        [self setStateOnMain:QemuVmStateStopped];
+        done([self err:@"The AppSandbox core must start with administrator privileges."]);
+        return;
+    }
+    NSError *networkError = nil;
+    AsbNatNetwork *network = [AsbNatNetwork sharedNetworkWithError:&networkError];
+    AsbNatPort *port = network ? [[AsbNatPort alloc] initWithNetwork:network name:self.name error:&networkError] : nil;
+    if (!port) {
+        [self setStateOnMain:QemuVmStateStopped];
+        done(networkError);
+        return;
+    }
+    self.networkPort = port;
+    NSMutableArray<NSString *> *launchArgs = [args mutableCopy];
+    NSString *resources = [self.vmDir URLByAppendingPathComponent:@"resources.iso"].path;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:resources]) {
+        [launchArgs addObjectsFromArray:@[@"-device", @"usb-storage,drive=setup",
+            @"-drive", [NSString stringWithFormat:@"if=none,id=setup,media=cdrom,readonly=on,format=raw,file=%@",
+                       [resources stringByReplacingOccurrencesOfString:@"," withString:@",,"]]]];
+    }
+    uid_t owner = [VmDir ownerUID];
+    NSString *runWith = owner ? [NSString stringWithFormat:@"user=%u:%u,exit-with-parent=on",
+        (unsigned)owner, (unsigned)[VmDir ownerGID]] : @"exit-with-parent=on";
+    [launchArgs addObjectsFromArray:@[@"-run-with", runWith]];
+    [port startWithCompletion:^(NSError *attachError) {
+        if (self.networkPort != port) { [port stop]; return; }
+        if (self.state != QemuVmStateStarting || attachError) {
+            [port stop];
+            self.networkPort = nil;
+            [self setStateOnMain:QemuVmStateStopped];
+            done(attachError ?: [self err:@"VM start cancelled"]);
+            return;
+        }
         NSTask *task = [[NSTask alloc] init];
         task.executableURL = [NSURL fileURLWithPath:qemu];
-        task.arguments = args;
+        task.arguments = launchArgs;
+        task.environment = @{ @"PATH": @"/usr/bin:/bin:/usr/sbin:/sbin", @"LANG": @"en_US.UTF-8" };
         __weak QemuVm *weakSelf = self;
         task.terminationHandler = ^(NSTask *t) {
+            [port stop];
             QemuVm *s = weakSelf;
             if (!s) return;
-            [s.transport close];
-            s.transport = nil;
-            [s logFmt:@"[%@] QEMU exited (status %d)", s.name, t.terminationStatus];
-            [s setStateOnMain:QemuVmStateStopped];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (s.task != t) return;
+                [s.transport close];
+                s.transport = nil;
+                s.networkPort = nil;
+                s.task = nil;
+                s->_exitedCleanly = t.terminationStatus == 0;
+                [s logFmt:@"[%@] QEMU exited (status %d)", s.name, t.terminationStatus];
+                [s setStateOnMain:QemuVmStateStopped];
+            });
         };
         NSError *launchErr = nil;
-        if (![task launchAndReturnError:&launchErr]) {
+        self.task = task;
+        if (![port launchTask:task error:&launchErr]) {
+            self.task = nil;
+            [port stop];
+            self.networkPort = nil;
             [self setStateOnMain:QemuVmStateStopped];
             done(launchErr ?: [self err:@"qemu launch failed"]);
             return;
         }
-        self.task = task;
-        [self logFmt:@"[%@] QEMU launched as root (pid %d)", self.name, task.processIdentifier];
-    } else {
-        NSError *elevErr = nil;
-        if (![self launchElevated:qemu args:args error:&elevErr]) {
-            [self setStateOnMain:QemuVmStateStopped];
-            done(elevErr ?: [self err:@"elevated qemu launch failed"]);
-            return;
-        }
-        [self logFmt:@"[%@] QEMU launched with elevated privileges (vmnet)", self.name];
-        [self watchElevatedExit];
-    }
+        __weak AsbNatPort *weakPort = port;
+        port.onFailure = ^(NSError *error) {
+            QemuVm *s = weakSelf;
+            if (!s || s.networkPort != weakPort || !s.task.isRunning) return;
+            [s logFmt:@"[%@] Shared NAT failed: %@", s.name, error.localizedDescription];
+            [s stop];
+        };
+        [self logFmt:@"[%@] QEMU launched by core (pid %d, guest execution uid %u)",
+                      self.name, task.processIdentifier, (unsigned)owner];
 
-    /* Map the published backing as the transport the channel helpers use. */
-    self.transport = [[AsbIvshmemTransport alloc] initWithBackingPath:ivsPath];
-    if (!self.transport) { [self logFmt:@"[%@] WARN: transport map failed", self.name]; }
+        /* Map the published backing as the transport the channel helpers use. */
+        self.transport = [[AsbIvshmemTransport alloc] initWithBackingPath:ivsPath];
+        if (!self.transport) { [self logFmt:@"[%@] WARN: transport map failed", self.name]; }
 
-    [self setStateOnMain:QemuVmStateRunning];
-    done(nil);
+        [self setStateOnMain:QemuVmStateRunning];
+        done(nil);
+    }];
 }
 
 /* Bind a loopback TCP socket to port 0, read the kernel-assigned port, release it, and hand that
@@ -305,70 +347,6 @@
     }
     close(s);
     return port;
-}
-
-/* Launch `tool` as root via AuthorizationExecuteWithPrivileges (pops the admin prompt). Stores the
- * AuthorizationRef + the child's stdout FILE* (whose EOF signals process exit). */
-- (BOOL)launchElevated:(NSString *)tool args:(NSArray<NSString *> *)args error:(NSError **)err {
-    AuthorizationRef auth = NULL;
-    OSStatus s = AuthorizationCreate(NULL, kAuthorizationEmptyEnvironment,
-                                     kAuthorizationFlagDefaults, &auth);
-    if (s != errAuthorizationSuccess) { if (err) *err = [self err:@"AuthorizationCreate failed"]; return NO; }
-
-    AuthorizationItem item = { kAuthorizationRightExecute, 0, NULL, 0 };
-    AuthorizationRights rights = { 1, &item };
-    AuthorizationFlags flags = kAuthorizationFlagDefaults | kAuthorizationFlagInteractionAllowed |
-                               kAuthorizationFlagPreAuthorize | kAuthorizationFlagExtendRights;
-    s = AuthorizationCopyRights(auth, &rights, kAuthorizationEmptyEnvironment, flags, NULL);
-    if (s != errAuthorizationSuccess) {
-        AuthorizationFree(auth, kAuthorizationFlagDefaults);
-        if (err) *err = [self err:@"administrator authorization was denied (required for VM networking)"];
-        return NO;
-    }
-
-    NSUInteger n = args.count;
-    char **argv = calloc(n + 1, sizeof(char *));
-    for (NSUInteger i = 0; i < n; i++) argv[i] = strdup(args[i].UTF8String);
-    argv[n] = NULL;
-
-    FILE *outPipe = NULL;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    s = AuthorizationExecuteWithPrivileges(auth, tool.UTF8String,
-                                           kAuthorizationFlagDefaults, argv, &outPipe);
-#pragma clang diagnostic pop
-    for (NSUInteger i = 0; i < n; i++) free(argv[i]);
-    free(argv);
-
-    if (s != errAuthorizationSuccess) {
-        AuthorizationFree(auth, kAuthorizationFlagDefaults);
-        if (err) *err = [self err:@"failed to launch QEMU with elevated privileges"];
-        return NO;
-    }
-    _authRef = auth;
-    _elevatedPipe = outPipe;
-    return YES;
-}
-
-/* The AEWP child isn't a waitpid-able child, so detect exit by draining its stdout to EOF. */
-- (void)watchElevatedExit {
-    __weak QemuVm *weakSelf = self;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        QemuVm *s = weakSelf;
-        FILE *p = s ? s->_elevatedPipe : NULL;
-        if (!p) return;
-        char buf[1024];
-        while (fread(buf, 1, sizeof buf, p) > 0) { /* drain; QEMU chatter goes to stderr */ }
-        s = weakSelf;
-        if (!s) { return; }
-        fclose(p);
-        s->_elevatedPipe = NULL;
-        if (s->_authRef) { AuthorizationFree(s->_authRef, kAuthorizationFlagDefaults); s->_authRef = NULL; }
-        [s.transport close];
-        s.transport = nil;
-        [s logFmt:@"[%@] QEMU (elevated) exited", s.name];
-        [s setStateOnMain:QemuVmStateStopped];
-    });
 }
 
 #pragma mark - Stop
@@ -399,11 +377,19 @@
 }
 
 - (void)stop {
+    if (self.state == QemuVmStateStarting && !self.task) {
+        [self.networkPort stop];
+        self.networkPort = nil;
+        [self setStateOnMain:QemuVmStateStopped];
+        return;
+    }
     [self logFmt:@"[%@] force stop (monitor quit)", self.name];
     if (![self sendMonitor:@"quit"]) {
         @try { [self.task terminate]; } @catch (__unused NSException *e) {}
     }
 }
+
+- (void)dealloc { [_networkPort stop]; }
 
 #pragma mark - Errors
 

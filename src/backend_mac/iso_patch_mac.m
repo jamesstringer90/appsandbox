@@ -1,19 +1,11 @@
 #import "iso_patch_mac.h"
 #import "vm_dir.h"               /* AppSandbox support root (sibling of VMs/) for the driver cache */
-#import <Security/Security.h>
-#import <Security/AuthorizationTags.h>
+#import "asb_network_mac.h"
 #import <Carbon/Carbon.h>
+#include <signal.h>
+#include <unistd.h>
 #import "../../tools/provision/win_provision.h"  /* shared answer-file generator (same source the Windows backend uses) */
-#import "../../tools/provision/mac_account_hash.h"  /* shared macOS ShadowHash + kcpassword encoders */
 
-/* AuthorizationExecuteWithPrivileges has been deprecated since 10.7 but is
- * still functional. Suppress the warning locally; we'll migrate to
- * SMAppService when ready. */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-
-static AuthorizationRef  g_auth = NULL;
-static dispatch_source_t g_authKeepAlive = NULL;
 
 static NSString *windows_input_locale(void) {
     TISInputSourceRef source = TISCopyCurrentKeyboardInputSource();
@@ -59,12 +51,6 @@ static NSString *windows_input_locale(void) {
     return locale;
 }
 
-/* Keep-alive interval: shorter than the default 300s TTL of
- * kAuthorizationRightExecute so the right never expires while the app
- * runs. Without this, a long install (>5 min) causes AEWP to prompt a
- * second time when stage finally runs. */
-#define AUTH_KEEPALIVE_SECONDS 240
-
 @implementation IsoPatchMac
 
 + (nullable NSString *)toolPath {
@@ -84,96 +70,6 @@ static NSString *windows_input_locale(void) {
         cur = [cur stringByDeletingLastPathComponent];
     }
     return nil;
-}
-
-#pragma mark - Authorization (for stage)
-
-+ (void)startKeepAlive {
-    if (g_authKeepAlive) return;
-    g_authKeepAlive = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-    dispatch_source_set_timer(g_authKeepAlive,
-        dispatch_time(DISPATCH_TIME_NOW, AUTH_KEEPALIVE_SECONDS * NSEC_PER_SEC),
-        AUTH_KEEPALIVE_SECONDS * NSEC_PER_SEC,
-        10 * NSEC_PER_SEC);
-    dispatch_source_set_event_handler(g_authKeepAlive, ^{
-        if (!g_auth) return;
-        /* Non-interactive refresh: if rights are still valid, this silently
-         * resets their TTL. If they've somehow expired, we fail silently
-         * here and the next real call to ensureAuthorization will prompt. */
-        AuthorizationItem right = { kAuthorizationRightExecute, 0, NULL, 0 };
-        AuthorizationRights rights = { 1, &right };
-        AuthorizationFlags flags = kAuthorizationFlagDefaults
-                                 | kAuthorizationFlagExtendRights;
-        (void)AuthorizationCopyRights(g_auth, &rights, NULL, flags, NULL);
-    });
-    /* Free g_auth from the cancel handler: GCD runs it only after any in-flight
-     * event handler returns. */
-    dispatch_source_set_cancel_handler(g_authKeepAlive, ^{
-        if (g_auth) {
-            AuthorizationFree(g_auth, kAuthorizationFlagDestroyRights);
-            g_auth = NULL;
-        }
-    });
-    dispatch_resume(g_authKeepAlive);
-}
-
-+ (BOOL)ensureAuthorization:(NSError **)errOut {
-    /* Allocate the ref on first call. */
-    if (!g_auth) {
-        OSStatus s = AuthorizationCreate(NULL, NULL,
-                                          kAuthorizationFlagDefaults, &g_auth);
-        if (s != errAuthorizationSuccess) {
-            g_auth = NULL;
-            if (errOut) *errOut = [NSError errorWithDomain:NSOSStatusErrorDomain code:s
-                                                  userInfo:@{NSLocalizedDescriptionKey:
-                                                             @"AuthorizationCreate failed"}];
-            return NO;
-        }
-    }
-
-    /* Always re-check rights. If they're still valid (keep-alive kept them
-     * fresh), this is silent. If they've expired, this is where the UI
-     * prompt fires — which should be at VM-creation time, not mid-install. */
-    AuthorizationItem right = { kAuthorizationRightExecute, 0, NULL, 0 };
-    AuthorizationRights rights = { 1, &right };
-    AuthorizationFlags flags = kAuthorizationFlagDefaults
-                             | kAuthorizationFlagInteractionAllowed
-                             | kAuthorizationFlagPreAuthorize
-                             | kAuthorizationFlagExtendRights;
-    OSStatus s = AuthorizationCopyRights(g_auth, &rights, NULL, flags, NULL);
-    if (s != errAuthorizationSuccess) {
-        if (errOut) *errOut = [NSError errorWithDomain:NSOSStatusErrorDomain code:s
-                                              userInfo:@{NSLocalizedDescriptionKey:
-                                                         @"User denied admin prompt"}];
-        return NO;
-    }
-
-    [self startKeepAlive];
-    return YES;
-}
-
-+ (void)releaseAuthorization {
-    if (g_authKeepAlive) {
-        /* The cancel handler frees g_auth; don't free it here as well. */
-        dispatch_source_cancel(g_authKeepAlive);
-        g_authKeepAlive = NULL;
-        return;
-    }
-    /* Keep-alive was never started (auth created but rights check failed, so
-     * no timer/handler ever existed); free directly. */
-    if (g_auth) {
-        AuthorizationFree(g_auth, kAuthorizationFlagDestroyRights);
-        g_auth = NULL;
-    }
-}
-
-+ (BOOL)preauthorize:(NSError **)error {
-    /* Already root (the headless daemon runs under sudo): no AuthorizationRef
-     * needed -- runPrivilegedArgs launches the stage step directly. Keeps
-     * headless fully non-interactive (no username/password prompt). */
-    if (geteuid() == 0) return YES;
-    return [self ensureAuthorization:error];
 }
 
 #pragma mark - Stdout protocol parser
@@ -287,14 +183,37 @@ static NSString *windows_input_locale(void) {
     });
 }
 
-#pragma mark - Unprivileged (NSTask)
+#pragma mark - Core-owned workers
+
+static NSMutableSet<NSTask *> *s_workers;
+static BOOL s_workersStopping;
+
++ (void)stopWorkers {
+    NSArray<NSTask *> *workers;
+    @synchronized(self) {
+        s_workersStopping = YES;
+        workers = s_workers.allObjects;
+    }
+    for (NSTask *task in workers) if (task.isRunning) kill(task.processIdentifier, SIGTERM);
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:15.0];
+    for (NSTask *task in workers) {
+        while (task.isRunning && deadline.timeIntervalSinceNow > 0) usleep(20000);
+        if (task.isRunning) {
+            pid_t pid = task.processIdentifier;
+            if (getpgid(pid) == pid) kill(-pid, SIGKILL);
+            else kill(pid, SIGKILL);
+        }
+    }
+}
 
 /* Returns the launched task, or nil on failure (completion fired with error). */
-+ (nullable NSTask *)runUnprivilegedArgs:(NSArray<NSString *> *)args
++ (nullable NSTask *)runWorkerArgs:(NSArray<NSString *> *)args
+                            networkPort:(nullable AsbNatPort *)port
                                 progress:(IsoPatchProgress)progressBlock
                               completion:(IsoPatchCompletion)completion {
     NSString *tool = [self toolPath];
     if (!tool) {
+        [port stop];
         completion([NSError errorWithDomain:@"IsoPatchMac" code:1
                      userInfo:@{NSLocalizedDescriptionKey:
                                 @"iso-patch-mac binary not found"}]);
@@ -304,12 +223,35 @@ static NSString *windows_input_locale(void) {
     NSTask *task = [[NSTask alloc] init];
     task.launchPath = tool;
     task.arguments  = args;
+    task.environment = @{@"PATH": @"/usr/bin:/bin:/usr/sbin:/sbin", @"LANG": @"en_US.UTF-8"};
     NSPipe *outPipe = [NSPipe pipe];
     task.standardOutput = outPipe;
     task.standardError  = outPipe; /* merge so errors show up in our parser */
 
+    __weak NSTask *weakTask = task;
+    port.onFailure = ^(NSError *error) {
+        NSTask *worker = weakTask;
+        if (worker.isRunning) [worker terminate];
+    };
+    task.terminationHandler = ^(NSTask *worker) {
+        [port stop];
+        @synchronized(self) { [s_workers removeObject:worker]; }
+    };
     NSError *launchErr = nil;
-    if (![task launchAndReturnError:&launchErr]) {
+    BOOL launched = NO;
+    @synchronized(self) {
+        if (!s_workersStopping) {
+            launched = port ? [port launchTask:task error:&launchErr] : [task launchAndReturnError:&launchErr];
+            if (launched) {
+                if (!s_workers) s_workers = [NSMutableSet set];
+                [s_workers addObject:task];
+            }
+        } else {
+            launchErr = [NSError errorWithDomain:NSCocoaErrorDomain code:NSUserCancelledError userInfo:nil];
+        }
+    }
+    if (!launched) {
+        [port stop];
         completion(launchErr);
         return nil;
     }
@@ -317,11 +259,27 @@ static NSString *windows_input_locale(void) {
     [self drainFileHandle:outPipe.fileHandleForReading
                    pipeFP:NULL
                  progress:progressBlock
-               completion:completion];
+               completion:^(NSError *error) {
+                   dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                       [task waitUntilExit];
+                       [port stop];
+                       NSError *result = error;
+                       if (!result && task.terminationStatus != 0)
+                           result = [NSError errorWithDomain:@"IsoPatchMac" code:task.terminationStatus
+                               userInfo:@{NSLocalizedDescriptionKey: @"iso-patch-mac worker failed"}];
+                       dispatch_async(dispatch_get_main_queue(), ^{ completion(result); });
+                   });
+               }];
     return task;
 }
 
-#pragma mark - Privileged (AEWP)
++ (nullable NSTask *)runWorkerArgs:(NSArray<NSString *> *)args
+                          progress:(IsoPatchProgress)progressBlock
+                        completion:(IsoPatchCompletion)completion {
+    return [self runWorkerArgs:args networkPort:nil progress:progressBlock completion:completion];
+}
+
+#pragma mark - Privileged workers
 
 + (void)runPrivilegedArgs:(NSArray<NSString *> *)args
                   progress:(IsoPatchProgress)progressBlock
@@ -334,95 +292,23 @@ static NSString *windows_input_locale(void) {
         return;
     }
 
-    /* Already root (headless daemon under sudo): a plain NSTask child IS
-     * privileged -- skip AuthorizationExecuteWithPrivileges entirely, so no
-     * interactive prompt can ever appear in headless mode. */
     if (geteuid() == 0) {
-        [self runUnprivilegedArgs:args progress:progressBlock completion:completion];
+        [self runWorkerArgs:args progress:progressBlock completion:completion];
         return;
     }
 
-    NSError *authErr = nil;
-    if (![self ensureAuthorization:&authErr]) {
-        completion(authErr);
-        return;
-    }
-
-    NSUInteger n = args.count;
-    char **cargs = calloc(n + 1, sizeof(char *));
-    for (NSUInteger i = 0; i < n; i++) cargs[i] = strdup([args[i] UTF8String]);
-    cargs[n] = NULL;
-
-    FILE *pipe = NULL;
-    OSStatus s = AuthorizationExecuteWithPrivileges(g_auth,
-        tool.UTF8String,
-        kAuthorizationFlagDefaults,
-        cargs,
-        &pipe);
-
-    for (NSUInteger i = 0; i < n; i++) free(cargs[i]);
-    free(cargs);
-
-    if (s != errAuthorizationSuccess) {
-        completion([NSError errorWithDomain:NSOSStatusErrorDomain code:s
-                     userInfo:@{NSLocalizedDescriptionKey:
-                                @"AuthorizationExecuteWithPrivileges failed"}]);
-        return;
-    }
-
-    [self drainFileHandle:nil
-                   pipeFP:pipe
-                 progress:progressBlock
-               completion:completion];
+    completion([NSError errorWithDomain:@"IsoPatchMac" code:1 userInfo:@{
+        NSLocalizedDescriptionKey: @"The AppSandbox core must start with administrator privileges." }]);
 }
 
 #pragma mark - Public API
 
-/* Keyed by VM name. Mutated only on s_fetchQueue. */
-static NSMutableDictionary<NSString *, NSTask *> *s_fetchTasks = nil;
-static dispatch_queue_t s_fetchQueue = NULL;
-
-static void ensure_fetch_registry(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        s_fetchTasks = [NSMutableDictionary dictionary];
-        s_fetchQueue = dispatch_queue_create("com.appsandbox.iso-patch.fetch",
-                                             DISPATCH_QUEUE_SERIAL);
-    });
-}
-
 + (void)fetchLatestIpswToURL:(NSURL *)ipswURL
-                        forVm:(NSString *)vmName
                      progress:(IsoPatchProgress)progressBlock
                    completion:(IsoPatchCompletion)completion {
-    ensure_fetch_registry();
-
-    NSString *key = [vmName copy];
-    IsoPatchCompletion wrapped = ^(NSError *err) {
-        dispatch_async(s_fetchQueue, ^{ [s_fetchTasks removeObjectForKey:key]; });
-        if (completion) completion(err);
-    };
-
-    NSTask *task = [self runUnprivilegedArgs:@[@"fetch-ipsw", @"--output", ipswURL.path]
-                                     progress:progressBlock
-                                   completion:wrapped];
-    if (task) {
-        dispatch_async(s_fetchQueue, ^{ s_fetchTasks[key] = task; });
-    }
-}
-
-+ (void)cancelFetchForVm:(NSString *)vmName {
-    ensure_fetch_registry();
-    NSString *key = [vmName copy];
-    dispatch_async(s_fetchQueue, ^{
-        NSTask *task = s_fetchTasks[key];
-        if (!task) return;
-        [s_fetchTasks removeObjectForKey:key];
-        if (task.isRunning) {
-            @try { [task terminate]; }
-            @catch (NSException *e) { (void)e; }
-        }
-    });
+    [self runWorkerArgs:@[@"fetch-ipsw", @"--output", ipswURL.path]
+               progress:progressBlock
+             completion:completion];
 }
 
 + (void)installMacOSWithName:(NSString *)name
@@ -444,23 +330,31 @@ static void ensure_fetch_registry(void) {
         @"--cpus",     [NSString stringWithFormat:@"%d", cpus],
         @"--disk-gb",  [NSString stringWithFormat:@"%d", diskGb],
         @"--mac-address", macAddress,
+        @"--network-fd", @"0",
     ];
-    [self runUnprivilegedArgs:args
-                     progress:progressBlock
-                   completion:completion];
+    NSError *networkError = nil;
+    AsbNatNetwork *network = [AsbNatNetwork sharedNetworkWithError:&networkError];
+    AsbNatPort *port = network ? [[AsbNatPort alloc] initWithNetwork:network
+        name:name datagram:YES error:&networkError] : nil;
+    if (!port) { completion(networkError); return; }
+    [port startWithCompletion:^(NSError *error) {
+        if (error) { [port stop]; completion(error); return; }
+        [self runWorkerArgs:args networkPort:port progress:progressBlock completion:completion];
+    }];
 }
 
-#pragma mark - build-windows (unprivileged)
+#pragma mark - build-windows
 
 /* Generate unattend.xml in-process -- the password is encoded HERE (in the daemon) and only the
  * obfuscated answer file is ever handed to the build-windows child, which never sees the plaintext.
  * This is the exact mirror of generate_unattend_vhdx -> asb_provision_unattend in the Windows
  * backend (src/backend_win/disk_util.c / asb_core.c vhdx_create_thread). */
 static BOOL write_unattend_xml(NSString *path, NSString *vmName, NSString *user,
-                               NSString *pass, NSString *lang, NSString *inputLocale, BOOL testMode) {
+                               NSString *pass, NSString *lang, NSString *inputLocale, BOOL testMode, int templateMode) {
     FILE *fu = fopen(path.fileSystemRepresentation, "wb");
     if (!fu) return NO;
-    int rc = asb_provision_unattend(fu, vmName.UTF8String, user.UTF8String,
+    int rc = templateMode == 1 ? asb_provision_unattend_template(fu, vmName.UTF8String, "arm64", testMode, 1)
+        : (templateMode == 2 ? asb_provision_unattend_instance : asb_provision_unattend)(fu, vmName.UTF8String, user.UTF8String,
                                     pass.length ? pass.UTF8String : "",
                                     "arm64", testMode ? 1 : 0, /*is_arm64=*/1,
                                     lang.length ? lang.UTF8String : "en-US",
@@ -470,12 +364,12 @@ static BOOL write_unattend_xml(NSString *path, NSString *vmName, NSString *user,
 }
 
 /* Generate setup.cmd + SetupComplete.cmd in-process (no secrets; same shared source as Windows). */
-static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
+static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName, BOOL fromMedia) {
     BOOL ok = YES;
     FILE *fs = fopen([dir stringByAppendingPathComponent:@"setup.cmd"].fileSystemRepresentation, "wb");
-    if (fs) { if (asb_provision_setup_cmd(fs) != 0) ok = NO; fclose(fs); } else ok = NO;
+    if (fs) { if (asb_provision_setup_cmd(fs, 1, fromMedia) != 0) ok = NO; fclose(fs); } else ok = NO;
     FILE *fc = fopen([dir stringByAppendingPathComponent:@"SetupComplete.cmd"].fileSystemRepresentation, "wb");
-    if (fc) { if (asb_provision_setupcomplete(fc, sshMsiName.length ? sshMsiName.UTF8String : NULL) != 0) ok = NO; fclose(fc); } else ok = NO;
+    if (fc) { if (asb_provision_setupcomplete(fc, sshMsiName.length ? sshMsiName.UTF8String : NULL, fromMedia) != 0) ok = NO; fclose(fc); } else ok = NO;
     return ok;
 }
 
@@ -490,6 +384,7 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
                            lang:(nullable NSString *)lang
                          diskGb:(int)diskGb
                        testMode:(BOOL)testMode
+                   templateMode:(int)templateMode
                        progress:(nullable IsoPatchProgress)progressBlock
                      completion:(IsoPatchCompletion)completion {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -512,8 +407,8 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
     NSString *initialLang = hasOverride ? lang : @"en-US";
     NSString *inputLocale = windows_input_locale();
     if (!write_unattend_xml([provDir stringByAppendingPathComponent:@"unattend.xml"],
-                            vmName, adminUser, adminPass, initialLang, inputLocale, testMode) ||
-        !write_prov_scripts(provDir, sshMsiName)) {
+                            vmName, adminUser, adminPass, initialLang, inputLocale, testMode, templateMode) ||
+        !write_prov_scripts(provDir, sshMsiName, templateMode == 2)) {
         [fm removeItemAtPath:provDir error:nil];
         completion([NSError errorWithDomain:@"IsoPatchMac" code:7
                      userInfo:@{NSLocalizedDescriptionKey:
@@ -523,13 +418,16 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
 
     NSMutableArray *args = [@[
         @"build-windows",
-        @"--iso",      isoURL.path,
+        @"--iso",      isoURL.path ?: @"",
         @"--out",      outDiskURL.path,
         @"--signed-payload-zip", signedPayloadZip,
         @"--prov-dir", provDir,                     /* daemon-generated answer file + scripts (no password on argv) */
         @"--disk-gb",  [NSString stringWithFormat:@"%d", diskGb > 0 ? diskGb : 64],
         @"--test-mode", (testMode ? @"1" : @"0"),   /* honor the create-time choice (mirrors Windows) */
     ] mutableCopy];
+    if (templateMode == 1) [args addObject:@"--template"];
+    if (templateMode == 2) [args addObject:@"--resources-iso"];
+
     /* Pass --lang ONLY for an explicit override; without it build-windows auto-detects the ISO's
      * language and reports it via LANG: so we re-generate unattend.xml in-process below. */
     if (hasOverride)       { [args addObject:@"--lang"];       [args addObject:lang]; }
@@ -541,9 +439,11 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
      * just like the Windows backend overwrites _vhdx_staging\unattend.xml on "LANG:"). */
     IsoPatchProgress wrapped = ^(double frac, NSString *step) {
         if (frac == ISO_PATCH_PROGRESS_LANG) {
+            [step writeToURL:[outDiskURL.URLByDeletingLastPathComponent URLByAppendingPathComponent:@"windows-language.txt"]
+                  atomically:YES encoding:NSUTF8StringEncoding error:nil];
             if (!hasOverride) {
                 (void)write_unattend_xml([provDir stringByAppendingPathComponent:@"unattend.xml"],
-                                         vmName, adminUser, adminPass, step, inputLocale, testMode);
+                                         vmName, adminUser, adminPass, step, inputLocale, testMode, templateMode);
             }
             if (progressBlock)
                 progressBlock(ISO_PATCH_PROGRESS_LOG,
@@ -553,7 +453,7 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
         if (progressBlock) progressBlock(frac, step);
     };
 
-    [self runUnprivilegedArgs:args
+    [self runWorkerArgs:args
                      progress:wrapped
                    completion:^(NSError * _Nullable err) {
         /* unattend.xml holds the obfuscated password; drop the staging dir once the build is done. */
@@ -690,8 +590,8 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
 + (void)stageAgentIntoDiskAtURL:(NSURL *)diskURL
                agentResourceDir:(NSString *)agentResDir
                        adminUser:(NSString *)adminUser
-                       adminPass:(NSString *)adminPass
                     computerName:(NSString *)computerName
+                          diskGb:(int)diskGb
                      sshEnabled:(BOOL)sshEnabled
                        progress:(IsoPatchProgress)progressBlock
                      completion:(IsoPatchCompletion)completion {
@@ -719,10 +619,6 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
         }
     }
 
-    /* Write the manifest (0600). The account password is NEVER written to disk or put on argv: we
-     * compute the macOS ShadowHash + kcpassword IN-PROCESS (mirrors the Windows path, where the
-     * password is encoded in the daemon, not handed to the disk-applier) and pass only those derived,
-     * non-plaintext blobs to the privileged stage child via 0600 files. Files are deleted on exit. */
     NSString *manifest = [self formatManifestForAgentDir:agentResDir binarySrc:binPath];
     NSString *manifestPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
                                 [NSString stringWithFormat:@"iso-patch-mac-%u.tsv", arc4random()]];
@@ -735,50 +631,11 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
     [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @(0600)}
                                      ofItemAtPath:manifestPath error:nil];
 
-    /* Derive the credential blobs in-process (only when a password was set, matching the prior
-     * behaviour where an empty password created no account). The plaintext stays in this process. */
-    NSString *shadowhashPath = nil, *kcpasswordPath = nil;
-    if (adminPass.length) {
-        const char *pw = adminPass.UTF8String;
-        size_t pwLen = strlen(pw);
-        NSData *shd = asb_macos_shadow_hash_data(pw, pwLen);
-        NSData *kc  = asb_macos_kcpassword(pw, pwLen);
-        if (!shd || !kc) {
-            [fm removeItemAtPath:manifestPath error:nil];
-            completion([NSError errorWithDomain:@"IsoPatchMac" code:6
-                         userInfo:@{NSLocalizedDescriptionKey:@"failed to derive account credential"}]);
-            return;
-        }
-        shadowhashPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                            [NSString stringWithFormat:@"iso-patch-mac-%u.shd", arc4random()]];
-        kcpasswordPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                            [NSString stringWithFormat:@"iso-patch-mac-%u.kc", arc4random()]];
-        if (![shd writeToFile:shadowhashPath atomically:YES] ||
-            ![kc  writeToFile:kcpasswordPath atomically:YES]) {
-            [fm removeItemAtPath:manifestPath error:nil];
-            [fm removeItemAtPath:shadowhashPath error:nil];
-            [fm removeItemAtPath:kcpasswordPath error:nil];
-            completion([NSError errorWithDomain:@"IsoPatchMac" code:6
-                         userInfo:@{NSLocalizedDescriptionKey:@"failed to write credential tempfiles"}]);
-            return;
-        }
-        for (NSString *p in @[shadowhashPath, kcpasswordPath])
-            [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @(0600)}
-                                             ofItemAtPath:p error:nil];
-    }
-
     NSMutableArray *args = [@[
-        @"stage",
-        @"--disk", diskURL.path,
-        @"--manifest", manifestPath,
-        @"--user-shortname", adminUser,
-        @"--user-realname", adminUser,
-        @"--user-uid", @"501",
-        @"--skip-setup-assistant",
-        @"--auto-login",
+        @"stage", @"--disk", diskURL.path, @"--manifest", manifestPath,
+        @"--disk-gb", [NSString stringWithFormat:@"%d", diskGb],
+        @"--wait-for-user", adminUser,
     ] mutableCopy];
-    if (shadowhashPath) { [args addObject:@"--shadowhash-file"]; [args addObject:shadowhashPath]; }
-    if (kcpasswordPath) { [args addObject:@"--kcpassword-file"]; [args addObject:kcpasswordPath]; }
     if (sshEnabled) [args addObject:@"--enable-ssh"];
     if (computerName.length) {
         [args addObject:@"--computer-name"];
@@ -788,14 +645,9 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName) {
     [self runPrivilegedArgs:args
                    progress:progressBlock
                  completion:^(NSError * _Nullable err) {
-        /* Remove tempfiles ASAP (the credential blobs are derived, not plaintext). */
         [[NSFileManager defaultManager] removeItemAtPath:manifestPath error:nil];
-        if (shadowhashPath) [[NSFileManager defaultManager] removeItemAtPath:shadowhashPath error:nil];
-        if (kcpasswordPath) [[NSFileManager defaultManager] removeItemAtPath:kcpasswordPath error:nil];
         completion(err);
     }];
 }
 
 @end
-
-#pragma clang diagnostic pop

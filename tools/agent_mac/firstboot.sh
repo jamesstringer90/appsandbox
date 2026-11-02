@@ -20,12 +20,6 @@ fi
 chown root:wheel /Library/AppSandbox/appsandbox-agent
 chmod 755        /Library/AppSandbox/appsandbox-agent
 
-cp "$SRC" "$DST"
-chown root:wheel "$DST"
-chmod 644        "$DST"
-
-launchctl bootstrap system "$DST" >> "$LOG" 2>&1 || true
-
 # Clipboard sync helper — user-context LaunchAgent. Place the plist in
 # /Library/LaunchAgents/ so every user login gets its own instance in
 # that user's GUI session (needed for NSPasteboard access).
@@ -38,11 +32,22 @@ if [ -f /Library/AppSandbox/com.appsandbox.clipboard.plist ]; then
     chown root:wheel /Library/AppSandbox/appsandbox-clipboard 2>/dev/null || true
     chmod 755        /Library/AppSandbox/appsandbox-clipboard 2>/dev/null || true
 fi
+USER_FILE=/Library/AppSandbox/firstboot-user
+if [ -f "$USER_FILE" ]; then
+    GUEST_USER=$(cat "$USER_FILE")
+    echo "Waiting for the configured guest account" >> "$LOG"
+    until /usr/bin/id "$GUEST_USER" >/dev/null 2>&1 && [ -d "/Users/$GUEST_USER" ]; do
+        sleep 1
+    done
+    rm -f "$USER_FILE"
+fi
 
 # SSH: primary enablement is the launchd override DB flip the host does
 # during stage. As belt-and-braces, also run the in-guest enable path,
 # which works without Full Disk Access (unlike systemsetup -setremotelogin).
-/bin/launchctl load -w /System/Library/LaunchDaemons/ssh.plist >> "$LOG" 2>&1 || true
+if [ -f /Library/AppSandbox/enable-ssh ] && [ "$(cat /Library/AppSandbox/enable-ssh)" = 1 ]; then
+    /bin/launchctl load -w /System/Library/LaunchDaemons/ssh.plist >> "$LOG" 2>&1 || true
+fi
 
 # Disable all sleep modes so the VM display/CPU never power down — a
 # sandbox VM is expected to be driven by the host, not idle the way a
@@ -65,6 +70,11 @@ if [ -f "$NAME_FILE" ]; then
     fi
     rm -f "$NAME_FILE"
 fi
+cp "$SRC" "$DST"
+chown root:wheel "$DST"
+chmod 644        "$DST"
+
+launchctl bootstrap system "$DST" >> "$LOG" 2>&1 || true
 
 # Remove ourselves so we only run once.
 rm -f /Library/LaunchDaemons/com.appsandbox.firstboot.plist

@@ -1,5 +1,6 @@
 #include <winsock2.h>
 #include "vm_agent.h"
+#include "asb_events.h"
 #include "vm_ssh_proxy.h"
 #include "asb_core.h"
 #include "hcn_network.h"
@@ -200,8 +201,9 @@ static SOCKET connect_to_agent(VmInstance *vm, int timeout_ms)
 
 static void notify_agent_status(VmInstance *vm)
 {
+    asb_events_changed();
     if (g_agent_hwnd)
-        PostMessageW(g_agent_hwnd, WM_VM_AGENT_STATUS, 0, (LPARAM)vm);
+        PostMessageW(g_agent_hwnd, WM_VM_AGENT_STATUS, 0, (LPARAM)vm->unique_id);
 }
 
 /* Fire-and-forget: ask the guest agent to write the AppSandbox public key into
@@ -259,13 +261,16 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
            gates display-open on it. */
         vm->idd_ready = (strcmp(buf + 11, "ok") == 0);
         ui_log(L"[%s] IDD driver: %S", vm->name, buf + 11);
+        asb_events_changed();
     } else if (strncmp(buf, "hyperv_video:", 13) == 0) {
         ui_log(L"[%s] Hyper-V Video: %S", vm->name, buf + 13);
         /* NULL-guard like notify_agent_status: headless never sets the HWND,
            and PostMessageW(NULL, ...) would queue thread messages on this
            never-pumped agent thread. */
-        if (g_agent_hwnd && strcmp(buf + 13, "disabled") == 0)
-            PostMessageW(g_agent_hwnd, WM_VM_HYPERV_VIDEO_OFF, 0, (LPARAM)vm);
+        vm->hyperv_video_off = strcmp(buf + 13, "disabled") == 0;
+        asb_events_changed();
+        if (g_agent_hwnd && vm->hyperv_video_off)
+            PostMessageW(g_agent_hwnd, WM_VM_HYPERV_VIDEO_OFF, 0, (LPARAM)vm->unique_id);
     } else if (strncmp(buf, "displays:", 9) == 0) {
         ui_log(L"[%s] Displays: %S", vm->name, buf + 9);
     } else if (strncmp(buf, "log:", 4) == 0) {
