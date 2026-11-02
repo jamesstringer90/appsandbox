@@ -317,8 +317,8 @@ container** (`.app`, `.dmg`, `.pkg`), never to an individual nested executable:
   covers it.
 - `appsandbox-agent` / `appsandbox-clipboard` are injected into a **guest VM**
   during install. What lets them run there is their **Developer ID signature**
-  (plus the fact that programmatic injection sets no `com.apple.quarantine`
-  flag, so the guest's Gatekeeper doesn't gate them) — not a stapled ticket,
+  (the staging helper removes inherited `com.apple.quarantine` from each
+  installed copy) — not a stapled ticket,
   which can't travel into the guest. So they need no separate notarization or
   stapling.
 

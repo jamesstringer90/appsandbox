@@ -347,6 +347,8 @@ static const IDispatchVtbl g_sink_vtbl = {
 #define IDT_RDP_POLL      1001
 #define RDP_POLL_MS       1000
 struct VmDisplay {
+    UINT64              vm_id;
+    UINT_PTR            token;
     HWND                hwnd;          /* main display window           */
     HWND                ax_hwnd;       /* child hosting ActiveX control */
     HWND                btn_toggle;    /* session mode toggle button    */
@@ -357,7 +359,7 @@ struct VmDisplay {
     BOOL                pipe_callback_fired; /* TRUE after OnConnected or OnError */
     ULONGLONG           connect_start_tick;  /* GetTickCount64() when StartConnect called */
     BOOL                pipe_timeout_logged;  /* Only log timeout once */
-    VmInstance         *vm;
+    wchar_t             vm_name[256];
     HINSTANCE           hInstance;
     BOOL                ole_inited;
 
@@ -390,23 +392,23 @@ static HRESULT STDMETHODCALLTYPE Sink_Invoke(IDispatch *This, DISPID id,
 
     switch (id) {
     case CYCDD_OnConnecting:
-        if (d && d->vm)
+        if (d && d->vm_id)
             ui_log(L"RDP event: Connecting \"%s\" (%s)",
-                d->vm->name, d->enhanced_mode ? L"Enhanced" : L"Basic");
+                d->vm_name, d->enhanced_mode ? L"Enhanced" : L"Basic");
         break;
     case CYCDD_OnConnected:
-        if (d && d->vm) {
+        if (d && d->vm_id) {
             ui_log(L"RDP event: Connected \"%s\" (%s)",
-                d->vm->name, d->enhanced_mode ? L"Enhanced" : L"Basic");
+                d->vm_name, d->enhanced_mode ? L"Enhanced" : L"Basic");
         }
         break;
     case CYCDD_OnDisconnected:
-        if (d && d->vm) {
+        if (d && d->vm_id) {
             LONG reason = 0;
             if (pParams && pParams->cArgs >= 1 && pParams->rgvarg[0].vt == VT_I4)
                 reason = pParams->rgvarg[0].lVal;
             ui_log(L"RDP event: Disconnected \"%s\" (%s), reason=%ld",
-                d->vm->name, d->enhanced_mode ? L"Enhanced" : L"Basic", reason);
+                d->vm_name, d->enhanced_mode ? L"Enhanced" : L"Basic", reason);
 
             if (d->rdp_dispatch) {
                 VARIANT v;
@@ -421,19 +423,19 @@ static HRESULT STDMETHODCALLTYPE Sink_Invoke(IDispatch *This, DISPID id,
         }
         break;
     case CYCDD_OnLoginComplete:
-        if (d && d->vm)
-            ui_log(L"RDP event: LoginComplete \"%s\"", d->vm->name);
+        if (d && d->vm_id)
+            ui_log(L"RDP event: LoginComplete \"%s\"", d->vm_name);
         break;
     case CYCDD_OnLogonError:
-        if (d && d->vm) {
+        if (d && d->vm_id) {
             LONG err = 0;
             if (pParams && pParams->cArgs >= 1 && pParams->rgvarg[0].vt == VT_I4)
                 err = pParams->rgvarg[0].lVal;
-            ui_log(L"RDP event: LogonError \"%s\", code=%ld", d->vm->name, err);
+            ui_log(L"RDP event: LogonError \"%s\", code=%ld", d->vm_name, err);
         }
         break;
     case CYCDD_OnFatalError:
-        if (d && d->vm) {
+        if (d && d->vm_id) {
             LONG err = 0;
             if (pParams && pParams->cArgs >= 1 && pParams->rgvarg[0].vt == VT_I4)
                 err = pParams->rgvarg[0].lVal;
@@ -623,7 +625,7 @@ static void STDMETHODCALLTYPE CB_OnConnectionCompleted(
         VARIANT v;
 
         ui_log(L"RDP session connecting for \"%s\" (%s)...",
-            d->vm->name,
+            d->vm_name,
             d->enhanced_mode ? L"Enhanced" : L"Basic");
 
 
@@ -644,7 +646,7 @@ static void STDMETHODCALLTYPE CB_OnConnectorError(
     VmDisplay *d = cb->display;
     d->pipe_callback_fired = TRUE;
     ui_log(L"RDP pipe error for \"%s\" (%s): 0x%08X",
-        d->vm->name,
+        d->vm_name,
         d->enhanced_mode ? L"Enhanced" : L"Basic",
         hrError);
 
@@ -667,7 +669,7 @@ static void STDMETHODCALLTYPE CB_OnConnectorError(
     }
 
     if (d->enhanced_mode)
-        ui_log(L"VM \"%s\" disconnected from enhanced session.", d->vm->name);
+        ui_log(L"VM \"%s\" disconnected from enhanced session.", d->vm_name);
 }
 
 /* ==================================================================
@@ -794,7 +796,7 @@ static void display_reconnect(VmDisplay *d)
 
     /* 7. Connect to the selected pipe */
     swprintf_s(pipe_path, 512, L"\\\\.\\pipe\\%s.%s",
-        d->vm->name,
+        d->vm_name,
         d->enhanced_mode ? L"EnhancedSession" : L"BasicSession");
 
     hr = d->connector->lpVtbl->StartConnect(d->connector, pipe_path);
@@ -837,7 +839,7 @@ static DWORD WINAPI display_thread_proc(LPVOID param)
     }
     ensure_class(d->hInstance);
 
-    swprintf_s(title, 300, L"%s - Display", d->vm->name);
+    swprintf_s(title, 300, L"%s - Display", d->vm_name);
 
     /* ---- Create main display window ---- */
 
@@ -941,7 +943,7 @@ static DWORD WINAPI display_thread_proc(LPVOID param)
     }
 
     /* Start connecting to the VM's RDP pipe */
-    swprintf_s(pipe_path, 512, L"\\\\.\\pipe\\%s.%s", d->vm->name,
+    swprintf_s(pipe_path, 512, L"\\\\.\\pipe\\%s.%s", d->vm_name,
         d->enhanced_mode ? L"EnhancedSession" : L"BasicSession");
 
     /* Probe pipe existence without consuming the connection.
@@ -986,6 +988,9 @@ fail:
  * Public API
  * ================================================================== */
 
+static volatile LONG64 g_next_display_token;
+UINT_PTR vm_display_token(VmDisplay *display) { return display ? display->token : 0; }
+
 VmDisplay *vm_display_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd)
 {
     VmDisplay *d;
@@ -996,7 +1001,9 @@ VmDisplay *vm_display_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd
                                 sizeof(VmDisplay));
     if (!d) return NULL;
 
-    d->vm         = vm;
+    wcscpy_s(d->vm_name, 256, vm->name);
+    d->vm_id      = vm->unique_id;
+    d->token      = (UINT_PTR)InterlockedIncrement64(&g_next_display_token) << 1;
     d->hInstance  = hInstance;
     d->main_hwnd  = main_hwnd;
     d->running    = TRUE;
@@ -1121,9 +1128,9 @@ static LRESULT CALLBACK display_wnd_proc(
             }
 
             /* Notify main UI only if user closed the window */
-            if (user_initiated && d->main_hwnd && d->vm)
+            if (user_initiated && d->main_hwnd && d->vm_id)
                 PostMessageW(d->main_hwnd, (WM_APP + 5) /*WM_VM_DISPLAY_CLOSED*/,
-                             0, (LPARAM)d->vm);
+                             (WPARAM)d->token, (LPARAM)d->vm_id);
         }
         DestroyWindow(hwnd);
         return 0;
@@ -1162,10 +1169,10 @@ static LRESULT CALLBACK display_wnd_proc(
                 ULONGLONG elapsed = GetTickCount64() - d->connect_start_tick;
                 if (elapsed > 10000) {
                     wchar_t pp[512];
-                    swprintf_s(pp, 512, L"\\\\.\\pipe\\%s.%s", d->vm->name,
+                    swprintf_s(pp, 512, L"\\\\.\\pipe\\%s.%s", d->vm_name,
                         d->enhanced_mode ? L"EnhancedSession" : L"BasicSession");
                     ui_log(L"RDP DIAG: No pipe callback after %llus for \"%s\"",
-                        elapsed / 1000, d->vm->name);
+                        elapsed / 1000, d->vm_name);
                     if (WaitNamedPipeW(pp, 0))
                         ui_log(L"RDP DIAG: Pipe now exists: %s", pp);
                     else
@@ -1183,7 +1190,7 @@ static LRESULT CALLBACK display_wnd_proc(
 
             if (state != d->last_connected) {
                 ui_log(L"RDP Connected state: %ld -> %ld for \"%s\"",
-                    d->last_connected, state, d->vm->name);
+                    d->last_connected, state, d->vm_name);
                 if (d->last_connected > 0 && state == 0) {
                     VARIANT v2;
                     VariantInit(&v2);
@@ -1208,7 +1215,7 @@ static LRESULT CALLBACK display_wnd_proc(
     case WM_DISPLAY_DISCONNECT:
         if (d) {
             ui_log(L"RDP disconnecting \"%s\" (%s)...",
-                d->vm ? d->vm->name : L"?",
+                d->vm_id ? d->vm_name : L"?",
                 d->enhanced_mode ? L"Enhanced" : L"Basic");
             if (d->connector) {
                 d->connector->lpVtbl->TerminateInstance(d->connector);

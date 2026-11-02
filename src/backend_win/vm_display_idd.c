@@ -31,6 +31,7 @@
 #include <stdarg.h>
 
 #include "vm_display_idd.h"
+#include "asb_core.h"
 #include "../core/protocol.h"
 #include "vm_clipboard.h"
 #include "vm_agent.h"
@@ -179,7 +180,8 @@ typedef struct CursorHeader {
 /* ---- Display context ---- */
 
 struct VmDisplayIdd {
-    VmInstance  *vm;
+    UINT64       vm_id;
+    UINT_PTR     token;
     wchar_t      vm_name[256];     /* copy of vm->name for safe logging after VM teardown */
     GUID         runtime_id;       /* copy of vm->runtime_id for safe HvSocket after teardown */
     wchar_t      os_type[32];      /* copy of vm->os_type for picking the service GUID variant */
@@ -1860,9 +1862,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     }
 
     /* Tell the agent to respawn input helper in console session */
-    if (!d->stop && d->vm && d->vm->agent_online) {
+    VmInstance *vm = asb_find_vm_by_id(d->vm_id);
+    if (!d->stop && vm && vm->agent_online) {
         idd_log(d, L"Sending idd_connect to agent...");
-        vm_agent_send(d->vm, "idd_connect", NULL, 0, 5000);
+        vm_agent_send(vm, "idd_connect", NULL, 0, 5000);
     }
 
     /* Input socket lives independently of the frame channel — survives
@@ -2444,9 +2447,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
 
             /* Notify main UI only if user closed the window */
-            if (user_initiated && d->main_hwnd && d->vm)
+            if (user_initiated && d->main_hwnd && d->vm_id)
                 PostMessageW(d->main_hwnd, WM_VM_DISPLAY_CLOSED,
-                             1, (LPARAM)d->vm);
+                             (WPARAM)d->token, (LPARAM)d->vm_id);
         }
         DestroyWindow(hwnd);
         return 0;
@@ -2787,6 +2790,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  * Public API
  * ================================================================== */
 
+static volatile LONG64 g_next_display_token;
+UINT_PTR vm_display_idd_token(VmDisplayIdd *display) { return display ? display->token : 0; }
+
 VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd)
 {
     VmDisplayIdd *d;
@@ -2799,7 +2805,8 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
                                    sizeof(VmDisplayIdd));
     if (!d) return NULL;
 
-    d->vm           = vm;
+    d->vm_id        = vm->unique_id;
+    d->token        = ((UINT_PTR)InterlockedIncrement64(&g_next_display_token) << 1) | 1;
     wcscpy_s(d->vm_name, 256, vm->name);
     wcscpy_s(d->vhdx_path, MAX_PATH, vm->vhdx_path);
     d->runtime_id   = vm->runtime_id;

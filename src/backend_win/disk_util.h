@@ -20,6 +20,11 @@ HRESULT vhdx_create(const wchar_t *path, ULONGLONG size_gb);
    New writes go to child_path; parent_path remains unchanged. */
 HRESULT vhdx_create_differencing(const wchar_t *child_path, const wchar_t *parent_path);
 
+typedef void (*VhdxCopyProgress)(int percent, void *context);
+HRESULT vhdx_copy(const wchar_t *path, const wchar_t *source_path,
+                  HANDLE cancel_event, VhdxCopyProgress progress, void *context);
+HRESULT vhdx_get_identifiers(const wchar_t *path, GUID *identifier, GUID *parent);
+
 HRESULT vhdx_get_virtual_size(const wchar_t *path, ULONGLONG *size_bytes);
 
 /* Shrinking is rejected. Pass the child path, never the shared template path. */
@@ -45,6 +50,7 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
                               BOOL is_template,
                               BOOL test_mode,
                               BOOL ssh_enabled,
+                              BOOL nat_network,
                               const wchar_t *lang);
 
 /* Create a resources ISO for an instance created from a template.
@@ -56,6 +62,7 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        wchar_t *admin_pass,
                                        const wchar_t *res_dir,
                                        BOOL ssh_enabled,
+                                       BOOL nat_network,
                                        const wchar_t *lang);
 
 /* ---- VHDX-First VM Creation (no resources ISO) ---- */
@@ -81,7 +88,7 @@ BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
                                       BOOL test_mode);
 
 /* Generate setup.cmd for VHDX-first boot (agent already on disk). */
-BOOL generate_vhdx_setup_cmd(const wchar_t *output_path);
+BOOL generate_vhdx_setup_cmd(const wchar_t *output_path, BOOL nat_network);
 
 /* Generate SetupComplete.cmd for VHDX-first boot (VDD driver files on disk). */
 BOOL generate_vhdx_setupcomplete(const wchar_t *output_path, BOOL ssh_enabled);

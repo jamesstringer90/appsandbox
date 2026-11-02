@@ -7,15 +7,16 @@ Exact versions are recorded in `../dist/VERSIONS.txt`.
 ## QEMU — GPL-2.0  (`GPL-2.0.txt`)
 The hardware/firmware virtualizer. We ship a patched build (ivshmem-plain on
 macOS/HVF). **Corresponding source:** our fork
-`https://github.com/jamesstringer90/asb-qemu`, branch `asb-ivshmem-11.0.1`
-(= upstream tag `v11.0.1` + 3 ivshmem commits). QEMU runs as a separate process,
+`https://github.com/jamesstringer90/asb-qemu`, branch `asb-ivshmem-11.1.3`
+(upstream tag `v11.1.3` + four ivshmem changes). The exact source revision is recorded
+in the bundled `VERSIONS.txt`. QEMU runs as a separate process on Mac hosts,
 so it is aggregated with — not linked into — the AppSandbox application.
 
 ## GLib — libglib / libgobject / libgio / libgmodule — LGPL-2.1  (`LGPL-2.1.txt`)
-QEMU's core dependency. We ship Homebrew's precompiled GLib **2.88.1** binaries,
+QEMU's core dependency. We ship Homebrew's precompiled GLib **2.90.1** binaries,
 **dynamically linked**. **Corresponding source:** the upstream tarball plus the one
 patch Homebrew applies, both in `../source-mirror/`
-(`glib-2.88.1.tar.xz` + `glib-2.88.1-homebrew-hardcoded-paths.diff`; the exact
+(`glib-2.90.1.tar.xz` + `glib-2.90.1-homebrew-hardcoded-paths.diff`; the exact
 build recipe is `glib.homebrew-formula.rb`). Because GLib is dynamically linked,
 you may replace the `.dylib`s with a modified GLib (LGPL §6 satisfied). Also
 offered per `../WRITTEN_OFFER.txt`.

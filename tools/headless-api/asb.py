@@ -15,7 +15,7 @@ Then:
 Stdlib only (urllib) -- no third-party dependencies. The daemon exposes a
 Docker-style local HTTP/JSON API over loopback; the discovery file gives us the
 port + bearer token so connect() takes no arguments. The API is IDENTICAL on
-both platforms; feature differences (snapshots/templates are Windows-only) are
+both platforms; feature differences (snapshots are Windows-only) are
 advertised in version()["capabilities"] and those routes return 501 on macOS.
 """
 import json
@@ -24,6 +24,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 
 
 def _support_dir():
@@ -57,6 +58,20 @@ def key_path():
 RUNNING_STATES = {"booting", "online"}   # powered on (agent maybe not up yet)
 
 
+class VmId(str):
+    pass
+
+
+def _vm_identity_fields(value):
+    identity = value.get("id")
+    if (isinstance(identity, str) and len(identity) == 19 and
+            identity.startswith("vm-") and
+            all(c in "0123456789abcdef" for c in identity[3:]) and
+            identity != "vm-0000000000000000"):
+        value["id"] = VmId(identity)
+    return value
+
+
 class Client:
     def __init__(self, endpoint, token):
         self.base = endpoint.rstrip("/") + "/v1"
@@ -76,10 +91,23 @@ class Client:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 raw = r.read().decode("utf-8")
-                return r.status, (json.loads(raw) if raw else {})
+                return r.status, (json.loads(raw, object_hook=_vm_identity_fields) if raw else {})
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8")
-            return e.code, (json.loads(raw) if raw else {})
+            return e.code, (json.loads(raw, object_hook=_vm_identity_fields) if raw else {})
+
+    def vm_id(self, target):
+        if isinstance(target, VmId):
+            return target
+        code, body = self._req("GET", "/vms/" + urllib.parse.quote(target, safe=""))
+        if code == 404:
+            raise KeyError(target)
+        if code != 200 or not body.get("id"):
+            raise RuntimeError("Could not resolve VM identity: %r" % body)
+        return body["id"]
+
+    def _vm_path(self, target):
+        return "/vm-ids/" + urllib.parse.quote(self.vm_id(target), safe="")
 
     # ---- queries ----
     def version(self):
@@ -89,7 +117,7 @@ class Client:
         return self._req("GET", "/vms")[1].get("vms", [])
 
     def status(self, name):
-        code, body = self._req("GET", "/vms/" + name)
+        code, body = self._req("GET", self._vm_path(name))
         if code == 404:
             raise KeyError(name)
         return body
@@ -103,10 +131,10 @@ class Client:
         if snap_index != -1:   body["snapIndex"] = snap_index
         if branch_index != -1: body["branchIndex"] = branch_index
         if branch_name:        body["branchName"] = branch_name
-        return self._req("POST", "/vms/%s/start" % name, body or None)
-    def shutdown(self, name): return self._req("POST", "/vms/%s/shutdown" % name)   # graceful
-    def stop(self, name):     return self._req("POST", "/vms/%s/stop" % name)       # force
-    def delete_vm(self, name):return self._req("POST", "/vms/%s/delete" % name)
+        return self._req("POST", (self._vm_path(name) + "/start"), body or None)
+    def shutdown(self, name): return self._req("POST", (self._vm_path(name) + "/shutdown"))   # graceful
+    def stop(self, name):     return self._req("POST", (self._vm_path(name) + "/stop"))       # force
+    def delete_vm(self, name):return self._req("POST", (self._vm_path(name) + "/delete"))
 
     def create(self, **cfg):
         """Create a VM. Config keys: name, osType, imagePath|templateName, ramMb,
@@ -116,7 +144,8 @@ class Client:
         with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
         once it lands. The daemon validates these exactly like the GUI; ramMb is
         rounded down to even here (2 MB-aligned, an HCS requirement, like the GUI).
-        Async + auto-starts; watch status/events."""
+        Async + auto-starts; the response includes the persistent id to use for
+        all subsequent calls. Watch status/events."""
         if isinstance(cfg.get("ramMb"), int):
             cfg["ramMb"] -= cfg["ramMb"] % 2
         return self._req("POST", "/vms", cfg)
@@ -127,40 +156,43 @@ class Client:
         Returns (status, body) -- 409 if the VM is running."""
         if isinstance(fields.get("ramMb"), int):
             fields["ramMb"] -= fields["ramMb"] % 2   # 2 MB-aligned, like the GUI
-        return self._req("PUT", "/vms/%s" % name, fields)
+        return self._req("PUT", self._vm_path(name), fields)
 
     # ---- host / templates / ssh / snapshots ----
     def host(self):              return self._req("GET", "/host")[1]
     def templates(self):         return self._req("GET", "/templates")[1].get("templates", [])
-    def delete_template(self, name): return self._req("DELETE", "/templates/" + name)
-    def ssh_info(self, name):    return self._req("GET", "/vms/%s/sshInfo" % name)[1]
+    def delete_template(self, name):
+        if isinstance(name, VmId):
+            return self.delete_vm(name)
+        return self._req("DELETE", "/templates/" + urllib.parse.quote(name, safe=""))
+    def ssh_info(self, name):    return self._req("GET", (self._vm_path(name) + "/sshInfo"))[1]
     def open_display(self, name):
         """Open the VM's display window on the daemon's local desktop (the GUI's
         Connect view). The VM must be running, and the daemon must be in an
         interactive session that can show a window (a headless/SSH/service daemon
         returns 409 "no_display"). Returns (status, body); status() reports
         displayOpen, which also goes false if the user closes the window."""
-        return self._req("POST", "/vms/%s/display" % name)
-    def close_display(self, name): return self._req("DELETE", "/vms/%s/display" % name)
+        return self._req("POST", (self._vm_path(name) + "/display"))
+    def close_display(self, name): return self._req("DELETE", (self._vm_path(name) + "/display"))
     def display_status(self, name):
         """{'open': bool, 'ready': bool}. 'ready' is the agent's own report that the
         display driver is up (running + agentOnline + idd_status) -- a passive flag,
         NOT a probe: polling it touches no window and no frame channel, so it can't
         disturb the display. Wait for ready, then call open_display()."""
-        return self._req("GET", "/vms/%s/display" % name)[1]
+        return self._req("GET", (self._vm_path(name) + "/display"))[1]
     def display_ready(self, name):  return bool(self.display_status(name).get("ready"))
-    def snapshots(self, name):   return self._req("GET", "/vms/%s/snapshots" % name)[1].get("snapshots", [])
-    def snapshots_full(self, name): return self._req("GET", "/vms/%s/snapshots" % name)[1]  # incl. "current"
+    def snapshots(self, name):   return self._req("GET", (self._vm_path(name) + "/snapshots"))[1].get("snapshots", [])
+    def snapshots_full(self, name): return self._req("GET", (self._vm_path(name) + "/snapshots"))[1]  # incl. "current"
     def snap_take(self, name, snapname=None):
         """Take a snapshot -- the VM must be STOPPED (409 vm_running otherwise)."""
-        return self._req("POST", "/vms/%s/snapshots" % name, {"name": snapname} if snapname else {})
+        return self._req("POST", (self._vm_path(name) + "/snapshots"), {"name": snapname} if snapname else {})
     def snap_delete(self, name, index):
-        return self._req("DELETE", "/vms/%s/snapshots/%d" % (name, index))
+        return self._req("DELETE", self._vm_path(name) + "/snapshots/%d" % index)
     def snap_rename(self, name, index, new_name, branch_index=-1):
-        return self._req("PUT", "/vms/%s/snapshots/%d" % (name, index),
+        return self._req("PUT", self._vm_path(name) + "/snapshots/%d" % index,
                          {"name": new_name, "branchIndex": branch_index})
     def snap_delete_branch(self, name, index, branch_index):
-        return self._req("DELETE", "/vms/%s/snapshots/%d/branches/%d" % (name, index, branch_index))
+        return self._req("DELETE", self._vm_path(name) + "/snapshots/%d/branches/%d" % (index, branch_index))
 
     def shutdown_daemon(self, force=False):
         # Refused (409) while VMs run unless force=True (which terminates them).
@@ -169,7 +201,7 @@ class Client:
     # ---- events (Server-Sent Events) ----
     def events(self):
         """Stream daemon events as parsed dicts, e.g. {"event":"vmStateChanged",
-        "name":..., "running":...}. Blocks -- iterate it in a background thread;
+        "id":..., "name":..., "running":...}. Blocks -- iterate it in a background thread;
         reconnect by calling again. Events are a convenience: status/wait() are the
         miss-proof source of truth."""
         req = urllib.request.Request(self.base + "/events",
@@ -180,12 +212,13 @@ class Client:
                 if s.startswith("data:"):
                     payload = s[5:].strip()
                     try:
-                        yield json.loads(payload)
+                        yield json.loads(payload, object_hook=_vm_identity_fields)
                     except ValueError:
                         yield {"raw": payload}
 
     # ---- waiting (poll-first: level signals, miss-proof) ----
     def wait(self, name, target_states, timeout=300, interval=2):
+        name = self.vm_id(name)
         if isinstance(target_states, str):
             target_states = {target_states}
         deadline = time.time() + timeout

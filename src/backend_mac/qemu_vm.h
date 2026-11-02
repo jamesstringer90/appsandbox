@@ -34,6 +34,8 @@ typedef void (^QemuVmLog)(NSString *line);
 
 @interface QemuVm : NSObject
 
++ (BOOL)nestedVirtualizationSupported;
+
 /* Paths/params for one VM. ramMb/cpuCores/diskGb mirror the CoreVmConfig. The backing file lives in
  * the VM bundle (vmDir/ivshmem.bin); disk.img is the engine-built raw NTFS/GPT image. */
 - (instancetype)initWithName:(NSString *)name
@@ -41,10 +43,12 @@ typedef void (^QemuVmLog)(NSString *line);
                        ramMb:(int)ramMb
                     cpuCores:(int)cpuCores
                   macAddress:(NSString *)macAddress
-                    testMode:(BOOL)testMode;
+                    testMode:(BOOL)testMode
+        nestedVirtualization:(BOOL)nestedVirtualization;
 
 @property (nonatomic, copy, readonly)   NSString *name;
 @property (nonatomic, assign, readonly) QemuVmState state;
+@property (nonatomic, assign, readonly) BOOL exitedCleanly;
 
 /* The shared-memory transport, available once the VM is Running. The core hands this to
  * VmAgentMac / VmSshProxyMac / VmClipboardMac (the ivshmem path). nil before start / after stop. */

@@ -40,7 +40,8 @@ void vz_vm_set_no_audio(BOOL no_audio);
                                                          macAddress:(VZMACAddress *)macAddress
                                                               error:(NSError **)error;
 
-- (void)startWithCompletion:(void (^)(NSError * _Nullable))completion;
+- (void)startWithOptions:(VZMacOSVirtualMachineStartOptions *)options
+             completion:(void (^)(NSError * _Nullable))completion;
 - (void)stopWithCompletion:(void (^)(NSError * _Nullable))completion;
 - (void)requestStopWithCompletion:(void (^)(NSError * _Nullable))completion;
 

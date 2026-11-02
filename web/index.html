@@ -86,9 +86,9 @@
             <div class="image-row needs-iso">
                 <input type="text" id="image-path" placeholder="Path to ISO..." autocorrect="off" autocapitalize="off" spellcheck="false">
                 <button id="btn-browse" onclick="sendCmd('browseImage')">Browse...</button>
-                <span class="or-separator win-only">OR</span>
-                <label class="win-only" style="text-align:left">Template:</label>
-                <div class="template-dropdown win-only" id="template-dropdown">
+                <span class="or-separator templates-supported">OR</span>
+                <label class="templates-supported" style="text-align:left">Template:</label>
+                <div class="template-dropdown templates-supported" id="template-dropdown">
                     <div class="template-dropdown-selected" id="template-dropdown-selected">(None)</div>
                     <div class="template-dropdown-list" id="template-dropdown-list"></div>
                     <input type="hidden" id="template-select" value="">
@@ -167,7 +167,7 @@
         </div>
         <div class="modal-buttons">
             <button onclick="closeCreateModal()">Cancel</button>
-            <button id="btn-create-template" class="win-only" disabled onclick="onCreateTemplate()">Build Template</button>
+            <button id="btn-create-template" class="templates-supported" disabled onclick="onCreateTemplate()">Build Template</button>
             <button id="btn-create" class="primary" disabled onclick="onCreateVm()">Create Sandbox</button>
         </div>
     </div>

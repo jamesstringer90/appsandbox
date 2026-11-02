@@ -120,7 +120,9 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
     config.storageDevices = @[[[VZVirtioBlockDeviceConfiguration alloc] initWithAttachment:att]];
 
     config.graphicsDevices = @[BuildGraphics()];
-    config.networkDevices = @[[VzNetwork natConfigurationWithMACAddress:macAddress]];
+    VZVirtioNetworkDeviceConfiguration *network = [VzNetwork natConfigurationWithMACAddress:macAddress error:error];
+    if (!network) return nil;
+    config.networkDevices = @[network];
     config.pointingDevices = @[[[VZMacTrackpadConfiguration alloc] init],
                                 [[VZUSBScreenCoordinatePointingDeviceConfiguration alloc] init]];
     config.keyboards = @[[[VZUSBKeyboardConfiguration alloc] init]];
@@ -178,7 +180,9 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
     config.bootLoader = [[VZMacOSBootLoader alloc] init];
     config.storageDevices = @[[[VZVirtioBlockDeviceConfiguration alloc] initWithAttachment:att]];
     config.graphicsDevices = @[BuildGraphics()];
-    config.networkDevices = @[[VzNetwork natConfigurationWithMACAddress:macAddress]];
+    VZVirtioNetworkDeviceConfiguration *network = [VzNetwork natConfigurationWithMACAddress:macAddress error:error];
+    if (!network) return nil;
+    config.networkDevices = @[network];
     config.pointingDevices = @[[[VZMacTrackpadConfiguration alloc] init],
                                 [[VZUSBScreenCoordinatePointingDeviceConfiguration alloc] init]];
     config.keyboards = @[[[VZUSBKeyboardConfiguration alloc] init]];
@@ -196,9 +200,10 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
     return vm;
 }
 
-- (void)startWithCompletion:(void (^)(NSError * _Nullable))completion {
+- (void)startWithOptions:(VZMacOSVirtualMachineStartOptions *)options
+             completion:(void (^)(NSError * _Nullable))completion {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self.machine startWithCompletionHandler:^(NSError * _Nullable err) {
+        [self.machine startWithOptions:options completionHandler:^(NSError * _Nullable err) {
             if (completion) completion(err);
         }];
     });

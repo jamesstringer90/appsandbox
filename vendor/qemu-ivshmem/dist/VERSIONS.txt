@@ -2,11 +2,12 @@ AppSandbox bundled QEMU + dependencies — exact versions shipped in this dist/.
 Corresponding source: ../source-mirror/ (run fetch-sources.sh) and the asb-qemu fork.
 Licenses + notices: ../LICENSES/ ; written offer: ../WRITTEN_OFFER.txt
 
-QEMU emulator version 11.0.1
-  GPL-2.0   source: github.com/jamesstringer90/asb-qemu @ asb-ivshmem-11.0.1 (v11.0.1 + 3 ivshmem commits)
-glib     2.88.1   LGPL-2.1   source: glib-2.88.1.tar.xz + glib-2.88.1-homebrew-hardcoded-paths.diff
+QEMU emulator version 11.1.3 (v11.1.3-5-g40311b7)
+  GPL-2.0   source: https://github.com/jamesstringer90/asb-qemu/tree/40311b7ce891804996c2607f46ea2767bef09601
+  branch: asb-ivshmem-11.1.3; upstream: v11.1.3; four ivshmem changes retained
+glib     2.90.1   LGPL-2.1   source: glib-2.90.1.tar.xz + glib-2.90.1-homebrew-hardcoded-paths.diff
 gettext  1.0   LGPL-2.1   source: gettext-1.0.tar.gz  (libintl runtime only; not the GPL tools)
-pcre2    10.47_1  BSD        notice only (LICENSES/pcre2-LICENCE.txt)
+pcre2    10.49  BSD        notice only (LICENSES/pcre2-LICENCE.txt)
 edk2     AAVMF  BSD-2-Clause-Patent   notice only (LICENSES/EDK2-licenses.txt)
 
 The glib/gettext/pcre2 dylibs are Homebrew-built precompiled binaries, dynamically

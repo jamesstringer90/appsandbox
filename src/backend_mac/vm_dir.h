@@ -10,11 +10,14 @@
  */
 
 #import <Foundation/Foundation.h>
+#include <sys/types.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
 @interface VmDir : NSObject
 
++ (uid_t)ownerUID;
++ (gid_t)ownerGID;
 + (NSURL *)vmsRootDirectory;
 + (NSURL *)directoryForVm:(NSString *)name;
 + (NSURL *)diskDirectoryForVm:(NSString *)name;

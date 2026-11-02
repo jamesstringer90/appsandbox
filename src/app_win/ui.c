@@ -7,6 +7,8 @@
 
 #include "ui.h"
 #include "asb_core.h"
+#include "asb_events.h"
+#include "headless.h"
 #include "resource.h"
 #include "hcs_vm.h"
 #include "hcn_network.h"
@@ -37,7 +39,6 @@
 
 static HWND g_hwnd_main = NULL;
 static HINSTANCE g_hInstance = NULL;
-static int g_selected_vm = -1;
 
 /* Minimum window size */
 static int g_min_width = 0;
@@ -46,6 +47,11 @@ static int g_min_height = 0;
 /* Display windows (indexed parallel to the library's VM array) */
 static VmDisplay *g_displays[ASB_MAX_VMS];
 static VmDisplayIdd *g_idd_displays[ASB_MAX_VMS];
+static UINT64 g_display_vm_ids[ASB_MAX_VMS];
+static unsigned g_core_subscription;
+static LONG g_refresh_pending;
+static int g_command_depth;
+#define WM_CORE_CHANGED (WM_APP + 32)
 
 /* Custom window messages */
 #define WM_VM_STATE_CHANGED    (WM_APP + 1)
@@ -123,6 +129,37 @@ static void safe_destroy_idd(int idx)
         g_idd_displays[idx] = NULL;
         vm_display_idd_destroy(d);
     }
+}
+
+static void reconcile_displays(void)
+{
+    VmDisplay *rdp[ASB_MAX_VMS] = {0};
+    VmDisplayIdd *idd[ASB_MAX_VMS] = {0};
+    UINT64 ids[ASB_MAX_VMS] = {0};
+    int i;
+    for (i = 0; i < ASB_MAX_VMS; ++i) {
+        VmInstance *vm = asb_find_vm_by_id(g_display_vm_ids[i]);
+        int idx = vm ? asb_vm_index((AsbVm)vm) : -1;
+        if (idx < 0 || !vm->running) {
+            safe_destroy_rdp(i);
+            safe_destroy_idd(i);
+        } else {
+            rdp[idx] = g_displays[i];
+            idd[idx] = g_idd_displays[i];
+            ids[idx] = vm->unique_id;
+        }
+    }
+    memcpy(g_displays, rdp, sizeof(rdp));
+    memcpy(g_idd_displays, idd, sizeof(idd));
+    memcpy(g_display_vm_ids, ids, sizeof(ids));
+}
+
+BOOL ui_command_active(void) { return g_command_depth != 0; }
+void ui_refresh_from_core(void)
+{
+    if (g_hwnd_main && InterlockedCompareExchange(&g_refresh_pending, 1, 0) == 0)
+        if (!PostMessageW(g_hwnd_main, WM_CORE_CHANGED, 0, 0))
+            InterlockedExchange(&g_refresh_pending, 0);
 }
 
 /* ---- JSON state builders ---- */
@@ -286,11 +323,15 @@ static void build_vm_json(JsonBuilder *jb, int i)
     if (!v || !st_) return;
 
     jb_object_begin(jb);
+    wchar_t id[ASB_VM_ID_TEXT_SIZE];
+    asb_vm_id_format_w(v->unique_id, id);
+    jb_string(jb, L"id", id);
     jb_string(jb, L"name", v->name);
     jb_string(jb, L"osType", v->os_type);
     asb_vm_disk_directory(asb_vm_get(i), disk_directory, MAX_PATH);
     jb_string(jb, L"diskDirectory", disk_directory);
     jb_bool(jb, L"running", v->running);
+    jb_bool(jb, L"starting", v->starting);
     jb_bool(jb, L"shuttingDown", v->shutdown_requested);
     jb_bool(jb, L"agentOnline", v->agent_online);
     jb_int(jb, L"ramMb", (int)v->ram_mb);
@@ -662,6 +703,7 @@ static void do_connect_rdp(int idx)
     }
 
     ui_log(L"Opening RDP basic-session display for \"%s\"...", v->name);
+    g_display_vm_ids[idx] = v->unique_id;
     g_displays[idx] = vm_display_create(v, g_hInstance, g_hwnd_main);
     if (!g_displays[idx]) ui_log(L"Error: Failed to create RDP display window.");
 }
@@ -678,8 +720,10 @@ static void do_connect_idd(int idx)
     }
     safe_destroy_idd(idx);
     ui_log(L"Opening IDD display for \"%s\"...", v->name);
+    g_display_vm_ids[idx] = v->unique_id;
     g_idd_displays[idx] = vm_display_idd_create(v, g_hInstance, g_hwnd_main);
     if (!g_idd_displays[idx]) ui_log(L"Error: Failed to create IDD display window.");
+    asb_events_changed();
 }
 
 /* User-initiated Connect: open BOTH the IDD display and the RDP
@@ -697,6 +741,12 @@ static void do_connect_idd(int idx)
    can close one without re-opening the other. */
 static void do_connect_vm(int idx)
 {
+    VmInstance *vm;
+    reconcile_displays();
+    if (idx < 0 || idx >= asb_vm_count()) return;
+    vm = asb_vm_instance(asb_vm_get(idx));
+    if (!vm || !vm->running) return;
+    asb_vm_set_display_suppressed((AsbVm)vm, FALSE);
     /* Direct ISO->VHDX flow boots straight into the configured rootfs with
        IDD live from the start, so the RDP fallback window is no longer
        needed. do_connect_rdp() + vm_display.c stay on disk as reference
@@ -704,6 +754,36 @@ static void do_connect_vm(int idx)
        The g_displays[]/safe_destroy_rdp cleanup paths remain inert
        because nothing populates the slots. */
     do_connect_idd(idx);
+}
+
+BOOL ui_display_is_open(UINT64 id)
+{
+    int i;
+    for (i = 0; i < ASB_MAX_VMS; ++i)
+        if (g_display_vm_ids[i] == id && g_idd_displays[i])
+            return vm_display_idd_is_open(g_idd_displays[i]);
+    return FALSE;
+}
+BOOL ui_display_open(UINT64 id)
+{
+    VmInstance *vm;
+    reconcile_displays();
+    vm = asb_find_vm_by_id(id);
+    if (!vm) return FALSE;
+    do_connect_vm(asb_vm_index((AsbVm)vm));
+    return ui_display_is_open(id);
+}
+void ui_display_close(UINT64 id)
+{
+    int i;
+    asb_vm_set_display_suppressed((AsbVm)asb_find_vm_by_id(id), TRUE);
+    for (i = 0; i < ASB_MAX_VMS; ++i) {
+        if (g_display_vm_ids[i] != id) continue;
+        safe_destroy_rdp(i);
+        safe_destroy_idd(i);
+        g_display_vm_ids[i] = 0;
+    }
+    asb_events_changed();
 }
 
 /* ---- System tray ---- */
@@ -888,6 +968,7 @@ static void tray_show_menu(HWND hwnd)
     HMENU menu = CreatePopupMenu();
     POINT pt;
     int i, cmd, count = asb_vm_count();
+    UINT64 vm_ids[ASB_MAX_VMS] = {0};
     HHOOK hook;
     MENUINFO mi;
 
@@ -906,6 +987,7 @@ static void tray_show_menu(HWND hwnd)
     for (i = 0; i < count; i++) {
         VmInstance *v = asb_vm_instance(asb_vm_get(i));
         if (!v || !v->running) continue;
+        vm_ids[i] = v->unique_id;
         tray_append(menu, 0, v->name, FALSE, TRUE, FALSE);
         tray_append(menu, TRAY_CMD_CONNECT_BASE + i,  L"\U0001F4FA  Connect",    FALSE, FALSE, TRUE);
         tray_append(menu, TRAY_CMD_SHUTDOWN_BASE + i, L"\u23FB  Shutdown",       FALSE, FALSE, TRUE);
@@ -930,16 +1012,25 @@ static void tray_show_menu(HWND hwnd)
     } else if (cmd == TRAY_CMD_EXIT) {
         DestroyWindow(hwnd);
     } else if (cmd >= TRAY_CMD_STOP_BASE) {
-        int vi = cmd - TRAY_CMD_STOP_BASE;
+        int slot = cmd - TRAY_CMD_STOP_BASE;
+        VmInstance *vm = slot < ASB_MAX_VMS ? asb_find_vm_by_id(vm_ids[slot]) : NULL;
+        int vi = vm ? asb_vm_index((AsbVm)vm) : -1;
+        if (vi < 0) return;
+        reconcile_displays();
         safe_destroy_rdp(vi);
         safe_destroy_idd(vi);
-        asb_vm_stop(asb_vm_get(vi));
+        asb_vm_stop((AsbVm)vm);
         send_vm_list();
     } else if (cmd >= TRAY_CMD_SHUTDOWN_BASE) {
-        asb_vm_shutdown(asb_vm_get(cmd - TRAY_CMD_SHUTDOWN_BASE));
+        int slot = cmd - TRAY_CMD_SHUTDOWN_BASE;
+        VmInstance *vm = slot < ASB_MAX_VMS ? asb_find_vm_by_id(vm_ids[slot]) : NULL;
+        if (!vm) return;
+        asb_vm_shutdown((AsbVm)vm);
         send_vm_list();
     } else if (cmd >= TRAY_CMD_CONNECT_BASE) {
-        do_connect_vm(cmd - TRAY_CMD_CONNECT_BASE);
+        int slot = cmd - TRAY_CMD_CONNECT_BASE;
+        VmInstance *vm = slot < ASB_MAX_VMS ? asb_find_vm_by_id(vm_ids[slot]) : NULL;
+        if (vm) do_connect_vm(asb_vm_index((AsbVm)vm));
     }
 }
 
@@ -970,7 +1061,15 @@ static DWORD WINAPI enable_feature_thread(LPVOID param)
 
 /* ---- WebView2 message dispatch ---- */
 
-static void on_webview2_message(const wchar_t *json)
+static BOOL json_vm_index(const wchar_t *json, int *idx)
+{
+    wchar_t id[ASB_VM_ID_TEXT_SIZE];
+    if (!json_get_string(json, L"vmId", id, ARRAYSIZE(id))) return FALSE;
+    *idx = asb_vm_index((AsbVm)asb_find_vm_by_id(asb_vm_id_parse_w(id)));
+    return *idx >= 0;
+}
+
+static void handle_webview2_message(const wchar_t *json)
 {
     wchar_t action[64] = { 0 };
 
@@ -987,6 +1086,8 @@ static void on_webview2_message(const wchar_t *json)
         }
         g_prereq_ok = TRUE;
         asb_init();
+        if (!asb_api_start(g_hInstance, g_hwnd_main))
+            ui_show_alert(L"The local API could not start. See headless.log for details.");
         send_full_state();
     } else if (wcscmp(action, L"createVm") == 0) {
         if (!g_prereq_ok) {
@@ -1085,7 +1186,7 @@ static void on_webview2_message(const wchar_t *json)
         }
         int idx, si = -1, bi = -1;
         wchar_t bname[128] = {0};
-        if (json_get_int(json, L"vmIndex", &idx)) {
+        if (json_vm_index(json, &idx)) {
             json_get_int(json, L"snapIndex", &si);
             json_get_int(json, L"branchIndex", &bi);
             json_get_string(json, L"branchName", bname, 128);
@@ -1094,9 +1195,7 @@ static void on_webview2_message(const wchar_t *json)
         }
     } else if (wcscmp(action, L"shutdownVm") == 0) {
         int idx;
-        if (json_get_int(json, L"vmIndex", &idx)) {
-            VmInstance *inst = asb_vm_instance(asb_vm_get(idx));
-            if (inst) inst->shutdown_requested = TRUE;
+        if (json_vm_index(json, &idx)) {
             safe_destroy_rdp(idx);
             safe_destroy_idd(idx);
             asb_vm_shutdown(asb_vm_get(idx));
@@ -1104,19 +1203,17 @@ static void on_webview2_message(const wchar_t *json)
         }
     } else if (wcscmp(action, L"stopVm") == 0) {
         int idx;
-        if (json_get_int(json, L"vmIndex", &idx)) {
-            VmInstance *inst = asb_vm_instance(asb_vm_get(idx));
-            if (inst) inst->shutdown_requested = TRUE;
+        if (json_vm_index(json, &idx)) {
             safe_destroy_rdp(idx);
             safe_destroy_idd(idx);
             asb_vm_stop(asb_vm_get(idx));
             send_vm_list();
         }
     } else if (wcscmp(action, L"connectIddVm") == 0) {
-        int idx; if (json_get_int(json, L"vmIndex", &idx)) do_connect_vm(idx);
+        int idx; if (json_vm_index(json, &idx)) do_connect_vm(idx);
     } else if (wcscmp(action, L"sshConnect") == 0) {
         int idx;
-        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
+        if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count()) {
             VmInstance *inst = asb_vm_instance(asb_vm_get(idx));
             if (inst && inst->ssh_enabled && inst->ssh_port) {
                 wchar_t cmd[1024], keyopt[700] = L"";
@@ -1161,27 +1258,20 @@ static void on_webview2_message(const wchar_t *json)
         }
     } else if (wcscmp(action, L"deleteVm") == 0) {
         int idx;
-        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
-            int j;
+        if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count()) {
             HRESULT hr;
-            ui_log(L"Deleting VM \"%s\"...", asb_vm_name(asb_vm_get(idx)));
-            safe_destroy_rdp(idx);
-            safe_destroy_idd(idx);
-            hr = asb_vm_delete(asb_vm_get(idx));
+            AsbVm vm = asb_vm_get(idx);
+            VmInstance *instance = asb_vm_instance(vm);
+            ui_log(L"Deleting VM \"%s\"...", asb_vm_name(vm));
+            if (instance) ui_display_close(instance->unique_id);
+            hr = asb_vm_delete(vm);
             if (FAILED(hr)) {
                 ui_log(L"VM deletion failed (0x%08X). Check that its disk storage is available and writable.", hr);
                 ui_show_alert(L"VM deletion failed. Check that its disk storage is available and writable.");
                 send_vm_list();
                 return;
             }
-            /* Compact display arrays */
-            for (j = idx; j < asb_vm_count(); j++) {
-                g_displays[j] = g_displays[j + 1];
-                g_idd_displays[j] = g_idd_displays[j + 1];
-            }
-            g_displays[asb_vm_count()] = NULL;
-            g_idd_displays[asb_vm_count()] = NULL;
-            g_selected_vm = -1;
+            reconcile_displays();
             send_vm_list();
             ui_log(L"VM deleted.");
         }
@@ -1190,7 +1280,9 @@ static void on_webview2_message(const wchar_t *json)
         json_get_string(json, L"name", tpl_name, 256);
         if (tpl_name[0] != L'\0') {
             HRESULT hr = asb_template_delete(tpl_name);
-            if (FAILED(hr)) {
+            if (hr == HRESULT_FROM_WIN32(ERROR_BUSY)) {
+                ui_show_alert(L"This template is still required by an existing VM or an active disk copy.");
+            } else if (FAILED(hr)) {
                 ui_log(L"Template deletion failed (0x%08X). Check that its disk storage is available and writable.", hr);
                 ui_show_alert(L"Template deletion failed. Check that its disk storage is available and writable.");
             }
@@ -1199,7 +1291,7 @@ static void on_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"editVm") == 0) {
         int idx;
         wchar_t field[64], value[256];
-        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count() &&
+        if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count() &&
             json_get_string(json, L"field", field, 64) &&
             json_get_string(json, L"value", value, 256)) {
             AsbVm vm = asb_vm_get(idx);
@@ -1230,8 +1322,6 @@ static void on_webview2_message(const wchar_t *json)
         }
         send_vm_list();
     } else if (wcscmp(action, L"selectVm") == 0) {
-        int idx;
-        if (json_get_int(json, L"vmIndex", &idx)) g_selected_vm = idx;
     } else if (wcscmp(action, L"getDiskSpace") == 0) {
         wchar_t *copy = _wcsdup(json);
         HANDLE thread = copy ? CreateThread(NULL, 0, disk_space_thread, copy, 0, NULL) : NULL;
@@ -1290,20 +1380,20 @@ static void on_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"snapTake") == 0) {
         int vi;
         wchar_t sname[128] = {0};
-        if (json_get_int(json, L"vmIndex", &vi)) {
+        if (json_vm_index(json, &vi)) {
             json_get_string(json, L"name", sname, 128);
             asb_snap_take(asb_vm_get(vi), sname);
             send_vm_list();
         }
     } else if (wcscmp(action, L"snapDelete") == 0) {
         int vi, si;
-        if (json_get_int(json, L"vmIndex", &vi) && json_get_int(json, L"snapIndex", &si)) {
+        if (json_vm_index(json, &vi) && json_get_int(json, L"snapIndex", &si)) {
             asb_snap_delete(asb_vm_get(vi), si);
             send_vm_list();
         }
     } else if (wcscmp(action, L"snapDeleteBranch") == 0) {
         int vi, si, bi;
-        if (json_get_int(json, L"vmIndex", &vi) && json_get_int(json, L"snapIndex", &si) &&
+        if (json_vm_index(json, &vi) && json_get_int(json, L"snapIndex", &si) &&
             json_get_int(json, L"branchIndex", &bi)) {
             asb_snap_delete_branch(asb_vm_get(vi), si, bi);
             send_vm_list();
@@ -1311,7 +1401,7 @@ static void on_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"snapRename") == 0) {
         int vi, si, bi = -1;
         wchar_t new_name[128];
-        if (json_get_int(json, L"vmIndex", &vi) && json_get_int(json, L"snapIndex", &si) &&
+        if (json_vm_index(json, &vi) && json_get_int(json, L"snapIndex", &si) &&
             json_get_string(json, L"name", new_name, 128)) {
             json_get_int(json, L"branchIndex", &bi);
             asb_snap_rename(asb_vm_get(vi), si, bi, new_name);
@@ -1366,33 +1456,29 @@ static void CALLBACK ui_log_callback(const wchar_t *message, void *user_data)
     }
 }
 
-static void CALLBACK ui_state_callback(AsbVm vm, BOOL running, void *user_data)
+static void ui_core_event(const CoreVmEvent *event, void *context)
 {
-    (void)user_data;
-    if (g_hwnd_main)
-        PostMessageW(g_hwnd_main, WM_VM_STATE_CHANGED, (WPARAM)running, (LPARAM)vm);
+    (void)context;
+    if (event->type == CORE_VM_EVENT_LOG || event->type == CORE_VM_EVENT_ALERT) {
+        wchar_t message[16384] = {0};
+        if (event->str_value)
+            MultiByteToWideChar(CP_UTF8, 0, event->str_value, -1, message, ARRAYSIZE(message));
+        if (event->type == CORE_VM_EVENT_LOG) ui_log_callback(message, NULL);
+        else ui_show_alert(message);
+    } else ui_refresh_from_core();
 }
 
-static void CALLBACK ui_progress_callback(AsbVm vm, int pct, BOOL staging, void *user_data)
+static void on_webview2_message(const wchar_t *json)
 {
-    (void)pct; (void)staging; (void)user_data;
-    /* Progress is already set in the VmInstance by the library - just refresh */
-    if (g_hwnd_main)
-        PostMessageW(g_hwnd_main, WM_VM_STATE_CHANGED, (WPARAM)0, (LPARAM)vm);
-}
-
-static void CALLBACK ui_alert_callback(const wchar_t *message, void *user_data)
-{
-    (void)user_data;
-    ui_show_alert(message);
-}
-
-static void CALLBACK ui_vm_removed_callback(int index, void *user_data)
-{
-    (void)user_data;
-    /* Post to UI thread to compact display arrays */
-    if (g_hwnd_main)
-        PostMessageW(g_hwnd_main, WM_VM_REMOVED, (WPARAM)index, 0);
+    if (g_command_depth || asb_api_busy()) {
+        ui_show_alert(L"Another VM operation is in progress. Please try again when it finishes.");
+        return;
+    }
+    ++g_command_depth;
+    reconcile_displays();
+    handle_webview2_message(json);
+    --g_command_depth;
+    ui_refresh_from_core();
 }
 
 /* ---- Window creation ---- */
@@ -1408,12 +1494,7 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
     g_is_home_edition = detect_home_edition();
     asb_set_hinstance(hInstance);
 
-    /* Set library callbacks before init */
-    asb_set_log_callback(ui_log_callback, NULL);
-    asb_set_state_callback(ui_state_callback, NULL);
-    asb_set_progress_callback(ui_progress_callback, NULL);
-    asb_set_alert_callback(ui_alert_callback, NULL);
-    asb_set_vm_removed_callback(ui_vm_removed_callback, NULL);
+    g_core_subscription = asb_events_subscribe(ui_core_event, NULL);
 
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
@@ -1490,45 +1571,26 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    case WM_VM_STATE_CHANGED:
-    {
-        /* Library already handled cleanup - just refresh UI and manage displays */
-        AsbVm vm = (AsbVm)lp;
-        BOOL running = (BOOL)wp;
-        int idx = asb_vm_index(vm);
+    case WM_ASB_API_REQUEST:
+        return asb_api_dispatch((void *)lp);
 
-        if (idx >= 0 && !running) {
-            safe_destroy_rdp(idx);
-            safe_destroy_idd(idx);
-        }
-
-        send_vm_list();
+    case WM_ASB_API_SHUTDOWN:
+        DestroyWindow(hwnd);
         return 0;
-    }
 
-    case WM_VM_REMOVED:
-    {
-        /* Library removed a VM at this index - compact display arrays */
-        int idx = (int)wp;
-        int count = asb_vm_count();
-        int j;
-        safe_destroy_rdp(idx);
-        safe_destroy_idd(idx);
-        for (j = idx; j < count; j++) {
-            g_displays[j] = g_displays[j + 1];
-            g_idd_displays[j] = g_idd_displays[j + 1];
-        }
-        g_displays[count] = NULL;
-        g_idd_displays[count] = NULL;
+    case WM_CORE_CHANGED:
+        InterlockedExchange(&g_refresh_pending, 0);
+        if (g_command_depth || asb_api_busy()) return 0;
+        reconcile_displays();
         send_vm_list();
         send_templates();
         return 0;
-    }
 
     case WM_VM_AGENT_STATUS:
     {
-        VmInstance *inst = (VmInstance *)lp;
-        if (inst && inst->agent_online) {
+        reconcile_displays();
+        VmInstance *inst = asb_find_vm_by_id((UINT64)lp);
+        if (inst && inst->running && inst->agent_online && !inst->display_suppressed && !inst->shutdown_requested) {
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
@@ -1548,11 +1610,12 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_VM_IDD_READY:
     {
+        reconcile_displays();
         /* lp is a stable per-VM id (UINT64), not a VmInstance*. Resolve
            fresh; returns NULL if the VM was deleted between PostMessage
            and our processing. */
         VmInstance *inst = asb_find_vm_by_id((UINT64)lp);
-        if (inst && inst->running && !inst->install_complete && !inst->shutdown_requested) {
+        if (inst && inst->running && !inst->install_complete && !inst->shutdown_requested && !inst->display_suppressed) {
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
@@ -1566,23 +1629,12 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    case WM_VM_AGENT_SHUTDOWN:
-    {
-        VmInstance *inst = (VmInstance *)lp;
-        if (inst) {
-            inst->shutdown_requested = TRUE;
-            inst->shutdown_time = GetTickCount64();
-        }
-        send_vm_list();
-        return 0;
-    }
-
     case WM_VM_HYPERV_VIDEO_OFF:
     {
-        VmInstance *inst = (VmInstance *)lp;
-        if (inst && inst->running) {
+        reconcile_displays();
+        VmInstance *inst = asb_find_vm_by_id((UINT64)lp);
+        if (inst && inst->running && !inst->display_suppressed) {
             int i, count = asb_vm_count();
-            inst->hyperv_video_off = TRUE;
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
                 if (g_displays[i] && vm_display_is_open(g_displays[i])) {
@@ -1599,50 +1651,26 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_VM_DISPLAY_CLOSED:
     {
-        VmInstance *inst = (VmInstance *)lp;
+        reconcile_displays();
+        VmInstance *inst = asb_find_vm_by_id((UINT64)lp);
         if (inst) {
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
                 if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
-                if (wp == 0) safe_destroy_rdp(i);
-                if (wp == 1) safe_destroy_idd(i);
+                if (wp && wp == vm_display_token(g_displays[i])) safe_destroy_rdp(i);
+                else if (wp && wp == vm_display_idd_token(g_idd_displays[i])) safe_destroy_idd(i);
+                else break;
+                asb_vm_set_display_suppressed((AsbVm)inst, TRUE);
+                asb_events_changed();
                 break;
             }
         }
-        return 0;
-    }
-
-    case WM_VM_MONITOR_DETECTED:
-    {
-        /* Safety net: monitor thread detected VM stopped.
-           The library's HCS callback should handle this, but the monitor
-           provides a fallback. Mark the VM as stopped and refresh. */
-        VmInstance *inst = (VmInstance *)lp;
-        if (inst && inst->running) {
-            int i, count = asb_vm_count();
-            ui_log(L"Monitor detected VM \"%s\" stopped.", inst->name);
-            inst->running = FALSE;
-            inst->shutdown_requested = FALSE;
-            inst->hyperv_video_off = FALSE;
-            hcs_stop_monitor(inst);
-            vm_agent_stop(inst);
-            for (i = 0; i < count; i++) {
-                if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
-                safe_destroy_rdp(i);
-                safe_destroy_idd(i);
-                break;
-            }
-            asb_vm_cleanup_network(inst);
-            hcs_close_vm(inst);
-        }
-        send_vm_list();
-        asb_save();
         return 0;
     }
 
     case WM_VM_SHUTDOWN_TIMEOUT:
     {
-        VmInstance *inst = (VmInstance *)lp;
+        VmInstance *inst = asb_find_vm_by_id((UINT64)lp);
         ULONGLONG elapsed = (ULONGLONG)wp;
         if (inst && inst->running && elapsed % 30 < 3)
             ui_log(L"WARNING: VM \"%s\" still shutting down (%llu seconds).", inst->name, elapsed);
@@ -1651,7 +1679,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_VM_AGENT_GPUCOPY:
     {
-        VmInstance *inst = (VmInstance *)lp;
+        reconcile_displays();
+        VmInstance *inst = asb_find_vm_by_id((UINT64)lp);
         if (inst) {
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
@@ -1701,6 +1730,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_prereq_ok = TRUE;
             webview2_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":false}");
             asb_init();
+            if (!asb_api_start(g_hInstance, g_hwnd_main))
+                ui_show_alert(L"The local API could not start. See headless.log for details.");
             send_full_state();
         } else if (ok && reboot_required) {
             g_prereq_reboot_pending = TRUE;
@@ -1719,16 +1750,21 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_TRAYICON:
+        if (g_command_depth || asb_api_busy()) return 0;
         if (lp == WM_LBUTTONDBLCLK) {
             ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
         } else if (lp == WM_LBUTTONUP || lp == WM_RBUTTONUP) {
+            ++g_command_depth;
             tray_show_menu(hwnd);
+            --g_command_depth;
+            ui_refresh_from_core();
         }
         return 0;
 
     case WM_CLOSE:
     {
+        if (g_command_depth || asb_api_busy()) return 0;
         int i, count = asb_vm_count();
         BOOL has_running = FALSE;
         for (i = 0; i < count; i++) {
@@ -1778,6 +1814,9 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
     {
         int i;
+        asb_api_stop();
+        asb_events_unsubscribe(g_core_subscription);
+        g_core_subscription = 0;
         tray_remove();
         webview2_cleanup();
         for (i = 0; i < ASB_MAX_VMS; i++) {
@@ -1785,6 +1824,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             safe_destroy_idd(i);
         }
         asb_cleanup();
+        g_hwnd_main = NULL;
         PostQuitMessage(0);
         return 0;
     }

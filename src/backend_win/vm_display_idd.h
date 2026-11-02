@@ -14,6 +14,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
 
 void vm_display_idd_destroy(VmDisplayIdd *display);
 BOOL vm_display_idd_is_open(VmDisplayIdd *display);
+UINT_PTR vm_display_idd_token(VmDisplayIdd *display);
 
 /* Bring an already-open display window to the foreground/focus.
    Safe to call from any thread; the work is marshaled to the window thread. */

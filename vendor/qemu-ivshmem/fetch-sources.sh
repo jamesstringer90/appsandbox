@@ -18,13 +18,13 @@ get() { # url sha256 dest
   verify "$2" "$3"; echo "  ok: $3"
 }
 
-echo "==> glib 2.88.1 (LGPL v2.1) — REQUIRED corresponding source"
-get "https://download.gnome.org/sources/glib/2.88/glib-2.88.1.tar.xz" \
-    "51ab804c56f6eab3e5045c774d1290ac5e4c923d4f9a3d8e33123bee45c1840e" \
-    "glib-2.88.1.tar.xz"
-get "https://raw.githubusercontent.com/Homebrew/homebrew-core/1cf441a0/Patches/glib/hardcoded-paths.diff" \
+echo "==> glib 2.90.1 (LGPL v2.1) — REQUIRED corresponding source"
+get "https://download.gnome.org/sources/glib/2.90/glib-2.90.1.tar.xz" \
+    "93c941aa17d5eb1d53fe838365f29a8b4e539c222a256d974ec8f30fc413e396" \
+    "glib-2.90.1.tar.xz"
+get "https://raw.githubusercontent.com/Homebrew/homebrew-core/e1a11dc93c6ce0140c983b37cea012199ca82ffc/Patches/glib/hardcoded-paths.diff" \
     "d846efd0bf62918350da94f850db33b0f8727fece9bfaf8164566e3094e80c97" \
-    "glib-2.88.1-homebrew-hardcoded-paths.diff"
+    "glib-2.90.1-homebrew-hardcoded-paths.diff"
 
 echo "==> gettext 1.0 (LGPL v2.1) — we ship libintl.8.dylib, so its source is REQUIRED too"
 get "https://ftpmirror.gnu.org/gnu/gettext/gettext-1.0.tar.gz" \

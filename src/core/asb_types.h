@@ -9,6 +9,7 @@
 #define ASB_TYPES_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,7 @@ typedef struct CoreVmConfig {
 /* ---- VM snapshot state (outputs from list_vms) ---- */
 
 typedef struct CoreVmInfo {
+    uint64_t    vm_id;
     char        name[CORE_VM_NAME_MAX];
     char        os_type[CORE_VM_OS_TYPE_MAX];
     int         running;
@@ -74,13 +76,15 @@ typedef struct CoreVmInfo {
 #define CORE_VM_EVENT_INSTALL_STATUS  5   /* str_value: phase string */
 #define CORE_VM_EVENT_LIST_CHANGED    6   /* entire VM list changed */
 #define CORE_VM_EVENT_AGENT_STATUS    7   /* int_value: 1=online, 0=offline */
-#define CORE_VM_EVENT_DIAG            8   /* protocol/diag — Event Log only */
+#define CORE_VM_EVENT_DIAG            8
 
 typedef struct CoreVmEvent {
+    uint64_t    vm_id;
     int         type;
     char        vm_name[CORE_VM_NAME_MAX];
     int         int_value;
     const char *str_value;  /* may be NULL */
+    int         staging;
 } CoreVmEvent;
 
 typedef void (*CoreVmEventCallback)(const CoreVmEvent *event, void *user_data);
