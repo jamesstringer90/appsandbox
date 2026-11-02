@@ -92,7 +92,7 @@ static BOOL display_is_open(UINT64 vm_id)
 static void display_reap_stale(UINT64 vm_id)
 {
     DisplayEntry *e = display_find(vm_id);
-    if (e && e->disp && !vm_display_idd_is_open(e->disp))
+    if (e && e->disp && !vm_display_idd_is_active(e->disp))
         display_drop(e);
 }
 /* A-gate: can this process put a window on a visible desktop? FALSE in a service /

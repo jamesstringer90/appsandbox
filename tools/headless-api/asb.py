@@ -15,7 +15,7 @@ Then:
 Stdlib only (urllib) -- no third-party dependencies. The daemon exposes a
 Docker-style local HTTP/JSON API over loopback; the discovery file gives us the
 port + bearer token so connect() takes no arguments. The API is IDENTICAL on
-both platforms; feature differences (snapshots are Windows-only) are
+both platforms; feature differences (snapshots/templates are Windows-only) are
 advertised in version()["capabilities"] and those routes return 501 on macOS.
 """
 import json
@@ -144,8 +144,7 @@ class Client:
         with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
         once it lands. The daemon validates these exactly like the GUI; ramMb is
         rounded down to even here (2 MB-aligned, an HCS requirement, like the GUI).
-        Async + auto-starts; the response includes the persistent id to use for
-        all subsequent calls. Watch status/events."""
+        Async + auto-starts; watch status/events."""
         if isinstance(cfg.get("ramMb"), int):
             cfg["ramMb"] -= cfg["ramMb"] % 2
         return self._req("POST", "/vms", cfg)
@@ -201,7 +200,7 @@ class Client:
     # ---- events (Server-Sent Events) ----
     def events(self):
         """Stream daemon events as parsed dicts, e.g. {"event":"vmStateChanged",
-        "id":..., "name":..., "running":...}. Blocks -- iterate it in a background thread;
+        "name":..., "running":...}. Blocks -- iterate it in a background thread;
         reconnect by calling again. Events are a convenience: status/wait() are the
         miss-proof source of truth."""
         req = urllib.request.Request(self.base + "/events",

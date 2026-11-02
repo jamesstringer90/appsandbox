@@ -26,11 +26,13 @@
 
 /* Reserved inodes (must match kernel's expectations). */
 #define EXT4_ROOT_INO          2u
+#define EXT4_JOURNAL_INO       8u
+#define EXT4_JOURNAL_BLOCKS    32768u
 #define EXT4_LOST_FOUND_INO    11u
 #define EXT4_FIRST_INO         11u   /* s_first_ino: first non-reserved */
 
 /* Feature flags - kept very small. */
-#define EXT4_FEATURE_COMPAT     0x08u
+#define EXT4_FEATURE_COMPAT     0x0Cu
 #define EXT4_FEATURE_INCOMPAT   (0x02u | 0x40u)   /* FILETYPE | EXTENTS */
 #define EXT4_FEATURE_RO_COMPAT  (0x01u | 0x02u | 0x08u | 0x20u | 0x40u)
                                  /* SPARSE_SUPER | LARGE_FILE | HUGE_FILE
@@ -1016,6 +1018,39 @@ static int write_file_extents(ext4_writer_t *w, inode_rec_t *r,
     return 0;
 }
 
+static void journal_put_be32(uint8_t *p, uint32_t value)
+{
+    p[0] = (uint8_t)(value >> 24);
+    p[1] = (uint8_t)(value >> 16);
+    p[2] = (uint8_t)(value >> 8);
+    p[3] = (uint8_t)value;
+}
+
+static int write_journal(ext4_writer_t *w)
+{
+    size_t size = (size_t)EXT4_JOURNAL_BLOCKS * BLOCK_SIZE;
+    uint8_t *data = (uint8_t *)calloc(1, size);
+    inode_rec_t *r;
+    int result;
+
+    if (!data) return -1;
+    r = alloc_inode_rec(w, EXT4_JOURNAL_INO);
+    if (!r) { free(data); return -1; }
+    inode_init(&r->body, S_IFREG | 0600, 0, 0, (uint32_t)time(NULL));
+    journal_put_be32(data + 0x00, 0xC03B3998u);
+    journal_put_be32(data + 0x04, 4);
+    journal_put_be32(data + 0x0C, BLOCK_SIZE);
+    journal_put_be32(data + 0x10, EXT4_JOURNAL_BLOCKS);
+    journal_put_be32(data + 0x14, 1);
+    journal_put_be32(data + 0x18, 1);
+    journal_put_be32(data + 0x28, 1);
+    memcpy(data + 0x30, w->uuid, sizeof(w->uuid));
+    journal_put_be32(data + 0x40, 1);
+    result = write_file_extents(w, r, data, size);
+    free(data);
+    return result;
+}
+
 int ext4_writer_add_file(ext4_writer_t *w, const char *path,
                          uint16_t perms, uint32_t uid, uint32_t gid,
                          uint32_t mtime, const void *data, uint64_t size)
@@ -1405,6 +1440,11 @@ static int write_superblocks_and_gdt(ext4_writer_t *w)
     sb->s_feature_compat     = EXT4_FEATURE_COMPAT;
     sb->s_feature_incompat   = EXT4_FEATURE_INCOMPAT;
     sb->s_feature_ro_compat  = EXT4_FEATURE_RO_COMPAT;
+    sb->s_journal_inum       = EXT4_JOURNAL_INO;
+    sb->s_jnl_backup_type    = 1;
+    memcpy(sb->s_jnl_blocks, w->inodes[EXT4_JOURNAL_INO]->body.i_block, 60);
+    sb->s_jnl_blocks[15] = w->inodes[EXT4_JOURNAL_INO]->body.i_size_hi;
+    sb->s_jnl_blocks[16] = w->inodes[EXT4_JOURNAL_INO]->body.i_size_lo;
     memcpy(sb->s_uuid, w->uuid, 16);
     strncpy(sb->s_volume_name, w->label, sizeof(sb->s_volume_name));
     sb->s_desc_size          = 32;  /* not 64bit */
@@ -1489,6 +1529,8 @@ static int write_superblocks_and_gdt(ext4_writer_t *w)
 int ext4_writer_close(ext4_writer_t *w)
 {
     LOG_I("ext4_writer_close: finalizing %u inodes", w->n_used_inodes);
+
+    if (write_journal(w) != 0) { LOG_E("write_journal failed"); return -1; }
 
     /* 1. Serialize all directory data + allocate their blocks + set inode extents. */
     if (finalize_dirs(w) != 0) { LOG_E("finalize_dirs failed"); return -1; }

@@ -2855,6 +2855,8 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
 
 void vm_display_idd_destroy(VmDisplayIdd *display)
 {
+    BOOL quit_requested = FALSE;
+    int quit_code = 0;
     if (!display) return;
 
     /* Signal stop */
@@ -2874,6 +2876,11 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
             if (result == WAIT_OBJECT_0 + 1) {
                 MSG msg;
                 while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                    if (msg.message == WM_QUIT) {
+                        quit_requested = TRUE;
+                        quit_code = (int)msg.wParam;
+                        continue;
+                    }
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
@@ -2915,6 +2922,12 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
         HeapFree(GetProcessHeap(), 0, display->frame_buf);
 
     HeapFree(GetProcessHeap(), 0, display);
+    if (quit_requested) PostQuitMessage(quit_code);
+}
+
+BOOL vm_display_idd_is_active(VmDisplayIdd *display)
+{
+    return display && display->open && !display->stop;
 }
 
 BOOL vm_display_idd_is_open(VmDisplayIdd *display)

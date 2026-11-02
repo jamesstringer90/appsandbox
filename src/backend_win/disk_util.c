@@ -120,15 +120,20 @@ HRESULT vhdx_copy(const wchar_t *path, const wchar_t *source_path,
 {
     VIRTUAL_STORAGE_TYPE storage_type = { VIRTUAL_STORAGE_TYPE_DEVICE_VHDX, VHDX_VENDOR_MS };
     CREATE_VIRTUAL_DISK_PARAMETERS params = {0};
+    SET_VIRTUAL_DISK_INFO identity = {0};
     OVERLAPPED overlapped = {0};
     HANDLE disk = INVALID_HANDLE_VALUE, events[2];
     DWORD result;
     BOOL cancelling = FALSE;
     int last_percent = -1;
+    HRESULT hr;
 
     if (!path || !source_path || !cancel_event) return E_INVALIDARG;
     if (WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0)
         return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    identity.Version = SET_VIRTUAL_DISK_INFO_VIRTUAL_DISK_ID;
+    hr = CoCreateGuid(&identity.VirtualDiskId);
+    if (FAILED(hr)) return hr;
     overlapped.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!overlapped.hEvent) return HRESULT_FROM_WIN32(GetLastError());
     events[0] = overlapped.hEvent;
@@ -165,6 +170,8 @@ HRESULT vhdx_copy(const wchar_t *path, const wchar_t *source_path,
                 }
             }
         }
+        if (result == ERROR_SUCCESS && !cancelling)
+            result = SetVirtualDiskInformation(disk, &identity);
         CloseHandle(disk);
     }
     CloseHandle(overlapped.hEvent);

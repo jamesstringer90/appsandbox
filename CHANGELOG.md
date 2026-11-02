@@ -15,6 +15,11 @@
 - Core events update the shared frontend. Windows records remain stable while
   asynchronous work is active, and viewer-close notifications identify the viewer
   instance so a stale close cannot affect its replacement.
+- New Ubuntu disks on Windows hosts include an ext4 journal for filesystem
+  recovery after crashes or forced stops. Existing disks retain their current
+  filesystem configuration.
+- Ubuntu disk creation reserves enough free inodes for first-boot installation
+  on minimum-size disks.
 
 ### macOS
 
@@ -52,23 +57,10 @@
 - New Windows NAT guests on both host platforms configure the relevant adapter as
   Private and enable the existing Windows IPv4 echo-request rule for the local
   subnet. No additional application firewall rules are created.
+- New Ubuntu guests start their agent after the network manager, preventing a
+  first-boot race that could remove the configured NAT address.
 - On Mac hosts, quitting during disk creation stops owned workers and detaches mounted
   installer media. Unfinished disks are rejected for boot and can be deleted.
-
-### Verification status
-
-Real macOS-host QA covered GUI/API template creation, larger usable clone disks,
-concurrent guests, SSH, inter-guest ping, clone restart after base deletion, Mac
-viewer synchronization, interrupted disk-build cleanup, and headless guest boots.
-The local headless menu icon and menu Quit were confirmed, including listener,
-discovery-file, and process cleanup.
-
-Windows-host compilation and runtime QA of the new independent-VHDX path remain
-pending, including copy cancellation, template deletion, and legacy snapshot protection.
-Full menu-state synchronization, the
-Windows guest viewer on the Mac QA host, actual SSH/service host launches, and
-hardware-dependent nested virtualization remain unverified. See
-[the Windows handoff](WINDOWS_HANDOFF.md) for the remaining Windows work.
 
 These are unreleased branch changes. No app release or deployment-system update
 is part of this work.

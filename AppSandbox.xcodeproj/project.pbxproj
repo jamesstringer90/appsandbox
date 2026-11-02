@@ -7,11 +7,11 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A5B200000000000000000001 /* Hypervisor.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A5B200000000000000000002 /* Hypervisor.framework */; };
-        A5B100000000000000000001 /* asb_network_mac.m in Sources */ = {isa = PBXBuildFile; fileRef = A5B100000000000000000003 /* asb_network_mac.m */; };
-        A5B100000000000000000004 /* vmnet.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A5B100000000000000000005 /* vmnet.framework */; };
-        A5BE00000000000000000001 /* asb_events.c in Sources */ = {isa = PBXBuildFile; fileRef = A5BE00000000000000000002 /* asb_events.c */; };
-        A5BE00000000000000000004 /* asb_events.h in Headers */ = {isa = PBXBuildFile; fileRef = A5BE00000000000000000003 /* asb_events.h */; settings = {ATTRIBUTES = (Public, ); }; };
+		A5B200000000000000000001   = {isa = PBXBuildFile; fileRef = A5B200000000000000000002  ; };
+        A5B100000000000000000001   = {isa = PBXBuildFile; fileRef = A5B100000000000000000003  ; };
+        A5B100000000000000000004   = {isa = PBXBuildFile; fileRef = A5B100000000000000000005  ; };
+        A5BE00000000000000000001   = {isa = PBXBuildFile; fileRef = A5BE00000000000000000002  ; };
+        A5BE00000000000000000004   = {isa = PBXBuildFile; fileRef = A5BE00000000000000000003  ; settings = {ATTRIBUTES = (Public, ); }; };
 		/* App target — Sources (app_mac only) */
 		2001000000000000000000AA /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 1001000000000000000000AA /* main.m */; };
 		2003000000000000000000AA /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = 1003000000000000000000AA /* AppDelegate.m */; };
@@ -159,12 +159,12 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		A5B200000000000000000002 /* Hypervisor.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Hypervisor.framework; path = System/Library/Frameworks/Hypervisor.framework; sourceTree = SDKROOT; };
-        A5B100000000000000000002 /* asb_network_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_network_mac.h; sourceTree = "<group>"; };
-        A5B100000000000000000003 /* asb_network_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = asb_network_mac.m; sourceTree = "<group>"; };
-        A5B100000000000000000005 /* vmnet.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = vmnet.framework; path = System/Library/Frameworks/vmnet.framework; sourceTree = SDKROOT; };
-        A5BE00000000000000000002 /* asb_events.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = asb_events.c; sourceTree = "<group>"; };
-        A5BE00000000000000000003 /* asb_events.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_events.h; sourceTree = "<group>"; };
+		A5B200000000000000000002   = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Hypervisor.framework; path = System/Library/Frameworks/Hypervisor.framework; sourceTree = SDKROOT; };
+        A5B100000000000000000002   = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_network_mac.h; sourceTree = "<group>"; };
+        A5B100000000000000000003   = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = asb_network_mac.m; sourceTree = "<group>"; };
+        A5B100000000000000000005   = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = vmnet.framework; path = System/Library/Frameworks/vmnet.framework; sourceTree = SDKROOT; };
+        A5BE00000000000000000002   = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = asb_events.c; sourceTree = "<group>"; };
+        A5BE00000000000000000003   = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_events.h; sourceTree = "<group>"; };
 		1001000000000000000000AA /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
 		1002000000000000000000AA /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
 		1003000000000000000000AA /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppDelegate.m; sourceTree = "<group>"; };
@@ -264,8 +264,8 @@
 				4011000000000000000000BB /* Cocoa.framework in Frameworks */,
 				4016000000000000000000BB /* Carbon.framework in Frameworks */,
 				4012000000000000000000BB /* Virtualization.framework in Frameworks */,
-                A5B100000000000000000004 /* vmnet.framework in Frameworks */,
-				A5B200000000000000000001 /* Hypervisor.framework in Frameworks */,
+                A5B100000000000000000004  ,
+				A5B200000000000000000001  ,
 				4013000000000000000000BB /* Metal.framework in Frameworks */,
 				4014000000000000000000BB /* Security.framework in Frameworks */,
 				4015000000000000000000BB /* AudioToolbox.framework in Frameworks */,
@@ -402,8 +402,8 @@
 			isa = PBXGroup;
 			children = (
 				1018000000000000000000AA /* asb_types.h */,
-                A5BE00000000000000000002 /* asb_events.c */,
-                A5BE00000000000000000003 /* asb_events.h */,
+                A5BE00000000000000000002  ,
+                A5BE00000000000000000003  ,
 				1070000000000000000000AA /* protocol.h */,
 			);
 			name = core;
@@ -423,8 +423,8 @@
 				1010000000000000000000AA /* vz_display.m */,
 				1013000000000000000000AA /* vz_network.h */,
 				1014000000000000000000AA /* vz_network.m */,
-                A5B100000000000000000002 /* asb_network_mac.h */,
-                A5B100000000000000000003 /* asb_network_mac.m */,
+                A5B100000000000000000002  ,
+                A5B100000000000000000003  ,
 				1015000000000000000000AA /* vz_vm.h */,
 				1016000000000000000000AA /* vz_vm.m */,
 				101B000000000000000000AA /* vm_agent_mac.h */,
@@ -453,8 +453,8 @@
 				3016000000000000000000BB /* Carbon.framework */,
 				3002000000000000000000AA /* WebKit.framework */,
 				3003000000000000000000AA /* Virtualization.framework */,
-                A5B100000000000000000005 /* vmnet.framework */,
-				A5B200000000000000000002 /* Hypervisor.framework */,
+                A5B100000000000000000005  ,
+				A5B200000000000000000002  ,
 				3004000000000000000000AA /* Metal.framework */,
 				3005000000000000000000AA /* Security.framework */,
 				3006000000000000000000AA /* Foundation.framework */,
@@ -483,7 +483,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				6012000000000000000000BB /* asb_types.h in Headers */,
-                A5BE00000000000000000004 /* asb_events.h in Headers */,
+                A5BE00000000000000000004  ,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -728,12 +728,12 @@
 			buildActionMask = 2147483647;
 			files = (
 				2028000000000000000000BB /* asb_core_mac.m in Sources */,
-                A5BE00000000000000000001 /* asb_events.c in Sources */,
+                A5BE00000000000000000001  ,
 				2021000000000000000000BB /* host_info.m in Sources */,
 				2022000000000000000000BB /* vm_dir.m in Sources */,
 				2024000000000000000000BB /* vz_display.m in Sources */,
 				2026000000000000000000BB /* vz_network.m in Sources */,
-                A5B100000000000000000001 /* asb_network_mac.m in Sources */,
+                A5B100000000000000000001  ,
 				2027000000000000000000BB /* vz_vm.m in Sources */,
 				2029000000000000000000BB /* vm_agent_mac.m in Sources */,
 				2030000000000000000000BB /* iso_patch_mac.m in Sources */,

@@ -714,7 +714,7 @@ static void do_connect_idd(int idx)
     if (idx < 0 || idx >= asb_vm_count()) return;
     v = asb_vm_instance(asb_vm_get(idx));
     if (!v || !v->running) { ui_log(L"VM \"%s\" is not running.", v ? v->name : L"?"); return; }
-    if (g_idd_displays[idx] && vm_display_idd_is_open(g_idd_displays[idx])) {
+    if (g_idd_displays[idx] && vm_display_idd_is_active(g_idd_displays[idx])) {
         vm_display_idd_focus(g_idd_displays[idx]);
         return;
     }
@@ -767,11 +767,15 @@ BOOL ui_display_is_open(UINT64 id)
 BOOL ui_display_open(UINT64 id)
 {
     VmInstance *vm;
+    int i;
     reconcile_displays();
     vm = asb_find_vm_by_id(id);
     if (!vm) return FALSE;
     do_connect_vm(asb_vm_index((AsbVm)vm));
-    return ui_display_is_open(id);
+    for (i = 0; i < ASB_MAX_VMS; ++i)
+        if (g_display_vm_ids[i] == id && g_idd_displays[i])
+            return vm_display_idd_is_active(g_idd_displays[i]);
+    return FALSE;
 }
 void ui_display_close(UINT64 id)
 {
