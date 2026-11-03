@@ -419,6 +419,8 @@ int asb_send(AsbConn *c, const void *buf, int len) {
         ULONGLONG progress = c->send_timeout_ms ? GetTickCount64() : 0;
         while (off < len) {
             int n;
+            if (c->send_timeout_ms && GetTickCount64() - progress >= c->send_timeout_ms)
+                return off ? off : -1;
             MemoryBarrier();
             /* Disconnect if the host left ESTABLISHED, OR (ch1-7) re-armed the slot with a NEW
                host_token — the latter means a fresh arm superseded ours, so we must stop producing
@@ -429,10 +431,7 @@ int asb_send(AsbConn *c, const void *buf, int len) {
             n = ring_write(c->g2h, c->g2h_data, (const uint8_t *)buf + off, len - off);
             if (n > 0) {
                 off += n;
-                if (c->send_timeout_ms) progress = GetTickCount64();
             } else {
-                if (c->send_timeout_ms && GetTickCount64() - progress >= c->send_timeout_ms)
-                    return off ? off : -1;
                 Sleep(0);
             }
         }
@@ -441,7 +440,10 @@ int asb_send(AsbConn *c, const void *buf, int len) {
     {   /* PC: loop until all bytes are sent (a single send() can return < len on a
            stream socket) — preserves the original send_all() behaviour. */
         int off = 0;
+        ULONGLONG started = c->send_timeout_ms ? GetTickCount64() : 0;
         while (off < len) {
+            if (c->send_timeout_ms && GetTickCount64() - started >= c->send_timeout_ms)
+                return off ? off : -1;
             int n = send(c->sock, (const char *)buf + off, len - off, 0);
             if (n <= 0) return off ? off : n;
             off += n;
@@ -497,8 +499,8 @@ int asb_poll(AsbConn *c, int timeout_ms) {
 
 void asb_set_timeout(AsbConn *c, int recv_ms, int send_ms) {
     if (!c) return;
+    c->send_timeout_ms = send_ms > 0 ? (DWORD)send_ms : 0;
     if (c->is_ivshmem) {
-        c->send_timeout_ms = send_ms > 0 ? (DWORD)send_ms : 0;
         return;
     }
     setsockopt(c->sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&recv_ms, sizeof(recv_ms));

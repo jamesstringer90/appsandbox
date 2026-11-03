@@ -213,6 +213,9 @@ typedef struct _VDD_SWAP_PROC {
     VDD_GPU_SLOT        gpuSlots[DISPLAY_GPU_SLOTS];
     ID3D11Texture2D*     pGpuPendingTex;
     BOOL                bGpuPendingFrame;
+    UINT                gpuPendingPresentationFrame;
+    UINT64              gpuPendingAcquiredQpc;
+    ULONGLONG           gpuBlockedSince;
     UINT64              gpuSession;
     UINT                gpuNextSlot;
     UINT                gpuLastSlot;
@@ -227,6 +230,15 @@ typedef struct _VDD_SWAP_PROC {
     BOOL                bGpuSourceCompatible;
     DisplayGpuPacket    gpuControl;
     UINT                gpuControlBytes;
+    HANDLE              hGpuIoThread;
+    HANDLE              hGpuIoWake;
+    HANDLE              hGpuIoStop;
+    AsbConn*            hGpuIoConn;
+    volatile LONG       gpuIoFailed;
+    SRWLOCK             gpuCursorLock;
+    BYTE*               pGpuCursorPacket;
+    UINT                gpuCursorBytes;
+    BOOL                bGpuCursorPending;
 
     /* Hardware cursor */
     IDDCX_MONITOR       hMonitor;           /* needed for QueryHardwareCursor */
