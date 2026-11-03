@@ -436,6 +436,11 @@ static __weak IddDisplayWindow *g_mouseOwner;
 - (void)releaseHeldKeys;
 - (void)releaseKeyboardCapture;
 - (void)updateKeyboardCapture;
+- (BOOL)canMatchWindowSize;
+- (void)updateDisplaySize:(BOOL)follow;
+- (void)flushDisplaySize;
+- (void)scheduleDisplaySize;
+- (void)toggleMatchWindowSize:(id)sender;
 @end
 
 @implementation IddDisplayWindow {
@@ -447,6 +452,12 @@ static __weak IddDisplayWindow *g_mouseOwner;
     volatile uint32_t _fbSeq;       /* bumped on each applied frame */
     uint32_t          _renderSeq;   /* last _fbSeq uploaded to the GPU */
     pthread_mutex_t   _fbLock;
+    BOOL              _matchWindow, _followDisplaySize, _adjustingDisplaySize, _fullscreenSizing;
+    BOOL              _resizeSupported, _hasDisplayFrame, _displaySizing;
+    uint32_t          _guestSizeMode, _displayGeneration;
+    uint64_t          _displaySession;
+    DisplayGpuPacket  _sizeRequest, _lastSizeRequest;
+    NSSize            _normalMinSize, _normalMaxSize;
 
     /* Metal GPU render (zero-copy, mirrors the Windows D3D11 path). The reconstructed frame is copied
        ONCE into a pool of IOSurface-backed MTLTextures (the same Map+memcpy floor Windows has), then the
@@ -588,6 +599,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
     _view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     window.contentView = _view;
     window.delegate = self;
+    _normalMinSize = window.contentMinSize;
+    _normalMaxSize = window.contentMaxSize;
     [self loadDisplaySettings];
     [self setupMetal];
     return self;
@@ -633,8 +646,91 @@ static __weak IddDisplayWindow *g_mouseOwner;
     [self saveDisplaySettings];
 }
 
+- (BOOL)canMatchWindowSize {
+    pthread_mutex_lock(&_inputLock);
+    BOOL ready = !_stop && _displayFd >= 0 && _resizeSupported && _hasDisplayFrame;
+    pthread_mutex_unlock(&_inputLock);
+    return ready;
+}
+
+- (void)toggleMatchWindowSize:(id)sender {
+    (void)sender;
+    if (![self canMatchWindowSize]) return;
+    _matchWindow = !_matchWindow;
+    [self updateDisplaySize:YES];
+}
+
+- (void)updateDisplaySize:(BOOL)follow {
+    if (_stop) return;
+    if (follow) _followDisplaySize = YES;
+    BOOL ready = [self canMatchWindowSize];
+    _adjustingDisplaySize = YES;
+    self.window.contentMinSize = _matchWindow && ready
+        ? [self.view convertSizeFromBacking:NSMakeSize(DISPLAY_MIN_WIDTH, DISPLAY_MIN_HEIGHT)] : _normalMinSize;
+    self.window.contentMaxSize = _matchWindow && ready
+        ? [self.view convertSizeFromBacking:NSMakeSize(DISPLAY_MAX_WIDTH, DISPLAY_MAX_HEIGHT)] : _normalMaxSize;
+    _adjustingDisplaySize = NO;
+    if (self.view.inLiveResize || self.window.isMiniaturized || _fullscreenSizing) return;
+    if (_matchWindow && !ready) return;
+    pthread_mutex_lock(&_fbLock);
+    uint32_t width = _fbW, height = _fbH;
+    pthread_mutex_unlock(&_fbLock);
+    if (!width || !height) return;
+    uint32_t frameWidth = width, frameHeight = height;
+    BOOL resizeWindow = NO;
+    if (_matchWindow) {
+        NSSize pixels = [self.view convertSizeToBacking:self.view.bounds.size];
+        width = (uint32_t)fmax(DISPLAY_MIN_WIDTH, fmin(DISPLAY_MAX_WIDTH, round(pixels.width)));
+        height = (uint32_t)fmax(DISPLAY_MIN_HEIGHT, fmin(DISPLAY_MAX_HEIGHT, round(pixels.height)));
+        resizeWindow = fabs(pixels.width - width) > 0.5 || fabs(pixels.height - height) > 0.5;
+        _followDisplaySize = NO;
+    } else if (_followDisplaySize && !(self.window.styleMask & NSWindowStyleMaskFullScreen)) {
+        resizeWindow = YES;
+        _followDisplaySize = NO;
+    }
+    if (resizeWindow && !(self.window.styleMask & NSWindowStyleMaskFullScreen)) {
+        _adjustingDisplaySize = YES;
+        [self.window setContentSize:[self.view convertSizeFromBacking:NSMakeSize(width, height)]];
+        _adjustingDisplaySize = NO;
+    }
+    uint32_t mode = _matchWindow ? DISPLAY_SIZE_WINDOW : DISPLAY_SIZE_GUEST;
+    pthread_mutex_lock(&_inputLock);
+    if (_resizeSupported && _hasDisplayFrame && _displayFd >= 0) {
+        if (mode != _guestSizeMode || (_matchWindow && (width != frameWidth || height != frameHeight))) {
+            DisplayGpuPacket request = {0};
+            request.magic = DISPLAY_GPU_MAGIC;
+            request.type = DISPLAY_GPU_RESIZE;
+            request.version = DISPLAY_GPU_VERSION;
+            request.session = _displaySession;
+            request.width = width;
+            request.height = height;
+            request.slot = mode;
+            if (memcmp(&_lastSizeRequest, &request, sizeof(request)) != 0) {
+                _sizeRequest = request;
+                _lastSizeRequest = request;
+            }
+        } else {
+            memset(&_sizeRequest, 0, sizeof(_sizeRequest));
+            memset(&_lastSizeRequest, 0, sizeof(_lastSizeRequest));
+        }
+    }
+    pthread_mutex_unlock(&_inputLock);
+}
+
+- (void)flushDisplaySize {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(flushDisplaySize) object:nil];
+    if (_matchWindow || _followDisplaySize) [self updateDisplaySize:NO];
+}
+
+- (void)scheduleDisplaySize {
+    if (_stop || _adjustingDisplaySize || _fullscreenSizing || self.view.inLiveResize || !_matchWindow) return;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(flushDisplaySize) object:nil];
+    [self performSelector:@selector(flushDisplaySize) withObject:nil afterDelay:0.15];
+}
+
 - (void)showTitlebarMenuAtPoint:(NSPoint)point {
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+    menu.autoenablesItems = NO;
     NSMenuItem *mute = [menu addItemWithTitle:@"Mute audio" action:@selector(toggleAudioMute:) keyEquivalent:@""];
     mute.target = self;
     mute.state = _audioMuted ? NSControlStateValueOn : NSControlStateValueOff;
@@ -642,6 +738,11 @@ static __weak IddDisplayWindow *g_mouseOwner;
                                        action:@selector(toggleTransmitHotkeys:) keyEquivalent:@""];
     hotkeys.target = self;
     hotkeys.state = _transmitHotkeys ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *match = [menu addItemWithTitle:@"Match window size"
+                                      action:@selector(toggleMatchWindowSize:) keyEquivalent:@""];
+    match.target = self;
+    match.state = _matchWindow ? NSControlStateValueOn : NSControlStateValueOff;
+    match.enabled = [self canMatchWindowSize];
     _trackingMenus++;
     [self releaseKeyboardCapture];
     [self releaseMouseCapture];
@@ -1139,7 +1240,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
     int i;
     if (newFrame) {
         if (_surfW != _fbW || _surfH != _fbH) [self recreateSurfacesW:_fbW h:_fbH];
-        if (!_surf[0]) { _renderSeq = _fbSeq; return; }
+        if (!_surf[0] || !_surfW || !_surfH) return;
         i = _frontValid ? (_frontIdx + 1) % IDD_SURF_COUNT : 0;
     } else {
         if (!_frontValid) return;                  /* resize before any frame -> nothing to show yet */
@@ -1156,6 +1257,12 @@ static __weak IddDisplayWindow *g_mouseOwner;
         size_t dstStride = IOSurfaceGetBytesPerRow(_surf[i]);
         size_t dstRows = IOSurfaceGetHeight(_surf[i]);
         pthread_mutex_lock(&_fbLock);
+        if (_fbW != _surfW || _fbH != _surfH) {
+            pthread_mutex_unlock(&_fbLock);
+            IOSurfaceUnlock(_surf[i], 0, NULL);
+            dispatch_semaphore_signal(_mtlSem);
+            return;
+        }
         size_t copyStride = _fbStride < dstStride ? _fbStride : dstStride;
         /* Clamp rows to the surface height: the display thread may have grown _fbH after the
            surface was sized (above, from an unlocked read), so never write past the IOSurface. */
@@ -1295,12 +1402,65 @@ static __weak IddDisplayWindow *g_mouseOwner;
         /* Publish the fd BEFORE the blocking read loop so teardown can shutdown() it to unblock us. */
         pthread_mutex_lock(&_inputLock);
         _displayFd = fd;
+        _displaySession = ((uint64_t)(uint32_t)getpid() << 32) | ++_displayGeneration;
+        uint64_t session = _displaySession;
+        _resizeSupported = NO;
+        _hasDisplayFrame = NO;
+        memset(&_sizeRequest, 0, sizeof(_sizeRequest));
+        memset(&_lastSizeRequest, 0, sizeof(_lastSizeRequest));
         pthread_mutex_unlock(&_inputLock);
+        struct timeval sendTimeout = {1, 0};
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout));
+        DisplayGpuPacket query = {0};
+        query.magic = DISPLAY_GPU_MAGIC;
+        query.type = DISPLAY_GPU_QUERY;
+        query.version = DISPLAY_GPU_VERSION;
+        query.session = session;
+        query.reserved = DISPLAY_GPU_CAP_RESIZE | DISPLAY_GPU_CAP_IVSHMEM;
+        if (!idd_wr_full(fd, &query, sizeof(query))) shutdown(fd, SHUT_RDWR);
 
         for (;;) {
             if (_stop) break;
+            DisplayGpuPacket request = {0};
+            pthread_mutex_lock(&_inputLock);
+            if (_resizeSupported && _hasDisplayFrame && !_displaySizing && _sizeRequest.session == session) {
+                request = _sizeRequest;
+                memset(&_sizeRequest, 0, sizeof(_sizeRequest));
+            }
+            pthread_mutex_unlock(&_inputLock);
+            if (request.type && !idd_wr_full(fd, &request, sizeof(request))) break;
             uint32_t magic;
             if (!idd_rd_full(fd, &magic, 4)) break;
+
+            if (magic == DISPLAY_GPU_MAGIC) {
+                DisplayGpuPacket packet = {0};
+                packet.magic = magic;
+                if (!idd_rd_full(fd, (uint8_t *)&packet + 4, sizeof(packet) - 4)) break;
+                if (packet.version != DISPLAY_GPU_VERSION || packet.session != session) break;
+                pthread_mutex_lock(&_inputLock);
+                if (packet.type == DISPLAY_GPU_CAPS) {
+                    uint64_t required = DISPLAY_GPU_CAP_RESIZE | DISPLAY_GPU_CAP_IVSHMEM;
+                    _resizeSupported = packet.status == 0 && (packet.reserved & required) == required &&
+                        packet.slot <= DISPLAY_SIZE_WINDOW && packet.width && packet.height &&
+                        packet.width <= DISPLAY_MAX_WIDTH && packet.height <= DISPLAY_MAX_HEIGHT;
+                    _guestSizeMode = packet.slot;
+                } else if (packet.type == DISPLAY_GPU_RESIZED && packet.status != 0) {
+                    _resizeSupported = NO;
+                    memset(&_sizeRequest, 0, sizeof(_sizeRequest));
+                    memset(&_lastSizeRequest, 0, sizeof(_lastSizeRequest));
+                    NSLog(@"IDD [%@]: display resize rejected (0x%08x)", self.name, packet.status);
+                }
+                pthread_mutex_unlock(&_inputLock);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    IddDisplayWindow *owner = weakSelf;
+                    if (!owner) return;
+                    pthread_mutex_lock(&owner->_inputLock);
+                    BOOL current = owner->_displaySession == session && owner->_displayFd == fd;
+                    pthread_mutex_unlock(&owner->_inputLock);
+                    if (current) [owner updateDisplaySize:NO];
+                });
+                continue;
+            }
 
             if (magic == VDD_CURSOR_MAGIC) {
                 WireCursorHeader ch;
@@ -1352,7 +1512,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
                 fh.width > 8192 || fh.height > 8192) break;
 
             /* (Re)allocate the working framebuffer if geometry changed. */
-            if (_fbW != fh.width || _fbH != fh.height || _fbStride != fh.stride || !_fb) {
+            BOOL geometryChanged = _fbW != fh.width || _fbH != fh.height;
+            if (geometryChanged || _fbStride != fh.stride || !_fb) {
                 uint8_t *nb = malloc((size_t)fh.stride * fh.height);
                 if (!nb) break;
                 pthread_mutex_lock(&_fbLock);
@@ -1408,6 +1569,18 @@ static __weak IddDisplayWindow *g_mouseOwner;
             pthread_mutex_lock(&_curLock);
             _displayReady = YES;
             pthread_mutex_unlock(&_curLock);
+            pthread_mutex_lock(&_inputLock);
+            BOOL firstFrame = !_hasDisplayFrame;
+            _hasDisplayFrame = YES;
+            pthread_mutex_unlock(&_inputLock);
+            if (firstFrame || geometryChanged) dispatch_async(dispatch_get_main_queue(), ^{
+                IddDisplayWindow *owner = weakSelf;
+                if (!owner) return;
+                pthread_mutex_lock(&owner->_inputLock);
+                BOOL current = owner->_displaySession == session && owner->_displayFd == fd;
+                pthread_mutex_unlock(&owner->_inputLock);
+                if (current) [owner updateDisplaySize:geometryChanged];
+            });
         }
 
         pthread_mutex_lock(&_curLock);
@@ -1417,7 +1590,11 @@ static __weak IddDisplayWindow *g_mouseOwner;
         dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf releaseMouseCapture]; });
         pthread_mutex_lock(&_inputLock);
         if (_displayFd == fd) _displayFd = -1;   /* unpublish before close so teardown won't shutdown a reused fd */
+        _resizeSupported = NO;
+        _hasDisplayFrame = NO;
+        memset(&_sizeRequest, 0, sizeof(_sizeRequest));
         pthread_mutex_unlock(&_inputLock);
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf updateDisplaySize:NO]; });
         close(fd);   /* tears the pump down + releases the slot; reconnect = a fresh VDD full frame */
         if (!_stop) usleep(100000);
     }
@@ -1957,6 +2134,73 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
 #pragma mark - NSWindowDelegate
 
+- (void)windowWillStartLiveResize:(NSNotification *)notification {
+    (void)notification;
+    pthread_mutex_lock(&_inputLock);
+    _displaySizing = YES;
+    memset(&_sizeRequest, 0, sizeof(_sizeRequest));
+    memset(&_lastSizeRequest, 0, sizeof(_lastSizeRequest));
+    pthread_mutex_unlock(&_inputLock);
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(flushDisplaySize) object:nil];
+}
+
+- (void)windowDidEndLiveResize:(NSNotification *)notification {
+    (void)notification;
+    pthread_mutex_lock(&_inputLock);
+    _displaySizing = NO;
+    pthread_mutex_unlock(&_inputLock);
+    [self flushDisplaySize];
+}
+
+- (void)windowDidResize:(NSNotification *)notification {
+    (void)notification;
+    [self scheduleDisplaySize];
+}
+
+- (void)windowDidChangeBackingProperties:(NSNotification *)notification {
+    (void)notification;
+    [self scheduleDisplaySize];
+}
+
+- (void)windowDidDeminiaturize:(NSNotification *)notification {
+    (void)notification;
+    [self flushDisplaySize];
+}
+
+- (void)windowWillEnterFullScreen:(NSNotification *)notification {
+    (void)notification;
+    _fullscreenSizing = YES;
+}
+
+- (void)windowWillExitFullScreen:(NSNotification *)notification {
+    (void)notification;
+    _fullscreenSizing = YES;
+}
+
+- (void)windowDidEnterFullScreen:(NSNotification *)notification {
+    (void)notification;
+    _fullscreenSizing = NO;
+    [self flushDisplaySize];
+}
+
+- (void)windowDidExitFullScreen:(NSNotification *)notification {
+    (void)notification;
+    _fullscreenSizing = NO;
+    [self flushDisplaySize];
+}
+
+- (void)windowDidFailToEnterFullScreen:(NSWindow *)window {
+    (void)window;
+    _fullscreenSizing = NO;
+    [self flushDisplaySize];
+}
+
+- (void)windowDidFailToExitFullScreen:(NSWindow *)window {
+    (void)window;
+    _fullscreenSizing = NO;
+    [self flushDisplaySize];
+}
+
 - (void)windowDidBecomeKey:(NSNotification *)notification {
     (void)notification;
     [self updateKeyboardCapture];
@@ -2020,6 +2264,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     _trackingMenus = 0;
     _stop = 1;
+    _fullscreenSizing = NO;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(flushDisplaySize) object:nil];
     [self.timer invalidate];
     self.timer = nil;
     pthread_mutex_lock(&_inqLock);
@@ -2027,6 +2273,10 @@ static __weak IddDisplayWindow *g_mouseOwner;
     pthread_mutex_unlock(&_inqLock);
     pthread_mutex_lock(&_inputLock);
     int dfd = _displayFd; _displayFd = -1;
+    _resizeSupported = NO;
+    _hasDisplayFrame = NO;
+    _displaySizing = NO;
+    memset(&_sizeRequest, 0, sizeof(_sizeRequest));
     int afd = _audioFd; _audioFd = -1;
     int cwfd = _clipWriterFd; _clipWriterFd = -1;
     int crfd = _clipReaderFd; _clipReaderFd = -1;

@@ -93,9 +93,27 @@ struct ResolutionEntry {
 
 static const ResolutionEntry g_SupportedResolutions[] = {
     { 1920, 1080 },
+    { 1024, 768 },
+    { 1280, 720 },
+    { 1280, 800 },
+    { 1280, 1024 },
+    { 1366, 768 },
+    { 1440, 900 },
+    { 1600, 900 },
+    { 1680, 1050 },
+    { 1920, 1200 },
+    { 2560, 1440 },
+    { 2560, 1600 },
+    { 3440, 1440 },
+    { 3840, 2160 },
+    { 5120, 1440 },
+    { 5120, 2880 },
+    { 7680, 4320 },
 };
 
 static const UINT g_NumResolutions = ARRAYSIZE(g_SupportedResolutions);
+static const UINT VDD_MAX_MODES = g_NumResolutions + 1;
+static const UINT VDD_EDID_BYTES = 128 * (1 + (VDD_MAX_MODES + 4) / 5);
 
 struct RefreshRateEntry {
     UINT numerator;
@@ -188,6 +206,10 @@ typedef struct _VDD_GPU_SLOT {
 } VDD_GPU_SLOT;
 
 typedef struct _VDD_SWAP_PROC {
+    struct _VDD_DEVICE_CONTEXT* pOwner;
+    UINT                width;
+    UINT                height;
+    UINT                stride;
     IDDCX_SWAPCHAIN     hSwapChain;
     HANDLE              hAvailableEvent;    /* from pInArgs->hNextSurfaceAvailable */
     HANDLE              hTerminateEvent;
@@ -213,21 +235,18 @@ typedef struct _VDD_SWAP_PROC {
     VDD_GPU_SLOT        gpuSlots[DISPLAY_GPU_SLOTS];
     ID3D11Texture2D*     pGpuPendingTex;
     BOOL                bGpuPendingFrame;
-    UINT                gpuPendingPresentationFrame;
-    UINT64              gpuPendingAcquiredQpc;
     ULONGLONG           gpuBlockedSince;
     UINT64              gpuSession;
     UINT                gpuNextSlot;
     UINT                gpuLastSlot;
-    UINT                gpuReportedFrame;
-    UINT                gpuReEncodeNumber;
-    BOOL                bGpuFrameReported;
     BOOL                bGpuPoolReady;
     BOOL                bGpuPoolFailed;
     BOOL                bGpuCapsSent;
     BOOL                bGpuHasFrame;
     BOOL                bGpuSourceKnown;
     BOOL                bGpuSourceCompatible;
+    BOOL                gpuResizeSupported;
+    BOOL                gpuModeNotified;
     DisplayGpuPacket    gpuControl;
     UINT                gpuControlBytes;
     HANDLE              hGpuIoThread;
@@ -264,9 +283,18 @@ typedef struct _VDD_DEVICE_CONTEXT {
     ID3D11DeviceContext* pCachedCtx;
     LUID                cachedDeviceLuid;
 
-    /* Monitor mode list */
-    DISPLAYCONFIG_VIDEO_SIGNAL_INFO modes[2]; /* 1920x1080@60 (monitor + target) */
-    UINT                modeCount;
+    GUID                monitorContainerId;
+    SRWLOCK             swapLock;
+    SRWLOCK             displayLock;
+    SRWLOCK             displayWorkLock;
+    WDFWORKITEM         hDisplayWork;
+    DisplayGpuPacket    displayRequest;
+    UINT64              gpuModeSession;
+    volatile LONG       gpuModes;
+    volatile LONG       fullModes;
+    volatile LONG       stopping;
+    volatile LONG       reconfiguring;
+    BOOL                swapChanging;
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,
        depart and re-arrive the monitor to force DWM re-engagement.
@@ -289,6 +317,9 @@ WDF_DECLARE_CONTEXT_TYPE(IndirectDeviceContextWrapper);
 struct MonitorContextWrapper
 {
     VDD_DEVICE_CONTEXT* pContext;
+    ResolutionEntry modes[VDD_MAX_MODES];
+    UINT modeCount;
+    BOOL matchWindow;
 };
 
 WDF_DECLARE_CONTEXT_TYPE(MonitorContextWrapper);

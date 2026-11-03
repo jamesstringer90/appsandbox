@@ -112,7 +112,7 @@ typedef struct AudioFrameHeader {
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+#define MAX_FRAME_DATA_SIZE (DISPLAY_MAX_WIDTH * DISPLAY_MAX_HEIGHT * 4)
 
 /* ---- Window messages ---- */
 
@@ -122,6 +122,7 @@ typedef struct AudioFrameHeader {
 #define WM_IDD_FOCUS            (WM_USER + 101)
 #define WM_IDD_INPUT_READY      (WM_USER + 102)
 #define WM_IDD_CURSOR_CHANGED   (WM_USER + 103)
+#define WM_IDD_DISPLAY_SIZE     (WM_USER + 104)
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -218,6 +219,8 @@ struct VmDisplayIdd {
     BOOL                    render_pending;
     volatile LONG           render_requested;
     volatile LONG           resize_requested;
+    volatile LONG           gpu_refresh_requested;
+    CONDITION_VARIABLE      gpu_refresh_done;
     UINT                    title_width;
     UINT                    title_height;
     BOOL                    title_muted;
@@ -235,6 +238,17 @@ struct VmDisplayIdd {
     BOOL                    shared_rejected;
     BOOL                    shared_ready;
     BOOL                    shared_disabled;
+    BOOL                    shared_resize;
+    UINT                    shared_width;
+    UINT                    shared_height;
+    UINT                    display_width;
+    UINT                    display_height;
+    UINT                    guest_size_mode;
+    UINT                    size_mode;
+    DisplayGpuPacket        size_request;
+    ULONGLONG               size_reconnect_until;
+    BOOL                    size_follow_pending;
+    BOOL                    size_update_pending;
     SOCKET                  frame_socket;
     UINT                    shared_next;
     HANDLE                  shared_thread;
@@ -257,7 +271,7 @@ struct VmDisplayIdd {
     volatile LONG  mouse_version;
     volatile BOOL  frame_connected;
     BOOL           relative_mouse;
-    BOOL           input_sizing;
+    volatile BOOL  input_sizing;
     UINT           mouse_buttons;
     BOOL           raw_absolute_valid;
     HANDLE         raw_absolute_device;
@@ -314,10 +328,13 @@ static DWORD WINAPI     idd_recv_thread_proc(LPVOID param);
 static void d3d_resize_swap_chain(VmDisplayIdd *d);
 static void d3d_render_frame(VmDisplayIdd *d);
 static void d3d_recover(VmDisplayIdd *d);
+static void d3d_refresh_gpu(VmDisplayIdd *d);
 static void idd_request_render(VmDisplayIdd *d, BOOL resize);
 static void idd_update_relative_mouse(VmDisplayIdd *d);
 static void idd_resume_absolute_mouse(VmDisplayIdd *d, const InputPacket *reply);
 static void idd_poll_mouse_position(VmDisplayIdd *d);
+static BOOL idd_send_size_request(VmDisplayIdd *d, SOCKET s);
+static void idd_update_display_size(VmDisplayIdd *d, BOOL follow);
 static void window_to_vm_coords(HWND hwnd, int wx, int wy, UINT vm_w, UINT vm_h,
                                 UINT *vx, UINT *vy);
 
@@ -331,6 +348,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
+#define IDM_MATCH_WINDOW   0x1030
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -1056,6 +1074,8 @@ static BOOL recv_exact(VmDisplayIdd *d, SOCKET s, void *buf, int len, BOOL idle)
         struct timeval timeout = {0, 100000};
         int n;
         if (d->stop) return FALSE;
+        if (idle && remaining == len && s == d->frame_socket &&
+            !idd_send_size_request(d, s)) return FALSE;
         if ((!idle || remaining != len) && GetTickCount64() >= deadline)
             return FALSE;
         FD_ZERO(&readable);
@@ -1466,6 +1486,8 @@ static void idd_shared_release(VmDisplayIdd *d)
     d->shared_front = -1;
     d->shared_pending = -1;
     d->shared_ready = FALSE;
+    d->shared_resize = FALSE;
+    ZeroMemory(&d->size_request, sizeof(d->size_request));
     d->shared_next = 0;
     if (d->shared_wake) SetEvent(d->shared_wake);
 }
@@ -1520,8 +1542,21 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
         }
         if (hr == S_OK) {
             d->shared_pending = (int)index;
-            if (first_frame)
+            if (first_frame) {
+                BOOL size_changed = d->display_width != d->shared_width ||
+                    d->display_height != d->shared_height;
+                if (d->frame_width != d->shared_width || d->frame_height != d->shared_height) {
+                    if (d->frame_buf) HeapFree(GetProcessHeap(), 0, d->frame_buf);
+                    d->frame_buf = NULL;
+                }
+                d->frame_width = d->shared_width;
+                d->frame_height = d->shared_height;
+                d->frame_stride = d->frame_width * 4;
+                d->display_width = d->shared_width;
+                d->display_height = d->shared_height;
                 ui_log(L"IDD: first shared GPU frame acquired through the DXGI keyed mutex.");
+                PostMessageW(d->hwnd, WM_IDD_DISPLAY_SIZE, size_changed, 0);
+            }
             d->shared_next = (index + 1) % DISPLAY_GPU_SLOTS;
             d->frame_dirty = TRUE;
         }
@@ -1543,6 +1578,10 @@ static DWORD WINAPI idd_shared_thread_proc(LPVOID parameter)
         UINT i;
         BOOL can_acquire;
         BOOL render = InterlockedExchange(&d->render_requested, 0) != 0;
+        if (InterlockedCompareExchange(&d->gpu_refresh_requested, 0, 0)) {
+            d3d_refresh_gpu(d);
+            render = TRUE;
+        }
         if (InterlockedExchange(&d->resize_requested, 0)) {
             EnterCriticalSection(&d->frame_cs);
             d3d_resize_swap_chain(d);
@@ -1602,6 +1641,77 @@ static BOOL idd_send_gpu(SOCKET s, const DisplayGpuPacket *packet)
     return TRUE;
 }
 
+static BOOL idd_send_size_request(VmDisplayIdd *d, SOCKET s)
+{
+    DisplayGpuPacket packet = {0};
+    EnterCriticalSection(&d->frame_cs);
+    if (!d->input_sizing && d->shared_ready && d->shared_resize && !d->shared_disabled &&
+        d->frame_socket == s && d->size_request.type &&
+        (d->shared_front >= 0 || d->shared_pending >= 0)) {
+        packet = d->size_request;
+        packet.session = d->shared_session;
+        ZeroMemory(&d->size_request, sizeof(d->size_request));
+        d->size_reconnect_until = GetTickCount64() + 10000;
+    }
+    LeaveCriticalSection(&d->frame_cs);
+    return !packet.type || idd_send_gpu(s, &packet);
+}
+
+static void idd_update_display_size(VmDisplayIdd *d, BOOL follow)
+{
+    RECT rc;
+    UINT width, height, mode;
+    BOOL active, resize_window = FALSE;
+    if (!d || !d->hwnd) return;
+    d->size_update_pending = TRUE;
+    if (follow) d->size_follow_pending = TRUE;
+    if (!TryEnterCriticalSection(&d->frame_cs)) return;
+    active = d->shared_ready && d->shared_resize && !d->shared_disabled &&
+        (d->shared_front >= 0 || d->shared_pending >= 0);
+    mode = d->size_mode;
+    if ((mode == DISPLAY_SIZE_WINDOW && !active) ||
+        d->input_sizing || IsIconic(d->hwnd)) {
+        if (mode == DISPLAY_SIZE_WINDOW && !active) d->size_update_pending = FALSE;
+        LeaveCriticalSection(&d->frame_cs);
+        return;
+    }
+    d->size_update_pending = FALSE;
+    width = d->frame_width;
+    height = d->frame_height;
+    if (mode == DISPLAY_SIZE_WINDOW) {
+        GetClientRect(d->hwnd, &rc);
+        width = max(DISPLAY_MIN_WIDTH, min(DISPLAY_MAX_WIDTH, (UINT)rc.right));
+        height = max(DISPLAY_MIN_HEIGHT, min(DISPLAY_MAX_HEIGHT, (UINT)rc.bottom));
+        resize_window = width != (UINT)rc.right || height != (UINT)rc.bottom;
+    } else if (d->size_follow_pending) {
+        resize_window = TRUE;
+    }
+    d->size_follow_pending = FALSE;
+    ZeroMemory(&d->size_request, sizeof(d->size_request));
+    if (active && (mode != d->guest_size_mode || (mode == DISPLAY_SIZE_WINDOW &&
+        (width != d->shared_width || height != d->shared_height)))) {
+        DisplayGpuPacket *packet = &d->size_request;
+        ZeroMemory(packet, sizeof(*packet));
+        packet->magic = DISPLAY_GPU_MAGIC;
+        packet->type = DISPLAY_GPU_RESIZE;
+        packet->version = DISPLAY_GPU_VERSION;
+        packet->width = width;
+        packet->height = height;
+        packet->slot = mode;
+    }
+    LeaveCriticalSection(&d->frame_cs);
+    if (resize_window) {
+        rc.left = rc.top = 0;
+        rc.right = (LONG)width;
+        rc.bottom = (LONG)height;
+        AdjustWindowRectExForDpi(&rc, (DWORD)GetWindowLongW(d->hwnd, GWL_STYLE),
+            FALSE, (DWORD)GetWindowLongW(d->hwnd, GWL_EXSTYLE), GetDpiForWindow(d->hwnd));
+        if (IsZoomed(d->hwnd)) ShowWindow(d->hwnd, SW_RESTORE);
+        SetWindowPos(d->hwnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
 
 static BOOL idd_shared_offer(VmDisplayIdd *d, SOCKET s, const DisplayGpuPacket *caps, UINT index)
 {
@@ -1634,7 +1744,8 @@ static BOOL idd_shared_offer(VmDisplayIdd *d, SOCKET s, const DisplayGpuPacket *
         goto done;
     }
     if (d->shared_disabled || !d->device || !d->shared_thread || !duplicate || !caps->process_id ||
-        caps->width != DEFAULT_WIDTH || caps->height != DEFAULT_HEIGHT ||
+        !caps->width || !caps->height || caps->width > DISPLAY_MAX_WIDTH ||
+        caps->height > DISPLAY_MAX_HEIGHT ||
         caps->format != DXGI_FORMAT_B8G8R8A8_UNORM) goto done;
 
     hr = d->device->lpVtbl->QueryInterface(d->device, &IID_IDXGIDevice, (void **)&dxgi_device);
@@ -1734,12 +1845,45 @@ static IDXGIAdapter *idd_gpu_adapter(const wchar_t *device_path)
     return selected;
 }
 
+static HRESULT d3d_frame_texture(VmDisplayIdd *d)
+{
+    D3D11_TEXTURE2D_DESC desc = {0};
+    ID3D11Texture2D *texture = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    HRESULT hr;
+    if (d->frame_tex) {
+        d->frame_tex->lpVtbl->GetDesc(d->frame_tex, &desc);
+        if (desc.Width == d->frame_width && desc.Height == d->frame_height) return S_OK;
+    }
+    ZeroMemory(&desc, sizeof(desc));
+    desc.Width = d->frame_width;
+    desc.Height = d->frame_height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = d->device->lpVtbl->CreateTexture2D(d->device, &desc, NULL, &texture);
+    if (SUCCEEDED(hr))
+        hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
+            (ID3D11Resource *)texture, NULL, &srv);
+    if (FAILED(hr)) {
+        if (texture) texture->lpVtbl->Release(texture);
+        return hr;
+    }
+    if (d->frame_srv) d->frame_srv->lpVtbl->Release(d->frame_srv);
+    if (d->frame_tex) d->frame_tex->lpVtbl->Release(d->frame_tex);
+    d->frame_srv = srv;
+    d->frame_tex = texture;
+    return S_OK;
+}
+
 static BOOL d3d_init(VmDisplayIdd *d)
 {
     DXGI_SWAP_CHAIN_DESC scd;
     D3D_FEATURE_LEVEL feature_level;
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
     D3D11_SAMPLER_DESC sd;
     ID3DBlob *vs_blob = NULL;
     ID3DBlob *ps_blob = NULL;
@@ -1786,7 +1930,7 @@ static BOOL d3d_init(VmDisplayIdd *d)
             }
         }
         if (FAILED(hr)) {
-            d->gpu_id[0] = L'\0';
+            if (d->gpu_id[0]) d->shared_disabled = TRUE;
             hr = D3D11CreateDeviceAndSwapChain(
                 NULL, d->software_renderer ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
                 NULL, 0, D3D11_SDK_VERSION,
@@ -1842,33 +1986,7 @@ static BOOL d3d_init(VmDisplayIdd *d)
         }
     }
 
-    /* Create frame texture (dynamic, CPU-writable) */
-    ZeroMemory(&td, sizeof(td));
-    td.Width              = DEFAULT_WIDTH;
-    td.Height             = DEFAULT_HEIGHT;
-    td.MipLevels          = 1;
-    td.ArraySize          = 1;
-    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count   = 1;
-    td.Usage              = D3D11_USAGE_DYNAMIC;
-    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
-    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
-
-    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
-    if (FAILED(hr)) {
-        ui_log(L"IDD: CreateTexture2D failed (0x%08X)", hr);
-        return FALSE;
-    }
-
-    /* Shader resource view for the frame texture */
-    ZeroMemory(&srv_desc, sizeof(srv_desc));
-    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
-    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srv_desc.Texture2D.MipLevels       = 1;
-    srv_desc.Texture2D.MostDetailedMip = 0;
-
-    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
-            (ID3D11Resource *)d->frame_tex, &srv_desc, &d->frame_srv);
+    hr = d3d_frame_texture(d);
     if (FAILED(hr)) {
         ui_log(L"IDD: CreateShaderResourceView failed (0x%08X)", hr);
         return FALSE;
@@ -1972,7 +2090,7 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d)
 
 static void d3d_render_frame(VmDisplayIdd *d)
 {
-    D3D11_MAPPED_SUBRESOURCE mapped;
+    D3D11_MAPPED_SUBRESOURCE mapped = {0};
     D3D11_VIEWPORT vp;
     RECT rc;
     HRESULT hr;
@@ -2036,8 +2154,9 @@ static void d3d_render_frame(VmDisplayIdd *d)
             d->frame_connected = TRUE;
             PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
         }
-    } else if (d->frame_dirty) {
-        hr = d->ctx->lpVtbl->Map(d->ctx,
+    } else if (d->frame_dirty && d->frame_buf) {
+        hr = d3d_frame_texture(d);
+        if (SUCCEEDED(hr)) hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         if (SUCCEEDED(hr)) {
@@ -2048,7 +2167,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
             if (copy_stride > d->frame_stride)
                 copy_stride = d->frame_stride;
 
-            for (row = 0; row < d->frame_height && row < DEFAULT_HEIGHT; row++) {
+            for (row = 0; row < d->frame_height; row++) {
                 memcpy((BYTE *)mapped.pData + row * mapped.RowPitch,
                        d->frame_buf + row * d->frame_stride,
                        copy_stride);
@@ -2151,6 +2270,26 @@ static void d3d_recover(VmDisplayIdd *d)
     if (!d3d_init(d)) d3d_cleanup(d);
     d->render_retry_at = GetTickCount64() + 1000;
     d->frame_dirty = TRUE;
+    LeaveCriticalSection(&d->frame_cs);
+}
+
+static void d3d_refresh_gpu(VmDisplayIdd *d)
+{
+    EnterCriticalSection(&d->frame_cs);
+    d3d_cleanup(d);
+    d->software_renderer = FALSE;
+    d->shared_disabled = FALSE;
+    if (!d3d_init(d)) {
+        d3d_cleanup(d);
+        d->software_renderer = TRUE;
+        d->shared_disabled = TRUE;
+        d->render_retry_at = GetTickCount64() + 1000;
+    } else {
+        d3d_resize_swap_chain(d);
+    }
+    d->frame_dirty = TRUE;
+    InterlockedExchange(&d->gpu_refresh_requested, 0);
+    WakeAllConditionVariable(&d->gpu_refresh_done);
     LeaveCriticalSection(&d->frame_cs);
 }
 
@@ -2368,11 +2507,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    UINT recv_capacity = DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
     /* Allocate receive buffer for frame pixel data */
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
+    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, recv_capacity);
     if (!recv_buf) {
         ui_log(L"IDD recv: failed to allocate receive buffer");
         return 1;
@@ -2428,7 +2568,16 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             continue;
         }
 
+        vm = asb_find_vm_by_id(d->vm_id);
         EnterCriticalSection(&d->frame_cs);
+        if (!d->stop && d->shared_thread && vm && vm->running &&
+            wcscmp(d->gpu_id, vm->gpu_id) != 0) {
+            wcscpy_s(d->gpu_id, ARRAYSIZE(d->gpu_id), vm->gpu_id);
+            InterlockedExchange(&d->gpu_refresh_requested, 1);
+            SetEvent(d->shared_wake);
+            while (d->gpu_refresh_requested && !d->stop)
+                SleepConditionVariableCS(&d->gpu_refresh_done, &d->frame_cs, 100);
+        }
         if (d->stop) {
             LeaveCriticalSection(&d->frame_cs);
             closesocket(s);
@@ -2446,6 +2595,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             query.magic = DISPLAY_GPU_MAGIC;
             query.type = DISPLAY_GPU_QUERY;
             query.version = DISPLAY_GPU_VERSION;
+            query.reserved = DISPLAY_GPU_CAP_RESIZE;
             query.session = ((UINT64)GetCurrentProcessId() << 32) |
                             (UINT32)InterlockedIncrement(&gpu_session_id);
             d->shared_session = query.session;
@@ -2484,6 +2634,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     UINT slot;
                     if (d->shared_offered) break;
                     d->shared_offered = TRUE;
+                    EnterCriticalSection(&d->frame_cs);
+                    d->shared_resize = (packet.reserved & DISPLAY_GPU_CAP_RESIZE) != 0;
+                    d->shared_width = packet.width;
+                    d->shared_height = packet.height;
+                    d->guest_size_mode = packet.slot;
+                    LeaveCriticalSection(&d->frame_cs);
                     for (slot = 0; slot < DISPLAY_GPU_SLOTS; ++slot) {
                         if (!idd_shared_offer(d, s, &packet, slot)) break;
                     }
@@ -2509,6 +2665,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->shared_ready = ready;
                     if (ready) SetEvent(d->shared_wake);
                     LeaveCriticalSection(&d->frame_cs);
+                } else if (packet.type == DISPLAY_GPU_RESIZED) {
+                    if (packet.status != S_OK) {
+                        d->size_reconnect_until = 0;
+                        idd_log(d, L"Display resize rejected (0x%08X).", packet.status);
+                    }
                 } else {
                     break;
                 }
@@ -2604,6 +2765,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 idd_log(d, L"Frame data too large (%u bytes), reconnecting.", data_size);
                 break;
             }
+            if (data_size > recv_capacity) {
+                BYTE *new_buf = (BYTE *)HeapReAlloc(GetProcessHeap(), 0, recv_buf, data_size);
+                if (!new_buf) break;
+                recv_buf = new_buf;
+                recv_capacity = data_size;
+            }
 
             /* Read pixel data */
             if (data_size > 0) {
@@ -2615,7 +2782,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             EnterCriticalSection(&d->frame_cs);
 
             /* Reallocate frame_buf if resolution changed */
-            if (hdr.width != d->frame_width || hdr.height != d->frame_height) {
+            if (!d->frame_buf || hdr.width != d->frame_width || hdr.height != d->frame_height) {
                 UINT new_stride = hdr.width * 4;
                 UINT new_size   = new_stride * hdr.height;
                 BYTE *new_buf   = (BYTE *)HeapAlloc(GetProcessHeap(),
@@ -2690,6 +2857,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             }
 
             d->frame_dirty = TRUE;
+            if (d->display_width != d->frame_width || d->display_height != d->frame_height) {
+                d->display_width = d->frame_width;
+                d->display_height = d->frame_height;
+                PostMessageW(d->hwnd, WM_IDD_DISPLAY_SIZE, TRUE, 0);
+            }
             LeaveCriticalSection(&d->frame_cs);
             if (resolution_changed) {
                 idd_log(d, L"Frame resolution changed: %ux%u (stride=%u)",
@@ -2717,6 +2889,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         /* Frame channel lost — close it but keep input alive */
         EnterCriticalSection(&d->frame_cs);
+        if (d->shared_ready && !d->shared_disabled)
+            d->size_reconnect_until = GetTickCount64() + 10000;
         d->frame_socket = INVALID_SOCKET;
         idd_shared_release(d);
         LeaveCriticalSection(&d->frame_cs);
@@ -2736,8 +2910,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         /* Wait before reconnecting frame channel */
         {
             int wait;
-            for (wait = 0; wait < 3000 && !d->stop; wait += 500)
-                Sleep(500);
+            int delay = GetTickCount64() < d->size_reconnect_until ? 100 : 3000;
+            for (wait = 0; wait < delay && !d->stop; wait += 100)
+                Sleep(100);
         }
     }
 
@@ -2811,6 +2986,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
+            AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_MATCH_WINDOW, L"Match window size");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
         }
@@ -2954,7 +3130,28 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         idd_resume_absolute_mouse(d, NULL);
 
     switch (msg) {
+    case WM_INITMENU:
+        if (d) {
+            BOOL enabled;
+            HMENU menu = GetSystemMenu(hwnd, FALSE);
+            enabled = d->shared_ready && d->shared_resize && !d->shared_disabled &&
+                (d->shared_front >= 0 || d->shared_pending >= 0);
+            EnableMenuItem(menu, IDM_MATCH_WINDOW, MF_BYCOMMAND | (enabled ? MF_ENABLED : MF_GRAYED));
+            CheckMenuItem(menu, IDM_MATCH_WINDOW, MF_BYCOMMAND |
+                (d->size_mode == DISPLAY_SIZE_WINDOW ? MF_CHECKED : MF_UNCHECKED));
+        }
+        break;
     case WM_SYSCOMMAND:
+        if (d && (wp & 0xFFF0) == IDM_MATCH_WINDOW) {
+            BOOL enabled;
+            enabled = d->shared_ready && d->shared_resize && !d->shared_disabled &&
+                (d->shared_front >= 0 || d->shared_pending >= 0);
+            if (enabled) {
+                d->size_mode = d->size_mode == DISPLAY_SIZE_WINDOW ? DISPLAY_SIZE_GUEST : DISPLAY_SIZE_WINDOW;
+            }
+            if (enabled) idd_update_display_size(d, TRUE);
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_AUDIO_MUTE) {
             HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
             wchar_t title[300];
@@ -3096,16 +3293,22 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DWORD style   = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
         DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
         RECT wr;
-        /* Minimum: 320x180 client area */
-        wr.left = 0; wr.top = 0; wr.right = 320; wr.bottom = 180;
-        AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+        BOOL match_window = FALSE;
+        if (d) {
+            match_window = d->size_mode == DISPLAY_SIZE_WINDOW &&
+                d->shared_ready && d->shared_resize && !d->shared_disabled;
+        }
+        wr.left = 0; wr.top = 0;
+        wr.right = match_window ? DISPLAY_MIN_WIDTH : 320;
+        wr.bottom = match_window ? DISPLAY_MIN_HEIGHT : 180;
+        AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, GetDpiForWindow(hwnd));
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
-        /* Max: native frame size */
         if (d && d->frame_width > 0 && d->frame_height > 0) {
             wr.left = 0; wr.top = 0;
-            wr.right = (LONG)d->frame_width; wr.bottom = (LONG)d->frame_height;
-            AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+            wr.right = (LONG)(match_window ? DISPLAY_MAX_WIDTH : d->frame_width);
+            wr.bottom = (LONG)(match_window ? DISPLAY_MAX_HEIGHT : d->frame_height);
+            AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, GetDpiForWindow(hwnd));
             mmi->ptMaxTrackSize.x = wr.right - wr.left;
             mmi->ptMaxTrackSize.y = wr.bottom - wr.top;
         }
@@ -3119,6 +3322,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
             idd_request_render(d, TRUE);
+            if (d->size_mode == DISPLAY_SIZE_WINDOW) idd_update_display_size(d, FALSE);
             if (d->relative_mouse) {
                 AcquireSRWLockExclusive(&g_mouse_capture_lock);
                 if (g_mouse_capture_hwnd == hwnd) idd_clip_mouse(d);
@@ -3141,9 +3345,21 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_EXITSIZEMOVE:
         if (d) {
             d->input_sizing = msg == WM_ENTERSIZEMOVE;
+            if (d->size_mode == DISPLAY_SIZE_WINDOW && d->input_sizing &&
+                TryEnterCriticalSection(&d->frame_cs)) {
+                ZeroMemory(&d->size_request, sizeof(d->size_request));
+                LeaveCriticalSection(&d->frame_cs);
+            } else if (!d->input_sizing &&
+                (d->size_mode == DISPLAY_SIZE_WINDOW || d->size_follow_pending))
+                idd_update_display_size(d, FALSE);
             idd_update_relative_mouse(d);
         }
         break;
+
+    case WM_IDD_DISPLAY_SIZE:
+        if (d && (wp || d->size_mode == DISPLAY_SIZE_WINDOW || d->guest_size_mode != DISPLAY_SIZE_GUEST))
+            idd_update_display_size(d, wp != 0);
+        return 0;
 
     case WM_PAINT:
     {
@@ -3156,6 +3372,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_TIMER:
         if (wp == IDT_PRESENT && d) {
+            if (d->size_update_pending && !d->input_sizing && !IsIconic(hwnd))
+                idd_update_display_size(d, FALSE);
             if (d->mouse_sync_pending) idd_poll_mouse_position(d);
             if ((!d->shared_ready && d->frame_dirty) || !d->device ||
                 (!d->rtv && !IsIconic(hwnd)))
@@ -3479,6 +3697,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     }
 
     InitializeCriticalSection(&d->frame_cs);
+    InitializeConditionVariable(&d->gpu_refresh_done);
 
     /* Start the window thread (which will then start the recv thread) */
     d->window_thread = CreateThread(NULL, 0, idd_window_thread_proc, d, 0, NULL);
