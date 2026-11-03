@@ -54,6 +54,21 @@ ASB_API void vm_clipboard_destroy(VmClipboard clip);
  * On disable: sends SYNC_ENABLE(0) to guest, stops forwarding. */
 ASB_API void vm_clipboard_set_sync_enabled(VmClipboard clip, BOOL enabled);
 
+/* Set per-direction sharing overrides, applied on top of the focus gate.
+ * share_host_to_guest: when FALSE, host clipboard data is never pushed to the
+ *                      guest (and data requests from the guest return empty).
+ * share_guest_to_host: when FALSE, guest clipboard data is discarded by the
+ *                      host and never applied to the host clipboard.
+ * Both default to TRUE — full sharing whenever the display window is focused. */
+ASB_API void vm_clipboard_set_share_directions(VmClipboard clip,
+                                               BOOL share_host_to_guest,
+                                               BOOL share_guest_to_host);
+
+/* Read the current per-direction sharing overrides. */
+ASB_API void vm_clipboard_get_share_directions(VmClipboard clip,
+                                               BOOL *share_host_to_guest,
+                                               BOOL *share_guest_to_host);
+
 /* Call from WM_CLIPBOARDUPDATE in the display window's wndproc.
  * Forwards host clipboard to guest if sync is enabled. */
 ASB_API void vm_clipboard_on_clipboard_update(VmClipboard clip);
