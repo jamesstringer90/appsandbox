@@ -999,7 +999,13 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
 
         if (event == 0x00000001) {
             /* VM exited */
-            if (!InterlockedCompareExchange((LONG *)&instance->running, FALSE, TRUE)) break;
+            /* Set before running goes FALSE, so whoever sees the VM stopped can also see
+               that this thread is not done with it. See wait_exit_cleanup. */
+            if (InterlockedCompareExchange(&instance->exit_cleanup, TRUE, FALSE)) break;
+            if (!InterlockedCompareExchange((LONG *)&instance->running, FALSE, TRUE)) {
+                instance->exit_cleanup = FALSE;
+                break;
+            }
             instance->shutdown_requested = FALSE;
             instance->hyperv_video_off = FALSE;
             /* Re-deploy on next boot: the guest disk may change while stopped
@@ -1054,6 +1060,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
             }
 
             save_vm_list();
+            instance->exit_cleanup = FALSE;
         } else if (event == 0x01000000 || event == 0x02000000) {
             instance->callbacks_dead = TRUE;
             asb_log(L"VM \"%s\": HCS ServiceDisconnect.", instance->name);
@@ -1064,6 +1071,26 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
     /* Notify consumer */
     if (vm_id && instance->unique_id == vm_id)
         notify_state(vm_handle(instance), instance->running, g_state_ud);
+}
+
+/* A VM that has exited reads as stopped about a second before its exit callback is done:
+   the callback still holds the compute system, closes it, and saves vms.cfg last. So a
+   script that sees "stopped" and acts at once lands inside it. A start and the snapshot
+   operations wait here first, because they close the compute system or move the VM to
+   another disk: a second thread in hcs_close_vm frees the object under the first, and a
+   vms.cfg saved by the callback after the move would name the old disk. Call it after
+   checking inst->running. */
+static HRESULT wait_exit_cleanup(const VmInstance *inst)
+{
+    ULONGLONG start = GetTickCount64();
+    while (inst->exit_cleanup) {
+        if (GetTickCount64() - start > 30000) {
+            asb_log(L"VM \"%s\" is still shutting down.", inst->name);
+            return E_ACCESSDENIED;
+        }
+        Sleep(20);
+    }
+    return S_OK;
 }
 
 /* Returns TRUE if any other running VM (excluding `self`) is still attached
@@ -3867,6 +3894,10 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
     SnapshotTree *tree = &SNAP_AT(idx);
 
     if (inst->running) { asb_log(L"VM \"%s\" is already running.", inst->name); return S_FALSE; }
+    {
+        HRESULT hr = wait_exit_cleanup(inst);
+        if (FAILED(hr)) return hr;
+    }
     inst->display_suppressed = FALSE;
     if (resolve_vm_gpu_selection(inst)) save_vm_list();
     if (inst->network_mode != NET_NONE) {
@@ -4332,11 +4363,19 @@ ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)
     if (idx < 0) return E_INVALIDARG;
     if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
     if (VM_AT(idx).running) { asb_log(L"VM must be stopped to take a snapshot."); return E_ACCESSDENIED; }
+    hr = wait_exit_cleanup(&VM_AT(idx));
+    if (FAILED(hr)) return hr;
 
     if (name && name[0] != L'\0')
         wcscpy_s(snap_name, 128, name);
     else
         swprintf_s(snap_name, 128, L"Snapshot %d", SNAP_AT(idx).count + 1);
+
+    /* The snapshot can freeze the disk the VM last ran on, and the VM moves to a
+       new branch: drop any compute system still bound to the old disk, as
+       asb_vm_start does when it switches branches. Booting it would write to a
+       disk the new branch depends on. */
+    if (VM_AT(idx).handle) hcs_close_vm(&VM_AT(idx));
 
     asb_log(L"Taking snapshot \"%s\" of VM \"%s\"...", snap_name, VM_AT(idx).name);
     hr = snapshot_take(&SNAP_AT(idx), &VM_AT(idx), snap_name);
@@ -4350,6 +4389,25 @@ ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)
     return hr;
 }
 
+/* Before anything is deleted, the VM leaves the disks that are going and vms.cfg says so:
+   a crash at any later point leaves it naming a disk that still exists. If the delete
+   then fails nothing is gone, so the VM goes back. The caller saves vms.cfg either way. */
+static HRESULT delete_disks(int idx, int snap_idx, int branch_idx)
+{
+    wchar_t previous[MAX_PATH];
+    HRESULT hr;
+
+    wcscpy_s(previous, MAX_PATH, VM_AT(idx).vhdx_path);
+    hr = snapshot_leave_disks(&SNAP_AT(idx), &VM_AT(idx), snap_idx, branch_idx);
+    if (hr == S_OK && !save_vm_list()) hr = E_FAIL;
+    if (SUCCEEDED(hr)) {
+        hr = branch_idx >= 0 ? snapshot_delete_branch(&SNAP_AT(idx), &VM_AT(idx), snap_idx, branch_idx)
+                             : snapshot_delete(&SNAP_AT(idx), &VM_AT(idx), snap_idx);
+    }
+    if (FAILED(hr)) wcscpy_s(VM_AT(idx).vhdx_path, MAX_PATH, previous);
+    return hr;
+}
+
 ASB_API HRESULT asb_snap_delete(AsbVm vm, int snap_idx)
 {
     HRESULT hr;
@@ -4357,10 +4415,14 @@ ASB_API HRESULT asb_snap_delete(AsbVm vm, int snap_idx)
     if (idx < 0) return E_INVALIDARG;
     if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
     if (snap_idx < 0) { asb_log(L"Select a snapshot to delete."); return E_INVALIDARG; }
+    hr = wait_exit_cleanup(&VM_AT(idx));
+    if (FAILED(hr)) return hr;
 
     asb_log(L"Deleting snapshot %d...", snap_idx);
-    hr = snapshot_delete(&SNAP_AT(idx), &VM_AT(idx), snap_idx);
-    if (FAILED(hr)) asb_log(L"Error: Failed to delete snapshot (0x%08X)", hr);
+    hr = delete_disks(idx, snap_idx, -1);
+    if (hr == HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY))
+        asb_log(L"Error: Another snapshot was taken on this one. Delete that snapshot first.");
+    else if (FAILED(hr)) asb_log(L"Error: Failed to delete snapshot (0x%08X)", hr);
     else asb_log(L"Snapshot deleted.");
 
     save_vm_list();
@@ -4374,6 +4436,8 @@ ASB_API HRESULT asb_snap_new_branch(AsbVm vm, int snap_idx)
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
+    hr = wait_exit_cleanup(&VM_AT(idx));
+    if (FAILED(hr)) return hr;
 
     hr = snapshot_new_branch(&SNAP_AT(idx), &VM_AT(idx), snap_idx);
     if (FAILED(hr)) asb_log(L"Error: Failed to create branch (0x%08X)", hr);
@@ -4389,12 +4453,15 @@ ASB_API HRESULT asb_snap_delete_branch(AsbVm vm, int snap_idx, int branch_idx)
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
+    if (branch_idx < 0) return E_INVALIDARG;
+    hr = wait_exit_cleanup(&VM_AT(idx));
+    if (FAILED(hr)) return hr;
 
     asb_log(L"Deleting branch %d of %s...", branch_idx,
             snap_idx == -2 ? L"base"
               : (snap_idx >= 0 && snap_idx < SNAP_AT(idx).count
                    ? SNAP_AT(idx).nodes[snap_idx].name : L"?"));
-    hr = snapshot_delete_branch(&SNAP_AT(idx), &VM_AT(idx), snap_idx, branch_idx);
+    hr = delete_disks(idx, snap_idx, branch_idx);
     if (FAILED(hr)) asb_log(L"Error: Failed to delete branch (0x%08X)", hr);
     else asb_log(L"Branch deleted.");
 
@@ -4441,6 +4508,7 @@ ASB_API BOOL asb_snap_get_info(AsbVm vm, int snap_idx, AsbSnapshotInfo *out)
     wcscpy_s(out->name, 128, SNAP_AT(idx).nodes[snap_idx].name);
     wcscpy_s(out->guid, 64, SNAP_AT(idx).nodes[snap_idx].guid);
     out->branch_count = SNAP_AT(idx).nodes[snap_idx].branch_count;
+    out->parent_index = snapshot_parent_index(&SNAP_AT(idx), snap_idx);
     return TRUE;
 }
 
