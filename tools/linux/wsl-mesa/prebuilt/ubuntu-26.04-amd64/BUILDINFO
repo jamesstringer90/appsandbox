@@ -1,9 +1,0 @@
-ubuntu: 26.04 (resolute)
-arch: amd64
-built-on: 2026-05-19T21:11:49Z
-mesa-version: 25.3.6
-mesa-branch: 25.3
-llvm: 21
-gallium-drivers: llvmpipe,d3d12
-vulkan-drivers: swrast,microsoft-experimental
-icd-name: dzn_icd.x86_64.json

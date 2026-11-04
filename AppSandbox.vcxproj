@@ -203,6 +203,7 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClCompile Include="src\app_win\ui.c" />
     <ClCompile Include="src\backend_win\vm_display.c" />
     <ClCompile Include="src\backend_win\vm_display_idd.c" />
+    <ClCompile Include="src\backend_win\gpu_broker.c" />
     <ClCompile Include="src\app_win\webview2_bridge.c" />
     <ClCompile Include="src\app_win\headless.c" />
   </ItemGroup>
@@ -218,6 +219,7 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClInclude Include="src\backend_win\snapshot.h" />
     <ClInclude Include="src\backend_win\vm_display.h" />
     <ClInclude Include="src\backend_win\vm_display_idd.h" />
+    <ClInclude Include="src\backend_win\gpu_broker.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\app_win\appsandbox.rc" />

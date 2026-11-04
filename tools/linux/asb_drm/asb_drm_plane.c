@@ -49,10 +49,6 @@ static const u32 asb_cursor_formats[] = {
 	                         * plane suitability check rejects us. */
 };
 
-/* All planes accept linear-only buffers. We never see tiled buffers because
- * we never have a GPU doing tiled scanout — Mesa renders linear into shmem
- * (software) or PRIME-imports a dxgkrnl dma-buf that's already linear from
- * D3D12's perspective. */
 static const u64 asb_format_modifiers[] = {
 	DRM_FORMAT_MOD_LINEAR,
 	DRM_FORMAT_MOD_INVALID
@@ -88,14 +84,12 @@ static int asb_primary_atomic_check(struct drm_plane *plane,
 static void asb_primary_atomic_update(struct drm_plane *plane,
                                       struct drm_atomic_state *state)
 {
-	/* Virtual driver: nothing to push to hardware. The atomic helpers
-	 * have already updated plane->state with the new fb pointer, which
-	 * is what the userland daemon reads via drmModeGetPlane. */
-	(void)plane;
-	(void)state;
+	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
+	asb_gpu_update(to_asb(plane->dev), new_state->crtc ? new_state->fb : NULL);
 }
 
 static const struct drm_plane_helper_funcs asb_primary_helper_funcs = {
+	.prepare_fb    = drm_gem_plane_helper_prepare_fb,
 	.atomic_check  = asb_primary_atomic_check,
 	.atomic_update = asb_primary_atomic_update,
 };
@@ -164,6 +158,7 @@ static void asb_cursor_atomic_update(struct drm_plane *plane,
 }
 
 static const struct drm_plane_helper_funcs asb_cursor_helper_funcs = {
+	.prepare_fb    = drm_gem_plane_helper_prepare_fb,
 	.atomic_check  = asb_cursor_atomic_check,
 	.atomic_update = asb_cursor_atomic_update,
 };

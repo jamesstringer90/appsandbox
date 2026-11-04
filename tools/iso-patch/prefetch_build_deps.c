@@ -323,7 +323,7 @@ cleanup_sess: WinHttpCloseHandle(hSession);
  * SHA256 via BCrypt — verify the .debs against Packages metadata.
  * ==================================================================== */
 
-static int sha256_file(const wchar_t *path, char *hex_out /* 65 bytes */)
+int prefetch_sha256_file(const wchar_t *path, char *hex_out)
 {
     BCRYPT_ALG_HANDLE hAlg = NULL;
     BCRYPT_HASH_HANDLE hHash = NULL;
@@ -792,7 +792,7 @@ static int append_package_file(pkg_table_t *t, const wchar_t *path)
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return -1;
     LARGE_INTEGER sz;
-    if (!GetFileSizeEx(h, &sz) || sz.QuadPart < 0 || sz.QuadPart > 64 * 1024 * 1024) {
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart < 0 || sz.QuadPart > 256 * 1024 * 1024) {
         CloseHandle(h);
         return -1;
     }
@@ -865,24 +865,29 @@ int do_prefetch_build_deps(const wchar_t *codename,
     if (append_package_file(&iso, path) != 0 || parse_packages(&iso) != 0) goto cleanup;
 
     const wchar_t *pockets[] = { L"", L"-updates", L"-security" };
+    const wchar_t *components[] = { L"main"
+        , L"universe"
+    };
     wchar_t url[1024];
     for (size_t i = 0; i < ARRAYSIZE(pockets); i++) {
-        swprintf_s(url, 1024, L"%s/dists/%s%s/main/binary-" IP_DEB_ARCH L"/Packages.xz",
-                   mirror, codename, pockets[i]);
-        log_msg(L"prefetch: GET %s", url);
-        if (http_download(url, pkgs_xz) != 0) {
-            log_err(L"prefetch: download Packages.xz failed");
-            goto cleanup;
+        for (size_t j = 0; j < ARRAYSIZE(components); j++) {
+            swprintf_s(url, 1024, L"%s/dists/%s%s/%s/binary-" IP_DEB_ARCH L"/Packages.xz",
+                       mirror, codename, pockets[i], components[j]);
+            log_msg(L"prefetch: GET %s", url);
+            if (http_download(url, pkgs_xz) != 0) {
+                log_err(L"prefetch: download Packages.xz failed");
+                goto cleanup;
+            }
+            if (xz_decompress_file_to_file(pkgs_xz, pkgs) != 0) {
+                log_err(L"prefetch: xz decompress failed");
+                goto cleanup;
+            }
+            if (append_package_file(&T, pkgs) != 0) {
+                log_err(L"prefetch: read Packages failed");
+                goto cleanup;
+            }
+            DeleteFileW(pkgs);
         }
-        if (xz_decompress_file_to_file(pkgs_xz, pkgs) != 0) {
-            log_err(L"prefetch: xz decompress failed");
-            goto cleanup;
-        }
-        if (append_package_file(&T, pkgs) != 0) {
-            log_err(L"prefetch: read Packages failed");
-            goto cleanup;
-        }
-        DeleteFileW(pkgs);
     }
     if (parse_packages(&T) != 0) { log_err(L"prefetch: parse failed"); goto cleanup; }
     log_msg(L"prefetch: parsed %zu package records", T.n_records);
@@ -892,6 +897,7 @@ int do_prefetch_build_deps(const wchar_t *codename,
         "libasound2-dev", "libxcb1-dev", "libxcb-xfixes0-dev",
         "libdrm-dev", "libsystemd-dev", "pkg-config",
         "build-essential", "dkms", "zstd",
+        "directx-headers-dev",
         "openssh-server"  /* for ssh_enabled VMs; firstboot installs conditionally */
     };
     int closure_count = 0;
@@ -974,7 +980,7 @@ int do_prefetch_build_deps(const wchar_t *codename,
         }
         if (sha_utf8[0]) {
             char actual[65];
-            if (sha256_file(dst, actual) != 0) {
+            if (prefetch_sha256_file(dst, actual) != 0) {
                 log_err(L"prefetch: SHA256 hash compute failed for %ls", basename);
                 goto cleanup;
             }

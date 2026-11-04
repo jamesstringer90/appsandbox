@@ -27,6 +27,8 @@
  *     wsl-mesa.tar.zst     (from tools/linux/wsl-mesa/prebuilt/...)
  *
  * Returns 0 on success; non-zero on any failure. */
-int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir);
+int do_prefetch_repo(const wchar_t *tag, const wchar_t *mesa_tag,
+                     const wchar_t *dxgkrnl_tag, const wchar_t *cache_dir,
+                     const wchar_t *out_dir);
 
 #endif

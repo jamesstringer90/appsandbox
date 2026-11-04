@@ -17,6 +17,7 @@
 #define _ASB_DRM_H_
 
 #include <linux/hrtimer.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 
 #include <drm/drm_device.h>
@@ -49,6 +50,13 @@
 
 struct asb_device {
 	struct drm_device       drm;
+	struct mutex           gpu_lock;
+	struct list_head       gpu_objects;
+	struct drm_file       *gpu_presenter;
+	struct eventfd_ctx    *gpu_event;
+	struct drm_framebuffer *gpu_scanout;
+	u64                    gpu_sequence;
+	u64                    gpu_adapter_luid;
 
 	/* KMS objects — single-CRTC topology. */
 	struct drm_crtc         crtc;
@@ -99,6 +107,20 @@ int  asb_connector_init(struct asb_device *asb);
 int  asb_planes_init(struct asb_device *asb);
 
 int  asb_writeback_init(struct asb_device *asb);
+
+int asb_gpu_query_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+int asb_gpu_import_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+int asb_gpu_export_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+int asb_gpu_native_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+int asb_gpu_present_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+int asb_gpu_acquire_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+void asb_gpu_postclose(struct drm_device *drm, struct drm_file *file);
+void asb_gpu_update(struct asb_device *asb, struct drm_framebuffer *fb);
+void asb_gpu_fini(struct asb_device *asb);
+struct drm_framebuffer *asb_fb_create(struct drm_device *drm,
+				    struct drm_file *file,
+				    const struct drm_format_info *info,
+				    const struct drm_mode_fb_cmd2 *cmd);
 
 /* Build the synthesized EDID into asb->edid. Called from connector_init. */
 void asb_build_edid(struct asb_device *asb);

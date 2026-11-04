@@ -22,7 +22,7 @@
 
 #pragma warning(push)
 #pragma warning(disable: 4201) /* nameless struct/union in SDK headers */
-#include <d3d11_1.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <dxgi1_3.h>
 #include <dxgi1_5.h>
@@ -44,6 +44,7 @@
 #include "hcs_vm.h"
 #include "ui.h"
 #include "resource.h"
+#include "gpu_broker.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -192,6 +193,9 @@ typedef struct {
     ID3D11Texture2D *texture;
     ID3D11ShaderResourceView *srv;
     IDXGIKeyedMutex *mutex;
+    ID3D11Fence *fence;
+    UINT64 fence_value;
+    UINT64 fence_waiting;
     BOOL ready;
     BOOL acquired;
 } IddSharedSlot;
@@ -253,6 +257,8 @@ struct VmDisplayIdd {
     UINT                    shared_next;
     HANDLE                  shared_thread;
     HANDLE                  shared_wake;
+    HANDLE                  shared_fence_event;
+    ID3D11DeviceContext4    *shared_context;
     BOOL                    software_renderer;
     ULONGLONG               render_retry_at;
 
@@ -1471,15 +1477,30 @@ typedef struct {
 C_ASSERT(sizeof(IddDuplicateResource) == 48);
 C_ASSERT(sizeof(DisplayGpuPacket) == 68);
 
+static HRESULT idd_shared_unlock(VmDisplayIdd *d, IddSharedSlot *slot)
+{
+    HRESULT hr = S_OK;
+    if (slot->acquired) {
+        if (slot->mutex) hr = slot->mutex->lpVtbl->ReleaseSync(slot->mutex, 0);
+        else if (slot->fence && d->shared_context) {
+            hr = ID3D11DeviceContext4_Signal(d->shared_context, slot->fence, slot->fence_value + 1);
+            slot->fence_value += 2;
+            d->ctx->lpVtbl->Flush(d->ctx);
+        } else hr = E_FAIL;
+        slot->acquired = FALSE;
+    }
+    return hr;
+}
+
 static void idd_shared_release(VmDisplayIdd *d)
 {
     UINT i;
     for (i = 0; i < DISPLAY_GPU_SLOTS; ++i) {
         IddSharedSlot *slot = &d->shared_slots[i];
-        if (slot->acquired && slot->mutex)
-            slot->mutex->lpVtbl->ReleaseSync(slot->mutex, 0);
+        idd_shared_unlock(d, slot);
         if (slot->srv) slot->srv->lpVtbl->Release(slot->srv);
         if (slot->mutex) slot->mutex->lpVtbl->Release(slot->mutex);
+        if (slot->fence) ID3D11Fence_Release(slot->fence);
         if (slot->texture) slot->texture->lpVtbl->Release(slot->texture);
         ZeroMemory(slot, sizeof(*slot));
     }
@@ -1489,6 +1510,8 @@ static void idd_shared_release(VmDisplayIdd *d)
     d->shared_resize = FALSE;
     ZeroMemory(&d->size_request, sizeof(d->size_request));
     d->shared_next = 0;
+    if (d->shared_context) ID3D11DeviceContext4_Release(d->shared_context);
+    d->shared_context = NULL;
     if (d->shared_wake) SetEvent(d->shared_wake);
 }
 
@@ -1504,8 +1527,9 @@ static void idd_shared_fail(VmDisplayIdd *d)
 static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
 {
     IDXGIKeyedMutex *mutex;
+    ID3D11Fence *fence;
     UINT index;
-    UINT64 session;
+    UINT64 session, value;
     HRESULT hr;
     EnterCriticalSection(&d->frame_cs);
     if (d->stop || !d->shared_ready || d->shared_slots[d->shared_next].acquired) {
@@ -1515,29 +1539,50 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
     index = d->shared_next;
     session = d->shared_session;
     mutex = d->shared_slots[index].mutex;
-    mutex->lpVtbl->AddRef(mutex);
+    fence = d->shared_slots[index].fence;
+    value = d->shared_slots[index].fence_value;
+    hr = S_OK;
+    if (mutex) mutex->lpVtbl->AddRef(mutex);
+    else if (fence) {
+        ID3D11Fence_AddRef(fence);
+        if (d->shared_slots[index].fence_waiting != value) {
+            hr = ID3D11Fence_SetEventOnCompletion(fence, value, d->shared_fence_event);
+            if (SUCCEEDED(hr)) d->shared_slots[index].fence_waiting = value;
+        }
+    } else hr = E_FAIL;
     LeaveCriticalSection(&d->frame_cs);
 
-    hr = mutex->lpVtbl->AcquireSync(mutex, 1, timeout);
+    if (mutex) hr = mutex->lpVtbl->AcquireSync(mutex, 1, timeout);
+    else if (fence && SUCCEEDED(hr)) {
+        UINT64 completed = ID3D11Fence_GetCompletedValue(fence);
+        if (completed < value && timeout) {
+            WaitForSingleObject(d->shared_fence_event, timeout);
+            completed = ID3D11Fence_GetCompletedValue(fence);
+        }
+        hr = completed == UINT64_MAX ? DXGI_ERROR_DEVICE_REMOVED :
+             completed >= value ? S_OK : WAIT_TIMEOUT;
+    }
 
     EnterCriticalSection(&d->frame_cs);
     if (d->stop || !d->shared_ready || d->shared_session != session ||
-        d->shared_slots[index].mutex != mutex) {
-        if (hr == S_OK) mutex->lpVtbl->ReleaseSync(mutex, 0);
+        d->shared_slots[index].mutex != mutex || d->shared_slots[index].fence != fence) {
+        if (hr == S_OK && mutex) mutex->lpVtbl->ReleaseSync(mutex, 0);
         LeaveCriticalSection(&d->frame_cs);
-        mutex->lpVtbl->Release(mutex);
+        if (mutex) mutex->lpVtbl->Release(mutex);
+        if (fence) ID3D11Fence_Release(fence);
         return S_FALSE;
     }
     if (hr == WAIT_TIMEOUT && d->device)
         hr = FAILED(d->device->lpVtbl->GetDeviceRemovedReason(d->device))
             ? DXGI_ERROR_DEVICE_REMOVED : hr;
+    if (hr == S_OK && fence)
+        hr = ID3D11DeviceContext4_Wait(d->shared_context, fence, value);
     if (hr == S_OK) {
         BOOL first_frame = d->shared_front < 0 && d->shared_pending < 0;
         d->shared_slots[index].acquired = TRUE;
         if (d->shared_pending >= 0) {
             IddSharedSlot *old = &d->shared_slots[d->shared_pending];
-            hr = old->mutex->lpVtbl->ReleaseSync(old->mutex, 0);
-            old->acquired = FALSE;
+            hr = idd_shared_unlock(d, old);
             d->shared_pending = -1;
         }
         if (hr == S_OK) {
@@ -1554,7 +1599,8 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
                 d->frame_stride = d->frame_width * 4;
                 d->display_width = d->shared_width;
                 d->display_height = d->shared_height;
-                ui_log(L"IDD: first shared GPU frame acquired through the DXGI keyed mutex.");
+                ui_log(L"IDD: first shared GPU frame acquired through %s.",
+                    fence ? L"the shared GPU fence" : L"the DXGI keyed mutex");
                 PostMessageW(d->hwnd, WM_IDD_DISPLAY_SIZE, size_changed, 0);
             }
             d->shared_next = (index + 1) % DISPLAY_GPU_SLOTS;
@@ -1563,7 +1609,8 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
     }
     if (hr != S_OK && hr != WAIT_TIMEOUT) idd_shared_fail(d);
     LeaveCriticalSection(&d->frame_cs);
-    mutex->lpVtbl->Release(mutex);
+    if (mutex) mutex->lpVtbl->Release(mutex);
+    if (fence) ID3D11Fence_Release(fence);
     return hr;
 }
 
@@ -1639,6 +1686,118 @@ static BOOL idd_send_gpu(SOCKET s, const DisplayGpuPacket *packet)
         remaining -= sent;
     }
     return TRUE;
+}
+
+static BOOL idd_shared_start_linux(VmDisplayIdd *d, SOCKET socket,
+                                    const DisplayGpuPacket *caps, AsbGpuBroker **broker)
+{
+    IDXGIDevice *dxgi = NULL;
+    IDXGIAdapter *adapter = NULL;
+    ID3D11Device5 *device = NULL;
+    ID3D11DeviceContext4 *context = NULL;
+    DXGI_ADAPTER_DESC desc = {0};
+    HRESULT hr = E_INVALIDARG;
+    EnterCriticalSection(&d->frame_cs);
+    if (!d->stop && d->device && d->ctx && d->shared_thread && d->shared_fence_event &&
+        !d->shared_disabled && caps->width && caps->height &&
+        caps->width <= DISPLAY_MAX_WIDTH && caps->height <= DISPLAY_MAX_HEIGHT &&
+        caps->format == DXGI_FORMAT_B8G8R8A8_UNORM && !caps->status) {
+        hr = d->device->lpVtbl->QueryInterface(d->device, &IID_ID3D11Device5, (void **)&device);
+        if (SUCCEEDED(hr)) hr = d->ctx->lpVtbl->QueryInterface(d->ctx,
+            &IID_ID3D11DeviceContext4, (void **)&context);
+        if (SUCCEEDED(hr)) hr = d->device->lpVtbl->QueryInterface(d->device, &IID_IDXGIDevice, (void **)&dxgi);
+    }
+    LeaveCriticalSection(&d->frame_cs);
+    if (SUCCEEDED(hr)) hr = IDXGIDevice_GetAdapter(dxgi, &adapter);
+    if (SUCCEEDED(hr)) hr = IDXGIAdapter_GetDesc(adapter, &desc);
+    if (SUCCEEDED(hr)) {
+        *broker = asb_gpu_broker_open(&d->runtime_id, desc.AdapterLuid);
+        if (!*broker) hr = E_ACCESSDENIED;
+    }
+    EnterCriticalSection(&d->frame_cs);
+    if (d->stop || d->frame_socket != socket || d->shared_disabled) hr = E_ABORT;
+    if (SUCCEEDED(hr)) {
+        d->shared_context = context;
+        context = NULL;
+        d->shared_width = caps->width;
+        d->shared_height = caps->height;
+        d->shared_resize = FALSE;
+    }
+    LeaveCriticalSection(&d->frame_cs);
+    DisplayGpuPacket reply = *caps;
+    reply.type = DISPLAY_GPU_OFFER;
+    reply.status = (UINT32)hr;
+    reply.handle = 0;
+    if (FAILED(hr)) {
+        asb_gpu_broker_close(*broker);
+        *broker = NULL;
+        ui_log(L"IDD: Linux GPU import unavailable (0x%08X); using socket frames.", hr);
+    }
+    if (context) ID3D11DeviceContext4_Release(context);
+    if (device) ID3D11Device5_Release(device);
+    if (adapter) IDXGIAdapter_Release(adapter);
+    if (dxgi) IDXGIDevice_Release(dxgi);
+    return idd_send_gpu(socket, &reply);
+}
+
+static BOOL idd_shared_import_linux(VmDisplayIdd *d, SOCKET socket,
+                                    const DisplayGpuPacket *offer, AsbGpuBroker *broker)
+{
+    DisplayGpuPacket reply = *offer;
+    ID3D11Device5 *device = NULL;
+    ID3D11Texture2D *texture = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    ID3D11Fence *fence = NULL;
+    HANDLE handle = NULL;
+    HRESULT hr = E_INVALIDARG;
+    UINT index = offer->slot % DISPLAY_GPU_SLOTS;
+    BOOL is_fence = offer->slot >= DISPLAY_GPU_SLOTS;
+    reply.type = DISPLAY_GPU_READY;
+    reply.handle = 0;
+    EnterCriticalSection(&d->frame_cs);
+    if (!d->stop && !d->shared_disabled && d->device && d->shared_context && !d->shared_ready &&
+        offer->slot < DISPLAY_GPU_FENCE_SLOTS && offer->width == d->shared_width &&
+        offer->height == d->shared_height && offer->format == DXGI_FORMAT_B8G8R8A8_UNORM &&
+        !(is_fence ? d->shared_slots[index].fence != NULL : d->shared_slots[index].texture != NULL))
+        hr = d->device->lpVtbl->QueryInterface(d->device, &IID_ID3D11Device5, (void **)&device);
+    LeaveCriticalSection(&d->frame_cs);
+    if (SUCCEEDED(hr)) hr = asb_gpu_broker_import(broker, offer->handle, is_fence,
+        offer->width, offer->height, &handle);
+    if (SUCCEEDED(hr)) {
+        if (is_fence) hr = ID3D11Device5_OpenSharedFence(device, handle, &IID_ID3D11Fence, (void **)&fence);
+        else hr = ID3D11Device5_OpenSharedResource1(device, handle, &IID_ID3D11Texture2D, (void **)&texture);
+    }
+    if (SUCCEEDED(hr) && texture) {
+        D3D11_TEXTURE2D_DESC desc;
+        ID3D11Texture2D_GetDesc(texture, &desc);
+        if (desc.Width != offer->width || desc.Height != offer->height || (UINT)desc.Format != offer->format ||
+            desc.Usage != D3D11_USAGE_DEFAULT || desc.CPUAccessFlags || desc.SampleDesc.Count != 1)
+            hr = E_INVALIDARG;
+        else hr = ID3D11Device5_CreateShaderResourceView(device, (ID3D11Resource *)texture, NULL, &srv);
+    }
+    EnterCriticalSection(&d->frame_cs);
+    if (d->stop || d->frame_socket != socket || d->shared_disabled || !d->shared_context) hr = E_ABORT;
+    if (SUCCEEDED(hr)) {
+        IddSharedSlot *slot = &d->shared_slots[index];
+        if (is_fence) { slot->fence = fence; slot->fence_value = 1; fence = NULL; }
+        else { slot->texture = texture; slot->srv = srv; texture = NULL; srv = NULL; }
+        BOOL ready = TRUE;
+        for (UINT i = 0; i < DISPLAY_GPU_SLOTS; ++i) {
+            d->shared_slots[i].ready = d->shared_slots[i].texture && d->shared_slots[i].fence;
+            ready = ready && d->shared_slots[i].ready;
+        }
+        d->shared_ready = ready;
+        if (ready) SetEvent(d->shared_wake);
+    }
+    LeaveCriticalSection(&d->frame_cs);
+    if (handle) CloseHandle(handle);
+    if (texture) ID3D11Texture2D_Release(texture);
+    if (srv) ID3D11ShaderResourceView_Release(srv);
+    if (fence) ID3D11Fence_Release(fence);
+    if (device) ID3D11Device5_Release(device);
+    reply.status = (UINT32)hr;
+    BOOL sent = idd_send_gpu(socket, &reply);
+    return sent && SUCCEEDED(hr);
 }
 
 static BOOL idd_send_size_request(VmDisplayIdd *d, SOCKET s)
@@ -2059,8 +2218,7 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d)
         if (d->shared_front >= 0) {
             IddSharedSlot *front = &d->shared_slots[d->shared_front];
             if (d->shared_pending >= 0) {
-                hr = front->mutex->lpVtbl->ReleaseSync(front->mutex, 0);
-                front->acquired = FALSE;
+                hr = idd_shared_unlock(d, front);
                 if (hr != S_OK) idd_shared_fail(d);
             } else {
                 d->shared_pending = d->shared_front;
@@ -2137,8 +2295,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
             if (!d->shared_slots[d->shared_pending].acquired) goto shared_error;
             if (d->shared_front >= 0) {
                 IddSharedSlot *old = &d->shared_slots[d->shared_front];
-                hr = old->mutex->lpVtbl->ReleaseSync(old->mutex, 0);
-                old->acquired = FALSE;
+                hr = idd_shared_unlock(d, old);
                 if (hr != S_OK) goto shared_error;
             }
             d->shared_front = d->shared_pending;
@@ -2507,6 +2664,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    AsbGpuBroker *broker = NULL;
     UINT recv_capacity = DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -2588,14 +2746,15 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         d->shared_rejected = FALSE;
         d->shared_session = 0;
         LeaveCriticalSection(&d->frame_cs);
-        if (_wcsicmp(d->os_type, L"windows") == 0 && d->gpu_id[0] && !d->shared_disabled) {
+        if (vm && vm->gpu_mode == GPU_DEFAULT && !d->shared_disabled) {
             static volatile LONG gpu_session_id;
             DisplayGpuPacket query = {0};
             DWORD send_timeout = 1000;
             query.magic = DISPLAY_GPU_MAGIC;
             query.type = DISPLAY_GPU_QUERY;
             query.version = DISPLAY_GPU_VERSION;
-            query.reserved = DISPLAY_GPU_CAP_RESIZE;
+            query.reserved = _wcsicmp(d->os_type, L"windows") == 0
+                ? DISPLAY_GPU_CAP_RESIZE : DISPLAY_GPU_CAP_FENCE;
             query.session = ((UINT64)GetCurrentProcessId() << 32) |
                             (UINT32)InterlockedIncrement(&gpu_session_id);
             d->shared_session = query.session;
@@ -2634,6 +2793,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     UINT slot;
                     if (d->shared_offered) break;
                     d->shared_offered = TRUE;
+                    if (_wcsicmp(d->os_type, L"windows") != 0 &&
+                        (packet.reserved & DISPLAY_GPU_CAP_FENCE)) {
+                        if (!idd_shared_start_linux(d, s, &packet, &broker)) break;
+                        continue;
+                    }
                     EnterCriticalSection(&d->frame_cs);
                     d->shared_resize = (packet.reserved & DISPLAY_GPU_CAP_RESIZE) != 0;
                     d->shared_width = packet.width;
@@ -2644,7 +2808,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                         if (!idd_shared_offer(d, s, &packet, slot)) break;
                     }
                     if (slot != DISPLAY_GPU_SLOTS) break;
-                } else if (packet.type == DISPLAY_GPU_READY) {
+                } else if (packet.type == DISPLAY_GPU_OFFER && broker) {
+                    if (!idd_shared_import_linux(d, s, &packet, broker)) break;
+                } else if (packet.type == DISPLAY_GPU_READY && !broker) {
                     BOOL ready = TRUE;
                     UINT slot;
                     if (packet.slot >= DISPLAY_GPU_SLOTS) break;
@@ -2894,6 +3060,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         d->frame_socket = INVALID_SOCKET;
         idd_shared_release(d);
         LeaveCriticalSection(&d->frame_cs);
+        asb_gpu_broker_close(broker);
+        broker = NULL;
         d->frame_connected = FALSE;
         d->cursor_visible = TRUE;
         PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
@@ -3062,6 +3230,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     /* Start the recv thread now that the window and D3D11 are ready */
     d->shared_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    d->shared_fence_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (d->shared_wake)
         d->shared_thread = CreateThread(NULL, 0, idd_shared_thread_proc, d, 0, NULL);
     if (!d->shared_thread) d->shared_disabled = TRUE;
@@ -3075,6 +3244,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             CloseHandle(d->shared_thread);
             d->shared_thread = NULL;
         }
+        if (d->shared_fence_event) CloseHandle(d->shared_fence_event);
+        d->shared_fence_event = NULL;
         if (d->shared_wake) CloseHandle(d->shared_wake);
         d->shared_wake = NULL;
         d3d_cleanup(d);
@@ -3259,7 +3430,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             /* Clean up D3D11 */
             d3d_cleanup(d);
-            if (d->shared_wake) CloseHandle(d->shared_wake);
+            if (d->shared_fence_event) CloseHandle(d->shared_fence_event);
+        d->shared_fence_event = NULL;
+        if (d->shared_wake) CloseHandle(d->shared_wake);
             d->shared_wake = NULL;
 
             /* Clean up guest cursor */

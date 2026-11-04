@@ -20,6 +20,7 @@
 #include "vm_ssh_proxy.h"
 #include "prereq.h"
 #include "ui.h"
+#include "../core/linux_deps.h"
 
 #include <stdio.h>
 #include <io.h>
@@ -2429,12 +2430,6 @@ cleanup:
     return rc;
 }
 
-/* ---- Spawn iso-patch.exe with one of the --prefetch-* modes and
- * block. No cache layer: each call writes directly into <out_dir>
- * which is a subdir of the per-VM staging extras dir.
- *
- * args: extra argv tail (no quotes — caller is responsible for safe paths).
- * Returns 0 on success; -1 on any failure. Logs progress to asb_log. */
 static int spawn_iso_patch_prefetch(const wchar_t *args)
 {
     wchar_t exe_dir[MAX_PATH];
@@ -2662,10 +2657,17 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
            wsl-mesa.tar.zst directly into <staging>/extras/. */
         asb_log(L"Prefetch 1/3: downloading Linux sources from GitHub...");
         swprintf_s(args_buf, 2048,
-            L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
+            L"--prefetch-repo --tag \"" ASB_LINUX_CLIENT_TAG
+            L"\" --mesa-tag \"" ASB_LINUX_MESA_TAG
+            L"\" --dxgkrnl-tag \"" ASB_LINUX_DXGKRNL_TAG L"\" --out-dir \"%s\"",
             extras);
-        if (spawn_iso_patch_prefetch(args_buf) != 0)
-            asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
+        if (spawn_iso_patch_prefetch(args_buf) != 0) {
+            args->result = E_FAIL;
+            wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                      L"Failed to download the pinned Linux guest dependencies.");
+            SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
+            goto done;
+        }
 
         /* Prefetch 2: apt build-deps closure from archive.ubuntu.com.
            Needs (codename, kernel) detected from the ISO. */
@@ -2683,12 +2685,22 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
                 L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
                 L"--out-dir \"%s\" --iso-root \"%c:\"",
                 codename, kver, apt_out, iso_drive);
-            if (spawn_iso_patch_prefetch(args_buf) != 0)
-                asb_log(L"WARN: prefetch-build-deps failed");
+            int prefetch_result = spawn_iso_patch_prefetch(args_buf);
             DetachVirtualDisk(iso_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
             CloseHandle(iso_handle);
+            if (prefetch_result != 0) {
+                args->result = E_FAIL;
+                wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                          L"Failed to download the Linux guest build packages.");
+                SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
+                goto done;
+            }
         } else {
-            asb_log(L"WARN: could not detect ISO kernel — skipping build-deps");
+            args->result = E_FAIL;
+            wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                      L"Failed to identify the Ubuntu release and kernel for guest dependencies.");
+            SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
+            goto done;
         }
 
         /* Prefetch 3: wsl-deps proprietary .so libs from Microsoft NuGet. */

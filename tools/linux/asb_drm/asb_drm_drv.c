@@ -32,6 +32,7 @@
 #include <drm/drm_probe_helper.h>
 
 #include "asb_drm.h"
+#include "asb_drm_uapi.h"
 
 /* --------------------------------------------------------------------------
  * Module parameters
@@ -53,6 +54,15 @@ MODULE_PARM_DESC(refresh, "Refresh rate in Hz     (default 60)");
  * -------------------------------------------------------------------------- */
 
 DEFINE_DRM_GEM_FOPS(asb_fops);
+
+static const struct drm_ioctl_desc asb_ioctls[] = {
+	DRM_IOCTL_DEF_DRV(ASB_GPU_QUERY, asb_gpu_query_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(ASB_GPU_IMPORT, asb_gpu_import_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(ASB_GPU_EXPORT, asb_gpu_export_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(ASB_GPU_NATIVE, asb_gpu_native_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(ASB_GPU_PRESENT, asb_gpu_present_ioctl, 0),
+	DRM_IOCTL_DEF_DRV(ASB_GPU_ACQUIRE, asb_gpu_acquire_ioctl, 0),
+};
 
 static const struct drm_driver asb_drm_driver = {
 	/* We deliberately do NOT set DRIVER_CURSOR_HOTSPOT. That flag tells
@@ -79,14 +89,13 @@ static const struct drm_driver asb_drm_driver = {
 	.name               = "asb_drm",
 	.desc               = "AppSandbox virtual display",
 	.major              = 1,
-	.minor              = 0,
+	.minor              = 1,
 
 	.fops               = &asb_fops,
+	.ioctls             = asb_ioctls,
+	.num_ioctls         = ARRAY_SIZE(asb_ioctls),
+	.postclose          = asb_gpu_postclose,
 
-	/* Memory: use the kernel's shmem-backed GEM helpers. We don't need
-	 * GPU memory of our own — the compositor allocates buffers (either
-	 * shmem via dumb_create, or imported dma-buf from Mesa-d3d12). All
-	 * mapping / mmap / fault paths come from these macros. */
 	DRM_GEM_SHMEM_DRIVER_OPS,
 };
 
@@ -95,7 +104,7 @@ static const struct drm_driver asb_drm_driver = {
  * -------------------------------------------------------------------------- */
 
 static const struct drm_mode_config_funcs asb_mode_config_funcs = {
-	.fb_create     = drm_gem_fb_create,
+	.fb_create     = asb_fb_create,
 	.atomic_check  = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
@@ -145,6 +154,8 @@ static int asb_probe(struct platform_device *pdev)
 		return PTR_ERR(asb);
 
 	drm = &asb->drm;
+	mutex_init(&asb->gpu_lock);
+	INIT_LIST_HEAD(&asb->gpu_objects);
 	platform_set_drvdata(pdev, drm);
 
 	/* Clamp module params into the supported range. */
@@ -203,8 +214,8 @@ static void asb_remove(struct platform_device *pdev)
 	struct asb_device *asb = to_asb(drm);
 
 	drm_dev_unplug(drm);
-	asb_mode_fini(asb);
 	drm_atomic_helper_shutdown(drm);
+	asb_mode_fini(asb);
 }
 
 static struct platform_driver asb_platform_driver = {
@@ -252,5 +263,6 @@ MODULE_DESCRIPTION("AppSandbox virtual DRM/KMS driver");
 /* Source is MIT (see SPDX header). MODULE_LICENSE must declare GPL-compat
  * for the kernel loader to resolve EXPORT_SYMBOL_GPL DRM helpers. */
 MODULE_LICENSE("Dual MIT/GPL");
-MODULE_VERSION("1.0.0");
+MODULE_IMPORT_NS("DMA_BUF");
+MODULE_VERSION("1.1.0");
 MODULE_ALIAS("platform:asb_drm");

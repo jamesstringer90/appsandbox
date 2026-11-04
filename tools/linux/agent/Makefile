@@ -33,9 +33,14 @@ appsandbox-agent: appsandbox-agent.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 # Display daemon needs libdrm for drmModeGetFB2 + drmPrimeHandleToFD.
-appsandbox-display: appsandbox-display.c
-	$(CC) $(CFLAGS) $(shell pkg-config --cflags libdrm) -o $@ $< \
-	       $(LDFLAGS) $(shell pkg-config --libs libdrm)
+appsandbox-display: appsandbox-display.c display-gpu.c display-gpu.h $(wildcard protocol.h ../../../src/core/protocol.h) \
+                    $(wildcard ../asb_drm/asb_drm_uapi.h ../asb_drm-src/asb_drm_uapi.h) \
+                    $(wildcard ../dxgkrnl/.source/src/include/uapi/misc/d3dkmthk.h ../dxgkrnl-src/include/uapi/misc/d3dkmthk.h)
+	$(CC) $(CFLAGS) $(shell pkg-config --cflags libdrm DirectX-Headers) \
+	       -I../../../src/core -I../asb_drm -I../dxgkrnl/.source/src/include/uapi/misc \
+	       -I../asb_drm-src -I../dxgkrnl-src/include/uapi/misc \
+	       -o $@ appsandbox-display.c display-gpu.c \
+	       $(LDFLAGS) $(shell pkg-config --libs libdrm) -ldl -lsystemd
 
 appsandbox-input: appsandbox-input.c $(wildcard protocol.h ../../../src/core/protocol.h)
 	$(CC) $(CFLAGS) -I../../../src/core -o $@ $< $(LDFLAGS) -lsystemd

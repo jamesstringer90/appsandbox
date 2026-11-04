@@ -27,15 +27,21 @@
 #include <fcntl.h>
 #include <time.h>
 #include <signal.h>
+#include <poll.h>
+#include <systemd/sd-daemon.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/inotify.h>
+#include <sys/stat.h>
 #include <linux/vm_sockets.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
+#include "display-gpu.h"
+#include "asb_drm_uapi.h"
 
 #define VSOCK_PORT      2
 #define FRAME_MAGIC     0x52465341u   /* 'ASFR' little-endian */
@@ -146,6 +152,22 @@ static void drm_release_fb(struct capture_ctx *c)
     c->width = c->height = c->stride = 0;
 }
 
+static void drm_free_fb(int fd, drmModeFB2 *fb)
+{
+    if (!fb) return;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!fb->handles[i]) continue;
+        unsigned j;
+        for (j = 0; j < i; ++j)
+            if (fb->handles[j] == fb->handles[i]) break;
+        if (j == i) {
+            struct drm_gem_close close_handle = {.handle = fb->handles[i]};
+            ioctl(fd, DRM_IOCTL_GEM_CLOSE, &close_handle);
+        }
+    }
+    drmModeFreeFB2(fb);
+}
+
 /* Find the active primary-plane framebuffer and map it for read.
  * Re-maps only when the fb_id changes (compositor flipped to a new buffer). */
 static int drm_acquire_fb(struct capture_ctx *c)
@@ -193,14 +215,15 @@ static int drm_acquire_fb(struct capture_ctx *c)
             goto out;
         }
 
-        drmModeFB2 *fb2 = drmModeGetFB2(c->fd, p->fb_id);
+        uint32_t fb_id = p->fb_id;
+        drmModeFB2 *fb2 = drmModeGetFB2(c->fd, fb_id);
         drmModeFreePlane(p);
         if (!fb2) continue;
 
         /* Only XRGB8888 / ARGB8888 for now — that's what hyperv_drm uses. */
         if (fb2->pixel_format != DRM_FORMAT_XRGB8888 &&
             fb2->pixel_format != DRM_FORMAT_ARGB8888) {
-            drmModeFreeFB2(fb2);
+            drm_free_fb(c->fd, fb2);
             continue;
         }
 
@@ -208,13 +231,17 @@ static int drm_acquire_fb(struct capture_ctx *c)
         uint32_t pitch  = fb2->pitches[0];
         uint32_t height = fb2->height;
         uint32_t width  = fb2->width;
-        drmModeFreeFB2(fb2);
-        if (!handle || !pitch || !height) continue;
+        if (!handle || !pitch || !height) {
+            drm_free_fb(c->fd, fb2);
+            continue;
+        }
 
         int dma_fd = -1;
         if (drmPrimeHandleToFD(c->fd, handle, DRM_CLOEXEC | O_RDONLY, &dma_fd) < 0) {
+            drm_free_fb(c->fd, fb2);
             continue;
         }
+        drm_free_fb(c->fd, fb2);
         size_t size = (size_t)pitch * height;
         void *m = mmap(NULL, size, PROT_READ, MAP_SHARED, dma_fd, 0);
         if (m == MAP_FAILED) {
@@ -223,7 +250,7 @@ static int drm_acquire_fb(struct capture_ctx *c)
         }
 
         drm_release_fb(c);
-        c->fb_id_last = p->fb_id;
+        c->fb_id_last = fb_id;
         c->width  = width;
         c->height = height;
         c->stride = pitch;
@@ -468,7 +495,7 @@ static int cursor_tick(int client_fd, int drm_fd, struct cursor_state *cur)
 
     if (bmp)    munmap(bmp, bmp_sz);
     if (dma_fd >= 0) close(dma_fd);
-    if (fb2)    drmModeFreeFB2(fb2);
+    drm_free_fb(drm_fd, fb2);
 
     if (rc == 0) {
         cur->last_fb_id      = fb_id;
@@ -504,7 +531,7 @@ static int send_frame(int client_fd, struct capture_ctx *c, uint64_t seq)
     return 0;
 }
 
-static void capture_loop(int client_fd)
+static int capture_open(void)
 {
     struct capture_ctx ctx = { .fd = -1, .dma_fd = -1 };
 
@@ -616,7 +643,7 @@ static void capture_loop(int client_fd)
     }
     if (ctx.fd < 0) {
         agent_log("no /dev/dri/cardN with a connected output");
-        return;
+        return -1;
     }
 
 have_card:
@@ -643,55 +670,167 @@ have_card:
     drmSetClientCap(ctx.fd, 6, 1);
 #endif
 
-    /* Cache cursor plane id + property ids once. */
-    struct cursor_state cur;
-    cursor_init(ctx.fd, &cur);
-
-    struct timespec next;
-    clock_gettime(CLOCK_MONOTONIC, &next);
-    uint64_t seq = 0;
-    int last_status = 0;
-
-    while (!g_stop) {
-        int rc = drm_acquire_fb(&ctx);
-        if (rc < 0) {
-            if (last_status != -1) {
-                agent_log("no active framebuffer; waiting");
-                last_status = -1;
-            }
-        } else {
-            if (last_status != 1) {
-                agent_log("capturing %ux%u stride=%u", ctx.width, ctx.height, ctx.stride);
-                last_status = 1;
-            }
-            if (send_frame(client_fd, &ctx, ++seq) < 0) {
-                agent_log("client disconnected");
-                break;
-            }
-        }
-
-        /* Emit cursor update if its position/shape changed since last tick.
-         * Cheap when nothing changed (one drmModeGetPlane + one props read). */
-        if (cursor_tick(client_fd, ctx.fd, &cur) < 0) {
-            agent_log("client disconnected (cursor)");
-            break;
-        }
-
-        /* Pace to TARGET_FPS using absolute wakeup. */
-        next.tv_nsec += FRAME_INTERVAL_NS;
-        while (next.tv_nsec >= 1000000000L) {
-            next.tv_nsec -= 1000000000L;
-            next.tv_sec  += 1;
-        }
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
-    }
-
-    drm_release_fb(&ctx);
-    close(ctx.fd);
+    return ctx.fd;
 }
 
-int main(void)
+static void capture_size(int fd, uint32_t *width, uint32_t *height)
 {
+    *width = *height = 0;
+    drmModeRes *resources = drmModeGetResources(fd);
+    if (!resources) return;
+    for (int i = 0; i < resources->count_crtcs; ++i) {
+        drmModeCrtc *crtc = drmModeGetCrtc(fd, resources->crtcs[i]);
+        if (!crtc) continue;
+        if (crtc->mode_valid && crtc->buffer_id) {
+            *width = crtc->width;
+            *height = crtc->height;
+        }
+        drmModeFreeCrtc(crtc);
+        if (*width && *height) break;
+    }
+    drmModeFreeResources(resources);
+}
+
+static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu)
+{
+    struct capture_ctx ctx = {.fd = drm_fd, .dma_fd = -1};
+    struct cursor_state cur;
+    cursor_init(ctx.fd, &cur);
+    uint64_t seq = 0;
+    DisplayGpuPacket query = {0};
+    size_t query_bytes = 0;
+    int shared = 0, queried = 0;
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+    while (!g_stop) {
+        if (query_bytes < sizeof(query)) {
+            ssize_t count = recv(client_fd, (char *)&query + query_bytes,
+                                 sizeof(query) - query_bytes, MSG_DONTWAIT);
+            if (!count || (count < 0 && errno != EAGAIN && errno != EINTR)) break;
+            if (count > 0) query_bytes += (size_t)count;
+        } else {
+            char byte;
+            ssize_t count = recv(client_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (count >= 0 || (errno != EAGAIN && errno != EINTR)) break;
+        }
+        if (query_bytes == sizeof(query) && (!*gpu || display_gpu_active(*gpu))) {
+            if (queried || query.magic != DISPLAY_GPU_MAGIC || query.type != DISPLAY_GPU_QUERY ||
+                query.version != DISPLAY_GPU_VERSION) break;
+            uint32_t width, height;
+            capture_size(ctx.fd, &width, &height);
+            shared = display_gpu_connect(*gpu, client_fd, &query, width, height);
+            if (shared < 0) break;
+            queried = 1;
+            query_bytes = 0;
+            agent_log("display transport: %s", shared ? "shared GPU textures" : "socket frames");
+            if (shared) drm_release_fb(&ctx);
+        }
+        if (shared) {
+            int result = display_gpu_frame(*gpu);
+            if (result < 0) {
+                agent_log("shared GPU session ended (%d)", result);
+                if (result == -1) { display_gpu_destroy(*gpu); *gpu = NULL; }
+                break;
+            }
+        } else {
+            const void *pixels = NULL;
+            struct capture_ctx fallback = {.fd = drm_fd, .dma_fd = -1};
+            int result = display_gpu_readback(*gpu, &pixels, &fallback.width,
+                                              &fallback.height, &fallback.stride);
+            if (result < 0) {
+                agent_log("GPU unavailable; returning to software display capture");
+                display_gpu_destroy(*gpu);
+                *gpu = NULL;
+            } else if (result > 0) {
+                fallback.mem = (uint8_t *)pixels;
+                if (send_frame(client_fd, &fallback, ++seq) < 0) break;
+            } else if (drm_acquire_fb(&ctx) == 0) {
+                if (send_frame(client_fd, &ctx, ++seq) < 0) break;
+            }
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t remaining = (next.tv_sec - now.tv_sec) * 1000000000LL + next.tv_nsec - now.tv_nsec;
+        if (remaining <= 0) {
+            if (cursor_tick(client_fd, ctx.fd, &cur) < 0) break;
+            next = now;
+            next.tv_nsec += FRAME_INTERVAL_NS;
+            if (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; ++next.tv_sec; }
+            remaining = FRAME_INTERVAL_NS;
+        }
+        if (shared) {
+            int event = display_gpu_event(*gpu);
+            if (event < 0) break;
+            struct pollfd wait[] = {{.fd = client_fd, .events = POLLIN}, {.fd = event, .events = POLLIN}};
+            if (poll(wait, 2, (int)((remaining + 999999) / 1000000)) < 0 && errno != EINTR) break;
+        } else {
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+        }
+    }
+    display_gpu_disconnect(*gpu);
+    drm_release_fb(&ctx);
+}
+
+static int display_session(int argc, char **argv)
+{
+    if (argc < 3) return 1;
+    int accelerated = 0;
+    for (int i = 0; i < 8 && !accelerated; ++i) {
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/dri/card%d", i);
+        int fd = open(path, O_RDWR | O_CLOEXEC);
+        if (fd < 0) continue;
+        drmDropMaster(fd);
+        struct drm_asb_gpu_query query = {0};
+        if (ioctl(fd, DRM_IOCTL_ASB_GPU_QUERY, &query) == 0 &&
+            query.version == ASB_DRM_GPU_VERSION && (query.capabilities & ASB_DRM_GPU_CAP_PRESENT))
+            accelerated = 1;
+        close(fd);
+    }
+    if (accelerated) {
+        unsetenv("LIBGL_ALWAYS_SOFTWARE");
+        setenv("GALLIUM_DRIVER", "d3d12", 1);
+        setenv("MESA_LOADER_DRIVER_OVERRIDE", "d3d12", 1);
+        setenv("__GLX_VENDOR_LIBRARY_NAME", "mesa", 1);
+    } else {
+        unsetenv("GALLIUM_DRIVER");
+        unsetenv("MESA_LOADER_DRIVER_OVERRIDE");
+        unsetenv("VK_DRIVER_FILES");
+        setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+    }
+    agent_log("starting compositor with %s rendering", accelerated ? "GPU" : "software");
+    execvp(argv[2], &argv[2]);
+    return 1;
+}
+
+static void display_wait_runtime(void)
+{
+    if (access("/dev/dxg", F_OK) < 0) return;
+    if (mkdir("/run/appsandbox", 0755) < 0 && errno != EEXIST) return;
+    int events = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+    if (events < 0) return;
+    if (inotify_add_watch(events, "/run/appsandbox", IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
+        close(events);
+        return;
+    }
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (!g_stop && access("/run/appsandbox/gpu-ready", F_OK) < 0) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int remaining = 15000 - (int)((now.tv_sec - start.tv_sec) * 1000 +
+                                     (now.tv_nsec - start.tv_nsec) / 1000000);
+        if (remaining <= 0) break;
+        struct pollfd event = {.fd = events, .events = POLLIN};
+        if (poll(&event, 1, remaining) < 0 && errno != EINTR) break;
+        char buffer[4096];
+        while (read(events, buffer, sizeof(buffer)) > 0) {}
+    }
+    close(events);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && !strcmp(argv[1], "--session")) return display_session(argc, argv);
     signal(SIGPIPE, SIG_IGN);
     /* Install SIGINT/SIGTERM WITHOUT SA_RESTART so a blocking accept()
      * returns EINTR on signal (the loop below checks for it) instead of
@@ -706,11 +845,24 @@ int main(void)
         sigaction(SIGTERM, &sa, NULL);
     }
 
+    display_wait_runtime();
+    int drm_fd = capture_open();
+    if (drm_fd < 0) return 1;
+    struct display_gpu *gpu = display_gpu_create(drm_fd);
+    agent_log("GPU presenter: %s", gpu ? "ready" : "unavailable");
+    sd_notify(0, "READY=1");
+
     int srv = vsock_listen(VSOCK_PORT);
     if (srv < 0) return 1;
     agent_log("listening on vsock :%u", VSOCK_PORT);
 
     while (!g_stop) {
+        if (gpu && !display_gpu_healthy(gpu)) {
+            display_gpu_destroy(gpu);
+            gpu = NULL;
+        }
+        struct pollfd pending = {.fd = srv, .events = POLLIN};
+        if (poll(&pending, 1, 1000) <= 0) continue;
         struct sockaddr_vm peer;
         socklen_t plen = sizeof(peer);
         int c = accept(srv, (struct sockaddr *)&peer, &plen);
@@ -720,10 +872,14 @@ int main(void)
             break;
         }
         agent_log("client connected (cid=%u)", peer.svm_cid);
-        capture_loop(c);
+        struct timeval timeout = {.tv_sec = 2};
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        capture_loop(c, drm_fd, &gpu);
         close(c);
     }
 
     close(srv);
+    display_gpu_destroy(gpu);
+    close(drm_fd);
     return 0;
 }

@@ -429,29 +429,33 @@ static int recv_exact(int fd, void *buf, size_t len)
 {
     uint8_t *p = (uint8_t *)buf;
     size_t left = len;
-    while (left > 0) {
-        ssize_t n = recv(fd, p, left, 0);
+    while (left > 0 && !g_stop) {
+        struct pollfd pending = {.fd = fd, .events = POLLIN};
+        int ready = poll(&pending, 1, 1000);
+        if (ready < 0 && errno != EINTR) return -1;
+        if (ready <= 0) continue;
+        ssize_t n = recv(fd, p, left, MSG_DONTWAIT);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN) continue;
             return -1;
         }
         if (n == 0) return -1;
         p += n; left -= (size_t)n;
     }
-    return 0;
+    return left ? -1 : 0;
 }
 
 static int send_exact(int fd, const void *buf, size_t len)
 {
     const uint8_t *p = buf;
-    while (len) {
+    while (len && !g_stop) {
         ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         p += n;
         len -= (size_t)n;
     }
-    return 0;
+    return len ? -1 : 0;
 }
 
 static int get_pointer_position(uint32_t *x, uint32_t *y)
@@ -505,6 +509,8 @@ static int get_pointer_position(uint32_t *x, uint32_t *y)
 
 static void serve(int client_fd, int ui_fd)
 {
+    struct timeval timeout = {.tv_sec = 2};
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     /* Tell the host the guest is ready. */
     uint32_t ready = INPUT_READY_MAGIC;
     if (send_exact(client_fd, &ready, sizeof(ready)) < 0) {

@@ -76,6 +76,7 @@ static void asb_crtc_atomic_disable(struct drm_crtc *crtc,
 	struct asb_device *asb = crtc_to_asb(crtc);
 
 	drm_crtc_vblank_off(crtc);
+	asb_gpu_update(asb, NULL);
 	asb->vblank_enabled = false;
 	hrtimer_cancel(&asb->vblank_timer);
 }
@@ -161,4 +162,5 @@ void asb_mode_fini(struct asb_device *asb)
 {
 	asb->vblank_enabled = false;
 	hrtimer_cancel(&asb->vblank_timer);
+	asb_gpu_fini(asb);
 }

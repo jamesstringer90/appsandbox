@@ -38,4 +38,6 @@ int do_prefetch_build_deps(const wchar_t *codename,
                            const wchar_t *mirror,
                            const wchar_t *iso_root);
 
+int prefetch_sha256_file(const wchar_t *path, char *hex_out);
+
 #endif /* PREFETCH_BUILD_DEPS_H */
