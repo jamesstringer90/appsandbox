@@ -441,6 +441,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
 - (void)flushDisplaySize;
 - (void)scheduleDisplaySize;
 - (void)toggleMatchWindowSize:(id)sender;
+- (BOOL)readDisplay:(int)fd bytes:(void *)bytes length:(int)length
+            session:(uint64_t)session idle:(BOOL)idle;
 @end
 
 @implementation IddDisplayWindow {
@@ -1388,6 +1390,47 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
 #pragma mark - Reader threads (frame + input)
 
+- (BOOL)readDisplay:(int)fd bytes:(void *)bytes length:(int)length
+            session:(uint64_t)session idle:(BOOL)idle {
+    uint8_t *out = bytes;
+    int remaining = length;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (remaining > 0) {
+        if (_stop) return NO;
+        BOOL betweenPackets = idle && remaining == length;
+        if (betweenPackets) {
+            DisplayGpuPacket request = {0};
+            pthread_mutex_lock(&_inputLock);
+            if (_displayFd == fd && _displaySession == session && _resizeSupported &&
+                _hasDisplayFrame && !_displaySizing && _sizeRequest.session == session) {
+                request = _sizeRequest;
+                memset(&_sizeRequest, 0, sizeof(_sizeRequest));
+            }
+            pthread_mutex_unlock(&_inputLock);
+            if (request.type && !idd_wr_full(fd, &request, sizeof(request))) return NO;
+        } else {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if ((now.tv_sec - start.tv_sec) * 1000000000LL + now.tv_nsec - start.tv_nsec >= 5000000000LL)
+                return NO;
+        }
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(fd, &readable);
+        struct timeval timeout = {0, 100000};
+        int ready = select(fd + 1, &readable, NULL, NULL, &timeout);
+        if (ready < 0) { if (errno == EINTR) continue; return NO; }
+        if (!ready) continue;
+        if (betweenPackets) clock_gettime(CLOCK_MONOTONIC, &start);
+        ssize_t n = recv(fd, out, (size_t)remaining, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return NO;
+        out += n;
+        remaining -= (int)n;
+    }
+    return YES;
+}
+
 /* Reconstruct the VDD wire stream from the ch2 fd into _fb. We connect via the transport (host is
    the connector; the VDD's asb_accept claims the slot and, on each fresh accept, sends a full frame
    first then dirty-rect frames + cursor updates). On EOF/error we close the fd and reconnect — a new
@@ -1421,21 +1464,13 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
         for (;;) {
             if (_stop) break;
-            DisplayGpuPacket request = {0};
-            pthread_mutex_lock(&_inputLock);
-            if (_resizeSupported && _hasDisplayFrame && !_displaySizing && _sizeRequest.session == session) {
-                request = _sizeRequest;
-                memset(&_sizeRequest, 0, sizeof(_sizeRequest));
-            }
-            pthread_mutex_unlock(&_inputLock);
-            if (request.type && !idd_wr_full(fd, &request, sizeof(request))) break;
             uint32_t magic;
-            if (!idd_rd_full(fd, &magic, 4)) break;
+            if (![self readDisplay:fd bytes:&magic length:4 session:session idle:YES]) break;
 
             if (magic == DISPLAY_GPU_MAGIC) {
                 DisplayGpuPacket packet = {0};
                 packet.magic = magic;
-                if (!idd_rd_full(fd, (uint8_t *)&packet + 4, sizeof(packet) - 4)) break;
+                if (![self readDisplay:fd bytes:(uint8_t *)&packet + 4 length:sizeof(packet) - 4 session:session idle:NO]) break;
                 if (packet.version != DISPLAY_GPU_VERSION || packet.session != session) break;
                 pthread_mutex_lock(&_inputLock);
                 if (packet.type == DISPLAY_GPU_CAPS) {
@@ -1465,13 +1500,13 @@ static __weak IddDisplayWindow *g_mouseOwner;
             if (magic == VDD_CURSOR_MAGIC) {
                 WireCursorHeader ch;
                 ch.magic = magic;
-                if (!idd_rd_full(fd, (uint8_t *)&ch + 4, sizeof(ch) - 4)) break;
+                if (![self readDisplay:fd bytes:(uint8_t *)&ch + 4 length:sizeof(ch) - 4 session:session idle:NO]) break;
                 uint8_t *shape = NULL;
                 if (ch.shape_updated && ch.shape_data_size > 0) {
                     if (ch.shape_data_size > 4u*1024*1024) break;   /* sanity */
                     shape = malloc(ch.shape_data_size);
                     if (!shape) break;
-                    if (!idd_rd_full(fd, shape, (int)ch.shape_data_size)) { free(shape); break; }
+                    if (![self readDisplay:fd bytes:shape length:(int)ch.shape_data_size session:session idle:NO]) { free(shape); break; }
                 }
                 /* Build an AsbCursor blob (header + image) so the render timer reuses buildGuestCursor
                    unchanged. shape_updated=0 => keep last image, update visibility only. */
@@ -1507,7 +1542,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
             WireFrameHeader fh;
             fh.magic = magic;
-            if (!idd_rd_full(fd, (uint8_t *)&fh + 4, sizeof(fh) - 4)) break;
+            if (![self readDisplay:fd bytes:(uint8_t *)&fh + 4 length:sizeof(fh) - 4 session:session idle:NO]) break;
             if (fh.width == 0 || fh.height == 0 || fh.stride < fh.width * 4 ||
                 fh.width > 8192 || fh.height > 8192) break;
 
@@ -1529,11 +1564,11 @@ static __weak IddDisplayWindow *g_mouseOwner;
                    _fbLock, so holding it across the recv would stall the whole UI for the transfer.
                    _fbLock is taken only for the memcpy into _fb (as in the dirty-rect path below). */
                 uint32_t data_size = 0;
-                if (!idd_rd_full(fd, &data_size, 4)) break;
+                if (![self readDisplay:fd bytes:&data_size length:4 session:session idle:NO]) break;
                 uint32_t want = _fbStride * _fbH;
                 if (data_size != want) break;
                 if (data_size > scratchSz) { free(scratch); scratch = malloc(data_size); scratchSz = data_size; if (!scratch) break; }
-                if (!idd_rd_full(fd, scratch, (int)data_size)) break;
+                if (![self readDisplay:fd bytes:scratch length:(int)data_size session:session idle:NO]) break;
                 pthread_mutex_lock(&_fbLock);
                 memcpy(_fb, scratch, data_size);
                 _fbSeq++;
@@ -1542,11 +1577,11 @@ static __weak IddDisplayWindow *g_mouseOwner;
                 /* Dirty rects: rects[], data_size, then per-rect packed rows. */
                 if (fh.dirty_rect_count > VDD_MAX_DIRTY) break;
                 WireRect rects[VDD_MAX_DIRTY];
-                if (!idd_rd_full(fd, rects, (int)(fh.dirty_rect_count * sizeof(WireRect)))) break;
+                if (![self readDisplay:fd bytes:rects length:(int)(fh.dirty_rect_count * sizeof(WireRect)) session:session idle:NO]) break;
                 uint32_t data_size = 0;
-                if (!idd_rd_full(fd, &data_size, 4)) break;
+                if (![self readDisplay:fd bytes:&data_size length:4 session:session idle:NO]) break;
                 if (data_size > scratchSz) { free(scratch); scratch = malloc(data_size); scratchSz = data_size; if (!scratch) break; }
-                if (!idd_rd_full(fd, scratch, (int)data_size)) break;
+                if (![self readDisplay:fd bytes:scratch length:(int)data_size session:session idle:NO]) break;
                 pthread_mutex_lock(&_fbLock);
                 size_t off = 0;
                 for (uint32_t i = 0; i < fh.dirty_rect_count; i++) {
@@ -2503,6 +2538,8 @@ static CGRect idd_letterbox(double viewW, double viewH, double frameW, double fr
 - (void)viewDidEndLiveResize
 {
     [super viewDidEndLiveResize];
+    __weak IddDisplayWindow *owner = self.owner;
+    dispatch_async(dispatch_get_main_queue(), ^{ [owner flushDisplaySize]; });
     [self.owner renderMetal];   /* final crisp frame at the settled size */
 }
 

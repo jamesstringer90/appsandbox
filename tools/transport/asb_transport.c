@@ -324,7 +324,7 @@ AsbConn *asb_accept(AsbListener *l, int timeout_ms) {
            acceptance by echoing host_token into guest_ack (guest-sole), then WAITS for the host to
            publish ESTABLISHED. The guest NEVER writes `state`, so there is no two-writer clobber and no
            hardware atomic is needed (atomics fault on the ivshmem BAR under QEMU+HVF). */
-        int elapsed = 0;
+        ULONGLONG started = GetTickCount64();
         for (;;) {
             uint32_t s;
             for (s = 0; s < l->region->n_slots; s++) {
@@ -334,7 +334,7 @@ AsbConn *asb_accept(AsbListener *l, int timeout_ms) {
                 MemoryBarrier();
                 st = *tmp.state; tok = *tmp.host_token; ack = *tmp.guest_ack;
                 if (st == ASB_SLOT_CONNECTING && tok != 0 && ack != tok) {   /* a FRESH offer we have not acked */
-                    int w = 0;
+                    ULONGLONG accepted = GetTickCount64();
                     uint64_t oid = next_owner_id();
                     *tmp.owner_id  = oid;  MemoryBarrier();   /* (a) publish identity (guest-sole) */
                     *tmp.guest_ack = tok;  MemoryBarrier();   /* (b) accept THIS arm (guest-sole) */
@@ -355,13 +355,13 @@ AsbConn *asb_accept(AsbListener *l, int timeout_ms) {
                            us: abandon — we never wrote `state`, so there is nothing to undo. */
                         if (tok2 != tok || st2 == ASB_SLOT_FREE ||
                             st2 == ASB_SLOT_CLOSED || st2 == ASB_SLOT_CLOSING) break;
-                        if (++w > ACCEPT_EST_WAIT_MS) break;
+                        if (GetTickCount64() - accepted >= ACCEPT_EST_WAIT_MS) break;
                         Sleep(1);
                     }
                 }
             }
-            if (timeout_ms >= 0 && elapsed >= timeout_ms) return NULL;
-            Sleep(1); elapsed += 1;
+            if (timeout_ms >= 0 && GetTickCount64() - started >= (ULONGLONG)timeout_ms) return NULL;
+            Sleep(1);
         }
     }
     {   /* PC: select + accept */
@@ -385,12 +385,12 @@ AsbConn *asb_connect(int channel) {   /* guest connects out (9P) */
             bind_slot(&tmp, r, s);
             MemoryBarrier();
             if (*tmp.state == ASB_SLOT_FREE) {
-                int waited = 0;
+                ULONGLONG started = GetTickCount64();
                 *tmp.owner_id = next_owner_id(); MemoryBarrier();   /* keep owner_id valid (9P guest-connect-out; transient) */
                 *tmp.state = ASB_SLOT_CONNECTING; MemoryBarrier();
                 while (*(volatile uint32_t *)tmp.state != ASB_SLOT_ESTABLISHED) {
-                    if (waited > 5000) { *tmp.state = ASB_SLOT_FREE; return NULL; }
-                    Sleep(1); waited++; MemoryBarrier();
+                    if (GetTickCount64() - started >= 5000) { *tmp.state = ASB_SLOT_FREE; return NULL; }
+                    Sleep(1); MemoryBarrier();
                 }
                 { AsbConn *c = (AsbConn *)calloc(1, sizeof(*c)); if (!c) { *tmp.state = ASB_SLOT_FREE; return NULL; }
                   *c = tmp; c->channel = channel; c->is_ivshmem = 1;
@@ -479,14 +479,14 @@ int asb_recv(AsbConn *c, void *buf, int len) {
 int asb_poll(AsbConn *c, int timeout_ms) {
     if (!c) return -1;
     if (c->is_ivshmem) {
-        int elapsed = 0;
+        ULONGLONG started = GetTickCount64();
         for (;;) {
             MemoryBarrier();
             if (c->h2g->tail != c->h2g->head) return 1;       /* inbound bytes available */
             if (*c->state != ASB_SLOT_ESTABLISHED ||
                 (c->my_host_token != 0 && *c->host_token != c->my_host_token)) return -1; /* closed/re-armed (C4) */
-            if (timeout_ms >= 0 && elapsed >= timeout_ms) return 0;
-            Sleep(1); elapsed++;
+            if (timeout_ms >= 0 && GetTickCount64() - started >= (ULONGLONG)timeout_ms) return 0;
+            Sleep(1);
         }
     }
     {   /* PC: select on the socket */

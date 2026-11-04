@@ -298,9 +298,9 @@ static DWORD WINAPI VddNetworkThread(LPVOID lpParameter)
         VddLog("Network: listening for host connections (transport=%s)",
                asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
 
-        /* Accept loop — 1s timeout so we re-check bStopNetwork between accepts. */
+        int acceptTimeout = asb_transport_is_ivshmem() ? 100 : 1000;
         while (!proc->bStopNetwork) {
-            AsbConn* nc = asb_accept(l, 1000);
+            AsbConn* nc = asb_accept(l, acceptTimeout);
             if (!nc)
                 continue;
 
