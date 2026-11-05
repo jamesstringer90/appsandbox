@@ -50,6 +50,11 @@
 
 struct asb_device {
 	struct drm_device       drm;
+	struct mutex           display_lock;
+	struct drm_file       *display_owner;
+	u32                    display_flags;
+	u32                    display_width;
+	u32                    display_height;
 	struct mutex           gpu_lock;
 	struct list_head       gpu_objects;
 	struct drm_file       *gpu_presenter;
@@ -103,6 +108,8 @@ int  asb_mode_init(struct asb_device *asb);
 void asb_mode_fini(struct asb_device *asb);
 
 int  asb_connector_init(struct asb_device *asb);
+int asb_display_config_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
+void asb_display_release(struct asb_device *asb, struct drm_file *file);
 
 int  asb_planes_init(struct asb_device *asb);
 

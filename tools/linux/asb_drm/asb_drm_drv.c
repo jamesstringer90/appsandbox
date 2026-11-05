@@ -62,6 +62,7 @@ static const struct drm_ioctl_desc asb_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(ASB_GPU_NATIVE, asb_gpu_native_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(ASB_GPU_PRESENT, asb_gpu_present_ioctl, 0),
 	DRM_IOCTL_DEF_DRV(ASB_GPU_ACQUIRE, asb_gpu_acquire_ioctl, 0),
+	DRM_IOCTL_DEF_DRV(ASB_DISPLAY_CONFIG, asb_display_config_ioctl, 0),
 };
 
 static const struct drm_driver asb_drm_driver = {
@@ -154,6 +155,7 @@ static int asb_probe(struct platform_device *pdev)
 		return PTR_ERR(asb);
 
 	drm = &asb->drm;
+	mutex_init(&asb->display_lock);
 	mutex_init(&asb->gpu_lock);
 	INIT_LIST_HEAD(&asb->gpu_objects);
 	platform_set_drvdata(pdev, drm);
@@ -162,6 +164,8 @@ static int asb_probe(struct platform_device *pdev)
 	asb->width   = clamp(width_param,   64u, (unsigned)ASB_MAX_WIDTH);
 	asb->height  = clamp(height_param,  64u, (unsigned)ASB_MAX_HEIGHT);
 	asb->refresh = clamp(refresh_param, 24u, 240u);
+	asb->display_width = min(asb->width, 1920u);
+	asb->display_height = min(asb->height, 1080u);
 
 	ret = asb_mode_config_setup(asb);
 	if (ret) {

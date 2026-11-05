@@ -691,7 +691,116 @@ static void capture_size(int fd, uint32_t *width, uint32_t *height)
     drmModeFreeResources(resources);
 }
 
-static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu)
+struct display_config {
+    int supported;
+    struct drm_asb_display_config current, fallback, previous;
+    uint64_t reconnect_until, resize_until;
+    DisplayGpuPacket request;
+};
+
+static uint64_t display_time_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int display_config_set(int fd, struct display_config *config,
+                              struct drm_asb_display_config next)
+{
+    if (!config->supported) return 0;
+    if (config->current.flags == next.flags && config->current.width == next.width &&
+        config->current.height == next.height) return 0;
+    next.operation = ASB_DRM_DISPLAY_SET;
+    if (drmIoctl(fd, DRM_IOCTL_ASB_DISPLAY_CONFIG, &next) < 0) {
+        agent_log("display mode update failed: %s", strerror(errno));
+        return -1;
+    }
+    config->current = next;
+    return 0;
+}
+
+static void display_config_fallback(int fd, struct display_config *config)
+{
+    display_config_set(fd, config, config->fallback);
+    config->reconnect_until = config->resize_until = 0;
+}
+
+static int display_resize_failed(int client_fd, uint64_t session, struct display_config *config)
+{
+    if (client_fd < 0 || !session || !config->request.status) return 0;
+    DisplayGpuPacket reply = config->request;
+    reply.session = session;
+    reply.type = DISPLAY_GPU_RESIZED;
+    if (send_all(client_fd, &reply, sizeof(reply)) < 0) return -1;
+    config->request.status = 0;
+    return 0;
+}
+
+static int display_config_expire(int fd, struct display_config *config, int client_fd,
+                                 uint64_t session)
+{
+    uint64_t now = display_time_ms();
+    if (config->reconnect_until && now >= config->reconnect_until) {
+        display_config_fallback(fd, config);
+        return 1;
+    }
+    if (config->resize_until && now >= config->resize_until) {
+        agent_log("display resize timed out; restoring previous mode");
+        config->previous.flags = ASB_DRM_DISPLAY_SHARED;
+        display_config_set(fd, config, config->previous);
+        config->resize_until = 0;
+        config->request.status = ETIMEDOUT;
+        display_resize_failed(client_fd, session, config);
+        return 1;
+    }
+    return 0;
+}
+
+static int display_resize(int fd, int client_fd, struct display_config *config,
+                           const DisplayGpuPacket *request, uint64_t session, int supported,
+                           uint32_t width, uint32_t height)
+{
+    DisplayGpuPacket reply = *request;
+    reply.type = DISPLAY_GPU_RESIZED;
+    reply.status = EINVAL;
+    if (supported && request->session == session && request->slot <= DISPLAY_SIZE_WINDOW &&
+        request->width >= 64 && request->height >= 64 &&
+        request->width <= DISPLAY_MAX_WIDTH && request->height <= DISPLAY_MAX_HEIGHT &&
+        (request->slot == DISPLAY_SIZE_GUEST ||
+         (request->width >= DISPLAY_MIN_WIDTH && request->height >= DISPLAY_MIN_HEIGHT))) {
+        struct drm_asb_display_config next = {
+            .flags = ASB_DRM_DISPLAY_SHARED, .width = width, .height = height,
+        };
+        if (request->slot == DISPLAY_SIZE_WINDOW) {
+            next.flags |= ASB_DRM_DISPLAY_MATCH_WINDOW;
+            next.width = request->width;
+            next.height = request->height;
+        }
+        struct drm_asb_display_config previous = config->current;
+        if (!config->resize_until) {
+            previous.width = width;
+            previous.height = height;
+        }
+        if (display_config_set(fd, config, next) == 0) {
+            reply.status = 0;
+            if (next.width != width || next.height != height) {
+                if (!config->resize_until) config->previous = previous;
+                config->resize_until = display_time_ms() + 5000;
+                config->request = *request;
+                config->request.status = 0;
+            } else {
+                config->resize_until = 0;
+            }
+        } else {
+            reply.status = errno ? (uint32_t)errno : EIO;
+        }
+    }
+    return send_all(client_fd, &reply, sizeof(reply)) < 0 ? -1 : 0;
+}
+
+static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu,
+                          struct display_config *config)
 {
     struct capture_ctx ctx = {.fd = drm_fd, .dma_fd = -1};
     struct cursor_state cur;
@@ -699,10 +808,18 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu)
     uint64_t seq = 0;
     DisplayGpuPacket query = {0};
     size_t query_bytes = 0;
-    int shared = 0, queried = 0;
+    int shared = 0, queried = 0, resize = 0;
+    uint64_t session = 0, connected = display_time_ms();
+    uint32_t width = 0, height = 0;
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
     while (!g_stop) {
+        if (display_config_expire(drm_fd, config, shared && resize ? client_fd : -1, session) && shared) break;
+        if (!shared && *gpu && !display_gpu_healthy(*gpu)) {
+            display_gpu_destroy(*gpu);
+            *gpu = NULL;
+            display_config_fallback(drm_fd, config);
+        }
         if (query_bytes < sizeof(query)) {
             ssize_t count = recv(client_fd, (char *)&query + query_bytes,
                                  sizeof(query) - query_bytes, MSG_DONTWAIT);
@@ -713,26 +830,69 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu)
             ssize_t count = recv(client_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
             if (count >= 0 || (errno != EAGAIN && errno != EINTR)) break;
         }
-        if (query_bytes == sizeof(query) && (!*gpu || display_gpu_active(*gpu))) {
-            if (queried || query.magic != DISPLAY_GPU_MAGIC || query.type != DISPLAY_GPU_QUERY ||
-                query.version != DISPLAY_GPU_VERSION) break;
-            uint32_t width, height;
-            capture_size(ctx.fd, &width, &height);
-            shared = display_gpu_connect(*gpu, client_fd, &query, width, height);
-            if (shared < 0) break;
-            queried = 1;
-            query_bytes = 0;
-            agent_log("display transport: %s", shared ? "shared GPU textures" : "socket frames");
-            if (shared) drm_release_fb(&ctx);
+        if (query_bytes == sizeof(query)) {
+            if (query.magic != DISPLAY_GPU_MAGIC || query.version != DISPLAY_GPU_VERSION) break;
+            if (queried) {
+                if (query.type != DISPLAY_GPU_RESIZE ||
+                    display_resize(drm_fd, client_fd, config, &query, session, shared && resize,
+                                   width, height) < 0) break;
+                query_bytes = 0;
+            } else if (query.type != DISPLAY_GPU_QUERY) {
+                break;
+            } else if (!*gpu || display_gpu_active(*gpu)) {
+                capture_size(ctx.fd, &width, &height);
+                if (*gpu && (!width || !height)) {
+                    struct pollfd wait = {.fd = display_gpu_event(*gpu), .events = POLLIN};
+                    poll(&wait, 1, 16);
+                    continue;
+                }
+                resize = config->supported && (query.reserved & DISPLAY_GPU_CAP_RESIZE);
+                uint32_t size_mode = resize && (config->current.flags & ASB_DRM_DISPLAY_MATCH_WINDOW)
+                    ? DISPLAY_SIZE_WINDOW : DISPLAY_SIZE_GUEST;
+                shared = display_gpu_connect(*gpu, client_fd, &query, width, height, resize, size_mode);
+                if (shared < 0) {
+                    shared = 0;
+                    display_config_fallback(drm_fd, config);
+                    break;
+                }
+                session = query.session;
+                queried = 1;
+                query_bytes = 0;
+                agent_log("display transport: %s", shared ? "shared GPU textures" : "socket frames");
+                if (shared) {
+                    struct drm_asb_display_config mode = config->current;
+                    if (size_mode == DISPLAY_SIZE_GUEST && mode.flags != ASB_DRM_DISPLAY_SHARED) {
+                        mode.flags = ASB_DRM_DISPLAY_SHARED;
+                        mode.width = width;
+                        mode.height = height;
+                    }
+                    if (display_config_set(drm_fd, config, mode) < 0) break;
+                    if (resize && display_resize_failed(client_fd, session, config) < 0) break;
+                    drm_release_fb(&ctx);
+                } else {
+                    display_config_fallback(drm_fd, config);
+                }
+            }
         }
         if (shared) {
             int result = display_gpu_frame(*gpu);
             if (result < 0) {
                 agent_log("shared GPU session ended (%d)", result);
-                if (result == -1) { display_gpu_destroy(*gpu); *gpu = NULL; }
+                if (result == -1) {
+                    display_gpu_destroy(*gpu);
+                    *gpu = NULL;
+                    display_config_fallback(drm_fd, config);
+                }
                 break;
             }
+            if (result > 0) {
+                config->reconnect_until = 0;
+                if (config->resize_until && width == config->current.width && height == config->current.height)
+                    config->resize_until = 0;
+            }
         } else {
+            if (config->reconnect_until && display_time_ms() - connected >= 1000)
+                display_config_fallback(drm_fd, config);
             const void *pixels = NULL;
             struct capture_ctx fallback = {.fd = drm_fd, .dma_fd = -1};
             int result = display_gpu_readback(*gpu, &pixels, &fallback.width,
@@ -741,6 +901,7 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu)
                 agent_log("GPU unavailable; returning to software display capture");
                 display_gpu_destroy(*gpu);
                 *gpu = NULL;
+                display_config_fallback(drm_fd, config);
             } else if (result > 0) {
                 fallback.mem = (uint8_t *)pixels;
                 if (send_frame(client_fd, &fallback, ++seq) < 0) break;
@@ -767,6 +928,8 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu)
             clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
         }
     }
+    if (shared && *gpu && !config->reconnect_until)
+        config->reconnect_until = display_time_ms() + 10000;
     display_gpu_disconnect(*gpu);
     drm_release_fb(&ctx);
 }
@@ -848,6 +1011,10 @@ int main(int argc, char **argv)
     display_wait_runtime();
     int drm_fd = capture_open();
     if (drm_fd < 0) return 1;
+    struct display_config config = {0};
+    config.supported = drmIoctl(drm_fd, DRM_IOCTL_ASB_DISPLAY_CONFIG, &config.current) == 0;
+    config.fallback = config.current;
+    config.fallback.flags = 0;
     struct display_gpu *gpu = display_gpu_create(drm_fd);
     agent_log("GPU presenter: %s", gpu ? "ready" : "unavailable");
     sd_notify(0, "READY=1");
@@ -860,7 +1027,9 @@ int main(int argc, char **argv)
         if (gpu && !display_gpu_healthy(gpu)) {
             display_gpu_destroy(gpu);
             gpu = NULL;
+            display_config_fallback(drm_fd, &config);
         }
+        display_config_expire(drm_fd, &config, -1, 0);
         struct pollfd pending = {.fd = srv, .events = POLLIN};
         if (poll(&pending, 1, 1000) <= 0) continue;
         struct sockaddr_vm peer;
@@ -874,7 +1043,7 @@ int main(int argc, char **argv)
         agent_log("client connected (cid=%u)", peer.svm_cid);
         struct timeval timeout = {.tv_sec = 2};
         setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-        capture_loop(c, drm_fd, &gpu);
+        capture_loop(c, drm_fd, &gpu, &config);
         close(c);
     }
 

@@ -208,7 +208,7 @@ static BOOL idd_modifier_down(NSEventModifierFlags flags, unsigned short kc) {
 static int idd_input_versions(int fd, volatile int *stop, int *keyboardVersion, int *mouseVersion) {
     InputPacket queries[] = {
         { INPUT_MAGIC, INPUT_KEYBOARD_QUERY, INPUT_KEYBOARD_VERSION, arc4random() | 1u, 0 },
-        { INPUT_MAGIC, INPUT_MOUSE_QUERY, INPUT_MOUSE_VERSION, arc4random() | 1u, 0 }
+        { INPUT_MAGIC, INPUT_MOUSE_QUERY, INPUT_MOUSE_NORMALIZED_VERSION, arc4random() | 1u, 0 }
     };
     uint8_t received[sizeof(uint32_t) + sizeof(InputPacket)];
     size_t sent = 0, count = 0;
@@ -259,16 +259,17 @@ static int idd_input_versions(int fd, volatile int *stop, int *keyboardVersion, 
                         *keyboardVersion = reply.param1 == INPUT_KEYBOARD_VERSION ? INPUT_KEYBOARD_VERSION : 1;
                         keyboardReplied = YES;
                     } else if (reply.type == INPUT_MOUSE_REPLY && reply.param2 == queries[1].param2) {
-                        *mouseVersion = reply.param1 == INPUT_MOUSE_VERSION ? INPUT_MOUSE_VERSION : 0;
+                        *mouseVersion = reply.param1 >= INPUT_MOUSE_VERSION &&
+                            reply.param1 <= INPUT_MOUSE_NORMALIZED_VERSION ? (int)reply.param1 : 0;
                         mouseReplied = YES;
                     }
                 }
             }
         }
         if (sent == sizeof(queries) && keyboardReplied && mouseReplied)
-            return *mouseVersion == INPUT_MOUSE_VERSION && count ? 0 : 1;
+            return *mouseVersion >= INPUT_MOUSE_VERSION && count ? 0 : 1;
     }
-    if (*mouseVersion == INPUT_MOUSE_VERSION && count) return 0;
+    if (*mouseVersion >= INPUT_MOUSE_VERSION && count) return 0;
     return sent && sent < sizeof(queries) ? 0 : 1;
 }
 /* extended-key keycodes (arrows + nav + fwd-delete) */
@@ -423,7 +424,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 - (NSCursor *)appliedCursor;
 - (void)sendInput:(uint32_t)type p1:(uint32_t)p1 p2:(uint32_t)p2 p3:(uint32_t)p3;
 - (void)enqueueInputLocked:(InputPacket)packet;
-- (void)recordMoveX:(uint32_t)x y:(uint32_t)y;
+- (void)recordMoveX:(double)x y:(double)y width:(uint32_t)width height:(uint32_t)height;
 - (void)flushMove;
 - (BOOL)recordRelativeMove:(NSEvent *)event;
 - (void)releaseMouseCapture;
@@ -496,7 +497,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
        events than the guest can inject, so we keep only the latest position and emit at most
        one move per render tick; discrete events flush the pending move first to keep ordering. */
     int               _hasMove;
-    uint32_t          _moveX, _moveY;
+    double            _moveX, _moveY;
+    uint32_t          _moveWidth, _moveHeight;
     double            _relativeX, _relativeY;
     NSTimeInterval    _mousePositionDeadline, _mousePositionResumeTime;
 
@@ -951,7 +953,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
 - (void)beginMousePosition {
     pthread_mutex_lock(&_inqLock);
-    if (!_inputReady || _mouseVersion != INPUT_MOUSE_VERSION || !_relativeMouse ||
+    if (!_inputReady || _mouseVersion < INPUT_MOUSE_VERSION || !_relativeMouse ||
         _mouseCaptureConnection != _inputConnection) {
         pthread_mutex_unlock(&_inqLock);
         [self releaseMouseCapture];
@@ -1019,7 +1021,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
 - (void)updateMouseCapture {
     pthread_mutex_lock(&_inqLock);
-    BOOL ready = _inputReady && _mouseVersion == INPUT_MOUSE_VERSION &&
+    BOOL ready = _inputReady && _mouseVersion >= INPUT_MOUSE_VERSION &&
         ((!_relativeMouse && !_mousePositionRequest) || _mouseCaptureConnection == _inputConnection);
     pthread_mutex_unlock(&_inqLock);
     pthread_mutex_lock(&_curLock);
@@ -1316,8 +1318,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
     }
 }
 
-- (uint32_t)frameWidth  { return _fbW; }
-- (uint32_t)frameHeight { return _fbH; }
+- (uint32_t)frameWidth  { return _frontValid ? _surfW : 0; }
+- (uint32_t)frameHeight { return _frontValid ? _surfH : 0; }
 
 #pragma mark - Cursor access (main thread, render timer)
 
@@ -1371,9 +1373,10 @@ static __weak IddDisplayWindow *g_mouseOwner;
     pthread_cond_signal(&_inqCond);
 }
 
-- (void)recordMoveX:(uint32_t)x y:(uint32_t)y {
+- (void)recordMoveX:(double)x y:(double)y width:(uint32_t)width height:(uint32_t)height {
     if (_mousePositionRequest) return;
     _moveX = x; _moveY = y; _hasMove = 1;
+    _moveWidth = width; _moveHeight = height;
 }
 - (void)flushMove {
     if (_mousePositionRequest) return;
@@ -1385,7 +1388,17 @@ static __weak IddDisplayWindow *g_mouseOwner;
         if (dx || dy) [self sendInput:INPUT_MOUSE_RELATIVE p1:(uint32_t)dx p2:(uint32_t)dy p3:0];
         return;
     }
-    if (_hasMove) { _hasMove = 0; [self sendInput:INPUT_MOUSE_MOVE p1:_moveX p2:_moveY p3:0]; }
+    if (_hasMove) {
+        _hasMove = 0;
+        pthread_mutex_lock(&_inqLock);
+        BOOL normalized = _mouseVersion >= INPUT_MOUSE_NORMALIZED_VERSION;
+        InputPacket pkt = { INPUT_MAGIC, INPUT_MOUSE_MOVE,
+            (uint32_t)(_moveX * (normalized ? INPUT_MOUSE_ABSOLUTE_MAX : _moveWidth - 1)),
+            (uint32_t)(_moveY * (normalized ? INPUT_MOUSE_ABSOLUTE_MAX : _moveHeight - 1)),
+            normalized ? INPUT_MOUSE_NORMALIZED : 0 };
+        if (_inputReady && !_stop) [self enqueueInputLocked:pkt];
+        pthread_mutex_unlock(&_inqLock);
+    }
 }
 
 #pragma mark - Reader threads (frame + input)
@@ -1704,7 +1717,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
                 if ((move && (moveGeneration != _mouseMoveGeneration || _mousePositionRequest)) ||
                     (batch[i].type == INPUT_MOUSE_MOVE && _relativeMouse) ||
                     (batch[i].type == INPUT_MOUSE_RELATIVE &&
-                        (!_relativeMouse || _mouseVersion != INPUT_MOUSE_VERSION)) ||
+                        (!_relativeMouse || _mouseVersion < INPUT_MOUSE_VERSION)) ||
                     (batch[i].type == INPUT_MOUSE_POSITION_QUERY &&
                         (!_mousePositionRequest || batch[i].param1 != _mousePositionRequest))) {
                     pthread_mutex_unlock(&_inqLock);
@@ -2598,7 +2611,7 @@ static CGRect idd_letterbox(double viewW, double viewH, double frameW, double fr
     double ny = (lb.origin.y + lb.size.height - p.y) / lb.size.height;   /* y-up view -> top-down guest */
     if (nx < 0) nx = 0; if (nx > 1) nx = 1;
     if (ny < 0) ny = 0; if (ny > 1) ny = 1;
-    [o recordMoveX:(uint32_t)(nx * (gw - 1)) y:(uint32_t)(ny * (gh - 1))];
+    [o recordMoveX:nx y:ny width:gw height:gh];
 }
 - (void)mouseMoved:(NSEvent *)e        { [self recordMove:e]; }
 - (void)mouseDragged:(NSEvent *)e      { [self recordMove:e]; }

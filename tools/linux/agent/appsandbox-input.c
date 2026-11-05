@@ -321,15 +321,17 @@ static void emit_syn(int fd) { emit(fd, EV_SYN, SYN_REPORT, 0); }
 
 /* ---- Event translation ---- */
 
-static void do_mouse_move(int ui_fd, uint32_t x, uint32_t y, int after_relative)
+static void do_mouse_move(int ui_fd, uint32_t x, uint32_t y,
+                          int normalized, int after_relative)
 {
-    /* Host gives us pixel coordinates in the current frame. Map to
-     * 0..ABS_RANGE so the compositor scales correctly regardless of
-     * the actual screen size. */
-    int32_t ax = (int32_t)((uint64_t)x * ABS_RANGE / (g_frame_w ? g_frame_w : 1));
-    int32_t ay = (int32_t)((uint64_t)y * ABS_RANGE / (g_frame_h ? g_frame_h : 1));
-    if (ax < 0) ax = 0; if (ax > ABS_RANGE) ax = ABS_RANGE;
-    if (ay < 0) ay = 0; if (ay > ABS_RANGE) ay = ABS_RANGE;
+    uint32_t range_x = normalized ? INPUT_MOUSE_ABSOLUTE_MAX : (uint32_t)g_frame_w;
+    uint32_t range_y = normalized ? INPUT_MOUSE_ABSOLUTE_MAX : (uint32_t)g_frame_h;
+    int32_t ax = (int32_t)((uint64_t)x * ABS_RANGE / range_x);
+    int32_t ay = (int32_t)((uint64_t)y * ABS_RANGE / range_y);
+    if (ax < 0) ax = 0;
+    if (ax > ABS_RANGE) ax = ABS_RANGE;
+    if (ay < 0) ay = 0;
+    if (ay > ABS_RANGE) ay = ABS_RANGE;
     if (after_relative) {
         /* EV_ABS filters unchanged values. Keep the reset in the same SYN frame. */
         emit(ui_fd, EV_ABS, ABS_X, ax ? ax - 1 : 1);
@@ -532,7 +534,13 @@ static void serve(int client_fd, int ui_fd)
         }
         switch (pkt.type) {
         case INPUT_MOUSE_MOVE:
-            do_mouse_move(ui_fd, pkt.param1, pkt.param2, after_relative);
+            if (pkt.param3 != 0 &&
+                (pkt.param3 != INPUT_MOUSE_NORMALIZED ||
+                 mouse_version < INPUT_MOUSE_NORMALIZED_VERSION ||
+                 pkt.param1 > INPUT_MOUSE_ABSOLUTE_MAX ||
+                 pkt.param2 > INPUT_MOUSE_ABSOLUTE_MAX)) break;
+            do_mouse_move(ui_fd, pkt.param1, pkt.param2,
+                          pkt.param3 == INPUT_MOUSE_NORMALIZED, after_relative);
             after_relative = 0;
             break;
         case INPUT_MOUSE_BUTTON: do_mouse_button(ui_fd, pkt.param1, pkt.param2); break;
@@ -545,14 +553,19 @@ static void serve(int client_fd, int ui_fd)
             if (pkt.param1 >= INPUT_MOUSE_VERSION && relative_fd < 0)
                 relative_fd = uinput_open_relative();
             InputPacket reply = { INPUT_MAGIC, INPUT_MOUSE_REPLY,
-                pkt.param1 >= INPUT_MOUSE_VERSION && relative_fd >= 0 ? INPUT_MOUSE_VERSION : 0,
-                pkt.param2, 0 };
+                0, pkt.param2, 0 };
+            if (relative_fd >= 0) {
+                if (pkt.param1 >= INPUT_MOUSE_NORMALIZED_VERSION)
+                    reply.param1 = INPUT_MOUSE_NORMALIZED_VERSION;
+                else if (pkt.param1 >= INPUT_MOUSE_VERSION)
+                    reply.param1 = INPUT_MOUSE_VERSION;
+            }
             if (send_exact(client_fd, &reply, sizeof(reply)) < 0) goto disconnected;
             mouse_version = reply.param1;
             break;
         }
         case INPUT_MOUSE_RELATIVE:
-            if (mouse_version == INPUT_MOUSE_VERSION && pkt.param3 == 0) {
+            if (mouse_version >= INPUT_MOUSE_VERSION && pkt.param3 == 0) {
                 emit(relative_fd, EV_REL, REL_X, (int32_t)pkt.param1);
                 emit(relative_fd, EV_REL, REL_Y, (int32_t)pkt.param2);
                 emit_syn(relative_fd);
@@ -560,7 +573,7 @@ static void serve(int client_fd, int ui_fd)
             }
             break;
         case INPUT_MOUSE_POSITION_QUERY: {
-            if (mouse_version != INPUT_MOUSE_VERSION || pkt.param2 || pkt.param3) break;
+            if (mouse_version < INPUT_MOUSE_VERSION || pkt.param2 || pkt.param3) break;
             InputPacket reply = { INPUT_MAGIC, INPUT_MOUSE_POSITION_REPLY,
                 (uint32_t)INT32_MIN, (uint32_t)INT32_MIN, pkt.param1 };
             get_pointer_position(&reply.param1, &reply.param2);

@@ -225,8 +225,7 @@ struct VmDisplayIdd {
     volatile LONG           resize_requested;
     volatile LONG           gpu_refresh_requested;
     CONDITION_VARIABLE      gpu_refresh_done;
-    UINT                    title_width;
-    UINT                    title_height;
+    volatile LONG           rendered_size;
     BOOL                    title_muted;
     ID3D11RenderTargetView  *rtv;
     ID3D11Texture2D         *frame_tex;
@@ -341,8 +340,6 @@ static void idd_resume_absolute_mouse(VmDisplayIdd *d, const InputPacket *reply)
 static void idd_poll_mouse_position(VmDisplayIdd *d);
 static BOOL idd_send_size_request(VmDisplayIdd *d, SOCKET s);
 static void idd_update_display_size(VmDisplayIdd *d, BOOL follow);
-static void window_to_vm_coords(HWND hwnd, int wx, int wy, UINT vm_w, UINT vm_h,
-                                UINT *vx, UINT *vy);
 
 /* ---- Window class ---- */
 
@@ -623,7 +620,7 @@ static void idd_update_relative_mouse(VmDisplayIdd *d)
 {
     POINT pt = {0};
     BOOL active = !d->stop && d->frame_connected &&
-                   d->mouse_version == INPUT_MOUSE_VERSION &&
+                   d->mouse_version >= INPUT_MOUSE_VERSION &&
                    d->input_socket != INVALID_SOCKET && d->input_focused &&
                    !d->input_menu_active && !d->input_sizing &&
                    GetForegroundWindow() == d->hwnd && !IsIconic(d->hwnd) &&
@@ -666,7 +663,7 @@ static void idd_update_relative_mouse(VmDisplayIdd *d)
     }
     ReleaseSRWLockExclusive(&g_mouse_capture_lock);
     if (sync_absolute && d->frame_width && d->frame_height) {
-        if (d->mouse_version == INPUT_MOUSE_VERSION) {
+        if (d->mouse_version >= INPUT_MOUSE_VERSION) {
             if (++d->mouse_sync_id == 0) ++d->mouse_sync_id;
             d->mouse_sync_origin = pt;
             d->mouse_sync_deadline = GetTickCount64() + 250;
@@ -954,7 +951,7 @@ static void compute_letterbox(UINT client_w, UINT client_h,
 
 /* Map window client coordinates to VM framebuffer coordinates */
 static void window_to_vm_coords(HWND hwnd, int wx, int wy,
-                                 UINT vm_w, UINT vm_h,
+                                 UINT vm_w, UINT vm_h, BOOL normalized,
                                  UINT *vx, UINT *vy)
 {
     RECT rc;
@@ -971,46 +968,63 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy,
         return;
     }
 
-    local_x = ((float)wx - vp_x) / vp_w * (float)vm_w;
-    local_y = ((float)wy - vp_y) / vp_h * (float)vm_h;
+    local_x = ((float)wx - vp_x) / vp_w;
+    local_y = ((float)wy - vp_y) / vp_h;
 
     if (local_x < 0) local_x = 0;
     if (local_y < 0) local_y = 0;
-    *vx = (UINT)local_x;
-    *vy = (UINT)local_y;
-    if (*vx >= vm_w) *vx = vm_w - 1;
-    if (*vy >= vm_h) *vy = vm_h - 1;
+    if (local_x > 1) local_x = 1;
+    if (local_y > 1) local_y = 1;
+    *vx = (UINT)(local_x * (normalized ? INPUT_MOUSE_ABSOLUTE_MAX : vm_w));
+    *vy = (UINT)(local_y * (normalized ? INPUT_MOUSE_ABSOLUTE_MAX : vm_h));
+    if (!normalized) {
+        if (*vx >= vm_w) *vx = vm_w - 1;
+        if (*vy >= vm_h) *vy = vm_h - 1;
+    }
+}
+
+static void send_mouse_move(VmDisplayIdd *d, int x, int y, UINT frame_size)
+{
+    UINT width = LOWORD(frame_size), height = HIWORD(frame_size);
+    UINT vx, vy;
+    if (!width || !height) return;
+    AcquireSRWLockExclusive(&d->input_lock);
+    BOOL normalized = d->mouse_version >= INPUT_MOUSE_NORMALIZED_VERSION;
+    window_to_vm_coords(d->render_hwnd, x, y, width, height, normalized, &vx, &vy);
+    send_input_locked(d, INPUT_MOUSE_MOVE, vx, vy, normalized ? INPUT_MOUSE_NORMALIZED : 0);
+    ReleaseSRWLockExclusive(&d->input_lock);
 }
 
 static void idd_resume_absolute_mouse(VmDisplayIdd *d, const InputPacket *reply)
 {
     POINT point;
-    UINT vx, vy;
+    UINT frame_size = (UINT)InterlockedCompareExchange(&d->rendered_size, 0, 0);
+    UINT width = LOWORD(frame_size), height = HIWORD(frame_size);
     if (d->stop || !d->frame_connected || !d->input_focused ||
         d->input_menu_active || d->input_sizing || d->relative_mouse ||
-        !d->cursor_visible || !d->frame_width || !d->frame_height ||
+        !d->cursor_visible || !width || !height ||
         GetForegroundWindow() != d->hwnd || IsIconic(d->hwnd) ||
         !GetCursorPos(&point) || WindowFromPoint(point) != d->render_hwnd) {
         idd_cancel_mouse_sync(d);
         return;
     }
 
-    if (reply && reply->param1 < d->frame_width && reply->param2 < d->frame_height) {
+    if (reply && reply->param1 < width && reply->param2 < height) {
         RECT rc;
-        float x, y, width, height;
+        float x, y, vp_width, vp_height;
         LONG dx = point.x - d->mouse_sync_origin.x;
         LONG dy = point.y - d->mouse_sync_origin.y;
         if (GetClientRect(d->render_hwnd, &rc) && !IsRectEmpty(&rc)) {
-            compute_letterbox(rc.right, rc.bottom, d->frame_width, d->frame_height,
-                              &x, &y, &width, &height);
+            compute_letterbox(rc.right, rc.bottom, width, height,
+                              &x, &y, &vp_width, &vp_height);
             POINT target = {
-                (LONG)(x + (reply->param1 + 0.5f) * width / d->frame_width) + dx,
-                (LONG)(y + (reply->param2 + 0.5f) * height / d->frame_height) + dy
+                (LONG)(x + (reply->param1 + 0.5f) * vp_width / width) + dx,
+                (LONG)(y + (reply->param2 + 0.5f) * vp_height / height) + dy
             };
             if (target.x < (LONG)x) target.x = (LONG)x;
             if (target.y < (LONG)y) target.y = (LONG)y;
-            if (target.x >= (LONG)(x + width)) target.x = (LONG)(x + width) - 1;
-            if (target.y >= (LONG)(y + height)) target.y = (LONG)(y + height) - 1;
+            if (target.x >= (LONG)(x + vp_width)) target.x = (LONG)(x + vp_width) - 1;
+            if (target.y >= (LONG)(y + vp_height)) target.y = (LONG)(y + vp_height) - 1;
             if (ClientToScreen(d->render_hwnd, &target)) {
                 SetCursorPos(target.x, target.y);
                 GetCursorPos(&point);
@@ -1019,9 +1033,7 @@ static void idd_resume_absolute_mouse(VmDisplayIdd *d, const InputPacket *reply)
     }
     d->mouse_sync_pending = FALSE;
     ScreenToClient(d->render_hwnd, &point);
-    window_to_vm_coords(d->render_hwnd, point.x, point.y,
-                        d->frame_width, d->frame_height, &vx, &vy);
-    send_input(d, INPUT_MOUSE_MOVE, vx, vy, 0);
+    send_mouse_move(d, point.x, point.y, frame_size);
     SetCursor(d->guest_cursor ? d->guest_cursor : LoadCursorW(NULL, IDC_ARROW));
 }
 
@@ -1160,7 +1172,7 @@ static SOCKET connect_input(VmDisplayIdd *d)
     UINT32 ready = 0;
     InputPacket queries[] = {
         { INPUT_MAGIC, INPUT_KEYBOARD_QUERY, INPUT_KEYBOARD_VERSION, 0, 0 },
-        { INPUT_MAGIC, INPUT_MOUSE_QUERY, INPUT_MOUSE_VERSION, 0, 0 }
+        { INPUT_MAGIC, INPUT_MOUSE_QUERY, INPUT_MOUSE_NORMALIZED_VERSION, 0, 0 }
     };
     InputPacket reply = {0};
     int got = 0, version = 1, mouse_version = 0;
@@ -1206,8 +1218,9 @@ static SOCKET connect_input(VmDisplayIdd *d)
                         version = INPUT_KEYBOARD_VERSION;
                 } else if (reply.type == INPUT_MOUSE_REPLY) {
                     mouse_reply = TRUE;
-                    if (reply.param1 == INPUT_MOUSE_VERSION)
-                        mouse_version = INPUT_MOUSE_VERSION;
+                    if (reply.param1 >= INPUT_MOUSE_VERSION &&
+                        reply.param1 <= INPUT_MOUSE_NORMALIZED_VERSION)
+                        mouse_version = (int)reply.param1;
                 }
             }
             got = 0;
@@ -1721,7 +1734,8 @@ static BOOL idd_shared_start_linux(VmDisplayIdd *d, SOCKET socket,
         context = NULL;
         d->shared_width = caps->width;
         d->shared_height = caps->height;
-        d->shared_resize = FALSE;
+        d->shared_resize = (caps->reserved & DISPLAY_GPU_CAP_RESIZE) != 0;
+        d->guest_size_mode = caps->slot == DISPLAY_SIZE_WINDOW ? DISPLAY_SIZE_WINDOW : DISPLAY_SIZE_GUEST;
     }
     LeaveCriticalSection(&d->frame_cs);
     DisplayGpuPacket reply = *caps;
@@ -2356,13 +2370,13 @@ static void d3d_render_frame(VmDisplayIdd *d)
         vp.MaxDepth = 1.0f;
     }
 
-    if (frame_uploaded && d->hwnd &&
-        (d->title_width != d->frame_width || d->title_height != d->frame_height ||
-         d->title_muted != d->audio_muted)) {
-        d->title_width = d->frame_width;
-        d->title_height = d->frame_height;
-        d->title_muted = d->audio_muted;
-        PostMessageW(d->hwnd, WM_IDD_TITLE_CHANGED, 0, 0);
+    if (frame_uploaded && d->hwnd) {
+        LONG size = MAKELONG(d->frame_width, d->frame_height);
+        if (InterlockedExchange(&d->rendered_size, size) != size ||
+            d->title_muted != d->audio_muted) {
+            d->title_muted = d->audio_muted;
+            PostMessageW(d->hwnd, WM_IDD_TITLE_CHANGED, 0, 0);
+        }
     }
     d->ctx->lpVtbl->OMSetRenderTargets(d->ctx, 1, &d->rtv, NULL);
     d->ctx->lpVtbl->RSSetViewports(d->ctx, 1, &vp);
@@ -2754,7 +2768,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             query.type = DISPLAY_GPU_QUERY;
             query.version = DISPLAY_GPU_VERSION;
             query.reserved = _wcsicmp(d->os_type, L"windows") == 0
-                ? DISPLAY_GPU_CAP_RESIZE : DISPLAY_GPU_CAP_FENCE;
+                ? DISPLAY_GPU_CAP_RESIZE : DISPLAY_GPU_CAP_FENCE | DISPLAY_GPU_CAP_RESIZE;
             query.session = ((UINT64)GetCurrentProcessId() << 32) |
                             (UINT32)InterlockedIncrement(&gpu_session_id);
             d->shared_session = query.session;
@@ -2835,6 +2849,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     if (packet.status != S_OK) {
                         d->size_reconnect_until = 0;
                         idd_log(d, L"Display resize rejected (0x%08X).", packet.status);
+                        if (broker) PostMessageW(d->hwnd, WM_IDD_DISPLAY_SIZE, TRUE, packet.status);
+                    } else if (broker && packet.slot <= DISPLAY_SIZE_WINDOW) {
+                        EnterCriticalSection(&d->frame_cs);
+                        d->guest_size_mode = packet.slot;
+                        LeaveCriticalSection(&d->frame_cs);
                     }
                 } else {
                     break;
@@ -3530,6 +3549,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
 
     case WM_IDD_DISPLAY_SIZE:
+        if (d && lp) d->size_mode = DISPLAY_SIZE_GUEST;
         if (d && (wp || d->size_mode == DISPLAY_SIZE_WINDOW || d->guest_size_mode != DISPLAY_SIZE_GUEST))
             idd_update_display_size(d, wp != 0);
         return 0;
@@ -3561,9 +3581,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_IDD_TITLE_CHANGED:
         if (d) {
             wchar_t title[300];
+            UINT size = (UINT)InterlockedCompareExchange(&d->rendered_size, 0, 0);
             swprintf_s(title, ARRAYSIZE(title), L"%s%s Display %ux%u",
                 d->audio_muted ? L"\U0001F507 " : L"",
-                d->vm_name, d->frame_width, d->frame_height);
+                d->vm_name, (UINT)LOWORD(size), (UINT)HIWORD(size));
             SetWindowTextW(hwnd, title);
         }
         return 0;
@@ -3660,7 +3681,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_INPUT:
         if (d && d->relative_mouse && d->input_focused &&
             d->frame_connected && !d->cursor_visible &&
-            d->mouse_version == INPUT_MOUSE_VERSION &&
+            d->mouse_version >= INPUT_MOUSE_VERSION &&
             GetForegroundWindow() == hwnd) {
             RAWINPUT raw = {0};
             UINT size = sizeof(raw);
@@ -3707,12 +3728,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (!d->relative_mouse && !d->cursor_visible)
                 idd_update_relative_mouse(d);
 
-            if (!d->relative_mouse && !d->mouse_sync_pending && d->frame_width && d->frame_height) {
-                UINT vx, vy;
-                window_to_vm_coords(d->render_hwnd,
-                                    (int)(short)LOWORD(lp), (int)(short)HIWORD(lp),
-                                    d->frame_width, d->frame_height, &vx, &vy);
-                send_input(d, INPUT_MOUSE_MOVE, vx, vy, 0);
+            if (!d->relative_mouse && !d->mouse_sync_pending) {
+                UINT size = (UINT)InterlockedCompareExchange(&d->rendered_size, 0, 0);
+                send_mouse_move(d, (int)(short)LOWORD(lp), (int)(short)HIWORD(lp), size);
             }
         }
         return 0;

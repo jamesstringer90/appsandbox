@@ -11,14 +11,18 @@
  * detailed-timing descriptor; checksum byte is patched at the end.
  */
 
+#include <linux/capability.h>
+
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
+#include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_probe_helper.h>
 
 #include "asb_drm.h"
+#include "asb_drm_uapi.h"
 
 /* --------------------------------------------------------------------------
  * EDID builder
@@ -158,55 +162,147 @@ void asb_build_edid(struct asb_device *asb)
 static int asb_connector_get_modes(struct drm_connector *connector)
 {
 	struct asb_device *asb = to_asb(connector->dev);
+	static const struct { unsigned int width, height; } sizes[] = {
+		{ 1920, 1080 }, { 1024, 768 }, { 1280, 720 }, { 1280, 800 },
+		{ 1280, 1024 }, { 1366, 768 }, { 1440, 900 }, { 1600, 900 },
+		{ 1680, 1050 }, { 1920, 1200 }, { 2560, 1440 }, { 2560, 1600 },
+		{ 3440, 1440 }, { 3840, 2160 }, { 5120, 1440 }, { 5120, 2880 },
+		{ 7680, 4320 },
+	};
 	struct drm_display_mode *m;
+	u32 flags, width, height;
+	unsigned int i, refresh;
 	int count = 0;
+
+	mutex_lock(&asb->display_lock);
+	flags = asb->display_flags;
+	width = asb->display_width;
+	height = asb->display_height;
+	mutex_unlock(&asb->display_lock);
+	refresh = flags & ASB_DRM_DISPLAY_SHARED ? asb->refresh : min(asb->refresh, 60u);
 
 	drm_connector_update_edid_property(connector,
 	                                   (const struct edid *)asb->edid);
 
-	/* Preferred mode first — what the EDID DTD also points at. */
-	m = drm_cvt_mode(connector->dev,
-	                 asb->width, asb->height, asb->refresh,
+	m = drm_cvt_mode(connector->dev, roundup(width, 8), height, refresh,
 	                 false, false, false);
 	if (m) {
+		m->hdisplay = width;
+		drm_mode_set_name(m);
 		m->type |= DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER;
 		drm_mode_probed_add(connector, m);
 		count++;
 	}
 
-	/* Common fallbacks. Mutter typically ignores these unless the user
-	 * explicitly switches resolution, but they're cheap to publish. */
-	{
-		static const struct { int w, h, hz; } fallbacks[] = {
-			{ 2560, 1440, 60 },
-			{ 1920, 1200, 60 },
-			{ 1680, 1050, 60 },
-			{ 1280,  720, 60 },
-			{ 1024,  768, 60 },
-		};
-		size_t i;
-
-		for (i = 0; i < ARRAY_SIZE(fallbacks); i++) {
-			if (fallbacks[i].w == (int)asb->width &&
-			    fallbacks[i].h == (int)asb->height)
-				continue;
-			m = drm_cvt_mode(connector->dev,
-			                 fallbacks[i].w, fallbacks[i].h,
-			                 fallbacks[i].hz,
-			                 false, false, false);
-			if (m) {
-				m->type |= DRM_MODE_TYPE_DRIVER;
-				drm_mode_probed_add(connector, m);
-				count++;
-			}
+	if (flags & ASB_DRM_DISPLAY_MATCH_WINDOW)
+		return count;
+	for (i = 0; i < ARRAY_SIZE(sizes); i++) {
+		if ((sizes[i].width == width && sizes[i].height == height && refresh == 60) ||
+		    (!(flags & ASB_DRM_DISPLAY_SHARED) &&
+		     (sizes[i].width > 1920 || sizes[i].height > 1080)))
+			continue;
+		m = drm_cvt_mode(connector->dev, roundup(sizes[i].width, 8),
+		                 sizes[i].height, 60, false, false, false);
+		if (m) {
+			m->hdisplay = sizes[i].width;
+			drm_mode_set_name(m);
+			m->type |= DRM_MODE_TYPE_DRIVER;
+			drm_mode_probed_add(connector, m);
+			count++;
 		}
 	}
 
 	return count;
 }
 
+static enum drm_mode_status asb_connector_mode_valid(struct drm_connector *connector,
+                                                      const struct drm_display_mode *mode)
+{
+	struct asb_device *asb = to_asb(connector->dev);
+	u32 flags, width, height;
+
+	mutex_lock(&asb->display_lock);
+	flags = asb->display_flags;
+	width = asb->display_width;
+	height = asb->display_height;
+	mutex_unlock(&asb->display_lock);
+	if (mode->hdisplay < 64 || mode->vdisplay < 64 ||
+	    mode->hdisplay > ASB_MAX_WIDTH || mode->vdisplay > ASB_MAX_HEIGHT)
+		return MODE_BAD;
+	if (!(flags & ASB_DRM_DISPLAY_SHARED) &&
+	    (mode->hdisplay > 1920 || mode->vdisplay > 1080 ||
+	     (u64)mode->clock * 1000 > (u64)mode->htotal * mode->vtotal * 60))
+		return MODE_BAD;
+	if ((flags & ASB_DRM_DISPLAY_MATCH_WINDOW) &&
+	    (mode->hdisplay != width || mode->vdisplay != height))
+		return MODE_BAD;
+	return MODE_OK;
+}
+
+int asb_display_config_ioctl(struct drm_device *drm, void *data, struct drm_file *file)
+{
+	struct asb_device *asb = to_asb(drm);
+	struct drm_asb_display_config *args = data;
+	bool changed = false;
+
+	if (args->operation != ASB_DRM_DISPLAY_GET && args->operation != ASB_DRM_DISPLAY_SET)
+		return -EINVAL;
+	if (args->operation == ASB_DRM_DISPLAY_SET) {
+		if (!capable(CAP_SYS_ADMIN))
+			return -EACCES;
+		if (args->flags & ~(ASB_DRM_DISPLAY_SHARED | ASB_DRM_DISPLAY_MATCH_WINDOW) ||
+		    args->width < 64 || args->height < 64 ||
+		    args->width > ASB_MAX_WIDTH || args->height > ASB_MAX_HEIGHT ||
+		    (!(args->flags & ASB_DRM_DISPLAY_SHARED) &&
+		     (args->width > 1920 || args->height > 1080)) ||
+		    ((args->flags & ASB_DRM_DISPLAY_MATCH_WINDOW) &&
+		     (!(args->flags & ASB_DRM_DISPLAY_SHARED) || args->width < 1024 || args->height < 768)))
+			return -EINVAL;
+	}
+	mutex_lock(&asb->display_lock);
+	if (args->operation == ASB_DRM_DISPLAY_SET) {
+		if (asb->display_owner && asb->display_owner != file) {
+			mutex_unlock(&asb->display_lock);
+			return -EBUSY;
+		}
+		changed = asb->display_flags != args->flags ||
+		          asb->display_width != args->width || asb->display_height != args->height;
+		asb->display_owner = file;
+		asb->display_flags = args->flags;
+		asb->display_width = args->width;
+		asb->display_height = args->height;
+	} else {
+		args->flags = asb->display_flags;
+		args->width = asb->display_width;
+		args->height = asb->display_height;
+	}
+	mutex_unlock(&asb->display_lock);
+	if (changed)
+		drm_kms_helper_connector_hotplug_event(&asb->connector);
+	return 0;
+}
+
+void asb_display_release(struct asb_device *asb, struct drm_file *file)
+{
+	bool changed = false;
+
+	mutex_lock(&asb->display_lock);
+	if (asb->display_owner == file) {
+		changed = asb->display_flags != 0 || asb->display_width != min(asb->width, 1920u) ||
+		          asb->display_height != min(asb->height, 1080u);
+		asb->display_owner = NULL;
+		asb->display_flags = 0;
+		asb->display_width = min(asb->width, 1920u);
+		asb->display_height = min(asb->height, 1080u);
+	}
+	mutex_unlock(&asb->display_lock);
+	if (changed && !drm_dev_is_unplugged(&asb->drm))
+		drm_kms_helper_connector_hotplug_event(&asb->connector);
+}
+
 static const struct drm_connector_helper_funcs asb_connector_helper_funcs = {
 	.get_modes = asb_connector_get_modes,
+	.mode_valid = asb_connector_mode_valid,
 };
 
 static const struct drm_connector_funcs asb_connector_funcs = {
@@ -235,7 +331,6 @@ int asb_connector_init(struct asb_device *asb)
 		return ret;
 	drm_connector_helper_add(&asb->connector, &asb_connector_helper_funcs);
 
-	/* "Connected" forever — we're virtual, no hot-plug events. */
 	asb->connector.status = connector_status_connected;
 	asb->connector.interlace_allowed = false;
 	asb->connector.doublescan_allowed = false;

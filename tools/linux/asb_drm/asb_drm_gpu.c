@@ -79,13 +79,13 @@ int asb_gpu_query_ioctl(struct drm_device *drm, void *data, struct drm_file *fil
 	int (*native)(struct file *, struct file *, u32 *, u32 *, u64 *);
 
 	args->version = ASB_DRM_GPU_VERSION;
-	args->capabilities = 0;
+	args->capabilities = ASB_DRM_GPU_CAP_RESIZE;
 	args->max_width = ASB_MAX_WIDTH;
 	args->max_height = ASB_MAX_HEIGHT;
 	args->adapter_luid = 0;
 	query = symbol_get(dxgk_shared_resource_info);
 	if (query) {
-		args->capabilities = ASB_DRM_GPU_CAP_BUFFER_IMPORT;
+		args->capabilities |= ASB_DRM_GPU_CAP_BUFFER_IMPORT;
 		symbol_put(dxgk_shared_resource_info);
 	}
 	native = symbol_get(dxgk_shared_object_info);
@@ -139,6 +139,7 @@ void asb_gpu_postclose(struct drm_device *drm, struct drm_file *file)
 	mutex_unlock(&asb->gpu_lock);
 	if (event)
 		eventfd_ctx_put(event);
+	asb_display_release(asb, file);
 }
 
 void asb_gpu_fini(struct asb_device *asb)
