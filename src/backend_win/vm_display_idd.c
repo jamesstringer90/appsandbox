@@ -1270,6 +1270,9 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
     UINT32 scratch_cap = 0;
     UINT32 buf_frames = 0;
     UINT32 render_block_align = 0;
+    HANDLE render_event = NULL;
+    HANDLE audio_task = NULL;
+    DWORD audio_task_index = 0;
     AudioHeader hdr;
     BOOL stream_started = FALSE;
     BOOL session_logged = FALSE;
@@ -1278,6 +1281,7 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE)
         com_ok = TRUE;
+    audio_task = AvSetMmThreadCharacteristicsW(L"Audio", &audio_task_index);
 
     /* Outer retry loop — keep trying to connect to the guest capture helper */
     while (!d->stop) {
@@ -1354,11 +1358,10 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
         renderfmt->cbSize          = 0;
         render_block_align         = renderfmt->nBlockAlign;
 
-        /* 40ms buffer. HV socket is effectively memcpy and the guest polls
-           every 5ms, so scheduler jitter is the only thing we need to absorb. */
         hr = IAudioClient_Initialize(pAC, AUDCLNT_SHAREMODE_SHARED,
                                       AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
-                                      AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                      AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY |
+                                      AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                       400000, 0, renderfmt, NULL);
         if (FAILED(hr)) {
             idd_log(d, L"Audio: IAudioClient::Initialize failed 0x%08lX.", hr);
@@ -1371,23 +1374,22 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
         hr = IAudioClient_GetService(pAC, &AUDIO_IID_IAudioRenderClient, (void **)&pRC);
         if (FAILED(hr)) goto session_cleanup;
 
-        hr = IAudioClient_Start(pAC);
+        render_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!render_event) goto session_cleanup;
+        hr = IAudioClient_SetEventHandle(pAC, render_event);
         if (FAILED(hr)) goto session_cleanup;
-        stream_started = TRUE;
 
-        idd_log(d, L"Audio render started: buf=%lu frames.", buf_frames);
+        idd_log(d, L"Audio render buffer: %lu frames.", buf_frames);
 
         /* Receive loop */
         while (!d->stop) {
             AudioFrameHeader fh;
             UINT32 frames_in_payload;
-            UINT32 padding;
-            UINT32 free_frames;
-            UINT32 frames_to_write;
-            BYTE *dst;
+            UINT32 frame_offset = 0;
 
             if (!recv_exact(d, s, &fh, sizeof(fh), TRUE)) break;
-            if (fh.bytes == 0 || fh.bytes > 4 * 1024 * 1024) break;
+            if (fh.bytes == 0 || fh.bytes > 4 * 1024 * 1024 ||
+                !render_block_align || fh.bytes % render_block_align) break;
 
             if (fh.bytes > scratch_cap) {
                 BYTE *nb = scratch
@@ -1405,20 +1407,41 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
             frames_in_payload = fh.bytes / render_block_align;
             if (frames_in_payload == 0) continue;
 
-            /* Push into WASAPI buffer; drop if no room (low-latency, no stalling) */
-            hr = IAudioClient_GetCurrentPadding(pAC, &padding);
-            if (FAILED(hr)) break;
-            free_frames = buf_frames - padding;
-            frames_to_write = frames_in_payload;
-            if (frames_to_write > free_frames)
-                frames_to_write = free_frames;
-            if (frames_to_write == 0)
-                continue;
-
-            hr = IAudioRenderClient_GetBuffer(pRC, frames_to_write, &dst);
-            if (FAILED(hr)) break;
-            memcpy(dst, scratch, (size_t)frames_to_write * render_block_align);
-            IAudioRenderClient_ReleaseBuffer(pRC, frames_to_write, 0);
+            while (frame_offset < frames_in_payload && !d->stop && !d->audio_muted) {
+                UINT32 padding, free_frames, frames_to_write;
+                BYTE *dst;
+                hr = IAudioClient_GetCurrentPadding(pAC, &padding);
+                if (FAILED(hr) || padding > buf_frames) goto session_cleanup;
+                if (padding == 0 && buf_frames > 1) {
+                    UINT32 lead_frames = buf_frames / 2;
+                    hr = IAudioRenderClient_GetBuffer(pRC, lead_frames, &dst);
+                    if (FAILED(hr)) goto session_cleanup;
+                    hr = IAudioRenderClient_ReleaseBuffer(pRC, lead_frames, AUDCLNT_BUFFERFLAGS_SILENT);
+                    if (FAILED(hr)) goto session_cleanup;
+                    padding = lead_frames;
+                }
+                free_frames = buf_frames - padding;
+                if (!free_frames) {
+                    DWORD wait = WaitForSingleObject(render_event, 100);
+                    if (wait == WAIT_FAILED) goto session_cleanup;
+                    continue;
+                }
+                frames_to_write = frames_in_payload - frame_offset;
+                if (frames_to_write > free_frames) frames_to_write = free_frames;
+                hr = IAudioRenderClient_GetBuffer(pRC, frames_to_write, &dst);
+                if (FAILED(hr)) goto session_cleanup;
+                memcpy(dst, scratch + (size_t)frame_offset * render_block_align,
+                    (size_t)frames_to_write * render_block_align);
+                hr = IAudioRenderClient_ReleaseBuffer(pRC, frames_to_write, 0);
+                if (FAILED(hr)) goto session_cleanup;
+                frame_offset += frames_to_write;
+                if (!stream_started) {
+                    ResetEvent(render_event);
+                    hr = IAudioClient_Start(pAC);
+                    if (FAILED(hr)) goto session_cleanup;
+                    stream_started = TRUE;
+                }
+            }
         }
 
 session_cleanup:
@@ -1428,6 +1451,7 @@ session_cleanup:
         }
         if (pRC)    { IAudioRenderClient_Release(pRC);    pRC = NULL; }
         if (pAC)    { IAudioClient_Release(pAC);          pAC = NULL; }
+        if (render_event) { CloseHandle(render_event); render_event = NULL; }
         if (pDev)   { IMMDevice_Release(pDev);            pDev = NULL; }
         if (pEnum)  { IMMDeviceEnumerator_Release(pEnum); pEnum = NULL; }
         if (renderfmt) { CoTaskMemFree(renderfmt); renderfmt = NULL; }
@@ -1451,6 +1475,7 @@ session_cleanup:
     }
 
     if (scratch) HeapFree(GetProcessHeap(), 0, scratch);
+    if (audio_task) AvRevertMmThreadCharacteristics(audio_task);
     if (com_ok)  CoUninitialize();
     return 0;
 }
