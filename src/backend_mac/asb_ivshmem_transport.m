@@ -242,6 +242,11 @@ typedef struct {
 
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) { ASB_RELEASE_SLOT(); return -1; }
+    int noSigpipe = 1;
+    if (setsockopt(sp[0], SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, sizeof(noSigpipe)) != 0 ||
+        setsockopt(sp[1], SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, sizeof(noSigpipe)) != 0) {
+        close(sp[0]); close(sp[1]); ASB_RELEASE_SLOT(); return -1;
+    }
     /* The pump owns sp[1] and services BOTH directions on one thread; make its end non-blocking so a
      * backed-up guest->host write can never wedge the thread and starve host->guest. */
     fcntl(sp[1], F_SETFL, fcntl(sp[1], F_GETFL, 0) | O_NONBLOCK);

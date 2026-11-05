@@ -991,6 +991,13 @@ static void refresh_ldconfig_for_mounts(char (*paths)[1024], int n_paths)
     agent_log("ldconfig refreshed (%d paths, rc=%d)", n_paths, rc);
 }
 
+static void gpu_runtime_ready(void)
+{
+    if (mkdir("/run/appsandbox", 0755) < 0 && errno != EEXIST) return;
+    int ready = open("/run/appsandbox/gpu-ready", O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (ready >= 0) close(ready);
+}
+
 static void handle_gpu_query_response(int fd, int n_shares)
 {
     if (n_shares <= 0 || n_shares > 64) {
@@ -1041,6 +1048,7 @@ static void handle_gpu_query_response(int fd, int n_shares)
 
     if (n_ldpaths > 0)
         refresh_ldconfig_for_mounts(ldpaths, n_ldpaths);
+    gpu_runtime_ready();
 
     /* Status reply to host. vm_agent.c just logs it; we send anyway so
      * the host log line "GPU copy complete for ..." fires and the user
@@ -1136,7 +1144,7 @@ static void handle_client(int fd)
             /* No reply — host sends this fire-and-forget */
         }
         else if (strcmp(cmd, "gpu_none") == 0) {
-            /* Host reports no GPU-PV assignment — nothing to do */
+            gpu_runtime_ready();
         }
         else if (strcmp(cmd, "gpu_copy") == 0) {
             /* Host asks us to re-trigger the share enumeration.

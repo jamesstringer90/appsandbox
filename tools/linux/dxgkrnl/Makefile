@@ -1,29 +1,28 @@
-# Out-of-tree builder for dxgkrnl. Builds against the running kernel by
-# default; override KDIR for a specific kernel.
-#
-# Usage:
-#   make            # build dxgkrnl.ko for $(uname -r)
-#   make clean
-#   make install    # copy to /lib/modules/$(uname -r)/updates/dxgkrnl/ + depmod
-#
-# Source is vendored from microsoft/WSL2-Linux-Kernel branch
-# linux-msft-wsl-6.18.y, drivers/hv/dxgkrnl/. The Kbuild lives in src/
-# alongside the source files so the kernel build system can find the
-# .c objects via the standard out-of-tree pattern (M=$(PWD)/src).
-
 KDIR    ?= /lib/modules/$(shell uname -r)/build
 PWD     := $(shell pwd)
 INSTDIR ?= /lib/modules/$(shell uname -r)/updates/dxgkrnl
+SOURCE_TAG := $(shell sed -n 's/^[[:space:]]*"tag": "\([^"]*\)".*/\1/p' ../../../vendor/dxgkrnl/source-version.json)
+SOURCE_DIR := $(PWD)/.source
 
-all:
-	$(MAKE) -C $(KDIR) M=$(PWD)/src modules
+all: source
+	$(MAKE) modules
+
+modules:
+	$(MAKE) -C $(KDIR) M=$(SOURCE_DIR)/src modules
+
+source:
+	@test -n "$(SOURCE_TAG)"
+	@if [ ! -d "$(SOURCE_DIR)/.git" ]; then git clone --depth 1 --branch "$(SOURCE_TAG)" https://github.com/jamesstringer90/asb-dxgkrnl.git "$(SOURCE_DIR)"; fi
+	@test -z "$$(git -C "$(SOURCE_DIR)" status --porcelain --untracked-files=no)"
+	@git -C "$(SOURCE_DIR)" rev-parse --verify "refs/tags/$(SOURCE_TAG)" >/dev/null 2>&1 || git -C "$(SOURCE_DIR)" fetch --depth 1 origin "refs/tags/$(SOURCE_TAG):refs/tags/$(SOURCE_TAG)"
+	@git -C "$(SOURCE_DIR)" switch --detach "refs/tags/$(SOURCE_TAG)"
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD)/src clean
+	@if [ -d "$(SOURCE_DIR)/src" ]; then $(MAKE) -C $(KDIR) M=$(SOURCE_DIR)/src clean; fi
 
 install: all
 	install -d $(INSTDIR)
-	install -m 0644 src/dxgkrnl.ko $(INSTDIR)/
+	install -m 0644 $(SOURCE_DIR)/src/dxgkrnl.ko $(INSTDIR)/
 	depmod -a $(shell uname -r)
 
-.PHONY: all clean install
+.PHONY: all source modules clean install

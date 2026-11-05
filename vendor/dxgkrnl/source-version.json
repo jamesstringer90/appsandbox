@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/jamesstringer90/asb-dxgkrnl.git",
+  "tag": "2026-11-04",
+  "upstreamTag": "linux-msft-wsl-6.18.58.1",
+  "revision": "1768e385551439639cd487616cd8dd9d925f2c77",
+  "moduleVersion": "2.0.3.20261027",
+  "sourceDirectory": "src"
+}

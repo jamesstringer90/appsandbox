@@ -2895,16 +2895,20 @@ int wmain(int argc, wchar_t *argv[])
     }
 
     if (_wcsicmp(argv[1], L"--prefetch-repo") == 0) {
-        const wchar_t *branch = NULL, *out_dir = NULL;
+        const wchar_t *tag = NULL, *mesa_tag = NULL, *dxgkrnl_tag = NULL, *out_dir = NULL;
+        const wchar_t *cache_dir = NULL;
         for (int i = 2; i < argc; i++) {
-            if (_wcsicmp(argv[i], L"--branch") == 0 && i + 1 < argc) branch = argv[++i];
+            if (_wcsicmp(argv[i], L"--tag") == 0 && i + 1 < argc) tag = argv[++i];
+            else if (_wcsicmp(argv[i], L"--mesa-tag") == 0 && i + 1 < argc) mesa_tag = argv[++i];
+            else if (_wcsicmp(argv[i], L"--dxgkrnl-tag") == 0 && i + 1 < argc) dxgkrnl_tag = argv[++i];
+            else if (_wcsicmp(argv[i], L"--cache-dir") == 0 && i + 1 < argc) cache_dir = argv[++i];
             else if (_wcsicmp(argv[i], L"--out-dir") == 0 && i + 1 < argc) out_dir = argv[++i];
         }
-        if (!branch || !out_dir) {
-            log_err(L"--prefetch-repo requires --branch and --out-dir");
+        if (!tag || !mesa_tag || !dxgkrnl_tag || !out_dir) {
+            log_err(L"--prefetch-repo requires --tag, --mesa-tag, --dxgkrnl-tag, and --out-dir");
             return 1;
         }
-        return do_prefetch_repo(branch, out_dir);
+        return do_prefetch_repo(tag, mesa_tag, dxgkrnl_tag, cache_dir, out_dir);
     }
 
     if (_wcsicmp(argv[1], L"--prefetch-wsl-deps") == 0) {

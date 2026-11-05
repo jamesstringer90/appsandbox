@@ -2,13 +2,15 @@
 Description=App Sandbox display daemon (KMS framebuffer capture → vsock :2)
 Documentation=https://github.com/jamesstringer90/appsandbox
 After=appsandbox-agent.service
+Before=display-manager.service
 # No After=graphical.target — that introduces an ordering cycle with
 # multi-user.target on Desktop installs (multi-user→ppd→graphical→us).
 # The daemon polls /dev/dri/cardN itself and retries until the active
 # plane fb_id is non-zero, so it tolerates starting before GDM.
 
 [Service]
-Type=simple
+Type=notify
+TimeoutStartSec=20
 ExecStart=/usr/local/bin/appsandbox-display
 Restart=always
 RestartSec=3

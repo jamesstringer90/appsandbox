@@ -208,7 +208,7 @@ static BOOL idd_modifier_down(NSEventModifierFlags flags, unsigned short kc) {
 static int idd_input_versions(int fd, volatile int *stop, int *keyboardVersion, int *mouseVersion) {
     InputPacket queries[] = {
         { INPUT_MAGIC, INPUT_KEYBOARD_QUERY, INPUT_KEYBOARD_VERSION, arc4random() | 1u, 0 },
-        { INPUT_MAGIC, INPUT_MOUSE_QUERY, INPUT_MOUSE_VERSION, arc4random() | 1u, 0 }
+        { INPUT_MAGIC, INPUT_MOUSE_QUERY, INPUT_MOUSE_NORMALIZED_VERSION, arc4random() | 1u, 0 }
     };
     uint8_t received[sizeof(uint32_t) + sizeof(InputPacket)];
     size_t sent = 0, count = 0;
@@ -259,16 +259,17 @@ static int idd_input_versions(int fd, volatile int *stop, int *keyboardVersion, 
                         *keyboardVersion = reply.param1 == INPUT_KEYBOARD_VERSION ? INPUT_KEYBOARD_VERSION : 1;
                         keyboardReplied = YES;
                     } else if (reply.type == INPUT_MOUSE_REPLY && reply.param2 == queries[1].param2) {
-                        *mouseVersion = reply.param1 == INPUT_MOUSE_VERSION ? INPUT_MOUSE_VERSION : 0;
+                        *mouseVersion = reply.param1 >= INPUT_MOUSE_VERSION &&
+                            reply.param1 <= INPUT_MOUSE_NORMALIZED_VERSION ? (int)reply.param1 : 0;
                         mouseReplied = YES;
                     }
                 }
             }
         }
         if (sent == sizeof(queries) && keyboardReplied && mouseReplied)
-            return *mouseVersion == INPUT_MOUSE_VERSION && count ? 0 : 1;
+            return *mouseVersion >= INPUT_MOUSE_VERSION && count ? 0 : 1;
     }
-    if (*mouseVersion == INPUT_MOUSE_VERSION && count) return 0;
+    if (*mouseVersion >= INPUT_MOUSE_VERSION && count) return 0;
     return sent && sent < sizeof(queries) ? 0 : 1;
 }
 /* extended-key keycodes (arrows + nav + fwd-delete) */
@@ -423,7 +424,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 - (NSCursor *)appliedCursor;
 - (void)sendInput:(uint32_t)type p1:(uint32_t)p1 p2:(uint32_t)p2 p3:(uint32_t)p3;
 - (void)enqueueInputLocked:(InputPacket)packet;
-- (void)recordMoveX:(uint32_t)x y:(uint32_t)y;
+- (void)recordMoveX:(double)x y:(double)y width:(uint32_t)width height:(uint32_t)height;
 - (void)flushMove;
 - (BOOL)recordRelativeMove:(NSEvent *)event;
 - (void)releaseMouseCapture;
@@ -436,6 +437,13 @@ static __weak IddDisplayWindow *g_mouseOwner;
 - (void)releaseHeldKeys;
 - (void)releaseKeyboardCapture;
 - (void)updateKeyboardCapture;
+- (BOOL)canMatchWindowSize;
+- (void)updateDisplaySize:(BOOL)follow;
+- (void)flushDisplaySize;
+- (void)scheduleDisplaySize;
+- (void)toggleMatchWindowSize:(id)sender;
+- (BOOL)readDisplay:(int)fd bytes:(void *)bytes length:(int)length
+            session:(uint64_t)session idle:(BOOL)idle;
 @end
 
 @implementation IddDisplayWindow {
@@ -447,6 +455,12 @@ static __weak IddDisplayWindow *g_mouseOwner;
     volatile uint32_t _fbSeq;       /* bumped on each applied frame */
     uint32_t          _renderSeq;   /* last _fbSeq uploaded to the GPU */
     pthread_mutex_t   _fbLock;
+    BOOL              _matchWindow, _followDisplaySize, _adjustingDisplaySize, _fullscreenSizing;
+    BOOL              _resizeSupported, _hasDisplayFrame, _displaySizing;
+    uint32_t          _guestSizeMode, _displayGeneration;
+    uint64_t          _displaySession;
+    DisplayGpuPacket  _sizeRequest, _lastSizeRequest;
+    NSSize            _normalMinSize, _normalMaxSize;
 
     /* Metal GPU render (zero-copy, mirrors the Windows D3D11 path). The reconstructed frame is copied
        ONCE into a pool of IOSurface-backed MTLTextures (the same Map+memcpy floor Windows has), then the
@@ -483,7 +497,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
        events than the guest can inject, so we keep only the latest position and emit at most
        one move per render tick; discrete events flush the pending move first to keep ordering. */
     int               _hasMove;
-    uint32_t          _moveX, _moveY;
+    double            _moveX, _moveY;
+    uint32_t          _moveWidth, _moveHeight;
     double            _relativeX, _relativeY;
     NSTimeInterval    _mousePositionDeadline, _mousePositionResumeTime;
 
@@ -588,6 +603,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
     _view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     window.contentView = _view;
     window.delegate = self;
+    _normalMinSize = window.contentMinSize;
+    _normalMaxSize = window.contentMaxSize;
     [self loadDisplaySettings];
     [self setupMetal];
     return self;
@@ -633,8 +650,91 @@ static __weak IddDisplayWindow *g_mouseOwner;
     [self saveDisplaySettings];
 }
 
+- (BOOL)canMatchWindowSize {
+    pthread_mutex_lock(&_inputLock);
+    BOOL ready = !_stop && _displayFd >= 0 && _resizeSupported && _hasDisplayFrame;
+    pthread_mutex_unlock(&_inputLock);
+    return ready;
+}
+
+- (void)toggleMatchWindowSize:(id)sender {
+    (void)sender;
+    if (![self canMatchWindowSize]) return;
+    _matchWindow = !_matchWindow;
+    [self updateDisplaySize:YES];
+}
+
+- (void)updateDisplaySize:(BOOL)follow {
+    if (_stop) return;
+    if (follow) _followDisplaySize = YES;
+    BOOL ready = [self canMatchWindowSize];
+    _adjustingDisplaySize = YES;
+    self.window.contentMinSize = _matchWindow && ready
+        ? [self.view convertSizeFromBacking:NSMakeSize(DISPLAY_MIN_WIDTH, DISPLAY_MIN_HEIGHT)] : _normalMinSize;
+    self.window.contentMaxSize = _matchWindow && ready
+        ? [self.view convertSizeFromBacking:NSMakeSize(DISPLAY_MAX_WIDTH, DISPLAY_MAX_HEIGHT)] : _normalMaxSize;
+    _adjustingDisplaySize = NO;
+    if (self.view.inLiveResize || self.window.isMiniaturized || _fullscreenSizing) return;
+    if (_matchWindow && !ready) return;
+    pthread_mutex_lock(&_fbLock);
+    uint32_t width = _fbW, height = _fbH;
+    pthread_mutex_unlock(&_fbLock);
+    if (!width || !height) return;
+    uint32_t frameWidth = width, frameHeight = height;
+    BOOL resizeWindow = NO;
+    if (_matchWindow) {
+        NSSize pixels = [self.view convertSizeToBacking:self.view.bounds.size];
+        width = (uint32_t)fmax(DISPLAY_MIN_WIDTH, fmin(DISPLAY_MAX_WIDTH, round(pixels.width)));
+        height = (uint32_t)fmax(DISPLAY_MIN_HEIGHT, fmin(DISPLAY_MAX_HEIGHT, round(pixels.height)));
+        resizeWindow = fabs(pixels.width - width) > 0.5 || fabs(pixels.height - height) > 0.5;
+        _followDisplaySize = NO;
+    } else if (_followDisplaySize && !(self.window.styleMask & NSWindowStyleMaskFullScreen)) {
+        resizeWindow = YES;
+        _followDisplaySize = NO;
+    }
+    if (resizeWindow && !(self.window.styleMask & NSWindowStyleMaskFullScreen)) {
+        _adjustingDisplaySize = YES;
+        [self.window setContentSize:[self.view convertSizeFromBacking:NSMakeSize(width, height)]];
+        _adjustingDisplaySize = NO;
+    }
+    uint32_t mode = _matchWindow ? DISPLAY_SIZE_WINDOW : DISPLAY_SIZE_GUEST;
+    pthread_mutex_lock(&_inputLock);
+    if (_resizeSupported && _hasDisplayFrame && _displayFd >= 0) {
+        if (mode != _guestSizeMode || (_matchWindow && (width != frameWidth || height != frameHeight))) {
+            DisplayGpuPacket request = {0};
+            request.magic = DISPLAY_GPU_MAGIC;
+            request.type = DISPLAY_GPU_RESIZE;
+            request.version = DISPLAY_GPU_VERSION;
+            request.session = _displaySession;
+            request.width = width;
+            request.height = height;
+            request.slot = mode;
+            if (memcmp(&_lastSizeRequest, &request, sizeof(request)) != 0) {
+                _sizeRequest = request;
+                _lastSizeRequest = request;
+            }
+        } else {
+            memset(&_sizeRequest, 0, sizeof(_sizeRequest));
+            memset(&_lastSizeRequest, 0, sizeof(_lastSizeRequest));
+        }
+    }
+    pthread_mutex_unlock(&_inputLock);
+}
+
+- (void)flushDisplaySize {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(flushDisplaySize) object:nil];
+    if (_matchWindow || _followDisplaySize) [self updateDisplaySize:NO];
+}
+
+- (void)scheduleDisplaySize {
+    if (_stop || _adjustingDisplaySize || _fullscreenSizing || self.view.inLiveResize || !_matchWindow) return;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(flushDisplaySize) object:nil];
+    [self performSelector:@selector(flushDisplaySize) withObject:nil afterDelay:0.15];
+}
+
 - (void)showTitlebarMenuAtPoint:(NSPoint)point {
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+    menu.autoenablesItems = NO;
     NSMenuItem *mute = [menu addItemWithTitle:@"Mute audio" action:@selector(toggleAudioMute:) keyEquivalent:@""];
     mute.target = self;
     mute.state = _audioMuted ? NSControlStateValueOn : NSControlStateValueOff;
@@ -642,6 +742,11 @@ static __weak IddDisplayWindow *g_mouseOwner;
                                        action:@selector(toggleTransmitHotkeys:) keyEquivalent:@""];
     hotkeys.target = self;
     hotkeys.state = _transmitHotkeys ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *match = [menu addItemWithTitle:@"Match window size"
+                                      action:@selector(toggleMatchWindowSize:) keyEquivalent:@""];
+    match.target = self;
+    match.state = _matchWindow ? NSControlStateValueOn : NSControlStateValueOff;
+    match.enabled = [self canMatchWindowSize];
     _trackingMenus++;
     [self releaseKeyboardCapture];
     [self releaseMouseCapture];
@@ -848,7 +953,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
 - (void)beginMousePosition {
     pthread_mutex_lock(&_inqLock);
-    if (!_inputReady || _mouseVersion != INPUT_MOUSE_VERSION || !_relativeMouse ||
+    if (!_inputReady || _mouseVersion < INPUT_MOUSE_VERSION || !_relativeMouse ||
         _mouseCaptureConnection != _inputConnection) {
         pthread_mutex_unlock(&_inqLock);
         [self releaseMouseCapture];
@@ -916,7 +1021,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
 - (void)updateMouseCapture {
     pthread_mutex_lock(&_inqLock);
-    BOOL ready = _inputReady && _mouseVersion == INPUT_MOUSE_VERSION &&
+    BOOL ready = _inputReady && _mouseVersion >= INPUT_MOUSE_VERSION &&
         ((!_relativeMouse && !_mousePositionRequest) || _mouseCaptureConnection == _inputConnection);
     pthread_mutex_unlock(&_inqLock);
     pthread_mutex_lock(&_curLock);
@@ -1139,7 +1244,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
     int i;
     if (newFrame) {
         if (_surfW != _fbW || _surfH != _fbH) [self recreateSurfacesW:_fbW h:_fbH];
-        if (!_surf[0]) { _renderSeq = _fbSeq; return; }
+        if (!_surf[0] || !_surfW || !_surfH) return;
         i = _frontValid ? (_frontIdx + 1) % IDD_SURF_COUNT : 0;
     } else {
         if (!_frontValid) return;                  /* resize before any frame -> nothing to show yet */
@@ -1156,6 +1261,12 @@ static __weak IddDisplayWindow *g_mouseOwner;
         size_t dstStride = IOSurfaceGetBytesPerRow(_surf[i]);
         size_t dstRows = IOSurfaceGetHeight(_surf[i]);
         pthread_mutex_lock(&_fbLock);
+        if (_fbW != _surfW || _fbH != _surfH) {
+            pthread_mutex_unlock(&_fbLock);
+            IOSurfaceUnlock(_surf[i], 0, NULL);
+            dispatch_semaphore_signal(_mtlSem);
+            return;
+        }
         size_t copyStride = _fbStride < dstStride ? _fbStride : dstStride;
         /* Clamp rows to the surface height: the display thread may have grown _fbH after the
            surface was sized (above, from an unlocked read), so never write past the IOSurface. */
@@ -1207,8 +1318,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
     }
 }
 
-- (uint32_t)frameWidth  { return _fbW; }
-- (uint32_t)frameHeight { return _fbH; }
+- (uint32_t)frameWidth  { return _frontValid ? _surfW : 0; }
+- (uint32_t)frameHeight { return _frontValid ? _surfH : 0; }
 
 #pragma mark - Cursor access (main thread, render timer)
 
@@ -1262,9 +1373,10 @@ static __weak IddDisplayWindow *g_mouseOwner;
     pthread_cond_signal(&_inqCond);
 }
 
-- (void)recordMoveX:(uint32_t)x y:(uint32_t)y {
+- (void)recordMoveX:(double)x y:(double)y width:(uint32_t)width height:(uint32_t)height {
     if (_mousePositionRequest) return;
     _moveX = x; _moveY = y; _hasMove = 1;
+    _moveWidth = width; _moveHeight = height;
 }
 - (void)flushMove {
     if (_mousePositionRequest) return;
@@ -1276,10 +1388,61 @@ static __weak IddDisplayWindow *g_mouseOwner;
         if (dx || dy) [self sendInput:INPUT_MOUSE_RELATIVE p1:(uint32_t)dx p2:(uint32_t)dy p3:0];
         return;
     }
-    if (_hasMove) { _hasMove = 0; [self sendInput:INPUT_MOUSE_MOVE p1:_moveX p2:_moveY p3:0]; }
+    if (_hasMove) {
+        _hasMove = 0;
+        pthread_mutex_lock(&_inqLock);
+        BOOL normalized = _mouseVersion >= INPUT_MOUSE_NORMALIZED_VERSION;
+        InputPacket pkt = { INPUT_MAGIC, INPUT_MOUSE_MOVE,
+            (uint32_t)(_moveX * (normalized ? INPUT_MOUSE_ABSOLUTE_MAX : _moveWidth - 1)),
+            (uint32_t)(_moveY * (normalized ? INPUT_MOUSE_ABSOLUTE_MAX : _moveHeight - 1)),
+            normalized ? INPUT_MOUSE_NORMALIZED : 0 };
+        if (_inputReady && !_stop) [self enqueueInputLocked:pkt];
+        pthread_mutex_unlock(&_inqLock);
+    }
 }
 
 #pragma mark - Reader threads (frame + input)
+
+- (BOOL)readDisplay:(int)fd bytes:(void *)bytes length:(int)length
+            session:(uint64_t)session idle:(BOOL)idle {
+    uint8_t *out = bytes;
+    int remaining = length;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (remaining > 0) {
+        if (_stop) return NO;
+        BOOL betweenPackets = idle && remaining == length;
+        if (betweenPackets) {
+            DisplayGpuPacket request = {0};
+            pthread_mutex_lock(&_inputLock);
+            if (_displayFd == fd && _displaySession == session && _resizeSupported &&
+                _hasDisplayFrame && !_displaySizing && _sizeRequest.session == session) {
+                request = _sizeRequest;
+                memset(&_sizeRequest, 0, sizeof(_sizeRequest));
+            }
+            pthread_mutex_unlock(&_inputLock);
+            if (request.type && !idd_wr_full(fd, &request, sizeof(request))) return NO;
+        } else {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if ((now.tv_sec - start.tv_sec) * 1000000000LL + now.tv_nsec - start.tv_nsec >= 5000000000LL)
+                return NO;
+        }
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(fd, &readable);
+        struct timeval timeout = {0, 100000};
+        int ready = select(fd + 1, &readable, NULL, NULL, &timeout);
+        if (ready < 0) { if (errno == EINTR) continue; return NO; }
+        if (!ready) continue;
+        if (betweenPackets) clock_gettime(CLOCK_MONOTONIC, &start);
+        ssize_t n = recv(fd, out, (size_t)remaining, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return NO;
+        out += n;
+        remaining -= (int)n;
+    }
+    return YES;
+}
 
 /* Reconstruct the VDD wire stream from the ch2 fd into _fb. We connect via the transport (host is
    the connector; the VDD's asb_accept claims the slot and, on each fresh accept, sends a full frame
@@ -1295,23 +1458,68 @@ static __weak IddDisplayWindow *g_mouseOwner;
         /* Publish the fd BEFORE the blocking read loop so teardown can shutdown() it to unblock us. */
         pthread_mutex_lock(&_inputLock);
         _displayFd = fd;
+        _displaySession = ((uint64_t)(uint32_t)getpid() << 32) | ++_displayGeneration;
+        uint64_t session = _displaySession;
+        _resizeSupported = NO;
+        _hasDisplayFrame = NO;
+        memset(&_sizeRequest, 0, sizeof(_sizeRequest));
+        memset(&_lastSizeRequest, 0, sizeof(_lastSizeRequest));
         pthread_mutex_unlock(&_inputLock);
+        struct timeval sendTimeout = {1, 0};
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout));
+        DisplayGpuPacket query = {0};
+        query.magic = DISPLAY_GPU_MAGIC;
+        query.type = DISPLAY_GPU_QUERY;
+        query.version = DISPLAY_GPU_VERSION;
+        query.session = session;
+        query.reserved = DISPLAY_GPU_CAP_RESIZE | DISPLAY_GPU_CAP_IVSHMEM;
+        if (!idd_wr_full(fd, &query, sizeof(query))) shutdown(fd, SHUT_RDWR);
 
         for (;;) {
             if (_stop) break;
             uint32_t magic;
-            if (!idd_rd_full(fd, &magic, 4)) break;
+            if (![self readDisplay:fd bytes:&magic length:4 session:session idle:YES]) break;
+
+            if (magic == DISPLAY_GPU_MAGIC) {
+                DisplayGpuPacket packet = {0};
+                packet.magic = magic;
+                if (![self readDisplay:fd bytes:(uint8_t *)&packet + 4 length:sizeof(packet) - 4 session:session idle:NO]) break;
+                if (packet.version != DISPLAY_GPU_VERSION || packet.session != session) break;
+                pthread_mutex_lock(&_inputLock);
+                if (packet.type == DISPLAY_GPU_CAPS) {
+                    uint64_t required = DISPLAY_GPU_CAP_RESIZE | DISPLAY_GPU_CAP_IVSHMEM;
+                    _resizeSupported = packet.status == 0 && (packet.reserved & required) == required &&
+                        packet.slot <= DISPLAY_SIZE_WINDOW && packet.width && packet.height &&
+                        packet.width <= DISPLAY_MAX_WIDTH && packet.height <= DISPLAY_MAX_HEIGHT;
+                    _guestSizeMode = packet.slot;
+                } else if (packet.type == DISPLAY_GPU_RESIZED && packet.status != 0) {
+                    _resizeSupported = NO;
+                    memset(&_sizeRequest, 0, sizeof(_sizeRequest));
+                    memset(&_lastSizeRequest, 0, sizeof(_lastSizeRequest));
+                    NSLog(@"IDD [%@]: display resize rejected (0x%08x)", self.name, packet.status);
+                }
+                pthread_mutex_unlock(&_inputLock);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    IddDisplayWindow *owner = weakSelf;
+                    if (!owner) return;
+                    pthread_mutex_lock(&owner->_inputLock);
+                    BOOL current = owner->_displaySession == session && owner->_displayFd == fd;
+                    pthread_mutex_unlock(&owner->_inputLock);
+                    if (current) [owner updateDisplaySize:NO];
+                });
+                continue;
+            }
 
             if (magic == VDD_CURSOR_MAGIC) {
                 WireCursorHeader ch;
                 ch.magic = magic;
-                if (!idd_rd_full(fd, (uint8_t *)&ch + 4, sizeof(ch) - 4)) break;
+                if (![self readDisplay:fd bytes:(uint8_t *)&ch + 4 length:sizeof(ch) - 4 session:session idle:NO]) break;
                 uint8_t *shape = NULL;
                 if (ch.shape_updated && ch.shape_data_size > 0) {
                     if (ch.shape_data_size > 4u*1024*1024) break;   /* sanity */
                     shape = malloc(ch.shape_data_size);
                     if (!shape) break;
-                    if (!idd_rd_full(fd, shape, (int)ch.shape_data_size)) { free(shape); break; }
+                    if (![self readDisplay:fd bytes:shape length:(int)ch.shape_data_size session:session idle:NO]) { free(shape); break; }
                 }
                 /* Build an AsbCursor blob (header + image) so the render timer reuses buildGuestCursor
                    unchanged. shape_updated=0 => keep last image, update visibility only. */
@@ -1347,12 +1555,13 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
             WireFrameHeader fh;
             fh.magic = magic;
-            if (!idd_rd_full(fd, (uint8_t *)&fh + 4, sizeof(fh) - 4)) break;
+            if (![self readDisplay:fd bytes:(uint8_t *)&fh + 4 length:sizeof(fh) - 4 session:session idle:NO]) break;
             if (fh.width == 0 || fh.height == 0 || fh.stride < fh.width * 4 ||
                 fh.width > 8192 || fh.height > 8192) break;
 
             /* (Re)allocate the working framebuffer if geometry changed. */
-            if (_fbW != fh.width || _fbH != fh.height || _fbStride != fh.stride || !_fb) {
+            BOOL geometryChanged = _fbW != fh.width || _fbH != fh.height;
+            if (geometryChanged || _fbStride != fh.stride || !_fb) {
                 uint8_t *nb = malloc((size_t)fh.stride * fh.height);
                 if (!nb) break;
                 pthread_mutex_lock(&_fbLock);
@@ -1368,11 +1577,11 @@ static __weak IddDisplayWindow *g_mouseOwner;
                    _fbLock, so holding it across the recv would stall the whole UI for the transfer.
                    _fbLock is taken only for the memcpy into _fb (as in the dirty-rect path below). */
                 uint32_t data_size = 0;
-                if (!idd_rd_full(fd, &data_size, 4)) break;
+                if (![self readDisplay:fd bytes:&data_size length:4 session:session idle:NO]) break;
                 uint32_t want = _fbStride * _fbH;
                 if (data_size != want) break;
                 if (data_size > scratchSz) { free(scratch); scratch = malloc(data_size); scratchSz = data_size; if (!scratch) break; }
-                if (!idd_rd_full(fd, scratch, (int)data_size)) break;
+                if (![self readDisplay:fd bytes:scratch length:(int)data_size session:session idle:NO]) break;
                 pthread_mutex_lock(&_fbLock);
                 memcpy(_fb, scratch, data_size);
                 _fbSeq++;
@@ -1381,11 +1590,11 @@ static __weak IddDisplayWindow *g_mouseOwner;
                 /* Dirty rects: rects[], data_size, then per-rect packed rows. */
                 if (fh.dirty_rect_count > VDD_MAX_DIRTY) break;
                 WireRect rects[VDD_MAX_DIRTY];
-                if (!idd_rd_full(fd, rects, (int)(fh.dirty_rect_count * sizeof(WireRect)))) break;
+                if (![self readDisplay:fd bytes:rects length:(int)(fh.dirty_rect_count * sizeof(WireRect)) session:session idle:NO]) break;
                 uint32_t data_size = 0;
-                if (!idd_rd_full(fd, &data_size, 4)) break;
+                if (![self readDisplay:fd bytes:&data_size length:4 session:session idle:NO]) break;
                 if (data_size > scratchSz) { free(scratch); scratch = malloc(data_size); scratchSz = data_size; if (!scratch) break; }
-                if (!idd_rd_full(fd, scratch, (int)data_size)) break;
+                if (![self readDisplay:fd bytes:scratch length:(int)data_size session:session idle:NO]) break;
                 pthread_mutex_lock(&_fbLock);
                 size_t off = 0;
                 for (uint32_t i = 0; i < fh.dirty_rect_count; i++) {
@@ -1408,6 +1617,18 @@ static __weak IddDisplayWindow *g_mouseOwner;
             pthread_mutex_lock(&_curLock);
             _displayReady = YES;
             pthread_mutex_unlock(&_curLock);
+            pthread_mutex_lock(&_inputLock);
+            BOOL firstFrame = !_hasDisplayFrame;
+            _hasDisplayFrame = YES;
+            pthread_mutex_unlock(&_inputLock);
+            if (firstFrame || geometryChanged) dispatch_async(dispatch_get_main_queue(), ^{
+                IddDisplayWindow *owner = weakSelf;
+                if (!owner) return;
+                pthread_mutex_lock(&owner->_inputLock);
+                BOOL current = owner->_displaySession == session && owner->_displayFd == fd;
+                pthread_mutex_unlock(&owner->_inputLock);
+                if (current) [owner updateDisplaySize:geometryChanged];
+            });
         }
 
         pthread_mutex_lock(&_curLock);
@@ -1417,7 +1638,11 @@ static __weak IddDisplayWindow *g_mouseOwner;
         dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf releaseMouseCapture]; });
         pthread_mutex_lock(&_inputLock);
         if (_displayFd == fd) _displayFd = -1;   /* unpublish before close so teardown won't shutdown a reused fd */
+        _resizeSupported = NO;
+        _hasDisplayFrame = NO;
+        memset(&_sizeRequest, 0, sizeof(_sizeRequest));
         pthread_mutex_unlock(&_inputLock);
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf updateDisplaySize:NO]; });
         close(fd);   /* tears the pump down + releases the slot; reconnect = a fresh VDD full frame */
         if (!_stop) usleep(100000);
     }
@@ -1492,7 +1717,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
                 if ((move && (moveGeneration != _mouseMoveGeneration || _mousePositionRequest)) ||
                     (batch[i].type == INPUT_MOUSE_MOVE && _relativeMouse) ||
                     (batch[i].type == INPUT_MOUSE_RELATIVE &&
-                        (!_relativeMouse || _mouseVersion != INPUT_MOUSE_VERSION)) ||
+                        (!_relativeMouse || _mouseVersion < INPUT_MOUSE_VERSION)) ||
                     (batch[i].type == INPUT_MOUSE_POSITION_QUERY &&
                         (!_mousePositionRequest || batch[i].param1 != _mousePositionRequest))) {
                     pthread_mutex_unlock(&_inqLock);
@@ -1957,6 +2182,73 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
 #pragma mark - NSWindowDelegate
 
+- (void)windowWillStartLiveResize:(NSNotification *)notification {
+    (void)notification;
+    pthread_mutex_lock(&_inputLock);
+    _displaySizing = YES;
+    memset(&_sizeRequest, 0, sizeof(_sizeRequest));
+    memset(&_lastSizeRequest, 0, sizeof(_lastSizeRequest));
+    pthread_mutex_unlock(&_inputLock);
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(flushDisplaySize) object:nil];
+}
+
+- (void)windowDidEndLiveResize:(NSNotification *)notification {
+    (void)notification;
+    pthread_mutex_lock(&_inputLock);
+    _displaySizing = NO;
+    pthread_mutex_unlock(&_inputLock);
+    [self flushDisplaySize];
+}
+
+- (void)windowDidResize:(NSNotification *)notification {
+    (void)notification;
+    [self scheduleDisplaySize];
+}
+
+- (void)windowDidChangeBackingProperties:(NSNotification *)notification {
+    (void)notification;
+    [self scheduleDisplaySize];
+}
+
+- (void)windowDidDeminiaturize:(NSNotification *)notification {
+    (void)notification;
+    [self flushDisplaySize];
+}
+
+- (void)windowWillEnterFullScreen:(NSNotification *)notification {
+    (void)notification;
+    _fullscreenSizing = YES;
+}
+
+- (void)windowWillExitFullScreen:(NSNotification *)notification {
+    (void)notification;
+    _fullscreenSizing = YES;
+}
+
+- (void)windowDidEnterFullScreen:(NSNotification *)notification {
+    (void)notification;
+    _fullscreenSizing = NO;
+    [self flushDisplaySize];
+}
+
+- (void)windowDidExitFullScreen:(NSNotification *)notification {
+    (void)notification;
+    _fullscreenSizing = NO;
+    [self flushDisplaySize];
+}
+
+- (void)windowDidFailToEnterFullScreen:(NSWindow *)window {
+    (void)window;
+    _fullscreenSizing = NO;
+    [self flushDisplaySize];
+}
+
+- (void)windowDidFailToExitFullScreen:(NSWindow *)window {
+    (void)window;
+    _fullscreenSizing = NO;
+    [self flushDisplaySize];
+}
+
 - (void)windowDidBecomeKey:(NSNotification *)notification {
     (void)notification;
     [self updateKeyboardCapture];
@@ -2020,6 +2312,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     _trackingMenus = 0;
     _stop = 1;
+    _fullscreenSizing = NO;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(flushDisplaySize) object:nil];
     [self.timer invalidate];
     self.timer = nil;
     pthread_mutex_lock(&_inqLock);
@@ -2027,6 +2321,10 @@ static __weak IddDisplayWindow *g_mouseOwner;
     pthread_mutex_unlock(&_inqLock);
     pthread_mutex_lock(&_inputLock);
     int dfd = _displayFd; _displayFd = -1;
+    _resizeSupported = NO;
+    _hasDisplayFrame = NO;
+    _displaySizing = NO;
+    memset(&_sizeRequest, 0, sizeof(_sizeRequest));
     int afd = _audioFd; _audioFd = -1;
     int cwfd = _clipWriterFd; _clipWriterFd = -1;
     int crfd = _clipReaderFd; _clipReaderFd = -1;
@@ -2253,6 +2551,8 @@ static CGRect idd_letterbox(double viewW, double viewH, double frameW, double fr
 - (void)viewDidEndLiveResize
 {
     [super viewDidEndLiveResize];
+    __weak IddDisplayWindow *owner = self.owner;
+    dispatch_async(dispatch_get_main_queue(), ^{ [owner flushDisplaySize]; });
     [self.owner renderMetal];   /* final crisp frame at the settled size */
 }
 
@@ -2311,7 +2611,7 @@ static CGRect idd_letterbox(double viewW, double viewH, double frameW, double fr
     double ny = (lb.origin.y + lb.size.height - p.y) / lb.size.height;   /* y-up view -> top-down guest */
     if (nx < 0) nx = 0; if (nx > 1) nx = 1;
     if (ny < 0) ny = 0; if (ny > 1) ny = 1;
-    [o recordMoveX:(uint32_t)(nx * (gw - 1)) y:(uint32_t)(ny * (gh - 1))];
+    [o recordMoveX:nx y:ny width:gw height:gh];
 }
 - (void)mouseMoved:(NSEvent *)e        { [self recordMove:e]; }
 - (void)mouseDragged:(NSEvent *)e      { [self recordMove:e]; }

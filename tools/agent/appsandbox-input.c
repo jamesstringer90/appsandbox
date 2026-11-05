@@ -71,7 +71,7 @@ static void switch_to_input_desktop(void)
 
 /* ---- Input injection ---- */
 
-static void inject_input(const InputPacket *pkt)
+static void inject_input(const InputPacket *pkt, UINT mouse_version)
 {
     INPUT inp;
     UINT result;
@@ -80,13 +80,23 @@ static void inject_input(const InputPacket *pkt)
 
     switch (pkt->type) {
     case INPUT_MOUSE_MOVE: {
-        int screen_w = GetSystemMetrics(SM_CXSCREEN);
-        int screen_h = GetSystemMetrics(SM_CYSCREEN);
-        if (screen_w <= 0) screen_w = 1920;
-        if (screen_h <= 0) screen_h = 1080;
         inp.type = INPUT_MOUSE;
-        inp.mi.dx = (LONG)(pkt->param1 * 65535 / (UINT32)(screen_w - 1));
-        inp.mi.dy = (LONG)(pkt->param2 * 65535 / (UINT32)(screen_h - 1));
+        if (pkt->param3 == INPUT_MOUSE_NORMALIZED &&
+            mouse_version >= INPUT_MOUSE_NORMALIZED_VERSION) {
+            if (pkt->param1 > INPUT_MOUSE_ABSOLUTE_MAX ||
+                pkt->param2 > INPUT_MOUSE_ABSOLUTE_MAX) return;
+            inp.mi.dx = (LONG)pkt->param1;
+            inp.mi.dy = (LONG)pkt->param2;
+        } else if (pkt->param3 == 0) {
+            int screen_w = GetSystemMetrics(SM_CXSCREEN);
+            int screen_h = GetSystemMetrics(SM_CYSCREEN);
+            if (screen_w <= 1) screen_w = 1920;
+            if (screen_h <= 1) screen_h = 1080;
+            inp.mi.dx = (LONG)((UINT64)pkt->param1 * INPUT_MOUSE_ABSOLUTE_MAX / (UINT32)(screen_w - 1));
+            inp.mi.dy = (LONG)((UINT64)pkt->param2 * INPUT_MOUSE_ABSOLUTE_MAX / (UINT32)(screen_h - 1));
+        } else {
+            return;
+        }
         inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
         result = SendInput(1, &inp, sizeof(INPUT));
         if (result == 0)
@@ -282,19 +292,21 @@ static void handle_conn(AsbConn *c)
         if (pkt.type == INPUT_MOUSE_QUERY) {
             InputPacket reply = {INPUT_MAGIC, INPUT_MOUSE_REPLY, 0, pkt.param2, 0};
             if (pkt.param3 != 0) continue;
-            if (pkt.param1 >= INPUT_MOUSE_VERSION)
+            if (pkt.param1 >= INPUT_MOUSE_NORMALIZED_VERSION)
+                reply.param1 = INPUT_MOUSE_NORMALIZED_VERSION;
+            else if (pkt.param1 >= INPUT_MOUSE_VERSION)
                 reply.param1 = INPUT_MOUSE_VERSION;
             if (send_full(c, &reply, (int)sizeof(reply)) != (int)sizeof(reply))
                 break;
             mouse_version = reply.param1;
         } else if (pkt.type == INPUT_MOUSE_RELATIVE) {
-            if (mouse_version == INPUT_MOUSE_VERSION && pkt.param3 == 0)
+            if (mouse_version >= INPUT_MOUSE_VERSION && pkt.param3 == 0)
                 inject_relative_mouse(&pkt);
         } else if (pkt.type == INPUT_MOUSE_POSITION_QUERY) {
             POINT point;
             InputPacket reply = {INPUT_MAGIC, INPUT_MOUSE_POSITION_REPLY,
                                  (UINT32)INT32_MIN, (UINT32)INT32_MIN, pkt.param1};
-            if (mouse_version != INPUT_MOUSE_VERSION || pkt.param2 || pkt.param3) continue;
+            if (mouse_version < INPUT_MOUSE_VERSION || pkt.param2 || pkt.param3) continue;
             switch_to_input_desktop();
             if (GetPhysicalCursorPos(&point)) {
                 reply.param1 = (UINT32)point.x;
@@ -318,7 +330,7 @@ static void handle_conn(AsbConn *c)
             if (keyboard_version >= INPUT_KEYBOARD_VERSION)
                 inject_physical_key(&pkt, &keys);
         } else {
-            inject_input(&pkt);
+            inject_input(&pkt, mouse_version);
         }
     }
     release_physical_keys(&keys);

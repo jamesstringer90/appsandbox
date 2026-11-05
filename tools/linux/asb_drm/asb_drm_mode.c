@@ -12,6 +12,8 @@
  * and disarms when the last reference drops.
  */
 
+#include <linux/math64.h>
+
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc.h>
@@ -67,6 +69,11 @@ static void asb_crtc_disable_vblank(struct drm_crtc *crtc)
 static void asb_crtc_atomic_enable(struct drm_crtc *crtc,
                                    struct drm_atomic_state *state)
 {
+	struct asb_device *asb = crtc_to_asb(crtc);
+	const struct drm_display_mode *mode = &crtc->state->adjusted_mode;
+
+	asb->vblank_period = ns_to_ktime(div_u64((u64)mode->htotal * mode->vtotal * NSEC_PER_MSEC,
+	                                      max(mode->clock, 1)));
 	drm_crtc_vblank_on(crtc);
 }
 
@@ -76,6 +83,7 @@ static void asb_crtc_atomic_disable(struct drm_crtc *crtc,
 	struct asb_device *asb = crtc_to_asb(crtc);
 
 	drm_crtc_vblank_off(crtc);
+	asb_gpu_update(asb, NULL);
 	asb->vblank_enabled = false;
 	hrtimer_cancel(&asb->vblank_timer);
 }
@@ -161,4 +169,5 @@ void asb_mode_fini(struct asb_device *asb)
 {
 	asb->vblank_enabled = false;
 	hrtimer_cancel(&asb->vblank_timer);
+	asb_gpu_fini(asb);
 }

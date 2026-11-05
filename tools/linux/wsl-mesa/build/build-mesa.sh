@@ -1,52 +1,20 @@
 #!/usr/bin/env bash
-# build-mesa.sh — Build Mesa from upstream source with the d3d12 gallium
-# and microsoft-experimental Vulkan drivers enabled.
-#
-# Purpose: produce userspace GPU drivers that talk /dev/dxg directly
-# (Mesa's own dxcore-equivalent embedded in the d3d12 + dzn drivers)
-# so an Ubuntu VM with Hyper-V GPU-PV gets hardware OpenGL/Vulkan
-# acceleration without needing Microsoft's proprietary libdxcore.so.
-#
-# Output: installs to /opt/wsl-mesa/. The caller is expected to tar that
-# tree and stash it under tools/wsl-mesa/prebuilt/<ubuntu-codename>-amd64/.
-#
-# Tested on: Ubuntu 26.04 LTS (resolute), amd64, LLVM 21, Mesa 25.3.x.
-
 set -euo pipefail
 
-MESA_BRANCH="${MESA_BRANCH:-25.3}"
-MESA_SRC="${MESA_SRC:-$HOME/mesa}"
-PREFIX="${PREFIX:-/opt/wsl-mesa}"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+MESA_SRC="${MESA_SRC:-$HOME/asb-mesa}"
+SOURCE_TAG="$(sed -n 's/^[[:space:]]*"tag": "\([^"]*\)".*/\1/p' "$ROOT/vendor/mesa-d3d12/source-version.json")"
+[[ -n "$SOURCE_TAG" ]]
 
-echo "==> Installing build dependencies (apt build-dep mesa + LLVM 21 dev pkgs)"
-sudo apt-get update
-# deb-src must be enabled in /etc/apt/sources.list.d/ubuntu.sources
-sudo apt-get build-dep -y mesa
-sudo apt-get install -y \
-    git meson ninja-build \
-    libclc-21-dev llvm-spirv-21 libllvmspirvlib-21-dev libclang-21-dev
-
-echo "==> Cloning Mesa $MESA_BRANCH"
-[[ -d "$MESA_SRC" ]] || git clone --depth 1 -b "$MESA_BRANCH" \
-    https://gitlab.freedesktop.org/mesa/mesa.git "$MESA_SRC"
-
-echo "==> Configuring meson (prefix=$PREFIX)"
-cd "$MESA_SRC"
-rm -rf build
-meson setup --prefix="$PREFIX" --buildtype=release --strip \
-    -D gallium-drivers=llvmpipe,d3d12 \
-    -D vulkan-drivers=swrast,microsoft-experimental \
-    -D microsoft-clc=enabled \
-    -D video-codecs=all \
-    -D glvnd=enabled \
-    -D platforms=x11,wayland \
-    build/
-
-echo "==> Building (this is the slow part, ~30 min)"
-ninja -C build -j "$(nproc)"
-
-echo "==> Installing to $PREFIX"
-sudo ninja -C build install
-
-echo "==> Done. Tar for stash:"
-echo "    sudo tar -C / -cf - opt/wsl-mesa | zstd -T0 > wsl-mesa.tar.zst"
+if [[ ! -d "$MESA_SRC/.git" ]]; then
+    git clone --depth 1 --branch "$SOURCE_TAG" \
+        https://github.com/jamesstringer90/asb-mesa.git "$MESA_SRC"
+fi
+[[ -z "$(git -C "$MESA_SRC" status --porcelain --untracked-files=no)" ]] || {
+    echo 'The Mesa source tree has local changes.' >&2
+    exit 1
+}
+git -C "$MESA_SRC" rev-parse --verify "refs/tags/$SOURCE_TAG" >/dev/null 2>&1 || \
+    git -C "$MESA_SRC" fetch --depth 1 origin "refs/tags/$SOURCE_TAG:refs/tags/$SOURCE_TAG"
+git -C "$MESA_SRC" switch --detach "refs/tags/$SOURCE_TAG"
+exec bash "$MESA_SRC/build-appsandbox.sh"

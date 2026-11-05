@@ -34,7 +34,7 @@ ARCH  := $(shell uname -m)
 DISTDIR := $(CURDIR)/dist
 
 .PHONY: all compile agents modules dxgkrnl asb_drm install-agents install-modules \
-        clean distclean copy-help
+        clean distclean copy-help dxgkrnl-source
 
 all: compile install-agents install-modules copy-help
 
@@ -45,7 +45,7 @@ compile: agents modules
 # Re-uses the existing tools/linux/agent/Makefile which knows how to compile
 # each daemon with the right libs (libdrm for display, libasound for audio,
 # libxcb for clipboard).
-agents:
+agents: dxgkrnl-source
 	$(MAKE) -C agent
 
 install-agents: agents
@@ -69,16 +69,19 @@ install-agents: agents
 
 modules: dxgkrnl asb_drm
 
-dxgkrnl:
-	$(MAKE) -C /lib/modules/$(KVER)/build M=$(CURDIR)/dxgkrnl/src modules
+dxgkrnl: dxgkrnl-source
+	$(MAKE) -C dxgkrnl KDIR=/lib/modules/$(KVER)/build modules
+
+dxgkrnl-source:
+	$(MAKE) -C dxgkrnl source
 
 asb_drm:
 	$(MAKE) -C /lib/modules/$(KVER)/build M=$(CURDIR)/asb_drm modules
 
 install-modules: modules
 	@install -d $(DISTDIR)/modules/$(KVER)
-	@if [ -f dxgkrnl/src/dxgkrnl.ko ]; then \
-	    install -m 0644 dxgkrnl/src/dxgkrnl.ko $(DISTDIR)/modules/$(KVER)/; \
+	@if [ -f dxgkrnl/.source/src/dxgkrnl.ko ]; then \
+	    install -m 0644 dxgkrnl/.source/src/dxgkrnl.ko $(DISTDIR)/modules/$(KVER)/; \
 	    echo "  installed $(DISTDIR)/modules/$(KVER)/dxgkrnl.ko"; \
 	fi
 	@if [ -f asb_drm/asb_drm.ko ]; then \
@@ -90,7 +93,7 @@ install-modules: modules
 
 clean:
 	-$(MAKE) -C agent clean
-	-$(MAKE) -C /lib/modules/$(KVER)/build M=$(CURDIR)/dxgkrnl/src clean
+	-$(MAKE) -C dxgkrnl KDIR=/lib/modules/$(KVER)/build clean
 	-$(MAKE) -C /lib/modules/$(KVER)/build M=$(CURDIR)/asb_drm clean
 
 distclean: clean

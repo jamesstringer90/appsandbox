@@ -8,6 +8,7 @@ obj-m := asb_drm.o
 
 asb_drm-y := \
 	asb_drm_drv.o \
+	asb_drm_gpu.o \
 	asb_drm_mode.o \
 	asb_drm_connector.o \
 	asb_drm_plane.o \
