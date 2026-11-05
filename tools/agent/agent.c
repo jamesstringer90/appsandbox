@@ -224,9 +224,6 @@ static BOOL check_gpu_error43(void)
     return found_error43;
 }
 
-static void disable_hyperv_video(AsbConn *notify_sock);
-
-
 /* Disable and re-enable vrd.inf display devices.
    If only_error43 is TRUE, only cycles devices with problem code 43.
    If FALSE, cycles all vrd.inf devices (used at preshutdown). */
@@ -648,16 +645,9 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
             send_line(state->notify_sock, msg);
     }
 
-    /* If files were copied and vrd.inf has error 43, restart GPU + IDD devices
-       and re-disable Hyper-V Video adapter. */
     if (total_files > 0 && check_gpu_error43()) {
         agent_log("GPU drivers copied and error 43 detected - attempting device restart.");
         cycle_gpu_devices(state->notify_sock, TRUE);
-
-        /* TODO: re-enable once IDD display is stable
-        Sleep(2000);
-        disable_hyperv_video(state->notify_sock);
-        */
     } else if (total_files > 0) {
         agent_log("GPU drivers copied, no error 43 - no device restart needed.");
     } else {
@@ -1590,169 +1580,98 @@ static void ensure_vdd_running(void)
     agent_log("VDD restart (exit=%lu): %.400s", exit_code, output);
 }
 
-/* ---- Hyper-V Video device check: disable if running ---- */
+static SRWLOCK g_display_lock = SRWLOCK_INIT;
+static HANDLE g_display_process;
+static DWORD g_display_session = 0xFFFFFFFF;
 
-#define HYPERV_VIDEO_HWID L"*DA0A7802*"
-
-static void ensure_hyperv_video_disabled(AsbConn *notify)
+static void close_display_helper(void)
 {
-    char output[4096];
-    DWORD exit_code = 0;
-
-    if (!run_devcon(L"status " HYPERV_VIDEO_HWID, output, sizeof(output), &exit_code)) {
-        agent_log("ensure_hyperv_video_disabled: devcon failed to launch (%lu).", GetLastError());
-        return;
+    if (g_display_process) {
+        if (WaitForSingleObject(g_display_process, 0) != WAIT_OBJECT_0) {
+            TerminateProcess(g_display_process, 0);
+            WaitForSingleObject(g_display_process, 3000);
+        }
+        CloseHandle(g_display_process);
+        g_display_process = NULL;
     }
-
-    if (strstr(output, "disabled") || strstr(output, "No matching"))
-        return;
-
-    if (!strstr(output, "running"))
-        return;
-
-    agent_log("Hyper-V Video: running — disabling.");
-
-    if (!run_devcon(L"disable " HYPERV_VIDEO_HWID, output, sizeof(output), &exit_code)) {
-        agent_log("Hyper-V Video disable: devcon failed to launch (%lu).", GetLastError());
-        return;
-    }
-
-    if (notify != NULL)
-        send_line(notify, "hyperv_video:disabled");
-    agent_log("Hyper-V Video disable (exit=%lu): %.400s", exit_code, output);
+    g_display_session = 0xFFFFFFFF;
 }
 
-/* ---- Report display monitor info to host ---- */
+static void stop_display_monitor(void)
+{
+    AcquireSRWLockExclusive(&g_display_lock);
+    close_display_helper();
+    ReleaseSRWLockExclusive(&g_display_lock);
+}
 
-/* Spawn appsandbox-displays.exe in the interactive session and capture its
-   stdout.  The helper prints "N,WxH,WxH,..." and exits.  We use the same
-   token-dup + SetTokenInformation pattern as spawn_input_in_session(). */
-static void report_displays(AsbConn *notify)
+static void ensure_display_monitor(void)
 {
     HANDLE cur_token = NULL, dup_token = NULL;
-    HANDLE hReadPipe = NULL, hWritePipe = NULL;
-    SECURITY_ATTRIBUTES sa;
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
-    wchar_t exe_path[MAX_PATH];
+    wchar_t exe_path[MAX_PATH], cmd[MAX_PATH + 32];
     wchar_t *slash;
     DWORD session_id;
-    char output[512];
-    DWORD bytes_read;
-    char msg[512];
 
-    output[0] = '\0';
-
+    AcquireSRWLockExclusive(&g_display_lock);
+    if (WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0) goto done;
     session_id = WTSGetActiveConsoleSessionId();
-    if (session_id == 0xFFFFFFFF || session_id == 0) {
-        /* No interactive user session — skip display enumeration.
-           Session 0 is the services session (no desktop).
-           0xFFFFFFFF means no console session at all. */
-        if (notify != NULL) send_line(notify, "displays:0,");
-        return;
+    if (g_display_process && g_display_session == session_id &&
+        WaitForSingleObject(g_display_process, 0) != WAIT_OBJECT_0) goto done;
+    if (g_display_process) {
+        DWORD exit_code = 0;
+        if (GetExitCodeProcess(g_display_process, &exit_code) && exit_code != STILL_ACTIVE && exit_code)
+            agent_log("Display monitor exited (%lu), restarting.", exit_code);
     }
+    close_display_helper();
+    if (session_id == 0xFFFFFFFF || session_id == 0) goto done;
 
-    /* Build path to appsandbox-displays.exe (same directory as agent) */
     GetModuleFileNameW(NULL, exe_path, MAX_PATH);
     slash = wcsrchr(exe_path, L'\\');
     if (slash) *(slash + 1) = L'\0';
     wcscat_s(exe_path, MAX_PATH, L"appsandbox-displays.exe");
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%s\" --watch-hyperv", exe_path);
 
     if (GetFileAttributesW(exe_path) == INVALID_FILE_ATTRIBUTES) {
-        agent_log("report_displays: %ls not found.", exe_path);
-        if (notify != NULL) send_line(notify, "displays:0,");
-        return;
+        agent_log("Hyper-V display: %ls not found.", exe_path);
+        goto done;
     }
 
-    /* Create pipe for stdout capture */
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-        agent_log("report_displays: CreatePipe failed (%lu).", GetLastError());
-        if (notify != NULL) send_line(notify, "displays:0,");
-        return;
-    }
-    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
-
-    /* Duplicate our token and set the interactive session */
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &cur_token)) {
-        agent_log("report_displays: OpenProcessToken failed (%lu).", GetLastError());
-        CloseHandle(hReadPipe); CloseHandle(hWritePipe);
-        if (notify != NULL) send_line(notify, "displays:0,");
-        return;
+        agent_log("Hyper-V display: OpenProcessToken failed (%lu).", GetLastError());
+        goto done;
     }
     if (!DuplicateTokenEx(cur_token, TOKEN_ALL_ACCESS, NULL,
                            SecurityImpersonation, TokenPrimary, &dup_token)) {
-        agent_log("report_displays: DuplicateTokenEx failed (%lu).", GetLastError());
-        CloseHandle(cur_token); CloseHandle(hReadPipe); CloseHandle(hWritePipe);
-        if (notify != NULL) send_line(notify, "displays:0,");
-        return;
+        agent_log("Hyper-V display: DuplicateTokenEx failed (%lu).", GetLastError());
+        goto done;
     }
-    CloseHandle(cur_token);
 
     if (!SetTokenInformation(dup_token, TokenSessionId,
                               &session_id, sizeof(session_id))) {
-        agent_log("report_displays: SetTokenInformation(session=%lu) failed (%lu).",
+        agent_log("Hyper-V display: SetTokenInformation(session=%lu) failed (%lu).",
                    session_id, GetLastError());
-        CloseHandle(dup_token); CloseHandle(hReadPipe); CloseHandle(hWritePipe);
-        if (notify != NULL) send_line(notify, "displays:0,");
-        return;
+        goto done;
     }
 
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     si.lpDesktop = L"WinSta0\\Default";
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = hWritePipe;
-    si.hStdError = hWritePipe;
-    si.hStdInput = NULL;
     ZeroMemory(&pi, sizeof(pi));
 
-    if (!CreateProcessAsUserW(dup_token, exe_path, NULL, NULL, NULL,
-                               TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        agent_log("report_displays: CreateProcessAsUserW failed (%lu).", GetLastError());
-        CloseHandle(dup_token); CloseHandle(hReadPipe); CloseHandle(hWritePipe);
-        if (notify != NULL) send_line(notify, "displays:0,");
-        return;
+    if (!CreateProcessAsUserW(dup_token, exe_path, cmd, NULL, NULL,
+                               FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        agent_log("Hyper-V display: CreateProcessAsUserW failed (%lu).", GetLastError());
+        goto done;
     }
-    CloseHandle(dup_token);
-    CloseHandle(hWritePipe);  /* Close write end so ReadFile sees EOF */
-    hWritePipe = NULL;
-
-    /* Wait for process (max 2s) then read output.
-       Timeout is normal at early boot before the desktop is ready. */
-    if (WaitForSingleObject(pi.hProcess, 2000) == WAIT_TIMEOUT) {
-        agent_log("report_displays: helper timed out (desktop may not be ready).");
-        TerminateProcess(pi.hProcess, 1);
-        WaitForSingleObject(pi.hProcess, 1000);
-    }
-
-    {
-        int total = 0;
-        while (ReadFile(hReadPipe, output + total,
-                        (DWORD)(sizeof(output) - 1 - total), &bytes_read, NULL) &&
-               bytes_read > 0) {
-            total += (int)bytes_read;
-            if (total >= (int)sizeof(output) - 1) break;
-        }
-        output[total] = '\0';
-    }
-
-    CloseHandle(pi.hProcess);
+    g_display_process = pi.hProcess;
+    g_display_session = session_id;
     CloseHandle(pi.hThread);
-    CloseHandle(hReadPipe);
-
-    /* Strip trailing whitespace */
-    {
-        int len = (int)strlen(output);
-        while (len > 0 && (output[len-1] == '\r' || output[len-1] == '\n' || output[len-1] == ' '))
-            output[--len] = '\0';
-    }
-
-    snprintf(msg, sizeof(msg), "displays:%s", output);
-    agent_log("Displays: %s", output);
-    if (notify != NULL) send_line(notify, msg);
+    agent_log("Display monitor: spawned PID %lu in session %lu.", pi.dwProcessId, session_id);
+done:
+    if (dup_token) CloseHandle(dup_token);
+    if (cur_token) CloseHandle(cur_token);
+    ReleaseSRWLockExclusive(&g_display_lock);
 }
 
 /* ---- IDD connect: respawn helpers in console session ---- */
@@ -1795,66 +1714,6 @@ static void handle_idd_connect(AsbConn *client, const char *tag)
 }
 
 /* ---- Persistent client handler ---- */
-
-/* Disable the Hyper-V synthetic video adapter (if present).
-   Hardware ID: VMBUS\{da0a7802-e377-4aac-8e77-0558eb1073f8}
-   Silently does nothing if the device doesn't exist. */
-static void disable_hyperv_video(AsbConn *notify_sock)
-{
-    HDEVINFO devs;
-    SP_DEVINFO_DATA dev_info;
-    DWORD idx;
-    wchar_t hw_id[512];
-    CONFIGRET cr;
-    static const wchar_t *TARGET_HWID = L"VMBUS\\{DA0A7802-E377-4AAC-8E77-0558EB1073F8}";
-
-    devs = SetupDiGetClassDevsW(&GUID_DISPLAY_CLASS, NULL, NULL, DIGCF_PRESENT);
-    if (devs == INVALID_HANDLE_VALUE) {
-        agent_log("disable_hyperv_video: SetupDiGetClassDevs(PRESENT) failed, trying ALLCLASSES.");
-        devs = SetupDiGetClassDevsW(NULL, NULL, NULL, DIGCF_ALLCLASSES);
-        if (devs == INVALID_HANDLE_VALUE) return;
-    }
-
-    dev_info.cbSize = sizeof(dev_info);
-    for (idx = 0; SetupDiEnumDeviceInfo(devs, idx, &dev_info); idx++) {
-        ULONG dev_status = 0, dev_problem = 0;
-        hw_id[0] = L'\0';
-        CM_Get_Device_IDW(dev_info.DevInst, hw_id, 512, 0);
-
-        if (_wcsnicmp(hw_id, TARGET_HWID, wcslen(TARGET_HWID)) != 0)
-            continue;
-
-        /* Check if already disabled */
-        cr = CM_Get_DevNode_Status(&dev_status, &dev_problem, dev_info.DevInst, 0);
-        if (cr == CR_SUCCESS && !(dev_status & DN_STARTED) && (dev_problem == CM_PROB_DISABLED)) {
-            agent_log("Hyper-V Video adapter already disabled: %ls", hw_id);
-            if (notify_sock != NULL)
-                send_line(notify_sock, "hyperv_video:already_disabled");
-            SetupDiDestroyDeviceInfoList(devs);
-            return;
-        }
-
-        agent_log("Disabling Hyper-V Video adapter: %ls (status=0x%lX problem=%lu)", hw_id, dev_status, dev_problem);
-        if (notify_sock != NULL)
-            send_line(notify_sock, "hyperv_video:disabling");
-
-        cr = CM_Disable_DevNode(dev_info.DevInst, 0);
-        if (cr == CR_SUCCESS) {
-            agent_log("Hyper-V Video adapter disabled.");
-            if (notify_sock != NULL)
-                send_line(notify_sock, "hyperv_video:disabled");
-        } else {
-            agent_log("Hyper-V Video disable failed (%lu).", cr);
-        }
-        SetupDiDestroyDeviceInfoList(devs);
-        return;
-    }
-
-    agent_log("Hyper-V Video adapter not found (enumerated %lu devices).", idx);
-    if (notify_sock != NULL)
-        send_line(notify_sock, "hyperv_video:not_found");
-    SetupDiDestroyDeviceInfoList(devs);
-}
 
 /* Forward declaration — defined after SSH proxy section */
 static void handle_ssh_enable(AsbConn *client, const char *tag);
@@ -1919,7 +1778,7 @@ static void handle_client(AsbConn *client)
 
     /* Initial device checks */
     ensure_vdd_running();
-    ensure_hyperv_video_disabled(client);
+    ensure_display_monitor();
 
     last_heartbeat = GetTickCount();
     last_device_check = last_heartbeat;
@@ -1946,7 +1805,7 @@ static void handle_client(AsbConn *client)
         if (now - last_device_check >= device_check_interval) {
             last_device_check = now;
             ensure_vdd_running();
-            ensure_hyperv_video_disabled(client);
+            ensure_display_monitor();
             report_idd_status(client, 0);   /* re-report the (possibly self-healed) VDD state; on-change only */
         }
 
@@ -2504,6 +2363,7 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
 
     if (ctrl == SERVICE_CONTROL_SESSIONCHANGE) {
         WTSSESSION_NOTIFICATION *sn = (WTSSESSION_NOTIFICATION *)event_data;
+        ensure_display_monitor();
         if (event_type == WTS_SESSION_LOGOFF) {
             agent_log("Session logoff detected (session %lu).",
                        sn ? sn->dwSessionId : 0);
@@ -2513,8 +2373,6 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
                A devcon restart mid-transition destroys the adapter/monitor
                and prevents IddCx from completing the handoff. */
 
-            /* Disable Hyper-V Video after logoff (may have been re-enabled) */
-            ensure_hyperv_video_disabled(NULL);
         }
         if (event_type == WTS_SESSION_LOGON || event_type == WTS_SESSION_UNLOCK) {
             DWORD sid = sn ? sn->dwSessionId : WTSGetActiveConsoleSessionId();
@@ -2577,11 +2435,12 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     /* Ensure VDD device is running (may need restart after logout teardown) */
     ensure_vdd_running();
 
-    /* Ensure Hyper-V Video adapter is disabled (VDD replaces it) */
-    ensure_hyperv_video_disabled(NULL);
+    ensure_display_monitor();
 
     /* Wait until stop is signaled */
     WaitForSingleObject(g_stop_event, INFINITE);
+
+    stop_display_monitor();
 
     /* Clean up */
     agent_log("Stop event signaled, cleaning up...");
