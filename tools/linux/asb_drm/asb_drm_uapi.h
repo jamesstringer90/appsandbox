@@ -26,6 +26,7 @@ struct drm_asb_display_config {
 	__u32 flags;
 	__u32 width;
 	__u32 height;
+	__u32 refresh;
 };
 
 struct drm_asb_gpu_query {

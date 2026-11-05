@@ -55,6 +55,7 @@ struct asb_device {
 	u32                    display_flags;
 	u32                    display_width;
 	u32                    display_height;
+	u32                    display_refresh;
 	struct mutex           gpu_lock;
 	struct list_head       gpu_objects;
 	struct drm_file       *gpu_presenter;

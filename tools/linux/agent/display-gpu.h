@@ -13,7 +13,7 @@ int display_gpu_active(struct display_gpu *gpu);
 int display_gpu_healthy(struct display_gpu *gpu);
 int display_gpu_connect(struct display_gpu *gpu, int socket_fd,
                         const DisplayGpuPacket *query, uint32_t width, uint32_t height,
-                        int resize, uint32_t size_mode);
+                        int resize, uint32_t size_mode, uint32_t refresh);
 void display_gpu_disconnect(struct display_gpu *gpu);
 int display_gpu_frame(struct display_gpu *gpu);
 int display_gpu_readback(struct display_gpu *gpu, const void **pixels,

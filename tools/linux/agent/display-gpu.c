@@ -321,7 +321,7 @@ int display_gpu_active(struct display_gpu *gpu)
 
 int display_gpu_connect(struct display_gpu *gpu, int socket_fd,
                         const DisplayGpuPacket *query, uint32_t width, uint32_t height,
-                        int resize, uint32_t size_mode)
+                        int resize, uint32_t size_mode, uint32_t refresh)
 {
     if (!gpu || !width || !height || width > DISPLAY_MAX_WIDTH || height > DISPLAY_MAX_HEIGHT ||
         query->magic != DISPLAY_GPU_MAGIC || query->version != DISPLAY_GPU_VERSION ||
@@ -335,6 +335,10 @@ int display_gpu_connect(struct display_gpu *gpu, int socket_fd,
     };
     if (resize && (query->reserved & DISPLAY_GPU_CAP_RESIZE))
         packet.reserved |= DISPLAY_GPU_CAP_RESIZE;
+    if (resize && refresh && (query->reserved & DISPLAY_GPU_CAP_REFRESH)) {
+        packet.reserved |= DISPLAY_GPU_CAP_REFRESH;
+        packet.handle = refresh;
+    }
     if (gpu_transfer(socket_fd, &packet, sizeof(packet), true) < 0 ||
         gpu_transfer(socket_fd, &packet, sizeof(packet), false) < 0) return -1;
     if (packet.magic != DISPLAY_GPU_MAGIC || packet.version != DISPLAY_GPU_VERSION ||

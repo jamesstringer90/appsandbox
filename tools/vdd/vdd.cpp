@@ -100,7 +100,7 @@ static UINT VddBuildEdid(BYTE* edid, const ResolutionEntry* modes, UINT count)
 {
     UINT blocks = (count + 4) / 5;
     UINT width = modes[0].width, height = modes[0].height;
-    UINT clock = (UINT)((UINT64)(width + 160) * (height + 30) * 60 / 10000);
+    UINT clock = (UINT)((UINT64)(width + 160) * (height + 30) * modes[0].refresh / 10000);
     ZeroMemory(edid, VDD_EDID_BYTES);
     memcpy(edid, VDD_EDID, sizeof(VDD_EDID));
     BYTE* dtd = edid + 54;
@@ -137,7 +137,7 @@ static UINT VddBuildEdid(BYTE* edid, const ResolutionEntry* modes, UINT count)
             BYTE* timing = ext + 8 + n * 20;
             width = modes[index].width;
             height = modes[index].height;
-            clock = (UINT)((UINT64)(width + 160) * (height + 30) * 60 / 10000) - 1;
+            clock = (UINT)((UINT64)(width + 160) * (height + 30) * modes[index].refresh / 10000) - 1;
             VddWrite16(timing, clock);
             timing[2] = (BYTE)(clock >> 16);
             timing[3] = index ? 0 : 0x80;
@@ -170,7 +170,11 @@ static UINT VddReadModes(const IDDCX_MONITOR_DESCRIPTION* description, Resolutio
             UINT width = 1 + ext[offset + 4] + ((UINT)ext[offset + 5] << 8);
             UINT height = 1 + ext[offset + 12] + ((UINT)ext[offset + 13] << 8);
             if (width > DISPLAY_MAX_WIDTH || height > DISPLAY_MAX_HEIGHT) return 0;
-            modes[count++] = { width, height };
+            UINT64 clock = 1 + ext[offset] + ((UINT)ext[offset + 1] << 8) + ((UINT)ext[offset + 2] << 16);
+            UINT64 pixels = (UINT64)(width + 160) * (height + 30);
+            UINT refresh = (UINT)((clock * 10000 + pixels / 2) / pixels);
+            if (refresh < DISPLAY_MIN_REFRESH || refresh > DISPLAY_MAX_REFRESH) return 0;
+            modes[count++] = { width, height, refresh };
         }
     }
     return count;
@@ -181,7 +185,7 @@ static UINT VddReadModes(const IDDCX_MONITOR_DESCRIPTION* description, Resolutio
 /* ========================================================================= */
 
 static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig, UINT vSyncDivider,
-    UINT width, UINT height)
+    UINT width, UINT height, UINT refresh)
 {
     /* totalSize == activeSize, pixelRate = refresh * w * h.
        IddCx validates these relationships; using actual blanking values causes
@@ -192,21 +196,23 @@ static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig, UINT vSyn
     sig->activeSize.cy                          = height;
     sig->AdditionalSignalInfo.vSyncFreqDivider  = vSyncDivider;
     sig->AdditionalSignalInfo.videoStandard     = 255;
-    sig->vSyncFreq.Numerator                    = 60;
+    sig->vSyncFreq.Numerator                    = refresh;
     sig->vSyncFreq.Denominator                  = 1;
-    sig->hSyncFreq.Numerator                    = 60 * height;
+    sig->hSyncFreq.Numerator                    = refresh * height;
     sig->hSyncFreq.Denominator                  = 1;
     sig->scanLineOrdering                       = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    sig->pixelRate                               = (UINT64)60 * width * height;
+    sig->pixelRate                               = (UINT64)refresh * width * height;
 }
 
 static UINT VddTargetResolutions(IDDCX_MONITOR monitor, ResolutionEntry* modes)
 {
     MonitorContextWrapper* context = WdfObjectGet_MonitorContextWrapper(monitor);
     BOOL full = InterlockedCompareExchange(&context->pContext->fullModes, 0, 0) != 0;
+    BOOL gpu = InterlockedCompareExchange(&context->pContext->gpuModes, 0, 0) != 0;
     UINT count = 0;
     for (UINT i = 0; i < context->modeCount; ++i) {
         ResolutionEntry mode = context->modes[i];
+        if (!gpu && mode.refresh > 60) continue;
         if (full || (mode.width <= VDD_WIDTH && mode.height <= VDD_HEIGHT))
             modes[count++] = mode;
     }
@@ -482,6 +488,8 @@ static BOOL VddHandleResize(VDD_SWAP_PROC* proc, AsbConn* connection, DisplayGpu
     if (request.session == proc->gpuSession && proc->gpuResizeSupported && ctx->hDisplayWork &&
         !InterlockedCompareExchange(&ctx->stopping, 0, 0) &&
         request.slot <= DISPLAY_SIZE_WINDOW && request.width && request.height &&
+        (!request.handle || (!asb_transport_is_ivshmem() && request.handle >= DISPLAY_MIN_REFRESH &&
+                             request.handle <= DISPLAY_MAX_REFRESH)) &&
         request.width <= DISPLAY_MAX_WIDTH && request.height <= DISPLAY_MAX_HEIGHT &&
         (request.slot == DISPLAY_SIZE_GUEST ||
          (request.width >= DISPLAY_MIN_WIDTH && request.height >= DISPLAY_MIN_HEIGHT))) {
@@ -623,6 +631,10 @@ static BOOL VddSendGpuPacket(VDD_SWAP_PROC* proc, UINT type, HRESULT status, UIN
     packet.slot = slot;
     if (type == DISPLAY_GPU_CAPS) {
         packet.reserved = proc->pOwner->hDisplayWork ? DISPLAY_GPU_CAP_RESIZE : 0;
+        if (proc->pOwner->hDisplayWork && !asb_transport_is_ivshmem()) {
+            packet.reserved |= DISPLAY_GPU_CAP_REFRESH;
+            packet.handle = WdfObjectGet_MonitorContextWrapper(proc->hMonitor)->modes[0].refresh;
+        }
         packet.slot = WdfObjectGet_MonitorContextWrapper(proc->hMonitor)->matchWindow
             ? DISPLAY_SIZE_WINDOW : DISPLAY_SIZE_GUEST;
         if (asb_transport_is_ivshmem()) {
@@ -1603,7 +1615,7 @@ static void VddFinishInit(VDD_DEVICE_CONTEXT* ctx)
 /* ========================================================================= */
 
 static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx,
-    UINT width = VDD_WIDTH, UINT height = VDD_HEIGHT, BOOL matchWindow = FALSE)
+    UINT width = VDD_WIDTH, UINT height = VDD_HEIGHT, BOOL matchWindow = FALSE, UINT refresh = 60)
 {
     VddLog("CreateMonitor: entered (ctx=%p, adapter=%p)", (void*)ctx, (void*)ctx->hAdapter);
 
@@ -1613,7 +1625,7 @@ static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx,
     monitorInfo.ConnectorIndex = 0;
     ResolutionEntry modes[VDD_MAX_MODES] = {};
     UINT modeCount = 1;
-    modes[0] = { width, height };
+    modes[0] = { width, height, refresh };
     if (!matchWindow) {
         for (UINT i = 0; i < g_NumResolutions; ++i) {
             if (g_SupportedResolutions[i].width != width || g_SupportedResolutions[i].height != height)
@@ -1722,20 +1734,23 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
     }
     MonitorContextWrapper* mon = WdfObjectGet_MonitorContextWrapper(monitor);
     UINT width = mon->modes[0].width, height = mon->modes[0].height;
+    UINT refresh = mon->modes[0].refresh;
     BOOL matchWindow = mon->matchWindow;
     BOOL recreate = !proc;
     if (request.type && available && request.session == proc->gpuSession) {
         matchWindow = request.slot == DISPLAY_SIZE_WINDOW;
         width = request.width;
         height = request.height;
-        recreate = matchWindow != mon->matchWindow ||
+        refresh = matchWindow && request.handle ? (UINT)request.handle : 60;
+        recreate = refresh != mon->modes[0].refresh || matchWindow != mon->matchWindow ||
             (matchWindow && (width != mon->modes[0].width || height != mon->modes[0].height));
-    } else if ((!memory && !available && mon->matchWindow) || (!fullModes &&
+    } else if ((!memory && !available && (mon->matchWindow || refresh > 60)) || (!fullModes &&
         ((proc && (proc->width > VDD_WIDTH || proc->height > VDD_HEIGHT)) ||
          (!proc && (width > VDD_WIDTH || height > VDD_HEIGHT))))) {
         matchWindow = FALSE;
         width = VDD_WIDTH;
         height = VDD_HEIGHT;
+        refresh = 60;
         recreate = TRUE;
     }
     ResolutionEntry previous = mon->modes[0];
@@ -1759,11 +1774,12 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
             if (ctx->hRecoveryTimer) WdfTimerStart(ctx->hRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(2));
             return;
         }
-        status = VddCreateMonitor(ctx, width, height, matchWindow);
+        status = VddCreateMonitor(ctx, width, height, matchWindow, refresh);
         if (!NT_SUCCESS(status)) {
             VddLog("Display: resize failed 0x%08X; restoring monitor", status);
             status = VddCreateMonitor(ctx, available ? previous.width : VDD_WIDTH,
-                available ? previous.height : VDD_HEIGHT, available && previousMatch);
+                available ? previous.height : VDD_HEIGHT, available && previousMatch,
+                available ? previous.refresh : 60);
         }
         if (ctx->hRecoveryTimer)
             WdfTimerStart(ctx->hRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(NT_SUCCESS(status) ? 5 : 2));
@@ -1779,7 +1795,7 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
                 modes[i].Size = sizeof(modes[i]);
                 modes[i].BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
                 VddCreateMonitorMode(&modes[i].TargetVideoSignalInfo.targetVideoSignalInfo, 1,
-                    resolutions[i].width, resolutions[i].height);
+                    resolutions[i].width, resolutions[i].height, resolutions[i].refresh);
             }
             IDARG_IN_UPDATEMODES2 args = {};
             args.Reason = IDDCX_UPDATE_REASON_CONFIGURATION_CONSTRAINTS;
@@ -1791,7 +1807,7 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
             for (UINT i = 0; i < count; ++i) {
                 modes[i].Size = sizeof(modes[i]);
                 VddCreateMonitorMode(&modes[i].TargetVideoSignalInfo.targetVideoSignalInfo, 1,
-                    resolutions[i].width, resolutions[i].height);
+                    resolutions[i].width, resolutions[i].height, resolutions[i].refresh);
             }
             IDARG_IN_UPDATEMODES args = {};
             args.Reason = IDDCX_UPDATE_REASON_CONFIGURATION_CONSTRAINTS;
@@ -2068,7 +2084,7 @@ NTSTATUS VddParseMonitorDescription(
         ZeroMemory(mode, sizeof(*mode));
         mode->Size = sizeof(*mode);
         mode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-        VddCreateMonitorMode(&mode->MonitorVideoSignalInfo, 0, modes[i].width, modes[i].height);
+        VddCreateMonitorMode(&mode->MonitorVideoSignalInfo, 0, modes[i].width, modes[i].height, modes[i].refresh);
     }
     return STATUS_SUCCESS;
 }
@@ -2098,7 +2114,7 @@ NTSTATUS VddMonitorGetDefaultModes(
         ZeroMemory(mode, sizeof(*mode));
         mode->Size = sizeof(*mode);
         mode->Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
-        VddCreateMonitorMode(&mode->MonitorVideoSignalInfo, 0, mon->modes[i].width, mon->modes[i].height);
+        VddCreateMonitorMode(&mode->MonitorVideoSignalInfo, 0, mon->modes[i].width, mon->modes[i].height, mon->modes[i].refresh);
     }
     return STATUS_SUCCESS;
 }
@@ -2127,7 +2143,7 @@ NTSTATUS VddMonitorQueryTargetModes(
         IDDCX_TARGET_MODE* mode = &pInArgs->pTargetModes[i];
         ZeroMemory(mode, sizeof(*mode));
         mode->Size = sizeof(*mode);
-        VddCreateMonitorMode(&mode->TargetVideoSignalInfo.targetVideoSignalInfo, 1, modes[i].width, modes[i].height);
+        VddCreateMonitorMode(&mode->TargetVideoSignalInfo.targetVideoSignalInfo, 1, modes[i].width, modes[i].height, modes[i].refresh);
     }
     return STATUS_SUCCESS;
 }
@@ -2201,7 +2217,7 @@ NTSTATUS VddParseMonitorDescription2(
         mode->Size = sizeof(*mode);
         mode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
         mode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
-        VddCreateMonitorMode(&mode->MonitorVideoSignalInfo, 0, modes[i].width, modes[i].height);
+        VddCreateMonitorMode(&mode->MonitorVideoSignalInfo, 0, modes[i].width, modes[i].height, modes[i].refresh);
     }
     return STATUS_SUCCESS;
 }
@@ -2226,7 +2242,7 @@ NTSTATUS VddMonitorQueryTargetModes2(
         ZeroMemory(mode, sizeof(*mode));
         mode->Size = sizeof(*mode);
         mode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
-        VddCreateMonitorMode(&mode->TargetVideoSignalInfo.targetVideoSignalInfo, 1, modes[i].width, modes[i].height);
+        VddCreateMonitorMode(&mode->TargetVideoSignalInfo.targetVideoSignalInfo, 1, modes[i].width, modes[i].height, modes[i].refresh);
     }
     return STATUS_SUCCESS;
 }

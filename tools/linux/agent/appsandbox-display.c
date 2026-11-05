@@ -710,7 +710,7 @@ static int display_config_set(int fd, struct display_config *config,
 {
     if (!config->supported) return 0;
     if (config->current.flags == next.flags && config->current.width == next.width &&
-        config->current.height == next.height) return 0;
+        config->current.height == next.height && config->current.refresh == next.refresh) return 0;
     next.operation = ASB_DRM_DISPLAY_SET;
     if (drmIoctl(fd, DRM_IOCTL_ASB_DISPLAY_CONFIG, &next) < 0) {
         agent_log("display mode update failed: %s", strerror(errno));
@@ -765,12 +765,16 @@ static int display_resize(int fd, int client_fd, struct display_config *config,
     reply.type = DISPLAY_GPU_RESIZED;
     reply.status = EINVAL;
     if (supported && request->session == session && request->slot <= DISPLAY_SIZE_WINDOW &&
+        (!request->handle || (config->current.refresh &&
+         request->handle >= DISPLAY_MIN_REFRESH && request->handle <= DISPLAY_MAX_REFRESH)) &&
         request->width >= 64 && request->height >= 64 &&
         request->width <= DISPLAY_MAX_WIDTH && request->height <= DISPLAY_MAX_HEIGHT &&
         (request->slot == DISPLAY_SIZE_GUEST ||
          (request->width >= DISPLAY_MIN_WIDTH && request->height >= DISPLAY_MIN_HEIGHT))) {
         struct drm_asb_display_config next = {
             .flags = ASB_DRM_DISPLAY_SHARED, .width = width, .height = height,
+            .refresh = config->current.refresh ?
+                (request->slot == DISPLAY_SIZE_WINDOW && request->handle ? (uint32_t)request->handle : 60) : 0,
         };
         if (request->slot == DISPLAY_SIZE_WINDOW) {
             next.flags |= ASB_DRM_DISPLAY_MATCH_WINDOW;
@@ -849,7 +853,8 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu,
                 resize = config->supported && (query.reserved & DISPLAY_GPU_CAP_RESIZE);
                 uint32_t size_mode = resize && (config->current.flags & ASB_DRM_DISPLAY_MATCH_WINDOW)
                     ? DISPLAY_SIZE_WINDOW : DISPLAY_SIZE_GUEST;
-                shared = display_gpu_connect(*gpu, client_fd, &query, width, height, resize, size_mode);
+                shared = display_gpu_connect(*gpu, client_fd, &query, width, height, resize, size_mode,
+                                             config->current.refresh);
                 if (shared < 0) {
                     shared = 0;
                     display_config_fallback(drm_fd, config);
@@ -1015,6 +1020,7 @@ int main(int argc, char **argv)
     config.supported = drmIoctl(drm_fd, DRM_IOCTL_ASB_DISPLAY_CONFIG, &config.current) == 0;
     config.fallback = config.current;
     config.fallback.flags = 0;
+    if (config.fallback.refresh > 60) config.fallback.refresh = 60;
     struct display_gpu *gpu = display_gpu_create(drm_fd);
     agent_log("GPU presenter: %s", gpu ? "ready" : "unavailable");
     sd_notify(0, "READY=1");

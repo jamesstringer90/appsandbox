@@ -87,8 +87,9 @@ typedef struct _VDD_WIRE_CURSOR_HEADER {
  *  Supported resolutions and refresh rates (single mode for this driver)
  * ============================================================================ */
 struct ResolutionEntry {
-    UINT width;
-    UINT height;
+    UINT width = 0;
+    UINT height = 0;
+    UINT refresh = 60;
 };
 
 static const ResolutionEntry g_SupportedResolutions[] = {

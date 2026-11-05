@@ -166,6 +166,7 @@ static int asb_probe(struct platform_device *pdev)
 	asb->refresh = clamp(refresh_param, 24u, 240u);
 	asb->display_width = min(asb->width, 1920u);
 	asb->display_height = min(asb->height, 1080u);
+	asb->display_refresh = min(asb->refresh, 60u);
 
 	ret = asb_mode_config_setup(asb);
 	if (ret) {

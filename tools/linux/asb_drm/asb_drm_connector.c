@@ -178,8 +178,8 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 	flags = asb->display_flags;
 	width = asb->display_width;
 	height = asb->display_height;
+	refresh = asb->display_refresh;
 	mutex_unlock(&asb->display_lock);
-	refresh = flags & ASB_DRM_DISPLAY_SHARED ? asb->refresh : min(asb->refresh, 60u);
 
 	drm_connector_update_edid_property(connector,
 	                                   (const struct edid *)asb->edid);
@@ -250,11 +250,14 @@ int asb_display_config_ioctl(struct drm_device *drm, void *data, struct drm_file
 	if (args->operation == ASB_DRM_DISPLAY_SET) {
 		if (!capable(CAP_SYS_ADMIN))
 			return -EACCES;
+		if (!args->refresh) args->refresh = 60;
 		if (args->flags & ~(ASB_DRM_DISPLAY_SHARED | ASB_DRM_DISPLAY_MATCH_WINDOW) ||
+		    args->refresh < 24 || args->refresh > 1000 ||
+		    (!(args->flags & ASB_DRM_DISPLAY_MATCH_WINDOW) && args->refresh != 60) ||
 		    args->width < 64 || args->height < 64 ||
 		    args->width > ASB_MAX_WIDTH || args->height > ASB_MAX_HEIGHT ||
 		    (!(args->flags & ASB_DRM_DISPLAY_SHARED) &&
-		     (args->width > 1920 || args->height > 1080)) ||
+		     (args->width > 1920 || args->height > 1080 || args->refresh > 60)) ||
 		    ((args->flags & ASB_DRM_DISPLAY_MATCH_WINDOW) &&
 		     (!(args->flags & ASB_DRM_DISPLAY_SHARED) || args->width < 1024 || args->height < 768)))
 			return -EINVAL;
@@ -266,15 +269,18 @@ int asb_display_config_ioctl(struct drm_device *drm, void *data, struct drm_file
 			return -EBUSY;
 		}
 		changed = asb->display_flags != args->flags ||
-		          asb->display_width != args->width || asb->display_height != args->height;
+		          asb->display_width != args->width || asb->display_height != args->height ||
+		          asb->display_refresh != args->refresh;
 		asb->display_owner = file;
 		asb->display_flags = args->flags;
 		asb->display_width = args->width;
 		asb->display_height = args->height;
+		asb->display_refresh = args->refresh;
 	} else {
 		args->flags = asb->display_flags;
 		args->width = asb->display_width;
 		args->height = asb->display_height;
+		args->refresh = asb->display_refresh;
 	}
 	mutex_unlock(&asb->display_lock);
 	if (changed)
@@ -289,11 +295,12 @@ void asb_display_release(struct asb_device *asb, struct drm_file *file)
 	mutex_lock(&asb->display_lock);
 	if (asb->display_owner == file) {
 		changed = asb->display_flags != 0 || asb->display_width != min(asb->width, 1920u) ||
-		          asb->display_height != min(asb->height, 1080u);
+		          asb->display_height != min(asb->height, 1080u) || asb->display_refresh > 60;
 		asb->display_owner = NULL;
 		asb->display_flags = 0;
 		asb->display_width = min(asb->width, 1920u);
 		asb->display_height = min(asb->height, 1080u);
+		asb->display_refresh = min(asb->refresh, 60u);
 	}
 	mutex_unlock(&asb->display_lock);
 	if (changed && !drm_dev_is_unplugged(&asb->drm))

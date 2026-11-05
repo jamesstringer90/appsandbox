@@ -64,6 +64,7 @@ typedef struct {
 #define DISPLAY_GPU_CAP_RESIZE 1u
 #define DISPLAY_GPU_CAP_IVSHMEM 2u
 #define DISPLAY_GPU_CAP_FENCE 4u
+#define DISPLAY_GPU_CAP_REFRESH 8u
 #define DISPLAY_GPU_FENCE_SLOTS (DISPLAY_GPU_SLOTS * 2)
 #define DISPLAY_SIZE_GUEST    0u
 #define DISPLAY_SIZE_WINDOW   1u
@@ -71,6 +72,8 @@ typedef struct {
 #define DISPLAY_MIN_HEIGHT    768u
 #define DISPLAY_MAX_WIDTH     7680u
 #define DISPLAY_MAX_HEIGHT    4320u
+#define DISPLAY_MIN_REFRESH   24u
+#define DISPLAY_MAX_REFRESH   1000u
 
 #pragma pack(push, 1)
 typedef struct {

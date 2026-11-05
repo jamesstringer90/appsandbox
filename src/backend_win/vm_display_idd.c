@@ -242,6 +242,8 @@ struct VmDisplayIdd {
     BOOL                    shared_ready;
     BOOL                    shared_disabled;
     BOOL                    shared_resize;
+    BOOL                    shared_refresh;
+    UINT                    shared_refresh_rate;
     UINT                    shared_width;
     UINT                    shared_height;
     UINT                    display_width;
@@ -1577,6 +1579,8 @@ static void idd_shared_release(VmDisplayIdd *d)
     d->shared_pending = -1;
     d->shared_ready = FALSE;
     d->shared_resize = FALSE;
+    d->shared_refresh = FALSE;
+    d->shared_refresh_rate = 0;
     ZeroMemory(&d->size_request, sizeof(d->size_request));
     d->shared_next = 0;
     if (d->shared_context) ID3D11DeviceContext4_Release(d->shared_context);
@@ -1791,6 +1795,8 @@ static BOOL idd_shared_start_linux(VmDisplayIdd *d, SOCKET socket,
         d->shared_width = caps->width;
         d->shared_height = caps->height;
         d->shared_resize = (caps->reserved & DISPLAY_GPU_CAP_RESIZE) != 0;
+        d->shared_refresh = (caps->reserved & DISPLAY_GPU_CAP_REFRESH) != 0;
+        d->shared_refresh_rate = d->shared_refresh ? (UINT)caps->handle : 60;
         d->guest_size_mode = caps->slot == DISPLAY_SIZE_WINDOW ? DISPLAY_SIZE_WINDOW : DISPLAY_SIZE_GUEST;
     }
     LeaveCriticalSection(&d->frame_cs);
@@ -1886,10 +1892,24 @@ static BOOL idd_send_size_request(VmDisplayIdd *d, SOCKET s)
     return !packet.type || idd_send_gpu(s, &packet);
 }
 
+static UINT idd_monitor_refresh(HWND hwnd)
+{
+    MONITORINFOEXW monitor = {0};
+    DEVMODEW settings = {0};
+    UINT refresh = 60;
+    monitor.cbSize = sizeof(monitor);
+    settings.dmSize = sizeof(settings);
+    if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), (MONITORINFO *)&monitor))
+        return refresh;
+    if (EnumDisplaySettingsW(monitor.szDevice, ENUM_CURRENT_SETTINGS, &settings))
+        refresh = settings.dmDisplayFrequency;
+    return refresh >= DISPLAY_MIN_REFRESH && refresh <= DISPLAY_MAX_REFRESH ? min(refresh, 120u) : 60;
+}
+
 static void idd_update_display_size(VmDisplayIdd *d, BOOL follow)
 {
     RECT rc;
-    UINT width, height, mode;
+    UINT width, height, mode, refresh;
     BOOL active, resize_window = FALSE;
     if (!d || !d->hwnd) return;
     d->size_update_pending = TRUE;
@@ -1907,7 +1927,9 @@ static void idd_update_display_size(VmDisplayIdd *d, BOOL follow)
     d->size_update_pending = FALSE;
     width = d->frame_width;
     height = d->frame_height;
+    refresh = 60;
     if (mode == DISPLAY_SIZE_WINDOW) {
+        if (d->shared_refresh) refresh = idd_monitor_refresh(d->hwnd);
         GetClientRect(d->hwnd, &rc);
         width = max(DISPLAY_MIN_WIDTH, min(DISPLAY_MAX_WIDTH, (UINT)rc.right));
         height = max(DISPLAY_MIN_HEIGHT, min(DISPLAY_MAX_HEIGHT, (UINT)rc.bottom));
@@ -1917,7 +1939,8 @@ static void idd_update_display_size(VmDisplayIdd *d, BOOL follow)
     }
     d->size_follow_pending = FALSE;
     ZeroMemory(&d->size_request, sizeof(d->size_request));
-    if (active && (mode != d->guest_size_mode || (mode == DISPLAY_SIZE_WINDOW &&
+    if (active && ((mode == DISPLAY_SIZE_WINDOW && d->shared_refresh && refresh != d->shared_refresh_rate) ||
+        mode != d->guest_size_mode || (mode == DISPLAY_SIZE_WINDOW &&
         (width != d->shared_width || height != d->shared_height)))) {
         DisplayGpuPacket *packet = &d->size_request;
         ZeroMemory(packet, sizeof(*packet));
@@ -1927,6 +1950,7 @@ static void idd_update_display_size(VmDisplayIdd *d, BOOL follow)
         packet->width = width;
         packet->height = height;
         packet->slot = mode;
+        packet->handle = d->shared_refresh ? refresh : 0;
     }
     LeaveCriticalSection(&d->frame_cs);
     if (resize_window) {
@@ -2825,6 +2849,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             query.version = DISPLAY_GPU_VERSION;
             query.reserved = _wcsicmp(d->os_type, L"windows") == 0
                 ? DISPLAY_GPU_CAP_RESIZE : DISPLAY_GPU_CAP_FENCE | DISPLAY_GPU_CAP_RESIZE;
+            query.reserved |= DISPLAY_GPU_CAP_REFRESH;
             query.session = ((UINT64)GetCurrentProcessId() << 32) |
                             (UINT32)InterlockedIncrement(&gpu_session_id);
             d->shared_session = query.session;
@@ -2870,6 +2895,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     }
                     EnterCriticalSection(&d->frame_cs);
                     d->shared_resize = (packet.reserved & DISPLAY_GPU_CAP_RESIZE) != 0;
+                    d->shared_refresh = (packet.reserved & DISPLAY_GPU_CAP_REFRESH) != 0;
+                    d->shared_refresh_rate = d->shared_refresh ? (UINT)packet.handle : 60;
                     d->shared_width = packet.width;
                     d->shared_height = packet.height;
                     d->guest_size_mode = packet.slot;
@@ -2909,6 +2936,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     } else if (broker && packet.slot <= DISPLAY_SIZE_WINDOW) {
                         EnterCriticalSection(&d->frame_cs);
                         d->guest_size_mode = packet.slot;
+                        if (d->shared_refresh && packet.handle) d->shared_refresh_rate = (UINT)packet.handle;
                         LeaveCriticalSection(&d->frame_cs);
                     }
                 } else {
@@ -3552,7 +3580,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
 
+    case WM_DISPLAYCHANGE:
     case WM_MOVE:
+        if (d && d->size_mode == DISPLAY_SIZE_WINDOW && !d->input_sizing)
+            idd_update_display_size(d, FALSE);
         if (d && d->relative_mouse) {
             AcquireSRWLockExclusive(&g_mouse_capture_lock);
             if (g_mouse_capture_hwnd == hwnd) idd_clip_mouse(d);
@@ -3578,7 +3609,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_IDD_DISPLAY_SIZE:
         if (d && lp) d->size_mode = DISPLAY_SIZE_GUEST;
-        if (d && (wp || d->size_mode == DISPLAY_SIZE_WINDOW || d->guest_size_mode != DISPLAY_SIZE_GUEST))
+        if (d && (wp || d->shared_refresh || d->size_mode == DISPLAY_SIZE_WINDOW || d->guest_size_mode != DISPLAY_SIZE_GUEST))
             idd_update_display_size(d, wp != 0);
         return 0;
 
