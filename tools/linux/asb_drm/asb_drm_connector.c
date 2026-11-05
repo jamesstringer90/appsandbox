@@ -252,7 +252,7 @@ int asb_display_config_ioctl(struct drm_device *drm, void *data, struct drm_file
 			return -EACCES;
 		if (!args->refresh) args->refresh = 60;
 		if (args->flags & ~(ASB_DRM_DISPLAY_SHARED | ASB_DRM_DISPLAY_MATCH_WINDOW) ||
-		    args->refresh < 24 || args->refresh > 1000 ||
+		    args->refresh < 24 || args->refresh > 120 ||
 		    (!(args->flags & ASB_DRM_DISPLAY_MATCH_WINDOW) && args->refresh != 60) ||
 		    args->width < 64 || args->height < 64 ||
 		    args->width > ASB_MAX_WIDTH || args->height > ASB_MAX_HEIGHT ||

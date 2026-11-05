@@ -73,7 +73,7 @@ typedef struct {
 #define DISPLAY_MAX_WIDTH     7680u
 #define DISPLAY_MAX_HEIGHT    4320u
 #define DISPLAY_MIN_REFRESH   24u
-#define DISPLAY_MAX_REFRESH   1000u
+#define DISPLAY_MAX_REFRESH   120u
 
 #pragma pack(push, 1)
 typedef struct {

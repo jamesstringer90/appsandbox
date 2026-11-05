@@ -1903,7 +1903,7 @@ static UINT idd_monitor_refresh(HWND hwnd)
         return refresh;
     if (EnumDisplaySettingsW(monitor.szDevice, ENUM_CURRENT_SETTINGS, &settings))
         refresh = settings.dmDisplayFrequency;
-    return refresh >= DISPLAY_MIN_REFRESH && refresh <= DISPLAY_MAX_REFRESH ? min(refresh, 120u) : 60;
+    return refresh >= DISPLAY_MIN_REFRESH ? min(refresh, DISPLAY_MAX_REFRESH) : 60;
 }
 
 static void idd_update_display_size(VmDisplayIdd *d, BOOL follow)
