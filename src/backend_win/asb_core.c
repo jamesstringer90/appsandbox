@@ -2637,11 +2637,6 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     /* (Detection + prefetch happen below, after we've decided on the
        staging dir, since the prefetches write directly into it.) */
 
-    /* ---- 1a. Set up staging dir + run 3 prefetches that populate it
-       directly (no host cache). Order doesn't matter functionally;
-       sequential for simpler logging. Failures are non-fatal — VM
-       still builds; firstboot STEP 17 verification will flag any
-       missing artifacts in the rootfs. ---- */
     swprintf_s(staging, MAX_PATH, L"%s\\_vhdx_staging", args->vhdx_dir);
     CreateDirectoryW(staging, NULL);
     swprintf_s(manifest, MAX_PATH, L"%s\\manifest.txt", staging);

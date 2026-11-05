@@ -69,8 +69,8 @@ install-agents: agents
 
 modules: dxgkrnl asb_drm
 
-dxgkrnl:
-	$(MAKE) -C dxgkrnl KDIR=/lib/modules/$(KVER)/build
+dxgkrnl: dxgkrnl-source
+	$(MAKE) -C dxgkrnl KDIR=/lib/modules/$(KVER)/build modules
 
 dxgkrnl-source:
 	$(MAKE) -C dxgkrnl source

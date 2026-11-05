@@ -1,16 +1,7 @@
 #ifndef ASB_LINUX_DEPS_H
 #define ASB_LINUX_DEPS_H
 
-#define ASB_LINUX_STRINGIFY_INNER(value) #value
-#define ASB_LINUX_STRINGIFY(value) ASB_LINUX_STRINGIFY_INNER(value)
-#define ASB_LINUX_WIDEN_INNER(value) L##value
-#define ASB_LINUX_WIDEN(value) ASB_LINUX_WIDEN_INNER(value)
-
-#ifndef ASB_VERSION_SHORT
-#error ASB_VERSION_SHORT must identify the AppSandbox release
-#endif
-
-#define ASB_LINUX_CLIENT_TAG L"v" ASB_LINUX_WIDEN(ASB_LINUX_STRINGIFY(ASB_VERSION_SHORT))
+#define ASB_LINUX_CLIENT_TAG L"v0.1.10"
 #define ASB_LINUX_MESA_TAG L"2026-11-04"
 #define ASB_LINUX_DXGKRNL_TAG L"2026-11-04"
 

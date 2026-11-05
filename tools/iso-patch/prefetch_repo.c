@@ -234,11 +234,9 @@ static BOOL repository_layout_valid(const wchar_t *repository, const wchar_t *di
 static void cache_repository(const wchar_t *repository, const wchar_t *tag,
                               const wchar_t *cache_directory, const wchar_t *directory)
 {
-    wchar_t archive[MAX_PATH], cached[MAX_PATH], cache_parent[MAX_PATH], pending[MAX_PATH];
+    wchar_t archive[MAX_PATH], cached[MAX_PATH], pending[MAX_PATH];
     swprintf_s(archive, MAX_PATH, L"%s.tar.gz", directory);
-    swprintf_s(cache_parent, MAX_PATH, L"%s\\%s", cache_directory, repository);
-    swprintf_s(cached, MAX_PATH, L"%s\\%s.tar.gz", cache_parent, tag);
-    u_mkdir_p(cache_parent);
+    swprintf_s(cached, MAX_PATH, L"%s\\%s-%s.tar.gz", cache_directory, repository, tag);
     swprintf_s(pending, MAX_PATH, L"%s.%lu.%lu.tmp", cached, GetCurrentProcessId(), GetTickCount());
     if (!CopyFileW(archive, pending, FALSE) ||
         !MoveFileExW(pending, cached, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -257,7 +255,7 @@ static int fetch_repository(const wchar_t *repository, const wchar_t *tag,
     BOOL cache_hit = FALSE, used_main = FALSE, retried = FALSE;
     *save_cache = FALSE;
     swprintf_s(archive, MAX_PATH, L"%s.tar.gz", directory);
-    swprintf_s(cached, MAX_PATH, L"%s\\%s\\%s.tar.gz", cache_directory, repository, tag);
+    swprintf_s(cached, MAX_PATH, L"%s\\%s-%s.tar.gz", cache_directory, repository, tag);
 retry:
     cache_hit = FALSE;
     used_main = FALSE;
@@ -343,9 +341,11 @@ int do_prefetch_repo(const wchar_t *tag, const wchar_t *mesa_tag,
 
     wchar_t default_cache[MAX_PATH];
     if (!cache_dir) {
-        DWORD length = GetEnvironmentVariableW(L"ProgramData", default_cache, ARRAYSIZE(default_cache));
+        DWORD length = GetModuleFileNameW(NULL, default_cache, ARRAYSIZE(default_cache));
         if (!length || length >= ARRAYSIZE(default_cache)) return -1;
-        if (wcscat_s(default_cache, ARRAYSIZE(default_cache), L"\\AppSandbox\\cache\\linux") != 0) return -1;
+        wchar_t *slash = wcsrchr(default_cache, L'\\');
+        if (!slash) return -1;
+        *slash = L'\0';
         cache_dir = default_cache;
     }
     if (!cache_dir[0]) return -1;

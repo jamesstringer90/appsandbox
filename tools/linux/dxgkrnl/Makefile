@@ -5,6 +5,9 @@ SOURCE_TAG := $(shell sed -n 's/^[[:space:]]*"tag": "\([^"]*\)".*/\1/p' ../../..
 SOURCE_DIR := $(PWD)/.source
 
 all: source
+	$(MAKE) modules
+
+modules:
 	$(MAKE) -C $(KDIR) M=$(SOURCE_DIR)/src modules
 
 source:
@@ -22,4 +25,4 @@ install: all
 	install -m 0644 $(SOURCE_DIR)/src/dxgkrnl.ko $(INSTDIR)/
 	depmod -a $(shell uname -r)
 
-.PHONY: all source clean install
+.PHONY: all source modules clean install
