@@ -571,7 +571,6 @@ static BOOL send_input_locked(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2
             return FALSE;
         }
         idd_log(d, L"INPUT SEND ERR %d - flagging for reconnect.", err);
-        /* Mark dead — recv thread owns the socket and will close + reconnect */
         d->input_socket = INVALID_SOCKET;
         PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
         return FALSE;
@@ -1241,6 +1240,38 @@ static SOCKET connect_input(VmDisplayIdd *d)
 failed:
     closesocket(s);
     return INVALID_SOCKET;
+}
+
+static DWORD WINAPI idd_input_thread_proc(LPVOID param)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)param;
+    SOCKET input_s = INVALID_SOCKET;
+    ULONGLONG retry_at = 0;
+
+    while (!d->stop) {
+        AcquireSRWLockExclusive(&d->input_lock);
+        if (input_s != INVALID_SOCKET && d->input_socket == INVALID_SOCKET) {
+            closesocket(input_s);
+            input_s = INVALID_SOCKET;
+        }
+        ReleaseSRWLockExclusive(&d->input_lock);
+        if (input_s == INVALID_SOCKET && GetTickCount64() >= retry_at) {
+            input_s = connect_input(d);
+            retry_at = input_s == INVALID_SOCKET ? GetTickCount64() + 1000 : 0;
+        }
+        Sleep(100);
+    }
+
+    AcquireSRWLockExclusive(&d->input_lock);
+    d->input_socket = INVALID_SOCKET;
+    d->keyboard_version = 1;
+    d->mouse_version = 0;
+    ZeroMemory(d->held_down, sizeof(d->held_down));
+    if (input_s != INVALID_SOCKET) closesocket(input_s);
+    ReleaseSRWLockExclusive(&d->input_lock);
+    PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
+    idd_log(d, L"Input disconnected.");
+    return 0;
 }
 
 /* ==================================================================
@@ -2704,6 +2735,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     WSADATA wsa;
     BYTE *recv_buf = NULL;
     AsbGpuBroker *broker = NULL;
+    HANDLE input_thread;
     UINT recv_capacity = DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -2722,19 +2754,18 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         vm_agent_send(vm, "idd_connect", NULL, 0, 5000);
     }
 
-    /* Input socket lives independently of the frame channel — survives
-       frame disconnections so the user can still send input to wake
-       the VM screen if the display path goes inactive. */
-    {
-        SOCKET input_s = INVALID_SOCKET;
+    input_thread = CreateThread(NULL, 0, idd_input_thread_proc, d, 0, NULL);
+    if (!input_thread) {
+        ui_log(L"IDD: Failed to create input thread.");
+        HeapFree(GetProcessHeap(), 0, recv_buf);
+        WSACleanup();
+        PostMessageW(d->hwnd, WM_CLOSE, 0, 0);
+        return 1;
+    }
 
     while (!d->stop) {
         SOCKET s;
         FrameHeader hdr;
-
-        /* Ensure input channel is connected (independent of frame channel) */
-        if (input_s == INVALID_SOCKET)
-            input_s = connect_input(d);
 
         /* Clipboard module (handles :0005 + :0006 internally) */
         if (!d->clipboard) {
@@ -3086,15 +3117,6 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             /* Signal the window thread to repaint */
             if (d->hwnd && IsWindow(d->hwnd))
                 PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0);
-
-            /* Reconnect input socket if send_input flagged it dead */
-            if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
-                closesocket(input_s);
-                input_s = INVALID_SOCKET;
-                idd_log(d, L"Input socket closed, will reconnect...");
-            }
-            if (input_s == INVALID_SOCKET)
-                input_s = connect_input(d);
         }
 
         /* Frame channel lost — close it but keep input alive */
@@ -3112,13 +3134,6 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         closesocket(s);
         idd_log(d, L"Frame channel disconnected, reconnecting...");
 
-        /* Check if input is still alive (send_input may have flagged it dead) */
-        if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
-            closesocket(input_s);
-            input_s = INVALID_SOCKET;
-            idd_log(d, L"Input socket flagged dead, will reconnect.");
-        }
-
         /* Wait before reconnecting frame channel */
         {
             int wait;
@@ -3128,20 +3143,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
     }
 
-    /* Final cleanup — close input socket on thread exit */
-    AcquireSRWLockExclusive(&d->input_lock);
-    d->input_socket = INVALID_SOCKET;
-    d->keyboard_version = 1;
-    d->mouse_version = 0;
-    ZeroMemory(d->held_down, sizeof(d->held_down));
-    ReleaseSRWLockExclusive(&d->input_lock);
-    PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
-    if (input_s != INVALID_SOCKET) {
-        closesocket(input_s);
-    }
-    idd_log(d, L"Input disconnected.");
-
-    } /* end input_s scope */
+    WaitForSingleObject(input_thread, INFINITE);
+    CloseHandle(input_thread);
 
     if (recv_buf)
         HeapFree(GetProcessHeap(), 0, recv_buf);
