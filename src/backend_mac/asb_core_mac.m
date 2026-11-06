@@ -1347,10 +1347,6 @@ NSString *asb_mac_validate_password(NSString *os_type, id password) {
     return nil;
 }
 
-BOOL asb_mac_nested_virtualization_supported(const char *os_type) {
-    return os_type && strcasecmp(os_type, "Windows") == 0 && [QemuVm nestedVirtualizationSupported];
-}
-
 int asb_mac_vm_create(const char *name, const char *os_type,
                        int ram_mb, int hdd_gb, int cpu_cores,
                        int gpu_mode, int network_mode,
@@ -1579,8 +1575,7 @@ int asb_mac_vm_start(AsbVmId vm_id) {
                                              ramMb:g_vms[idx].ram_mb
                                           cpuCores:g_vms[idx].cpu_cores
                                         macAddress:macAddress.string
-                                          testMode:g_vms[idx].test_mode
-                              nestedVirtualization:asb_mac_nested_virtualization_supported(g_vms[idx].os_type)];
+                                          testMode:g_vms[idx].test_mode];
         g_qemu_refs[idx] = qvm;
         g_vms[idx].starting = YES;
         post_list_changed();
@@ -2071,7 +2066,7 @@ NSDictionary *asb_mac_vm_snapshot(const AsbVmMac *vm) {
         @"ramMb":           @(vm->ram_mb),
         @"hddGb":           @(vm->hdd_gb),
         @"cpuCores":        @(vm->cpu_cores),
-        @"nestedVirtualization": @(asb_mac_nested_virtualization_supported(vm->os_type)),
+        @"nestedVirtualization": @NO,
         @"gpuMode":         @(vm->gpu_mode),
         @"gpuName":         isWindows ? @"Software (WARP)" : [HostInfo hostGpuName],
         @"networkMode":     @(vm->network_mode),

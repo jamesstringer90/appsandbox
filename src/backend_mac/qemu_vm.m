@@ -2,7 +2,6 @@
 #import "vm_dir.h"
 #import "asb_ivshmem_transport.h"
 #import "asb_network_mac.h"
-#import <Hypervisor/Hypervisor.h>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -25,7 +24,6 @@
 @property (nonatomic, assign) int cpuCores;
 @property (nonatomic, copy) NSString *macAddress;
 @property (nonatomic, assign) BOOL testMode;
-@property (nonatomic, assign) BOOL nestedVirtualization;
 @property (nonatomic, assign, readwrite) QemuVmState state;
 @property (nonatomic, strong, readwrite) AsbIvshmemTransport *transport;
 @property (nonatomic, strong) NSTask *task;          /* set only on the root NSTask path */
@@ -35,18 +33,12 @@
 
 @implementation QemuVm
 
-+ (BOOL)nestedVirtualizationSupported {
-    bool supported = false;
-    return hv_vm_config_get_el2_supported(&supported) == HV_SUCCESS && supported;
-}
-
 - (instancetype)initWithName:(NSString *)name
                        vmDir:(NSURL *)vmDir
                        ramMb:(int)ramMb
                     cpuCores:(int)cpuCores
                   macAddress:(NSString *)macAddress
-                    testMode:(BOOL)testMode
-        nestedVirtualization:(BOOL)nestedVirtualization {
+                    testMode:(BOOL)testMode {
     if ((self = [super init])) {
         _name = [name copy];
         _vmDir = vmDir;
@@ -54,7 +46,6 @@
         _cpuCores = cpuCores > 0 ? cpuCores : 4;
         _macAddress = [macAddress copy];
         _testMode = testMode;
-        _nestedVirtualization = nestedVirtualization;
         _state = QemuVmStateStopped;
     }
     return self;
@@ -210,21 +201,10 @@
     self.monitorPort = [self allocLoopbackPort];
     if (self.monitorPort <= 0) { done([self err:@"could not allocate a monitor port"]); return; }
 
-    if (self.nestedVirtualization && ![QemuVm nestedVirtualizationSupported]) {
-        done([self err:@"This Mac does not support nested virtualization for Windows guests."]);
-        return;
-    }
-    NSString *accelerator = self.nestedVirtualization ? @"hvf,kernel-irqchip=on" : @"hvf";
-    NSString *machine = self.nestedVirtualization
-        ? @"virt,gic-version=3,highmem=on,virtualization=on"
-        : @"virt,gic-version=3,highmem=on";
-    if (self.nestedVirtualization)
-        [self logFmt:@"Nested virtualization enabled; QEMU disables SME for this CPU configuration."];
-
     NSArray<NSString *> *args = @[
         @"-name", self.name,
-        @"-accel", accelerator, @"-cpu", @"host",
-        @"-M", machine,
+        @"-accel", @"hvf", @"-cpu", @"host",
+        @"-M", @"virt,gic-version=3,highmem=on",
         @"-smp", [NSString stringWithFormat:@"%d", self.cpuCores],
         @"-m", [NSString stringWithFormat:@"%d", self.ramMb],
         @"-L", shareDir,
