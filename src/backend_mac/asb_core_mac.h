@@ -82,7 +82,6 @@ NSArray<NSDictionary *> *asb_mac_templates(void);
 NSString *asb_mac_validate_username(NSString *os_type, id username, NSString *vm_name);
 
 NSString *asb_mac_validate_password(NSString *os_type, id password);
-BOOL asb_mac_nested_virtualization_supported(const char *os_type);
 
 int  asb_mac_vm_create(const char *name, const char *os_type,
                         int ram_mb, int hdd_gb, int cpu_cores,

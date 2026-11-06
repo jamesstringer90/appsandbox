@@ -7,7 +7,6 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A5B200000000000000000001   = {isa = PBXBuildFile; fileRef = A5B200000000000000000002  ; };
         A5B100000000000000000001   = {isa = PBXBuildFile; fileRef = A5B100000000000000000003  ; };
         A5B100000000000000000004   = {isa = PBXBuildFile; fileRef = A5B100000000000000000005  ; };
         A5BE00000000000000000001   = {isa = PBXBuildFile; fileRef = A5BE00000000000000000002  ; };
@@ -159,7 +158,6 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		A5B200000000000000000002   = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Hypervisor.framework; path = System/Library/Frameworks/Hypervisor.framework; sourceTree = SDKROOT; };
         A5B100000000000000000002   = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_network_mac.h; sourceTree = "<group>"; };
         A5B100000000000000000003   = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = asb_network_mac.m; sourceTree = "<group>"; };
         A5B100000000000000000005   = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = vmnet.framework; path = System/Library/Frameworks/vmnet.framework; sourceTree = SDKROOT; };
@@ -265,7 +263,6 @@
 				4016000000000000000000BB /* Carbon.framework in Frameworks */,
 				4012000000000000000000BB /* Virtualization.framework in Frameworks */,
                 A5B100000000000000000004  ,
-				A5B200000000000000000001  ,
 				4013000000000000000000BB /* Metal.framework in Frameworks */,
 				4014000000000000000000BB /* Security.framework in Frameworks */,
 				4015000000000000000000BB /* AudioToolbox.framework in Frameworks */,
@@ -454,7 +451,6 @@
 				3002000000000000000000AA /* WebKit.framework */,
 				3003000000000000000000AA /* Virtualization.framework */,
                 A5B100000000000000000005  ,
-				A5B200000000000000000002  ,
 				3004000000000000000000AA /* Metal.framework */,
 				3005000000000000000000AA /* Security.framework */,
 				3006000000000000000000AA /* Foundation.framework */,
