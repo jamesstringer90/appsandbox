@@ -1590,8 +1590,6 @@ static void idd_shared_release(VmDisplayIdd *d)
 
 static void idd_shared_fail(VmDisplayIdd *d)
 {
-    if (!d->shared_disabled)
-        ui_log(L"IDD: shared GPU display failed; reconnecting with raw socket frames.");
     d->shared_disabled = TRUE;
     idd_shared_release(d);
     if (d->frame_socket != INVALID_SOCKET) shutdown(d->frame_socket, SD_BOTH);
@@ -1672,8 +1670,6 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
                 d->frame_stride = d->frame_width * 4;
                 d->display_width = d->shared_width;
                 d->display_height = d->shared_height;
-                ui_log(L"IDD: first shared GPU frame acquired through %s.",
-                    fence ? L"the shared GPU fence" : L"the DXGI keyed mutex");
                 PostMessageW(d->hwnd, WM_IDD_DISPLAY_SIZE, size_changed, 0);
             }
             d->shared_next = (index + 1) % DISPLAY_GPU_SLOTS;
@@ -2061,8 +2057,6 @@ done:
     if (texture) texture->lpVtbl->Release(texture);
     offer.status = (UINT32)hr;
     LeaveCriticalSection(&d->frame_cs);
-    if (hr != S_OK)
-        ui_log(L"IDD: shared GPU texture offer failed (0x%08X); retaining raw socket display.", hr);
     return idd_send_gpu(s, &offer);
 }
 
