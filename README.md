@@ -109,6 +109,8 @@ rebuild instructions.
 # Tips:
 The default username is `user` and the default password is `test123`
 
+Want to give your old VM the new App Sandbox features? Download and run the new App Sandbox version and give your AI agent this [prompt](https://github.com/jamesstringer90/appsandbox/blob/main/VM-UPGRADE.md) to help with the upgrade
+
 When your VM is running and open, right clicking its title bar will show several options like transmit hotkeys, mute audio and match window size where your VM display dynamically resizes to your viewers size.
 
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well  
