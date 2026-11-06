@@ -1661,10 +1661,15 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
             if (first_frame) {
                 BOOL size_changed = d->display_width != d->shared_width ||
                     d->display_height != d->shared_height;
-                if (d->frame_width != d->shared_width || d->frame_height != d->shared_height) {
-                    if (d->frame_buf) HeapFree(GetProcessHeap(), 0, d->frame_buf);
-                    d->frame_buf = NULL;
-                }
+                /* A resize can reconnect the shared channel. Retire the CPU frame
+                 * and its uploaded texture even when the dimensions match, so
+                 * repaints during that reconnect cannot replay an older frame. */
+                if (d->frame_buf) HeapFree(GetProcessHeap(), 0, d->frame_buf);
+                d->frame_buf = NULL;
+                if (d->frame_srv) d->frame_srv->lpVtbl->Release(d->frame_srv);
+                d->frame_srv = NULL;
+                if (d->frame_tex) d->frame_tex->lpVtbl->Release(d->frame_tex);
+                d->frame_tex = NULL;
                 d->frame_width = d->shared_width;
                 d->frame_height = d->shared_height;
                 d->frame_stride = d->frame_width * 4;
