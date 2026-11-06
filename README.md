@@ -15,7 +15,7 @@ Windows features:
 - GPU Hardware Video Decoder/Encoder support
 - SSH via Hyper-V socket proxy (no network required)
 - Snapshots
-- Fixed 1080P60 display
+- Multiple resolution options as well as optional dynamic resolution
 - Host to client hot-key support
 - Provision and boot with / without internet
 - Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support
@@ -23,12 +23,12 @@ Windows features:
 
 Mac features:
 - macOS or Windows 11 ARM VM support
-- Zero touch install for Windows 11 and macOS
+- Zero touch install
 - Copy and Paste
 - 2 Channel Audio
 - macOS: GPU Acceleration via Paravirtualization with support for Metal, Windows: No GPU Acceleration
 - SSH via virtio-vsock (no network required)
-- Fixed 1080P60 display on Windows 11 guests, Dynamic display sizing on macOS guests
+- Dynamic display sizing (optional on Windows)
 - Provision and boot with / without internet
 - Headless mode: the same scriptable local HTTP/JSON API + Python SDK (`asb.py`) as on Windows, for driving macOS and Windows 11 VMs programmatically
 
@@ -109,7 +109,7 @@ rebuild instructions.
 # Tips:
 The default username is `user` and the default password is `test123`
 
-[Windows] Enable hotkeys or mute the VM audio: connect to the VM and right-click the connection title bar  
+When your VM is running and open, right clicking its title bar will show several options like transmit hotkeys, mute audio and match window size where your VM display dynamically resizes to your viewers size.
 
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well  
 
