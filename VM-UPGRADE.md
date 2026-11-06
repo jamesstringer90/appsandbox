@@ -3,6 +3,9 @@
 Copy this prompt into Claude or Codex to update the guest components in an existing Windows or macOS VM.
 
 ```text
+
+I want you to help me upgrade my App Sandbox VM with the latest features.
+
 The release ZIP copied into the VM must be the same release version as the package
 currently used to run App Sandbox on the host, with the appropriate package for
 the guest OS and architecture. For best results, download the latest release from
