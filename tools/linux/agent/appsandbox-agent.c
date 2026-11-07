@@ -483,6 +483,57 @@ static void *heartbeat_thread(void *arg)
 
 /* ---- Command handlers ---- */
 
+/* Non-netplan distros (Arch): configure a static address through
+ * NetworkManager (keyfile) when it is active, else systemd-networkd.
+ * Returns the shell exit status. */
+static int set_ip_without_netplan(const char *ip, const char *prefix, const char *gw)
+{
+    char cmd[2400];
+    int n = snprintf(cmd, sizeof(cmd),
+        "if systemctl is-active --quiet NetworkManager; then "
+        "  nmcli -t -f NAME,TYPE connection show 2>/dev/null "
+        "    | awk -F: '$2 ~ /ethernet/ && $1 != \"appsandbox\" {print $1}' "
+        "    | while read -r c; do nmcli connection delete \"$c\" >/dev/null 2>&1; done; "
+        "  umask 077; mkdir -p /etc/NetworkManager/system-connections; "
+        "  cat > /etc/NetworkManager/system-connections/appsandbox.nmconnection <<EOF\n"
+        "[connection]\n"
+        "id=appsandbox\n"
+        "type=ethernet\n"
+        "autoconnect=true\n"
+        "[ipv4]\n"
+        "method=manual\n"
+        "address1=%s/%s,%s\n"
+        "dns=%s;8.8.8.8;\n"
+        "[ipv6]\n"
+        "method=ignore\n"
+        "EOF\n"
+        "  chmod 600 /etc/NetworkManager/system-connections/appsandbox.nmconnection; "
+        "  nmcli connection reload 2>&1; "
+        "  nmcli connection up appsandbox 2>&1; "
+        "else "
+        "  mkdir -p /etc/systemd/network; "
+        "  cat > /etc/systemd/network/10-appsandbox.network <<EOF\n"
+        "[Match]\n"
+        "Name=e*\n"
+        "[Network]\n"
+        "Address=%s/%s\n"
+        "Gateway=%s\n"
+        "DNS=%s\n"
+        "DNS=8.8.8.8\n"
+        "EOF\n"
+        "  systemctl enable --now systemd-networkd 2>&1; "
+        "  systemctl restart systemd-networkd 2>&1; "
+        "fi; "
+        "for i in 1 2 3 4 5 6 7 8 9 10; do "
+        "  ip -4 addr show | grep -q '%s/' && exit 0; "
+        "  sleep 0.5; "
+        "done; "
+        "echo 'set_ip: address never appeared'; ip -4 addr show; exit 1",
+        ip, prefix, gw, gw, ip, prefix, gw, gw, ip);
+    if (n < 0 || n >= (int)sizeof(cmd)) return 1;
+    return run_sync(cmd);
+}
+
 /* set_ip:<ip>/<prefix>:<gw>
  *   e.g. set_ip:192.168.42.2/24:192.168.42.1
  *
@@ -520,6 +571,14 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
     memcpy(ip,     args,        ip_len);  ip[ip_len]   = '\0';
     memcpy(prefix, slash + 1,   pfx_len); prefix[pfx_len] = '\0';
     snprintf(gw, sizeof(gw), "%s", colon2 + 1);
+
+    if (access("/usr/sbin/netplan", X_OK) != 0 &&
+        access("/usr/bin/netplan", X_OK) != 0) {
+        rc = set_ip_without_netplan(ip, prefix, gw);
+        agent_log("set_ip (no netplan): %s/%s via %s -> rc=%d", ip, prefix, gw, rc);
+        send_reply(fd, tag, rc == 0 ? "ok" : "error:network_failed");
+        return;
+    }
 
     n = snprintf(cmd, sizeof(cmd),
         /* Pick the renderer by probing whether the NetworkManager service
@@ -820,13 +879,19 @@ static int deploy_ssh_key(const char *pubkey)
  * calls just confirm state. */
 static void handle_ssh_enable(int fd, const char *tag)
 {
-    if (run_sync("systemctl is-active --quiet ssh") == 0) {
-        agent_log("ssh: already running");
+    /* The OpenSSH unit is "ssh" on Debian/Ubuntu and "sshd" on Arch/Fedora. */
+    const char *unit = (run_sync("systemctl cat sshd.service >/dev/null 2>&1") == 0)
+                       ? "sshd" : "ssh";
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "systemctl is-active --quiet %s", unit);
+    if (run_sync(cmd) == 0) {
+        agent_log("ssh: already running (%s)", unit);
         start_ssh_proxy();
         send_reply(fd, tag, "ssh_ready");
         return;
     }
-    int rc = run_sync("systemctl enable --now ssh 2>&1");
+    snprintf(cmd, sizeof(cmd), "systemctl enable --now %s 2>&1", unit);
+    int rc = run_sync(cmd);
     if (rc == 0) {
         agent_log("ssh: enabled and started");
         start_ssh_proxy();

@@ -65,6 +65,10 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        BOOL nat_network,
                                        const wchar_t *lang);
 
+/* Pack the contents of `dir` into an ISO at `iso_path` (label <= 16 chars). */
+HRESULT iso_create_from_dir(const wchar_t *iso_path, const wchar_t *dir,
+                             const wchar_t *volume_label);
+
 /* ---- VHDX-First VM Creation (no resources ISO) ---- */
 
 /* Forward declaration for GPU share list */

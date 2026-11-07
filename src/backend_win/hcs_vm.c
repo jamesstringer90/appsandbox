@@ -896,6 +896,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     wchar_t res_section[512];
     wchar_t net_section[512];
     wchar_t secureboot_section[512];
+    wchar_t chipset_section[4096];
     wchar_t nested_section[128];
     wchar_t security_section[512];
     wchar_t guest_state_section[1024];
@@ -958,6 +959,24 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     } else {
         wcscpy_s(secureboot_section, 512,
             L",\"ApplySecureBootTemplate\":\"Skip\"");
+    }
+
+    /* Chipset: UEFI by default; LinuxKernelDirect when a kernel is given
+       (unattended live-ISO installer, no bootloader involved). */
+    if (config->kernel_path[0] != L'\0') {
+        wchar_t k_esc[MAX_PATH * 2], i_esc[MAX_PATH * 2], c_esc[2048];
+        escape_json_path(config->kernel_path, k_esc, MAX_PATH * 2);
+        escape_json_path(config->initrd_path, i_esc, MAX_PATH * 2);
+        escape_json_path(config->kernel_cmdline, c_esc, 2048);
+        swprintf_s(chipset_section, 4096,
+            L"{\"LinuxKernelDirect\":{"
+                L"\"KernelFilePath\":\"%s\","
+                L"\"InitRdPath\":\"%s\","
+                L"\"KernelCmdLine\":\"%s\"}}",
+            k_esc, i_esc, c_esc);
+    } else {
+        swprintf_s(chipset_section, 4096,
+            L"{\"Uefi\":{\"Console\":\"Default\"%s}}", secureboot_section);
     }
 
     /* VMGS + VMRS files — always created regardless of TPM/SecureBoot.
@@ -1144,12 +1163,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         L"\"Owner\":\"%s\","
         L"\"ShouldTerminateOnLastHandleClosed\":true,"
         L"\"VirtualMachine\":{"
-            L"\"Chipset\":{"
-                L"\"Uefi\":{"
-                    L"\"Console\":\"Default\""
-                    L"%s"
-                L"}"
-            L"},"
+            L"\"Chipset\":%s,"
             L"\"ComputeTopology\":{"
                 L"\"Memory\":{"
                     L"\"SizeInMB\":%lu,"
@@ -1187,7 +1201,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         L"}"
         L"}",
         config->name,
-        secureboot_section,
+        chipset_section,
         config->ram_mb,
         config->cpu_cores,
         nested_section,
@@ -1239,6 +1253,10 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
             pfnGrantAccess(config->name, config->image_path);
         if (config->resources_iso_path[0] != L'\0')
             pfnGrantAccess(config->name, config->resources_iso_path);
+        if (config->kernel_path[0] != L'\0')
+            pfnGrantAccess(config->name, config->kernel_path);
+        if (config->initrd_path[0] != L'\0')
+            pfnGrantAccess(config->name, config->initrd_path);
     }
 
     /* Build JSON — endpoint_guid is set later by caller if networking is used */
@@ -1333,6 +1351,10 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
             pfnGrantAccess(config->name, config->image_path);
         if (config->resources_iso_path[0] != L'\0')
             pfnGrantAccess(config->name, config->resources_iso_path);
+        if (config->kernel_path[0] != L'\0')
+            pfnGrantAccess(config->name, config->kernel_path);
+        if (config->initrd_path[0] != L'\0')
+            pfnGrantAccess(config->name, config->initrd_path);
     }
 
     if (!hcs_build_vm_json(config, endpoint_guid, json, 16384))

@@ -2615,9 +2615,19 @@ typedef struct {
     char        host_tz[64];
 } LinuxCreateArgs;
 
+#include "arch_install.inc"  /* Arch Linux guest install */
+
 static DWORD WINAPI linux_create_thread(LPVOID param)
 {
     LinuxCreateArgs *args = (LinuxCreateArgs *)param;
+    /* Arch/Arch ISOs are installed in-guest (after the network exists);
+       Ubuntu keeps the host-side direct ISO->VHDX build. */
+    wchar_t arch_iso[MAX_PATH];
+    ArchBootInfo arch_boot;
+    ZeroMemory(&arch_boot, sizeof(arch_boot));
+    BOOL is_arch = (detect_iso_distro(args->config.image_path, args->vhdx_dir,
+                                      &arch_boot) == ASB_DISTRO_ARCH);
+    wcscpy_s(arch_iso, MAX_PATH, args->config.image_path);
     HRESULT hr;
     wchar_t exe_dir[MAX_PATH], res_dir[MAX_PATH];
     wchar_t staging[MAX_PATH], manifest[MAX_PATH];
@@ -2633,6 +2643,8 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     /* resources_iso_path is unused for the direct-ISO flow but the field
        still exists in the config; clear it so hcs_vm doesn't try to attach. */
     args->config.resources_iso_path[0] = L'\0';
+
+    if (is_arch) goto arch_skip_ubuntu;
 
     /* (Detection + prefetch happen below, after we've decided on the
        staging dir, since the prefetches write directly into it.) */
@@ -2765,6 +2777,7 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
        runtime VM — the installed VHDX is fully self-bootable. */
     args->config.image_path[0] = L'\0';
 
+arch_skip_ubuntu:
     /* ---- 2. NAT IP allocation. The chosen static /24 address is baked
        into the HCN endpoint policy below and pushed to the guest at
        runtime by the agent (set_ip -> static netplan); the guest never
@@ -2800,6 +2813,48 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         }
         if (FAILED(hr))
             args->config.network_mode = NET_NONE;
+    }
+
+    /* ---- 5b. Arch: in-guest install onto the blank VHDX. ---- */
+    if (is_arch) {
+        hr = arch_install(args, network_vm, arch_iso, &arch_boot);
+        if (FAILED(hr)) {
+            args->result = hr;
+            if (!args->error_msg[0])
+                swprintf_s(args->error_msg, 512, L"Arch install failed (0x%08X)", hr);
+            if (args->has_network) {
+                hcn_delete_endpoint(&args->endpoint_id);
+                args->has_network = FALSE;
+                args->endpoint_guid[0] = L'\0';
+            }
+            goto done;
+        }
+
+        /* The installer VM leaves its HCN endpoint "attached" (0x803B0014)
+         * even after it has exited and been closed, and waiting doesn't
+         * clear it. Throw the endpoint away and build a fresh one with the
+         * same static NAT address, exactly as a manual Start would. */
+        if (args->has_network) {
+            BOOL is_nat = (args->config.network_mode == NET_NAT);
+            char *nat_ip = network_vm ? network_vm->nat_ip : NULL;
+            size_t ip_size = network_vm ? sizeof(network_vm->nat_ip) : 0;
+            asb_log(L"Arch: recreating the network endpoint for the installed VM...");
+            hcn_delete_endpoint(&args->endpoint_id);
+            Sleep(1000);
+            hcs_destroy_stale(args->config.name);
+            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
+                                         args->endpoint_guid, 64,
+                                         nat_ip, ip_size, is_nat,
+                                         args->config.mac_address);
+            if (FAILED(hr)) {
+                args->result = hr;
+                args->has_network = FALSE;
+                args->endpoint_guid[0] = L'\0';
+                swprintf_s(args->error_msg, 512,
+                           L"Failed to recreate the network endpoint (0x%08X)", hr);
+                goto done;
+            }
+        }
     }
 
     /* ---- 6. HCS create + start (same as vhdx_create_thread:1145). ---- */

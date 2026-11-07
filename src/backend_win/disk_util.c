@@ -1392,6 +1392,21 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
     return hr;
 }
 
+/* Generic ISO builder: packs everything under `dir` into an ISO9660/Joliet
+   image (used for the Arch installer seed ISO). */
+HRESULT iso_create_from_dir(const wchar_t *iso_path, const wchar_t *dir,
+                             const wchar_t *volume_label)
+{
+    HRESULT hr;
+    if (!iso_path || !dir || !volume_label) return E_INVALIDARG;
+    if (GetFileAttributesW(iso_path) != INVALID_FILE_ATTRIBUTES)
+        DeleteFileW(iso_path);
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    hr = create_iso_from_dir(iso_path, dir, volume_label);
+    CoUninitialize();
+    return hr;
+}
+
 /* ---- VHDX-First VM Creation ---- */
 
 #include "gpu_enum.h"

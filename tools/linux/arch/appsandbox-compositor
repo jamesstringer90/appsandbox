@@ -1,0 +1,16 @@
+#!/bin/sh
+# GNOME Shell launcher (org.gnome.Shell@.service.d/no-gpu.conf runs it with the
+# session mode as $1). `appsandbox-display --session` starts gnome-shell on the GPU
+# (GALLIUM_DRIVER=d3d12) whenever asb_drm reports GPU present support, which needs
+# the patched Mesa in /opt/wsl-mesa. With stock Mesa every eglSwapBuffers fails
+# (0x3003) and the viewer stays black, and an LLVM bump on this rolling distro
+# does the same to the patched build. So: GPU path only while the patched
+# libgallium still resolves its libraries, otherwise software rendering.
+LIB=$(ls /opt/wsl-mesa/lib/x86_64-linux-gnu/libgallium-*.so 2>/dev/null | head -n1)
+if [ -n "$LIB" ] && ! ldd "$LIB" 2>/dev/null | grep -q 'not found'; then
+    exec /usr/local/bin/appsandbox-display --session /usr/bin/gnome-shell --mode="$1"
+fi
+echo "appsandbox-compositor: patched Mesa missing or broken, using software rendering (see /var/log/asb-mesa-rebuild.log)" >&2
+exec env -u LD_LIBRARY_PATH -u MESA_LOADER_DRIVER_OVERRIDE -u VK_DRIVER_FILES \
+    -u __GLX_VENDOR_LIBRARY_NAME LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
+    /usr/bin/gnome-shell --mode="$1"

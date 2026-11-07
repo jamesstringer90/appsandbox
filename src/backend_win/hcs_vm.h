@@ -48,6 +48,11 @@ typedef struct {
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
     BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
+    /* Direct kernel boot (replaces UEFI). Used to run an unattended installer
+       from a live ISO's own kernel/initramfs (Arch install phase). */
+    wchar_t kernel_path[MAX_PATH];
+    wchar_t initrd_path[MAX_PATH];
+    wchar_t kernel_cmdline[1024];
 } VmConfig;
 
 /* Runtime state of a VM */

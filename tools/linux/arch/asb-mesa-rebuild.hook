@@ -1,0 +1,15 @@
+# The patched Mesa links the system LLVM and SPIRV-Tools; rebuild it in the
+# background if an update left it unable to load (no-op otherwise).
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = llvm-libs
+Target = spirv-tools
+Target = libclc
+Target = spirv-llvm-translator
+
+[Action]
+Description = Rebuilding the AppSandbox Mesa if its LLVM libraries changed...
+When = PostTransaction
+Exec = /usr/bin/systemd-run --no-block --unit=asb-mesa-rebuild /usr/local/bin/asb-mesa-rebuild --if-broken

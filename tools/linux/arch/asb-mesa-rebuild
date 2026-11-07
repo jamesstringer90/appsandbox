@@ -1,0 +1,45 @@
+#!/bin/sh
+# Build the project's patched Mesa (asb-mesa) into /opt/wsl-mesa.
+#   asb-mesa-rebuild               build now
+#   asb-mesa-rebuild --if-broken   build only if the installed one no longer loads
+# Used by the installer, and by the pacman hook after LLVM/SPIRV-Tools updates.
+# The build is staged and swapped in, so a failed build never damages a working one.
+# d3d12/dzn only (no llvmpipe/lavapipe: the software fallback uses the distro Mesa):
+# about 1 minute instead of 5+. It still links the system LLVM and SPIRV-Tools.
+LOG=/var/log/asb-mesa-rebuild.log
+PREFIX=/opt/wsl-mesa
+LIBDIR=lib/x86_64-linux-gnu
+
+loads() { # does the libgallium under $1 resolve all its libraries?
+    LIB=$(ls "$1"/$LIBDIR/libgallium-*.so 2>/dev/null | head -n1)
+    [ -n "$LIB" ] && ! ldd "$LIB" 2>/dev/null | grep -q 'not found'
+}
+
+[ "${1:-}" = "--if-broken" ] && loads "$PREFIX" && exit 0
+
+exec >>"$LOG" 2>&1
+echo "== $(date) asb-mesa-rebuild"
+TAG=$(cat /etc/asb-mesa-tag 2>/dev/null)
+SRC=/var/tmp/asb-mesa
+STAGE=/var/tmp/asb-mesa-stage
+rm -rf "$SRC" "$STAGE"
+git clone --depth 1 --branch "${TAG:-main}" https://github.com/jamesstringer90/asb-mesa.git "$SRC" ||
+    git clone --depth 1 https://github.com/jamesstringer90/asb-mesa.git "$SRC" || exit 1
+cd "$SRC" || exit 1
+if meson setup build --prefix=$PREFIX --libdir=$LIBDIR --buildtype=release --strip \
+       -D gallium-drivers=d3d12 -D vulkan-drivers=microsoft-experimental \
+       -D microsoft-clc=enabled -D glvnd=enabled -D platforms=x11,wayland -D video-codecs= &&
+   nice -n 10 ninja -C build -j"$(nproc)" &&
+   DESTDIR=$STAGE ninja -C build install &&
+   loads "$STAGE$PREFIX"; then
+    rm -rf "$PREFIX.old"
+    [ -d "$PREFIX" ] && mv "$PREFIX" "$PREFIX.old"
+    mv "$STAGE$PREFIX" "$PREFIX" && rm -rf "$PREFIX.old"
+    echo "asb-mesa: installed to $PREFIX"
+    rc=0
+else
+    echo "asb-mesa: build failed; the previous build (if any) is untouched" >&2
+    rc=1
+fi
+cd / && rm -rf "$SRC" "$STAGE"
+exit $rc
