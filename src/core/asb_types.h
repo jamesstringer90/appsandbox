@@ -85,6 +85,7 @@ typedef struct CoreVmEvent {
     int         int_value;
     const char *str_value;  /* may be NULL */
     int         staging;
+    int         is_template;
 } CoreVmEvent;
 
 typedef void (*CoreVmEventCallback)(const CoreVmEvent *event, void *user_data);

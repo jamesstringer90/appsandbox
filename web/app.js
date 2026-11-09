@@ -70,7 +70,16 @@ var hostBridge = (function() {
 
 function sendCmd(action, data) {
     if (data && data.vmId && vmIndexById(data.vmId) < 0) return;
-    if (data && data.templateId && !currentTemplates.some(function(t) { return t.id === data.templateId; })) return;
+    if (data && data.vmId) {
+        var target = vms[vmIndexById(data.vmId)];
+        if (target.isTemplate) {
+            data = Object.assign({}, data, { templateId: target.id });
+            delete data.vmId;
+        }
+    }
+    if (data && data.templateId &&
+        !currentTemplates.some(function(t) { return t.id === data.templateId; }) &&
+        !vms.some(function(v) { return v.isTemplate && v.id === data.templateId; })) return;
     hostBridge.send(action, data);
 }
 
@@ -662,7 +671,7 @@ function gatherConfig() {
         diskDirectory: document.getElementById('disk-directory').value.trim() ===
             (lastHostInfo && lastHostInfo.defaultDiskDirectory) ? '' :
             document.getElementById('disk-directory').value.trim(),
-        templateName: document.getElementById('template-select').value,
+        templateName: selectedTemplateId ? undefined : document.getElementById('template-select').value,
         templateId: selectedTemplateId || undefined,
         hddGb:       document.getElementById('hdd-size').valueAsNumber,
         ramMb:       alignRamMb(document.getElementById('ram-size').valueAsNumber),
@@ -1367,8 +1376,7 @@ function onStopVm(idx) {
             'Stop & Delete'
         ).then(function(confirmed) {
             if (confirmed) {
-                sendCmd('stopVm', { vmId: vm.id });
-                sendCmd('deleteVm', { vmId: vm.id });
+                sendCmd('deleteTemplate', { templateId: vm.id });
             }
         });
     } else {
@@ -1406,6 +1414,7 @@ function showForceStopModal(idx) {
 function onDeleteVm(idx) {
     var vm = vms[idx];
     if (!vm) return;
+    if (vm.isTemplate) { onStopVm(idx); return; }
     showModal(
         'Confirm Delete',
         'Are you sure you want to delete VM "' + vm.name + '"?\n\nThis will permanently delete all disk data and snapshots.',

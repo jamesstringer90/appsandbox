@@ -63,6 +63,7 @@ static NSDictionary *buildHostInfoDict(void) {
     int count = asb_mac_vm_count();
     for (int i = 0; i < count; i++) {
         AsbVmMac *vm = asb_mac_vm_get(i);
+        if (!vm || vm->template_ready) continue;
         if (vm->running) {
             vmCores += vm->cpu_cores;
             vmRamMb += vm->ram_mb;
@@ -195,8 +196,13 @@ void ui_post_json(NSString *json) {
 #pragma mark - Incoming action dispatch
 
 static AsbVmId vmIdForMessage(NSDictionary *msg) {
-    id target = msg[@"vmId"];
-    return [target isKindOfClass:[NSString class]] ? asb_vm_id_parse([target UTF8String]) : 0;
+    BOOL template_resource=msg[@"templateId"]!=nil;
+    if (template_resource && msg[@"vmId"]) return 0;
+    id target=msg[template_resource?@"templateId":@"vmId"];
+    if (![target isKindOfClass:[NSString class]]) return 0;
+    AsbVmId identity=template_resource?asb_template_id_parse([target UTF8String]):asb_vm_id_parse([target UTF8String]);
+    AsbVmMac *vm=asb_mac_vm_find_by_id(identity);
+    return vm && !!vm->is_template==!!template_resource?identity:0;
 }
 
 static void handleCreateVm(NSDictionary *msg) {
@@ -215,7 +221,7 @@ static void handleCreateVm(NSDictionary *msg) {
     int gpuMode         = [msg[@"gpuMode"] intValue];
     int networkMode     = 1;
 
-    NSString *usernameError = asb_mac_validate_username(osType, adminUser, name);
+    NSString *usernameError = asb_mac_validate_username(osType, adminUser, [msg[@"isTemplate"] boolValue]?nil:name);
     if (usernameError) {
         sendAlert(usernameError);
         return;
@@ -233,7 +239,7 @@ static void handleCreateVm(NSDictionary *msg) {
                                 diskDirectory.UTF8String,
                                 [adminUser UTF8String], [adminPass UTF8String],
                                 sshEnabled, sshDeployKey, testMode, [msg[@"isTemplate"] boolValue],
-                                asb_vm_id_parse([msg[@"templateId"] UTF8String]),
+                                asb_template_id_parse([msg[@"templateId"] UTF8String]),
                                 [msg[@"templateName"] UTF8String]);
     if (rc != 0) {
         sendAlert([NSString stringWithFormat:@"Create failed (error %d)", rc]);
@@ -454,8 +460,8 @@ void ui_handle_message(NSString *json) {
         sendLog([NSString stringWithFormat:@"SSH: opened Terminal (127.0.0.1:%d as %@)",
                  vm->ssh_port, user]);
     } else if ([action isEqualToString:@"deleteTemplate"]) {
-        AsbVmMac *vm = asb_mac_vm_find_by_id(asb_vm_id_parse([msg[@"templateId"] UTF8String]));
-        if (!vm || !vm->template_ready || asb_mac_vm_delete(vm->unique_id) != BACKEND_OK)
+        AsbVmMac *vm = asb_mac_vm_find_by_id(asb_template_id_parse([msg[@"templateId"] UTF8String]));
+        if (!vm || !vm->is_template || asb_mac_template_delete(vm->unique_id) != BACKEND_OK)
             sendAlert(@"Template could not be deleted.");
     } else if ([action isEqualToString:@"snapTake"] ||
                [action isEqualToString:@"snapDelete"] ||

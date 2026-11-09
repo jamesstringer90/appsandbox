@@ -12,6 +12,7 @@
 
 #include "../transport/asb_transport.h"
 #include "../../src/core/protocol.h"
+#include "../../src/core/input_unicode.h"
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -154,6 +155,25 @@ static BOOL is_function_key(UINT32 vk)
 {
     return vk == VK_CANCEL || vk == VK_PAUSE || vk == VK_SNAPSHOT ||
            vk == VK_SLEEP || (vk >= VK_BROWSER_BACK && vk <= VK_LAUNCH_APP2);
+}
+
+static void inject_unicode(const InputPacket *pkt)
+{
+    uint16_t units[2];
+    UINT count = asb_unicode_utf16(pkt->param1, units);
+    INPUT events[4] = {0};
+    if (!count || pkt->param2 || pkt->param3)
+        return;
+    for (UINT i = 0; i < count; ++i) {
+        events[i * 2].type = INPUT_KEYBOARD;
+        events[i * 2].ki.wScan = units[i];
+        events[i * 2].ki.dwFlags = KEYEVENTF_UNICODE;
+        events[i * 2 + 1] = events[i * 2];
+        events[i * 2 + 1].ki.dwFlags |= KEYEVENTF_KEYUP;
+    }
+    switch_to_input_desktop();
+    if (SendInput(count * 2, events, sizeof(INPUT)) != count * 2)
+        input_log("SendInput(UNICODE) failed: %lu", GetLastError());
 }
 
 static void inject_relative_mouse(const InputPacket *pkt)
@@ -329,6 +349,8 @@ static void handle_conn(AsbConn *c)
         } else if (pkt.type == INPUT_KEY_PHYSICAL) {
             if (keyboard_version >= INPUT_KEYBOARD_VERSION)
                 inject_physical_key(&pkt, &keys);
+        } else if (pkt.type == INPUT_UNICODE) {
+            inject_unicode(&pkt);
         } else {
             inject_input(&pkt, mouse_version);
         }

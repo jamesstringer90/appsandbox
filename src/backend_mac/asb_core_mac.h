@@ -11,6 +11,7 @@
 
 #import <Foundation/Foundation.h>
 #include "asb_vm_id.h"
+#include "asb_template_id.h"
 
 @class VzVm, VzDisplayWindow, VmAgentMac, VmSshProxyMac;
 
@@ -94,11 +95,12 @@ int  asb_mac_vm_create(const char *name, const char *os_type,
                         BOOL ssh_deploy_key,
                         BOOL test_mode,
                         BOOL is_template,
-                        AsbVmId template_id,
+                        AsbTemplateId template_id,
                         const char *template_name);
 int  asb_mac_vm_start(AsbVmId vm_id);
 int  asb_mac_vm_stop(AsbVmId vm_id, int force);
 int  asb_mac_vm_delete(AsbVmId vm_id);
+int asb_mac_template_delete(AsbTemplateId template_id);
 int  asb_mac_vm_edit(AsbVmId vm_id, const char *field, const char *value);
 
 void asb_mac_save(void);

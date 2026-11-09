@@ -203,9 +203,15 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClCompile Include="src\app_win\ui.c" />
     <ClCompile Include="src\backend_win\vm_display.c" />
     <ClCompile Include="src\backend_win\vm_display_idd.c" />
+    <ClCompile Include="src\backend_win\agent_overlay.c" />
     <ClCompile Include="src\backend_win\gpu_broker.c" />
     <ClCompile Include="src\app_win\webview2_bridge.c" />
     <ClCompile Include="src\app_win\headless.c" />
+    <ClCompile Include="src\core\api_operations.c" />
+    <ClCompile Include="src\core\api_json.c" />
+    <ClCompile Include="src\core\api_contract.c" />
+    <ClCompile Include="src\core\mcp_server.c" />
+    <ClCompile Include="src\core\mcp_http.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\app_win\resource.h" />
@@ -219,6 +225,8 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClInclude Include="src\backend_win\snapshot.h" />
     <ClInclude Include="src\backend_win\vm_display.h" />
     <ClInclude Include="src\backend_win\vm_display_idd.h" />
+    <ClInclude Include="src\backend_win\agent_overlay.h" />
+    <ClInclude Include="src\backend_win\dcomp_c.h" />
     <ClInclude Include="src\backend_win\gpu_broker.h" />
   </ItemGroup>
   <ItemGroup>

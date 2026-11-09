@@ -12,6 +12,7 @@
 
 #include <windows.h>
 #include "asb_vm_id.h"
+#include "asb_template_id.h"
 
 #ifdef ASB_BUILDING_DLL
 #define ASB_API __declspec(dllexport)
@@ -51,6 +52,7 @@ typedef struct {
     const wchar_t *os_type;        /* L"Windows" or L"Linux" */
     const wchar_t *image_path;     /* ISO path, or NULL for template */
     const wchar_t *template_name;  /* template name, or NULL for image */
+    AsbTemplateId template_id;
     DWORD  ram_mb;
     DWORD  hdd_gb;
     DWORD  cpu_cores;
@@ -224,6 +226,11 @@ ASB_API void    asb_snap_get_current(AsbVm vm, int *snap_idx, int *branch_idx);
 /* ---- Templates ---- */
 
 ASB_API int     asb_template_count(void);
+ASB_API AsbTemplateId asb_template_id(int index);
+ASB_API AsbTemplateId asb_template_id_by_name(const wchar_t *name);
+ASB_API DWORD asb_template_hdd_gb(int index);
+ASB_API int asb_template_index_by_id(AsbTemplateId id);
+ASB_API HRESULT asb_template_delete_by_id(AsbTemplateId id);
 ASB_API const wchar_t *asb_template_name(int index);
 ASB_API const wchar_t *asb_template_os_type(int index);
 ASB_API HRESULT asb_template_delete(const wchar_t *name);

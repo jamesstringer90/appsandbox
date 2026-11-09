@@ -1,23 +1,3 @@
-"""
-asb.py -- Python client for the AppSandbox headless daemon (Windows + macOS).
-
-Start the daemon with:
-    Windows:  appsandbox.exe --headless                     (elevated shell)
-    macOS:    AppSandbox.app/Contents/MacOS/AppSandbox --headless
-Then:
-
-    import asb
-    c = asb.connect()                 # reads the per-platform host.json
-    c.start("linux")
-    c.wait("linux", {"booting", "online"})
-    c.stop("linux")
-
-Stdlib only (urllib) -- no third-party dependencies. The daemon exposes a
-Docker-style local HTTP/JSON API over loopback; the discovery file gives us the
-port + bearer token so connect() takes no arguments. The API is IDENTICAL on
-both platforms; feature differences (snapshots/templates are Windows-only) are
-advertised in version()["capabilities"] and those routes return 501 on macOS.
-"""
 import json
 import os
 import sys
@@ -25,6 +5,8 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+import re
+import base64
 
 
 def _support_dir():
@@ -62,14 +44,41 @@ class VmId(str):
     pass
 
 
+class TemplateId(str):
+    pass
+
+
+class ApiError(RuntimeError):
+    def __init__(self,status,body):
+        self.status=status
+        self.body=body
+        detail=body.get('error',body) if isinstance(body,dict) else body
+        super().__init__('AppSandbox API returned HTTP %s: %s' % (status,detail))
+
+
+class ApiNotFound(ApiError,KeyError):
+    pass
+
+
+def _is_vm_id(value):
+    return (isinstance(value,str) and len(value)==19 and
+            value.startswith('vm-') and
+            all(c in '0123456789abcdef' for c in value[3:]) and
+            value!='vm-0000000000000000')
+
+
 def _vm_identity_fields(value):
     identity = value.get("id")
-    if (isinstance(identity, str) and len(identity) == 19 and
-            identity.startswith("vm-") and
-            all(c in "0123456789abcdef" for c in identity[3:]) and
-            identity != "vm-0000000000000000"):
+    if _is_vm_id(identity):
         value["id"] = VmId(identity)
+    elif _is_template_id(identity):
+        value['id']=TemplateId(identity)
     return value
+
+
+def _is_template_id(value):
+    return (isinstance(value,str) and len(value)==25 and value.startswith('template-') and
+            all(c in '0123456789abcdef' for c in value[9:]) and value!='template-0000000000000000')
 
 
 class Client:
@@ -97,105 +106,182 @@ class Client:
             return e.code, (json.loads(raw, object_hook=_vm_identity_fields) if raw else {})
 
     def vm_id(self, target):
-        if isinstance(target, VmId):
-            return target
-        code, body = self._req("GET", "/vms/" + urllib.parse.quote(target, safe=""))
-        if code == 404:
-            raise KeyError(target)
-        if code != 200 or not body.get("id"):
-            raise RuntimeError("Could not resolve VM identity: %r" % body)
+        body=self._query('GET','/vms/'+urllib.parse.quote(target,safe=''))
+        if not body.get('id'): raise RuntimeError('VM response has no ID')
         return body["id"]
 
-    def _vm_path(self, target):
-        return "/vm-ids/" + urllib.parse.quote(self.vm_id(target), safe="")
+    def _vm_path(self, target=None, *, vm_id=None):
+        if vm_id is not None:
+            if target is not None: raise ValueError('Specify either name or vm_id, not both')
+            if not _is_vm_id(vm_id): raise ValueError('Invalid vm_id')
+            identity=vm_id
+        else:
+            if target is None: raise ValueError('Specify name or vm_id')
+            if not isinstance(target,str) or not target: raise ValueError('Invalid VM name')
+            return '/vms/'+urllib.parse.quote(target,safe='')
+        return '/vm-ids/'+urllib.parse.quote(identity,safe='')
+
+    def _query(self,method,path):
+        status,body=self._req(method,path)
+        if status>=400: raise (ApiNotFound if status==404 else ApiError)(status,body)
+        return body
+
+    @staticmethod
+    def _index(value,minimum=0):
+        if type(value) is not int or value<minimum:
+            raise ValueError('Index must be an integer >= %s' % minimum)
+        return str(value)
+
+    @staticmethod
+    def _request_timeout(milliseconds):
+        return max(60,min(milliseconds,60000)/1000+5) if type(milliseconds) is int and milliseconds>=0 else 60
 
     # ---- queries ----
     def version(self):
-        return self._req("GET", "/version")[1]
+        return self._query("GET", "/version")
 
     def list(self):
-        return self._req("GET", "/vms")[1].get("vms", [])
+        return self._query("GET", "/vms").get("vms", [])
 
-    def status(self, name):
-        code, body = self._req("GET", self._vm_path(name))
-        if code == 404:
-            raise KeyError(name)
-        return body
+    def status(self, name=None, *, vm_id=None):
+        return self._query("GET",self._vm_path(name,vm_id=vm_id))
 
     # ---- lifecycle (return (http_status, body)) ----
-    def start(self, name, snap_index=-1, branch_index=-1, branch_name=None):
+    def start(self, name=None, snap_index=-1, branch_index=-1, branch_name=None, open_display=None, *, vm_id=None):
         """Start the VM. Optionally boot from a snapshot/branch (mirrors the GUI's
         startVm). Passing snap_index + branch_name boots from that snapshot on a new
         branch -- the GUI's only way to create a branch. No args -> current state."""
         body = {}
-        if snap_index != -1:   body["snapIndex"] = snap_index
-        if branch_index != -1: body["branchIndex"] = branch_index
-        if branch_name:        body["branchName"] = branch_name
-        return self._req("POST", (self._vm_path(name) + "/start"), body or None)
-    def shutdown(self, name): return self._req("POST", (self._vm_path(name) + "/shutdown"))   # graceful
-    def stop(self, name):     return self._req("POST", (self._vm_path(name) + "/stop"))       # force
-    def delete_vm(self, name):return self._req("POST", (self._vm_path(name) + "/delete"))
+        if type(snap_index) is not int or snap_index != -1: body["snapIndex"] = snap_index
+        if type(branch_index) is not int or branch_index != -1: body["branchIndex"] = branch_index
+        if branch_name is not None: body["branchName"] = branch_name
+        if open_display is not None: body['openDisplay'] = open_display
+        return self._req("POST", (self._vm_path(name,vm_id=vm_id) + "/start"), body or None)
+    def shutdown(self, name=None, *, vm_id=None): return self._req("POST", (self._vm_path(name,vm_id=vm_id) + "/shutdown"))
+    def stop(self, name=None, *, vm_id=None):     return self._req("POST", (self._vm_path(name,vm_id=vm_id) + "/stop"))
+    def delete_vm(self, name=None, *, vm_id=None):return self._req("POST", (self._vm_path(name,vm_id=vm_id) + "/delete"))
 
     def create(self, **cfg):
-        """Create a VM. Config keys: name, osType, imagePath|templateName, ramMb,
-        hddGb, cpuCores, gpuMode(0-2), networkMode(0-3), netAdapter, adminUser,
-        adminPass, testMode, sshEnabled, sshDeployKey, isTemplate. sshDeployKey
-        (requires sshEnabled) deploys the AppSandbox public key so you can SSH in
-        with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
-        once it lands. The daemon validates these exactly like the GUI; ramMb is
-        rounded down to even here (2 MB-aligned, an HCS requirement, like the GUI).
-        Async + auto-starts; watch status/events."""
-        if isinstance(cfg.get("ramMb"), int):
-            cfg["ramMb"] -= cfg["ramMb"] % 2
         return self._req("POST", "/vms", cfg)
 
-    def edit(self, name, **fields):
+    def edit(self, name=None, *, vm_id=None, **fields):
         """Change config on a STOPPED VM. Honors ramMb/cpuCores/gpuMode/networkMode
         (same ranges as create); name is fixed at create and any other key is ignored.
         Returns (status, body) -- 409 if the VM is running."""
-        if isinstance(fields.get("ramMb"), int):
-            fields["ramMb"] -= fields["ramMb"] % 2   # 2 MB-aligned, like the GUI
-        return self._req("PUT", self._vm_path(name), fields)
+        return self._req("PUT", self._vm_path(name,vm_id=vm_id), fields)
+
+    def create_template(self,**cfg):
+        return self._req('POST','/templates',cfg)
+
+    def operations(self):
+        return self._query('GET','/operations')['operations']
+
+    def operation(self,operation_name,**arguments):
+        operation=next((item for item in self.operations() if item['name']==operation_name),None)
+        if operation is None: raise ValueError('Unknown API operation: '+operation_name)
+        body=dict(arguments)
+        def substitute(match):
+            key=match.group(1)
+            if key not in body: raise ValueError('Missing '+key)
+            value=body.pop(key)
+            if key=='vm_id' and not _is_vm_id(value): raise ValueError('Invalid vm_id')
+            if key=='template_id' and not _is_template_id(value): raise ValueError('Invalid template_id')
+            if key=='ssh_session_id': self._ssh_id(value)
+            if key.endswith('_index') and type(value) is not int: raise ValueError('Index must be an integer')
+            return urllib.parse.quote(str(value),safe='')
+        path=re.sub(r'\{([a-z_]+)\}',substitute,operation['path'])
+        if operation['method']=='GET' and body: raise ValueError('Unexpected query arguments')
+        return self._req(operation['method'],path,body or None,timeout=self._request_timeout(arguments.get('timeoutMs',0)))
+
+    def screenshot(self,name=None,timeout_ms=5000,*,vm_id=None):
+        return self._req('POST',self._vm_path(name,vm_id=vm_id)+'/screenshot',{'timeoutMs':timeout_ms})
+
+    def input_status(self,name=None,*,vm_id=None):
+        return self._query('GET',self._vm_path(name,vm_id=vm_id)+'/input')
+
+    def input_request_control(self,name=None,*,vm_id=None,identity,vendor,model,purpose):
+        return self._req('POST',self._vm_path(name,vm_id=vm_id)+'/input/control',
+            dict(identity=identity,vendor=vendor,model=model,purpose=purpose))
+
+    def input(self,name=None,actions=None,*,vm_id=None):
+        return self._req('POST',self._vm_path(name,vm_id=vm_id)+'/input',{'actions':actions})
+
+    def input_finish(self,name=None,*,vm_id=None):
+        return self._req('DELETE',self._vm_path(name,vm_id=vm_id)+'/input/control')
+
+    def input_wait_for_control(self,name=None,timeout_ms=30000,*,vm_id=None):
+        return self._req('POST',self._vm_path(name,vm_id=vm_id)+'/input/wait',{'timeoutMs':timeout_ms},timeout=self._request_timeout(timeout_ms))
+
+    @staticmethod
+    def _ssh_id(value):
+        if not isinstance(value,str) or not re.fullmatch(r'ssh-(?!0000000000000000$)[0-9a-f]{16}',value):
+            raise ValueError('Invalid SSH session ID')
+        return value
+
+    def ssh_open(self,name=None,command='',*,vm_id=None):
+        return self._req('POST',self._vm_path(name,vm_id=vm_id)+'/ssh/sessions',{'command':command})
+
+    def ssh_read(self,name=None,ssh_session_id=None,timeout_ms=1000,*,vm_id=None):
+        return self._req('POST',self._vm_path(name,vm_id=vm_id)+'/ssh/sessions/'+self._ssh_id(ssh_session_id)+'/read',{'timeoutMs':timeout_ms})
+
+    def ssh_write(self,name=None,ssh_session_id=None,data='',close_stdin=False,*,vm_id=None):
+        body={'closeStdin':close_stdin}
+        if isinstance(data,bytes): body['stdinBase64']=base64.b64encode(data).decode('ascii')
+        else: body['stdin']=data
+        return self._req('POST',self._vm_path(name,vm_id=vm_id)+'/ssh/sessions/'+self._ssh_id(ssh_session_id),body)
+
+    def ssh_close(self,name=None,ssh_session_id=None,*,vm_id=None):
+        return self._req('DELETE',self._vm_path(name,vm_id=vm_id)+'/ssh/sessions/'+self._ssh_id(ssh_session_id))
 
     # ---- host / templates / ssh / snapshots ----
-    def host(self):              return self._req("GET", "/host")[1]
-    def templates(self):         return self._req("GET", "/templates")[1].get("templates", [])
-    def delete_template(self, name):
-        if isinstance(name, VmId):
-            return self.delete_vm(name)
-        return self._req("DELETE", "/templates/" + urllib.parse.quote(name, safe=""))
-    def ssh_info(self, name):    return self._req("GET", (self._vm_path(name) + "/sshInfo"))[1]
-    def open_display(self, name):
+    def host(self):              return self._query("GET", "/host")
+    def templates(self):         return self._query("GET", "/templates").get("templates", [])
+    def _template_path(self,name=None,*,template_id=None):
+        if template_id is not None:
+            if name is not None: raise ValueError('Specify either name or template_id, not both')
+            if not _is_template_id(template_id): raise ValueError('Invalid template_id')
+            return '/template-ids/'+urllib.parse.quote(template_id,safe='')
+        if not isinstance(name,str) or not name: raise ValueError('Specify a template name or template_id')
+        return '/templates/'+urllib.parse.quote(name,safe='')
+
+    def template(self,name=None,*,template_id=None):
+        return self._query('GET',self._template_path(name,template_id=template_id))
+
+    def delete_template(self, name=None, *, template_id=None):
+        return self._req('DELETE',self._template_path(name,template_id=template_id))
+    def ssh_info(self, name=None, *, vm_id=None): return self._query("GET", (self._vm_path(name,vm_id=vm_id) + "/sshInfo"))
+    def open_display(self, name=None, *, vm_id=None):
         """Open the VM's display window on the daemon's local desktop (the GUI's
         Connect view). The VM must be running, and the daemon must be in an
         interactive session that can show a window (a headless/SSH/service daemon
         returns 409 "no_display"). Returns (status, body); status() reports
         displayOpen, which also goes false if the user closes the window."""
-        return self._req("POST", (self._vm_path(name) + "/display"))
-    def close_display(self, name): return self._req("DELETE", (self._vm_path(name) + "/display"))
-    def display_status(self, name):
+        return self._req("POST", (self._vm_path(name,vm_id=vm_id) + "/display"))
+    def close_display(self, name=None, *, vm_id=None): return self._req("DELETE", (self._vm_path(name,vm_id=vm_id) + "/display"))
+    def display_status(self, name=None, *, vm_id=None):
         """{'open': bool, 'ready': bool}. 'ready' is the agent's own report that the
         display driver is up (running + agentOnline + idd_status) -- a passive flag,
         NOT a probe: polling it touches no window and no frame channel, so it can't
         disturb the display. Wait for ready, then call open_display()."""
-        return self._req("GET", (self._vm_path(name) + "/display"))[1]
-    def display_ready(self, name):  return bool(self.display_status(name).get("ready"))
-    def snapshots(self, name):   return self._req("GET", (self._vm_path(name) + "/snapshots"))[1].get("snapshots", [])
-    def snapshots_full(self, name): return self._req("GET", (self._vm_path(name) + "/snapshots"))[1]  # incl. "current"
-    def snap_take(self, name, snapname=None):
+        return self._query("GET", (self._vm_path(name,vm_id=vm_id) + "/display"))
+    def display_ready(self, name=None, *, vm_id=None): return bool(self.display_status(name,vm_id=vm_id).get("ready"))
+    def snapshots(self, name=None, *, vm_id=None): return self._query("GET", (self._vm_path(name,vm_id=vm_id) + "/snapshots")).get("snapshots", [])
+    def snapshots_full(self, name=None, *, vm_id=None): return self._query("GET", (self._vm_path(name,vm_id=vm_id) + "/snapshots"))
+    def snap_take(self, name=None, snapname=None, *, vm_id=None):
         """Take a snapshot -- the VM must be STOPPED (409 vm_running otherwise)."""
-        return self._req("POST", (self._vm_path(name) + "/snapshots"), {"name": snapname} if snapname else {})
-    def snap_delete(self, name, index):
-        return self._req("DELETE", self._vm_path(name) + "/snapshots/%d" % index)
-    def snap_rename(self, name, index, new_name, branch_index=-1):
-        return self._req("PUT", self._vm_path(name) + "/snapshots/%d" % index,
+        return self._req("POST", (self._vm_path(name,vm_id=vm_id) + "/snapshots"), {"name": snapname} if snapname is not None else {})
+    def snap_delete(self, name=None, index=None, *, vm_id=None):
+        return self._req("DELETE", self._vm_path(name,vm_id=vm_id) + "/snapshots/"+self._index(index))
+    def snap_rename(self, name=None, index=None, new_name=None, branch_index=-1, *, vm_id=None):
+        self._index(branch_index,-1)
+        return self._req("PUT", self._vm_path(name,vm_id=vm_id) + "/snapshots/"+self._index(index,-2),
                          {"name": new_name, "branchIndex": branch_index})
-    def snap_delete_branch(self, name, index, branch_index):
-        return self._req("DELETE", self._vm_path(name) + "/snapshots/%d/branches/%d" % (index, branch_index))
+    def snap_delete_branch(self, name=None, index=None, branch_index=None, *, vm_id=None):
+        return self._req("DELETE", self._vm_path(name,vm_id=vm_id) + "/snapshots/"+self._index(index,-2)+"/branches/"+self._index(branch_index))
 
     def shutdown_daemon(self, force=False):
         # Refused (409) while VMs run unless force=True (which terminates them).
-        return self._req("POST", "/shutdown", {"force": True} if force else {})
+        return self._req("POST", "/shutdown", {"force": force})
 
     # ---- events (Server-Sent Events) ----
     def events(self):
@@ -216,26 +302,28 @@ class Client:
                         yield {"raw": payload}
 
     # ---- waiting (poll-first: level signals, miss-proof) ----
-    def wait(self, name, target_states, timeout=300, interval=2):
-        name = self.vm_id(name)
+    def wait(self, name=None, target_states=None, timeout=300, interval=2, *, vm_id=None):
+        path=self._vm_path(name,vm_id=vm_id)
+        target=vm_id if vm_id is not None else name
+        if target_states is None: raise ValueError('Specify target_states')
         if isinstance(target_states, str):
             target_states = {target_states}
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while True:
             try:
-                s = self.status(name)
+                s = self._query('GET',path)
             except KeyError:
-                raise RuntimeError("%s vanished (404)" % name)
+                raise RuntimeError("%s vanished (404)" % target)
             if s["state"] in target_states:
                 return s
-            if time.time() > deadline:
+            if time.monotonic() > deadline:
                 raise TimeoutError(
                     "%s did not reach %s within %ss (last state=%s)"
-                    % (name, sorted(target_states), timeout, s["state"]))
+                    % (target, sorted(target_states), timeout, s["state"]))
             time.sleep(interval)
 
-    def wait_online(self, name, timeout=900):
-        return self.wait(name, {"online"}, timeout=timeout)
+    def wait_online(self, name=None, timeout=900, *, vm_id=None):
+        return self.wait(name, {"online"}, timeout=timeout,vm_id=vm_id)
 
 
 def connect(endpoint=None, token=None, check=True):

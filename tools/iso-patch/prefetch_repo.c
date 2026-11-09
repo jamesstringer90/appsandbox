@@ -404,6 +404,19 @@ int do_prefetch_repo(const wchar_t *tag, const wchar_t *mesa_tag,
             swprintf_s(dst, MAX_PATH, L"%s\\display-gpu.h", out_agent);
             if (u_cp_file(gpu_src, dst) != 0) goto failed;
         }
+        wchar_t capture_src[MAX_PATH];
+        swprintf_s(capture_src, MAX_PATH, L"%s\\tools\\transport\\asb_capture_socket.c", extracted_root);
+        if (GetFileAttributesW(capture_src) != INVALID_FILE_ATTRIBUTES) {
+            const wchar_t *capture_files[] = {
+                L"asb_capture_socket.c", L"asb_capture_socket.h",
+                L"asb_capture_service.c", L"asb_capture_service.h", L"asb_automation.h"
+            };
+            for (size_t i = 0; i < ARRAYSIZE(capture_files); ++i) {
+                swprintf_s(capture_src, MAX_PATH, L"%s\\tools\\transport\\%s", extracted_root, capture_files[i]);
+                swprintf_s(dst, MAX_PATH, L"%s\\transport\\%s", out_agent, capture_files[i]);
+                if (u_cp_file(capture_src, dst) != 0) goto failed;
+            }
+        }
         wchar_t protocol_src[MAX_PATH];
         swprintf_s(protocol_src, MAX_PATH, L"%s\\src\\core\\protocol.h", extracted_root);
         swprintf_s(dst, MAX_PATH, L"%s\\protocol.h", out_agent);

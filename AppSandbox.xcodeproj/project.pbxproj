@@ -7,6 +7,25 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+        A5B3C0000000000000000002 = {isa = PBXBuildFile; fileRef = A5B3C0000000000000000001; };
+        A5B3C0000000000000000003 = {isa = PBXBuildFile; fileRef = A5B2A0000000000000000018; };
+        A5B2A0000000000000000023 = {isa = PBXBuildFile; fileRef = A5B2A0000000000000000022; };
+        A5B2A0000000000000000002 = {isa = PBXBuildFile; fileRef = A5B2A0000000000000000001; };
+        A5B2A0000000000000000004 = {isa = PBXBuildFile; fileRef = A5B2A0000000000000000003; };
+        A5B2A0000000000000000006 = {isa = PBXBuildFile; fileRef = A5B2A0000000000000000005; };
+        A5B2A0000000000000000008 = {isa = PBXBuildFile; fileRef = A5B2A0000000000000000007; };
+        A5B2A000000000000000000A = {isa = PBXBuildFile; fileRef = A5B2A0000000000000000009; };
+        A5B2A000000000000000000C = {isa = PBXBuildFile; fileRef = A5B2A000000000000000000B; };
+        A5B2A0000000000000000011 = {isa = PBXBuildFile; fileRef = A5B2A0000000000000000010; };
+        A5B2A000000000000000001A = {isa = PBXBuildFile; fileRef = 3002000000000000000000AA; };
+        A5B2A000000000000000001B = {isa = PBXBuildFile; fileRef = A5B1C0000000000000000004; };
+        A5B2A0000000000000000021 = {isa = PBXBuildFile; fileRef = A5B2A0000000000000000020; };
+
+        A5BF00000000000000000001 = {isa = PBXBuildFile; fileRef = A5BF00000000000000000011; };
+        A5BF00000000000000000002 = {isa = PBXBuildFile; fileRef = A5BF00000000000000000012; };
+        A5BF00000000000000000003 = {isa = PBXBuildFile; fileRef = A5BF00000000000000000013; };
+        A5BF00000000000000000004 = {isa = PBXBuildFile; fileRef = A5BF00000000000000000017; };
+        A5BF00000000000000000005 = {isa = PBXBuildFile; fileRef = A5BF00000000000000000018; };
         A5B100000000000000000001   = {isa = PBXBuildFile; fileRef = A5B100000000000000000003  ; };
         A5B100000000000000000004   = {isa = PBXBuildFile; fileRef = A5B100000000000000000005  ; };
         A5BE00000000000000000001   = {isa = PBXBuildFile; fileRef = A5BE00000000000000000002  ; };
@@ -158,6 +177,33 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+        A5B3C0000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = src/backend_mac/headless_capture_native.m; sourceTree = SOURCE_ROOT; };
+        A5B2A0000000000000000022 = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+        A5B2A0000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "src/backend_mac/headless_input.c"; sourceTree = SOURCE_ROOT; };
+        A5B2A0000000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "src/backend_mac/headless_capture.c"; sourceTree = SOURCE_ROOT; };
+        A5B2A0000000000000000005 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "src/backend_mac/headless_ssh.c"; sourceTree = SOURCE_ROOT; };
+        A5B2A0000000000000000007 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "src/backend_mac/headless_transport.m"; sourceTree = SOURCE_ROOT; };
+        A5B2A0000000000000000009 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "src/backend_mac/input_keys.c"; sourceTree = SOURCE_ROOT; };
+        A5B2A000000000000000000B = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "src/backend_mac/agent_overlay.m"; sourceTree = SOURCE_ROOT; };
+        A5B2A000000000000000000D = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "src/backend_mac/headless_vm.h"; sourceTree = SOURCE_ROOT; };
+        A5B2A000000000000000000E = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "src/backend_mac/input_keys.h"; sourceTree = SOURCE_ROOT; };
+        A5B2A000000000000000000F = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "src/backend_mac/agent_overlay.h"; sourceTree = SOURCE_ROOT; };
+        A5B2A0000000000000000010 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "src/core/input_router.c"; sourceTree = SOURCE_ROOT; };
+        A5B2A0000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "src/core/input_router.h"; sourceTree = SOURCE_ROOT; };
+        A5B2A0000000000000000013 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "src/core/input_unicode.h"; sourceTree = SOURCE_ROOT; };
+        A5B2A0000000000000000018 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "tools/transport/asb_capture_service.c"; sourceTree = SOURCE_ROOT; };
+        A5B2A0000000000000000020 = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ImageIO.framework; path = System/Library/Frameworks/ImageIO.framework; sourceTree = SDKROOT; };
+
+        A5B1C0000000000000000004 = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+        A5BF00000000000000000011 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = api_json.c; sourceTree = "<group>"; };
+        A5BF00000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = api_contract.c; sourceTree = "<group>"; };
+        A5BF00000000000000000013 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = api_operations.c; sourceTree = "<group>"; };
+        A5BF00000000000000000014 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = api_json.h; sourceTree = "<group>"; };
+        A5BF00000000000000000015 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = api_contract.h; sourceTree = "<group>"; };
+        A5BF00000000000000000016 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = api_operations.h; sourceTree = "<group>"; };
+        A5BF00000000000000000017 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mcp_server.c; sourceTree = "<group>"; };
+        A5BF00000000000000000018 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mcp_http.c; sourceTree = "<group>"; };
+        A5BF00000000000000000019 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = mcp_server.h; sourceTree = "<group>"; };
         A5B100000000000000000002   = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_network_mac.h; sourceTree = "<group>"; };
         A5B100000000000000000003   = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = asb_network_mac.m; sourceTree = "<group>"; };
         A5B100000000000000000005   = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = vmnet.framework; path = System/Library/Frameworks/vmnet.framework; sourceTree = SDKROOT; };
@@ -248,6 +294,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                A5B2A0000000000000000021,
+
 				4001000000000000000000AA /* Cocoa.framework in Frameworks */,
 				4002000000000000000000AA /* WebKit.framework in Frameworks */,
 				4003000000000000000000AA /* Virtualization.framework in Frameworks */,
@@ -259,6 +307,10 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                A5B2A000000000000000001A,
+                A5B2A000000000000000001B,
+                A5B2A0000000000000000023,
+
 				4011000000000000000000BB /* Cocoa.framework in Frameworks */,
 				4016000000000000000000BB /* Carbon.framework in Frameworks */,
 				4012000000000000000000BB /* Virtualization.framework in Frameworks */,
@@ -290,6 +342,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+
 				4040000000000000000000EE /* Foundation.framework in Frameworks */,
 				4041000000000000000000EE /* Cocoa.framework in Frameworks */,
 			);
@@ -313,6 +366,8 @@
 		7019000000000000000000AA /* tools */ = {
 			isa = PBXGroup;
 			children = (
+                A5B2A0000000000000000018,
+
 				7020000000000000000000CC /* iso-patch-mac */,
 				7030000000000000000000DD /* agent_mac */,
 			);
@@ -353,6 +408,7 @@
 		7030000000000000000000DD /* agent_mac */ = {
 			isa = PBXGroup;
 			children = (
+
 				1030000000000000000000DD /* appsandbox-agent.m */,
 				1031000000000000000000DD /* com.appsandbox.agent.plist */,
 				1032000000000000000000DD /* com.appsandbox.firstboot.plist */,
@@ -398,6 +454,19 @@
 		7006000000000000000000AA /* core */ = {
 			isa = PBXGroup;
 			children = (
+                A5B2A0000000000000000010,
+                A5B2A0000000000000000012,
+                A5B2A0000000000000000013,
+
+                A5BF00000000000000000011,
+                A5BF00000000000000000012,
+                A5BF00000000000000000013,
+                A5BF00000000000000000014,
+                A5BF00000000000000000015,
+                A5BF00000000000000000016,
+                A5BF00000000000000000017,
+                A5BF00000000000000000018,
+                A5BF00000000000000000019,
 				1018000000000000000000AA /* asb_types.h */,
                 A5BE00000000000000000002  ,
                 A5BE00000000000000000003  ,
@@ -410,6 +479,18 @@
 		7007000000000000000000AA /* backend_mac */ = {
 			isa = PBXGroup;
 			children = (
+                A5B3C0000000000000000001,
+
+                A5B2A0000000000000000001,
+                A5B2A0000000000000000003,
+                A5B2A0000000000000000005,
+                A5B2A0000000000000000007,
+                A5B2A0000000000000000009,
+                A5B2A000000000000000000B,
+                A5B2A000000000000000000D,
+                A5B2A000000000000000000E,
+                A5B2A000000000000000000F,
+
 				101A000000000000000000AA /* asb_core_mac.h */,
 				1019000000000000000000AA /* asb_core_mac.m */,
 				1009000000000000000000AA /* host_info.h */,
@@ -446,6 +527,9 @@
 		7008000000000000000000AA /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+                A5B2A0000000000000000022,
+                A5B2A0000000000000000020,
+
 				3001000000000000000000AA /* Cocoa.framework */,
 				3016000000000000000000BB /* Carbon.framework */,
 				3002000000000000000000AA /* WebKit.framework */,
@@ -454,6 +538,7 @@
 				3004000000000000000000AA /* Metal.framework */,
 				3005000000000000000000AA /* Security.framework */,
 				3006000000000000000000AA /* Foundation.framework */,
+                A5B1C0000000000000000004,
 				3007000000000000000000AA /* AudioToolbox.framework */,
 			);
 			name = Frameworks;
@@ -711,6 +796,11 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                A5BF00000000000000000001,
+                A5BF00000000000000000002,
+                A5BF00000000000000000003,
+                A5BF00000000000000000004,
+                A5BF00000000000000000005,
 				2001000000000000000000AA /* main.m in Sources */,
 				2003000000000000000000AA /* AppDelegate.m in Sources */,
 				2005000000000000000000AA /* MainWindowController.m in Sources */,
@@ -723,6 +813,17 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                A5B3C0000000000000000002,
+                A5B3C0000000000000000003,
+
+                A5B2A0000000000000000002,
+                A5B2A0000000000000000004,
+                A5B2A0000000000000000006,
+                A5B2A0000000000000000008,
+                A5B2A000000000000000000A,
+                A5B2A000000000000000000C,
+                A5B2A0000000000000000011,
+
 				2028000000000000000000BB /* asb_core_mac.m in Sources */,
                 A5BE00000000000000000001  ,
 				2021000000000000000000BB /* host_info.m in Sources */,
@@ -776,6 +877,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+
 				2040000000000000000000EE /* appsandbox-clipboard.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

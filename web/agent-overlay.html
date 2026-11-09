@@ -1,0 +1,117 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy"
+content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<style>
+html,body { margin:0; width:100%; height:100%; overflow:hidden; background:transparent;
+  pointer-events:none; user-select:none; font-family:Segoe UI,sans-serif; }
+#cursor { position:absolute; display:none; color:#1fccff; pointer-events:none; }
+#cursor.paused { color:#ffa629; }
+#cursor svg { width:25px; height:34px; filter:drop-shadow(1px 2px 1px #0009); }
+#label { position:absolute; left:23px; top:3px; border-radius:4px; padding:2px 5px;
+  background:#101722; font-size:11px; font-weight:700; line-height:15px; color:inherit; }
+#menu { display:none; position:absolute; box-sizing:border-box; right:16px; top:16px;
+  width:360px; max-width:calc(100% - 32px); max-height:calc(100% - 32px); overflow:auto; padding:14px; border:1px solid #ffffff55;
+  border-radius:10px; background:#172232; color:white; box-shadow:0 3px 12px #0005; pointer-events:none; }
+#identity { font-size:14px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#status { color:#1fccff; font-size:12px; margin-top:3px; }
+#model { color:#d3deea; font-size:12px; line-height:18px; margin-top:4px; overflow-wrap:anywhere; }
+#purpose-label { color:#a8bbcf; font-size:12px; margin-top:8px; }
+#purpose { color:#d3deea; font-size:13px; line-height:18px; margin:3px 0 12px;
+  white-space:pre-wrap; overflow-wrap:anywhere; max-height:108px; overflow:hidden; }
+#buttons { display:flex; gap:8px; }
+button { box-sizing:border-box; height:40px; border:1px solid #ffffff55; border-radius:7px;
+  background:#263d57; color:white; font:600 14px Segoe UI,sans-serif; cursor:pointer; }
+#take { flex:1; } #stop { width:100px; background:#3b2530; }
+button.hovered { border-color:#1fccff; background:#345371; }
+@media(max-width:340px) { #buttons { flex-direction:column; } #stop { width:100%; } }
+</style></head><body inert>
+<div id="cursor" aria-hidden="true"><svg viewBox="0 0 25 34"><path
+d="M2 2 L2 26 L8 21 L13 32 L18 30 L13 19 L22 18 Z"
+fill="currentColor" stroke="white" stroke-width="1.5" stroke-linejoin="round"/></svg>
+<span id="label">MCP</span></div>
+<div id="menu"><div id="identity"></div><div id="status"></div><div id="model"></div>
+<div id="purpose-label">What the agent is doing:</div><div id="purpose"></div>
+<div id="buttons"><button id="take" tabindex="-1">Take control</button>
+<button id="stop" tabindex="-1">Stop agent</button></div></div>
+<script>
+const cursor=document.getElementById('cursor'), take=document.getElementById('take');
+const menu=document.getElementById('menu'), stop=document.getElementById('stop');
+let pressed=null;
+const heldKeys=new Map();
+function clearInput() {
+  pressed=null;
+  heldKeys.clear();
+  take.classList.remove('hovered');
+  stop.classList.remove('hovered');
+}
+function contains(element,x,y) {
+  const r=element.getBoundingClientRect();
+  return x>=r.left && x<r.right && y>=r.top && y<r.bottom;
+}
+function activate(button) {
+  if(menu.style.display==='none') return;
+  menu.style.display='none';
+  clearInput();
+  window.chrome.webview.postMessage(button===take?take.dataset.command:'stop_agent');
+}
+function receiveInput(s) {
+  if(s.kind==='leave' || s.kind==='cancel') { clearInput(); return; }
+  if(menu.style.display==='none' || !contains(menu,s.x,s.y)) return;
+  const target=contains(take,s.x,s.y)?take:contains(stop,s.x,s.y)?stop:null;
+  take.classList.toggle('hovered',target===take);
+  stop.classList.toggle('hovered',target===stop);
+  if(s.kind==='key') {
+    if(s.key!==13 && s.key!==32) return;
+    if(!s.up) { if(!heldKeys.has(s.key)) heldKeys.set(s.key,target); }
+    else {
+      const original=heldKeys.get(s.key);
+      heldKeys.delete(s.key);
+      if(target && original===target) activate(target);
+    }
+    return;
+  }
+  if(s.kind==='down' && s.button===0) pressed=target;
+  else if(s.kind==='up' && s.button===0) {
+    const original=pressed;
+    pressed=null;
+    if(target && target===original) activate(target);
+  } else if(s.kind==='wheel') menu.scrollTop-=s.delta;
+  else if(s.kind==='hwheel') menu.scrollLeft+=s.delta;
+}
+for(const type of ['pointerdown','pointerup','pointermove','pointercancel','mousedown','mouseup','mousemove',
+  'click','dblclick','auxclick','contextmenu','wheel','touchstart','touchmove','touchend',
+  'keydown','keyup','keypress','beforeinput','input','compositionstart','compositionupdate','compositionend',
+  'dragstart','dragover','drop']) {
+  window.addEventListener(type,e=>{
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  },{capture:true,passive:false});
+}
+function layout() {
+  if(menu.style.display==='none') return;
+  const m=menu.getBoundingClientRect();
+  const c=cursor.getBoundingClientRect(), l=document.getElementById('label').getBoundingClientRect();
+  window.chrome.webview.postMessage('layout:'+JSON.stringify({x:Math.round(m.x),y:Math.round(m.y),
+    width:Math.round(m.width),height:Math.round(m.height),cursor:cursor.style.display!=='none',
+    cx:c.x,cy:c.y,cursorPath:cursor.querySelector('path').getAttribute('d'),
+    label:{x:l.x,y:l.y,width:l.width,height:l.height}}));
+}
+new ResizeObserver(layout).observe(menu);
+window.chrome.webview.addEventListener('message', e => {
+  const s=e.data;
+  if(s.type==='input') { receiveInput(s); return; }
+  cursor.style.display=s.showCursor?'block':'none';
+  cursor.style.transform=`translate(${s.x}px,${s.y}px)`;
+  cursor.classList.toggle('paused',!s.active);
+  menu.style.display=s.menu?'block':'none';
+  if(!s.menu) clearInput();
+  document.getElementById('identity').textContent=s.context?.identity || 'Agent';
+  document.getElementById('model').textContent=`Vendor: ${s.context?.vendor || 'unknown'} · Model: ${s.context?.model || 'unknown'}`;
+  document.getElementById('purpose').textContent=s.context?.purpose || '';
+  document.getElementById('status').textContent=s.active?'Using desktop':'Wants to continue';
+  take.textContent=s.active?'Take control':'Return control';
+  take.dataset.command=s.active?'take_control':'return_control';
+  requestAnimationFrame(layout);
+});
+window.chrome.webview.postMessage('ready');
+</script></body></html>

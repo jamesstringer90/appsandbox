@@ -168,6 +168,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\core\asb_events.c" />
+    <ClCompile Include="src\core\input_router.c" />
+    <ClCompile Include="src\backend_win\headless_transport.c" />
+    <ClCompile Include="src\backend_win\headless_input.c" />
+    <ClCompile Include="src\backend_win\headless_capture.c" />
+    <ClCompile Include="src\backend_win\headless_ssh.c" />
     <ClCompile Include="src\backend_win\asb_core.c" />
     <ClCompile Include="src\backend_win\asb_display.c" />
     <ClCompile Include="src\backend_win\hcs_vm.c" />
@@ -185,6 +190,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\core\asb_events.h" />
+    <ClInclude Include="src\core\input_router.h" />
+    <ClInclude Include="src\backend_win\headless_vm.h" />
     <ClInclude Include="src\core\asb_types.h" />
     <ClInclude Include="src\core\protocol.h" />
     <ClInclude Include="src\backend_win\asb_core.h" />

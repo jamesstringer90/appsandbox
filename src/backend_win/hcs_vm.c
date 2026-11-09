@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <sddl.h>
 #include <aclapi.h>
+#include "../../tools/transport/asb_automation.h"
 
 /* ---- HCS function pointer types ---- */
 
@@ -1112,12 +1113,16 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
        <N>-FACB-... GUID on the host side. Same security descriptors
        for both. Ports 1–6 cover agent + frame + input + audio + the
        two clipboard channels. */
+
     {
         wchar_t entry[256];
         wchar_t guid_str[64];
         unsigned port;
         service_table[0] = L'\0';
-        for (port = 1; port <= 6; port++) {
+        BOOL windows_guest=_wcsicmp(config->os_type,L"Windows")==0;
+        unsigned last_port=ASB_CH_SCREENSHOT;
+        for (port = 1; port <= last_port; port++) {
+            if (!windows_guest && port==7) continue;
             hcs_service_guid_str(config->os_type, port, guid_str, 64);
             swprintf_s(entry, 256,
                 L"%s\"%s\":{"

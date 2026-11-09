@@ -1007,6 +1007,7 @@ static void VddSendCursorUpdate(VDD_SWAP_PROC* proc)
     }
 }
 
+
 static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
 {
     IDXGIDevice* pDxgiDevice = NULL;
@@ -1051,6 +1052,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
     }
 
     BOOL bHasFrame = FALSE;
+    BOOL bSurfaceReady = FALSE;
     BOOL bSentFullFrame = FALSE;   /* TRUE after first full frame sent to current client */
 
 
@@ -1127,9 +1129,18 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             }
         }
 
+        BOOL bHoldCurrent = proc->screenshot.screenshotRequested && proc->bGpuPoolReady &&
+            proc->screenshot.current && !bSurfaceReady &&
+            WaitForSingleObject(proc->hAvailableEvent, 0) == WAIT_TIMEOUT;
+        if (!bHoldCurrent) {
+            bSurfaceReady = FALSE;
+            asb_vdd_screenshot_release_frame(&proc->screenshot);
+        }
         /* Use v2 acquire when available */
 #pragma warning(suppress: 4127)
-        if (IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
+        if (bHoldCurrent) {
+            hr = E_PENDING;
+        } else if (IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
             IDARG_IN_RELEASEANDACQUIREBUFFER2 bufferInArgs = { 0 };
             IDARG_OUT_RELEASEANDACQUIREBUFFER2 buffer = { 0 };
             bufferInArgs.Size = sizeof(bufferInArgs);
@@ -1142,8 +1153,15 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
         }
 
         if (hr == E_PENDING) {
+            VDD_GPU_SLOT* cached = &proc->gpuSlots[proc->gpuLastSlot];
+            asb_vdd_screenshot_poll(&proc->screenshot, proc->pStagingTex,
+                proc->bGpuPendingFrame ? proc->pGpuPendingTex : NULL,
+                proc->bGpuHasFrame ? cached->pMutex : NULL,
+                proc->bGpuHasFrame ? cached->pTexture : NULL,
+                proc->desktopFrameSeq, proc->bGpuPoolReady);
             DWORD waitResult = WaitForMultipleObjects(waitCount, waitHandles, FALSE,
                 proc->bGpuPendingFrame ? 1 : 100);
+            if (waitResult == WAIT_OBJECT_0) bSurfaceReady = TRUE;
             if (waitResult == WAIT_OBJECT_0 + 1) {
                 break;  /* Terminate */
             }
@@ -1238,8 +1256,11 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                     }
                     proc->bGpuSourceKnown = TRUE;
                     proc->bGpuSourceCompatible = VddGpuTextureCompatible(proc, pTexture);
+                    ++proc->desktopFrameSeq;
                     BOOL hadGpuTexture = proc->bGpuPoolReady;
                     if (VddPublishGpuFrame(proc, pTexture)) {
+                        asb_vdd_screenshot_frame(&proc->screenshot, pTexture,
+                            proc->desktopFrameSeq, TRUE);
                         bHasFrame = FALSE;
                         pTexture->Release();
                         pTexture = nullptr;
@@ -1382,6 +1403,8 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                         proc->pDeviceContext->Unmap(proc->pStagingTex, 0);
                     }
 
+                    asb_vdd_screenshot_frame(&proc->screenshot, pTexture,
+                        proc->desktopFrameSeq, FALSE);
                     pTexture->Release();
                 }
             }
@@ -1456,6 +1479,8 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
         VddLog("DestroySwapProc: network thread exited");
         CloseHandle(proc->hNetworkThread);
     }
+
+    asb_vdd_screenshot_destroy(&proc->screenshot);
 
     /* Close any remaining client connection */
     VddLog("DestroySwapProc: closing client connection (%p)", (void*)proc->hClientConn);
@@ -1930,6 +1955,8 @@ static NTSTATUS VddAssignSwapChain(
     proc->hPendingConn   = NULL;
     proc->bStopNetwork   = FALSE;
     proc->frameSeq       = 0;
+    asb_vdd_screenshot_init(&proc->screenshot, proc->pDevice,
+        proc->pDeviceContext, proc->hTerminateEvent, VddLog);
 
     /* Setup hardware cursor BEFORE starting swap chain thread — the thread
        reads proc->hCursorEvent at startup to build its wait handle array */
@@ -1999,6 +2026,8 @@ static NTSTATUS VddAssignSwapChain(
     }
 
     ctx->pSwapProc = proc;
+
+    asb_vdd_screenshot_start(&proc->screenshot);
 
     VddLog("AssignSwapChain: COMPLETE — swap chain assigned, all threads started");
     return STATUS_SUCCESS;

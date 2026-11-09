@@ -1,0 +1,52 @@
+#include "api_operations.h"
+
+#define STR "{\"type\":\"string\"}"
+#define INT "{\"type\":\"integer\"}"
+#define BOOL "{\"type\":\"boolean\"}"
+#define VM "\"vm_id\":{\"type\":\"string\",\"pattern\":\"^vm-[0-9a-f]{16}$\"}"
+#define TEMPLATE "\"template_id\":{\"type\":\"string\",\"pattern\":\"^template-[0-9a-f]{16}$\"}"
+#define OP(name,description,method,path,properties,required) \
+    "{\"name\":\"" name "\",\"description\":\"" description "\",\"method\":\"" method "\",\"path\":\"" path "\",\"inputSchema\":{\"type\":\"object\",\"properties\":{" properties "},\"required\":[" required "],\"additionalProperties\":false}}"
+#define CONFIG "\"name\":" STR ",\"osType\":" STR ",\"imagePath\":" STR ",\"diskDirectory\":" STR ",\"templateName\":" STR ",\"templateId\":" STR ",\"ramMb\":" INT ",\"hddGb\":" INT ",\"cpuCores\":" INT ",\"gpuMode\":" INT ",\"gpuId\":" STR ",\"networkMode\":" INT ",\"netAdapter\":" STR ",\"adminUser\":" STR ",\"adminPass\":" STR ",\"testMode\":" BOOL ",\"sshEnabled\":" BOOL ",\"sshDeployKey\":" BOOL ",\"isTemplate\":" BOOL
+#define EDIT "\"ramMb\":" INT ",\"cpuCores\":" INT ",\"gpuMode\":" INT ",\"gpuId\":" STR ",\"networkMode\":" INT
+#define INPUT_ACTIONS "\"actions\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":128,\"items\":{\"type\":\"object\",\"properties\":{\"type\":{\"enum\":[\"move\",\"click\",\"button\",\"text\",\"unicode\",\"key\",\"scroll\"]},\"x\":" INT ",\"y\":" INT ",\"width\":" INT ",\"height\":" INT ",\"button\":" INT ",\"text\":" STR ",\"scan\":" INT ",\"down\":" BOOL ",\"extended\":" BOOL ",\"delta\":" INT "},\"required\":[\"type\"],\"additionalProperties\":false}}"
+
+const char *asb_api_operations_json(void)
+{
+    return "{\"operations\":["
+        OP("api_version","Read API version and platform capabilities.","GET","/version","","") ","
+        OP("host_status","Read host capacity and available resources.","GET","/host","","") ","
+        OP("vm_list","List VMs and their persistent VM IDs.","GET","/vms","","") ","
+        OP("vm_status","Read a VM by its persistent VM ID.","GET","/vm-ids/{vm_id}",VM,"\"vm_id\"") ","
+        OP("vm_create","Create a VM; validation and asynchronous provisioning are owned by the API.","POST","/vms",CONFIG,"\"name\",\"osType\"") ","
+        OP("vm_edit","Edit a stopped VM configuration.","PUT","/vm-ids/{vm_id}",VM "," EDIT,"\"vm_id\"") ","
+        OP("vm_start","Start a VM. Set openDisplay to false for windowless use. Snapshot and branch options require the host capability.","POST","/vm-ids/{vm_id}/start",VM ",\"snapIndex\":" INT ",\"branchIndex\":" INT ",\"branchName\":" STR ",\"openDisplay\":" BOOL,"\"vm_id\"") ","
+        OP("vm_shutdown","Request graceful VM shutdown.","POST","/vm-ids/{vm_id}/shutdown",VM,"\"vm_id\"") ","
+        OP("vm_stop","Force-stop a VM.","POST","/vm-ids/{vm_id}/stop",VM,"\"vm_id\"") ","
+        OP("vm_delete","Delete a VM. Template IDs and template resources are rejected.","POST","/vm-ids/{vm_id}/delete",VM,"\"vm_id\"") ","
+        OP("template_list","List completed templates and their persistent template IDs.","GET","/templates","","") ","
+        OP("template_status","Read a template or template build by template ID.","GET","/template-ids/{template_id}",TEMPLATE,"\"template_id\"") ","
+        OP("template_create","Create a template, using template-specific resource identity.","POST","/templates",CONFIG,"\"name\",\"osType\"") ","
+        OP("template_delete","Delete a template or cancel its build. Ordinary VMs are rejected.","DELETE","/template-ids/{template_id}",TEMPLATE,"\"template_id\"") ","
+        OP("display_status","Read passive viewer and display readiness flags.","GET","/vm-ids/{vm_id}/display",VM,"\"vm_id\"") ","
+        OP("display_open","Open or focus the local VM viewer when a host desktop is available.","POST","/vm-ids/{vm_id}/display",VM,"\"vm_id\"") ","
+        OP("display_close","Close the local viewer without finishing agent input work.","DELETE","/vm-ids/{vm_id}/display",VM,"\"vm_id\"") ","
+        OP("snapshot_list","Read snapshots, branches, and the current pointer.","GET","/vm-ids/{vm_id}/snapshots",VM,"\"vm_id\"") ","
+        OP("snapshot_take","Take a snapshot of a stopped VM.","POST","/vm-ids/{vm_id}/snapshots",VM ",\"name\":" STR,"\"vm_id\"") ","
+        OP("snapshot_delete","Delete a snapshot by integer index.","DELETE","/vm-ids/{vm_id}/snapshots/{snapshot_index}",VM ",\"snapshot_index\":" INT,"\"vm_id\",\"snapshot_index\"") ","
+        OP("snapshot_rename","Rename a snapshot or a selected branch.","PUT","/vm-ids/{vm_id}/snapshots/{snapshot_index}",VM ",\"snapshot_index\":" INT ",\"name\":" STR ",\"branchIndex\":" INT,"\"vm_id\",\"snapshot_index\",\"name\"") ","
+        OP("snapshot_delete_branch","Delete a branch by integer indices; -2 identifies the base snapshot.","DELETE","/vm-ids/{vm_id}/snapshots/{snapshot_index}/branches/{branch_index}",VM ",\"snapshot_index\":" INT ",\"branch_index\":" INT,"\"vm_id\",\"snapshot_index\",\"branch_index\"") ","
+        OP("ssh_info","Read the VM loopback SSH connection details.","GET","/vm-ids/{vm_id}/sshInfo",VM,"\"vm_id\"") ","
+        OP("ssh_open","Open a host-owned SSH session to the VM loopback endpoint. SSH has independent streaming I/O and does not claim desktop input or activate its overlay. Close the session when finished.","POST","/vm-ids/{vm_id}/ssh/sessions",VM ",\"command\":" STR,"\"vm_id\"") ","
+        OP("ssh_read","Read incremental SSH stdout/stderr and exit state. Empty running output means the session is still working.","POST","/vm-ids/{vm_id}/ssh/sessions/{ssh_session_id}/read",VM ",\"ssh_session_id\":" STR ",\"timeoutMs\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10000}","\"vm_id\",\"ssh_session_id\"") ","
+        OP("ssh_write","Queue stdin for an SSH session, optionally closing stdin after the queued data is written. Use stdin text or stdinBase64 bytes.","POST","/vm-ids/{vm_id}/ssh/sessions/{ssh_session_id}",VM ",\"ssh_session_id\":" STR ",\"stdin\":" STR ",\"stdinBase64\":" STR ",\"closeStdin\":" BOOL,"\"vm_id\",\"ssh_session_id\"") ","
+        OP("ssh_close","Close an SSH session and its local SSH process.","DELETE","/vm-ids/{vm_id}/ssh/sessions/{ssh_session_id}",VM ",\"ssh_session_id\":" STR,"\"vm_id\",\"ssh_session_id\"") ","
+        OP("screenshot","Capture the next guest desktop frame with the viewer open or closed. Capture is independent of input ownership and display transport mode.","POST","/vm-ids/{vm_id}/screenshot",VM ",\"timeoutMs\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":10000}","\"vm_id\"") ","
+        OP("input_status","Read exclusive human/agent control, task status, cursor, and viewer presence.","GET","/vm-ids/{vm_id}/input",VM,"\"vm_id\"") ","
+        OP("input_request_control","Begin desktop work with self-reported identity, model vendor, model, and purpose. Paused work requires the human to Return control.","POST","/vm-ids/{vm_id}/input/control",VM ",\"identity\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":80},\"vendor\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":80},\"model\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":80},\"purpose\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":300}","\"vm_id\",\"identity\",\"vendor\",\"model\",\"purpose\"") ","
+        OP("input_wait_for_control","Wait for the human to return control to unfinished desktop work, without injecting or forcing takeover.","POST","/vm-ids/{vm_id}/input/wait",VM ",\"timeoutMs\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":60000}","\"vm_id\"") ","
+        OP("input_finish","Finish or acknowledge cancelled desktop work; release agent input and hide its overlay.","DELETE","/vm-ids/{vm_id}/input/control",VM,"\"vm_id\"") ","
+        OP("input","Send mouse and keyboard actions through the shared host input controller and existing guest input path. Keys are PC set-1; coordinates use native screenshot pixels. Text uses physical keys with the host layout; unicode sends text directly through the guest OS. Older agents ignore unicode actions.","POST","/vm-ids/{vm_id}/input",VM "," INPUT_ACTIONS,"\"vm_id\",\"actions\"") ","
+        OP("host_shutdown","Stop AppSandbox. Active VMs prevent shutdown unless force is explicitly true.","POST","/shutdown","\"force\":" BOOL,"")
+        "]}";
+}

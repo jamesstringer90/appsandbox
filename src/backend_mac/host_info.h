@@ -10,7 +10,6 @@
 
 @interface HostInfo : NSObject
 
-/* Physical cores reported by the kernel. */
 + (int)hostCores;
 
 /* Physical RAM in megabytes. */

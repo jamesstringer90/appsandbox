@@ -250,7 +250,6 @@ static DWORD WINAPI disk_space_thread(LPVOID param)
 
 static void build_host_info_json(JsonBuilder *jb)
 {
-    SYSTEM_INFO si;
     MEMORYSTATUSEX ms;
     GpuList *gpu_list = asb_gpu_list();
     DWORD host_cores, host_ram_mb;
@@ -259,8 +258,7 @@ static void build_host_info_json(JsonBuilder *jb)
     int free_gb;
     int i, count = asb_vm_count();
 
-    GetSystemInfo(&si);
-    host_cores = si.dwNumberOfProcessors;
+    host_cores = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     ms.dwLength = sizeof(ms);
     GlobalMemoryStatusEx(&ms);
     host_ram_mb = (DWORD)(ms.ullTotalPhys / (1024 * 1024));
@@ -323,8 +321,8 @@ static void build_vm_json(JsonBuilder *jb, int i)
     if (!v || !st_) return;
 
     jb_object_begin(jb);
-    wchar_t id[ASB_VM_ID_TEXT_SIZE];
-    asb_vm_id_format_w(v->unique_id, id);
+    wchar_t id[ASB_TEMPLATE_ID_TEXT_SIZE];
+    asb_resource_id_format_w(v->unique_id,v->is_template,id);
     jb_string(jb, L"id", id);
     jb_string(jb, L"name", v->name);
     jb_string(jb, L"osType", v->os_type);
@@ -343,6 +341,11 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"networkMode", v->network_mode);
     jb_string(jb, L"netAdapter", v->net_adapter);
     jb_bool(jb, L"isTemplate", v->is_template);
+    if (v->is_template) {
+        wchar_t template_id[ASB_TEMPLATE_ID_TEXT_SIZE];
+        asb_template_id_format_w(v->unique_id,template_id);
+        jb_string(jb,L"templateId",template_id);
+    }
     jb_bool(jb, L"hypervVideoOff", v->hyperv_video_off);
     jb_bool(jb, L"buildingVhdx", v->building_vhdx);
     jb_bool(jb, L"vhdxStaging", v->vhdx_staging);
@@ -551,6 +554,9 @@ static void send_templates(void)
     for (i = 0; i < count; i++) {
         if (i > 0) jb_append(&jb, L",");
         jb_object_begin(&jb);
+        wchar_t template_id[ASB_TEMPLATE_ID_TEXT_SIZE];
+        asb_template_id_format_w(asb_template_id(i),template_id);
+        jb_string(&jb,L"id",template_id);
         jb_string(&jb, L"name", asb_template_name(i));
         jb_string(&jb, L"osType", asb_template_os_type(i));
         jb_object_end(&jb);
@@ -626,6 +632,9 @@ static void send_full_state(void)
         for (i = 0; i < tc; i++) {
             if (i > 0) jb_append(&jb, L",");
             jb_object_begin(&jb);
+            wchar_t template_id[ASB_TEMPLATE_ID_TEXT_SIZE];
+            asb_template_id_format_w(asb_template_id(i),template_id);
+            jb_string(&jb,L"id",template_id);
             jb_string(&jb, L"name", asb_template_name(i));
             jb_string(&jb, L"osType", asb_template_os_type(i));
             jb_object_end(&jb);
@@ -1067,9 +1076,13 @@ static DWORD WINAPI enable_feature_thread(LPVOID param)
 
 static BOOL json_vm_index(const wchar_t *json, int *idx)
 {
-    wchar_t id[ASB_VM_ID_TEXT_SIZE];
-    if (!json_get_string(json, L"vmId", id, ARRAYSIZE(id))) return FALSE;
-    *idx = asb_vm_index((AsbVm)asb_find_vm_by_id(asb_vm_id_parse_w(id)));
+    wchar_t id[ASB_TEMPLATE_ID_TEXT_SIZE];
+    BOOL template_resource=json_has_key(json,L"templateId");
+    if (template_resource && json_has_key(json,L"vmId")) return FALSE;
+    if (!json_get_string(json,template_resource?L"templateId":L"vmId",id,ARRAYSIZE(id))) return FALSE;
+    VmInstance *instance=asb_find_vm_by_id(template_resource?asb_template_id_parse_w(id):asb_vm_id_parse_w(id));
+    if (!instance || !!instance->is_template!=!!template_resource) return FALSE;
+    *idx = asb_vm_index((AsbVm)instance);
     return *idx >= 0;
 }
 
@@ -1154,6 +1167,14 @@ static void handle_webview2_message(const wchar_t *json)
         cfg.os_type = os_buf;
         cfg.image_path = img_buf;
         cfg.template_name = tpl_buf;
+        if (json_has_key(json,L"templateId")) {
+            wchar_t template_id[ASB_TEMPLATE_ID_TEXT_SIZE]={0};
+            if (!json_get_string(json,L"templateId",template_id,ARRAYSIZE(template_id)) ||
+                !(cfg.template_id=asb_template_id_parse_w(template_id)) || tpl_buf[0]) {
+                SecureZeroMemory(pass_buf,sizeof(pass_buf));ui_show_alert(L"Specify a template name or template ID.");return;
+            }
+            cfg.template_name=NULL;
+        }
         cfg.username = user_buf;
         cfg.password = pass_buf;
         cfg.net_adapter = adapter_buf;
@@ -1266,6 +1287,7 @@ static void handle_webview2_message(const wchar_t *json)
             HRESULT hr;
             AsbVm vm = asb_vm_get(idx);
             VmInstance *instance = asb_vm_instance(vm);
+            if (instance && instance->is_template) { ui_show_alert(L"Use template deletion for templates.");return; }
             ui_log(L"Deleting VM \"%s\"...", asb_vm_name(vm));
             if (instance) ui_display_close(instance->unique_id);
             hr = asb_vm_delete(vm);
@@ -1281,6 +1303,14 @@ static void handle_webview2_message(const wchar_t *json)
         }
     } else if (wcscmp(action, L"deleteTemplate") == 0) {
         wchar_t tpl_name[256] = { 0 };
+        wchar_t template_id_text[ASB_TEMPLATE_ID_TEXT_SIZE]={0};
+        if (json_has_key(json,L"templateId")) {
+            AsbTemplateId template_id=0;
+            if (!json_get_string(json,L"templateId",template_id_text,ARRAYSIZE(template_id_text)) ||
+                !(template_id=asb_template_id_parse_w(template_id_text)) || FAILED(asb_template_delete_by_id(template_id)))
+                ui_show_alert(L"Template could not be deleted.");
+            reconcile_displays();send_vm_list();send_templates();return;
+        }
         json_get_string(json, L"name", tpl_name, 256);
         if (tpl_name[0] != L'\0') {
             HRESULT hr = asb_template_delete(tpl_name);

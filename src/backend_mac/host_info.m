@@ -10,7 +10,7 @@
 + (int)hostCores {
     int ncpu = 0;
     size_t sz = sizeof(ncpu);
-    if (sysctlbyname("hw.physicalcpu", &ncpu, &sz, NULL, 0) != 0 || ncpu <= 0) {
+    if (sysctlbyname("hw.logicalcpu", &ncpu, &sz, NULL, 0) != 0 || ncpu <= 0) {
         ncpu = (int)[[NSProcessInfo processInfo] activeProcessorCount];
     }
     return ncpu;

@@ -31,10 +31,12 @@ Environment:
 #include <dxgi1_5.h>
 #include <d3d11_2.h>
 #include <avrt.h>
+#include "screenshot.h"
 
 #include "Trace.h"
 #include "../transport/asb_transport.h"   /* AsbConn — host connection (AF_HYPERV on PC, ivshmem on Mac) */
 #include "../../src/core/protocol.h"
+#include "../transport/asb_automation.h"
 
 /* ============================================================================
  *  Display constants
@@ -227,6 +229,9 @@ typedef struct _VDD_SWAP_PROC {
 
     /* Host connection via asb_transport — AF_HYPERV HvSocket on a Windows host, ivshmem stream
        slot on a macOS host. One emit path, two backends. */
+    UINT64              desktopFrameSeq;
+    AsbVddScreenshot    screenshot;
+
     HANDLE              hNetworkThread;     /* listener/accept thread */
     AsbConn * volatile  hClientConn;        /* active client, owned by swap chain thread */
     AsbConn * volatile  hPendingConn;       /* new client from network thread, picked up by swap chain */

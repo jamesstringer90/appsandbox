@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +72,9 @@ struct display_gpu {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
     uint32_t readback_width;
     uint32_t readback_height;
+    struct display_gpu_slot capture_slot;
+    bool registered;
+    struct display_gpu_capture *capture;
 };
 
 static int gpu_ioctl(int fd, unsigned long command, void *args)
@@ -173,8 +177,11 @@ void display_gpu_destroy(struct display_gpu *gpu)
 {
     if (!gpu) return;
     struct drm_asb_gpu_present present = {.event_fd = -1};
-    if (gpu->drm_fd >= 0) gpu_ioctl(gpu->drm_fd, DRM_IOCTL_ASB_GPU_PRESENT, &present);
+    if (gpu->registered) gpu_ioctl(gpu->drm_fd, DRM_IOCTL_ASB_GPU_PRESENT, &present);
     if (gpu->complete) display_gpu_disconnect(gpu);
+    if (gpu->capture_slot.commands) ID3D12GraphicsCommandList_Release(gpu->capture_slot.commands);
+    if (gpu->capture_slot.allocator) ID3D12CommandAllocator_Release(gpu->capture_slot.allocator);
+    if (gpu->capture_slot.source) ID3D12Resource_Release(gpu->capture_slot.source);
     if (gpu->readback) {
         if (gpu->pixels) ID3D12Resource_Unmap(gpu->readback, 0, NULL);
         ID3D12Resource_Release(gpu->readback);
@@ -208,6 +215,7 @@ struct display_gpu *display_gpu_create(int drm_fd)
     gpu->dxg_fd = open("/dev/dxg", O_RDWR | O_CLOEXEC);
     gpu->event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     gpu->copy_fd = -1;
+    gpu->capture_slot.free_fd = -1;
     for (unsigned i = 0; i < DISPLAY_GPU_SLOTS; ++i) gpu->slots[i].free_fd = -1;
     gpu->d3d12_lib = dlopen("libd3d12.so", RTLD_NOW | RTLD_LOCAL);
     gpu->dxcore_lib = dlopen("libdxcore.so", RTLD_NOW | RTLD_LOCAL);
@@ -250,6 +258,7 @@ struct display_gpu *display_gpu_create(int drm_fd)
     };
     stage = "presenter registration";
     if (gpu_ioctl(gpu->drm_fd, DRM_IOCTL_ASB_GPU_PRESENT, &present) < 0) goto fail;
+    gpu->registered = true;
     gpu->adapter_luid = present.adapter_luid;
     IUnknown_Release(adapters);
     IUnknown_Release(factory);
@@ -408,29 +417,67 @@ static int gpu_acquire(struct display_gpu *gpu, struct drm_asb_gpu_acquire *fram
     return 1;
 }
 
-static int gpu_copy(struct display_gpu *gpu, struct display_gpu_slot *slot,
-                    const struct drm_asb_gpu_acquire *frame, bool readback)
+enum { GPU_COPY_VIEWER=1, GPU_COPY_READBACK=2 };
+
+static void capture_changing(struct display_gpu_capture *);
+
+static int gpu_prepare_readback(struct display_gpu *gpu,uint32_t width,uint32_t height)
 {
+    if (!width || !height || width>DISPLAY_MAX_WIDTH || height>DISPLAY_MAX_HEIGHT) return -1;
+    if (gpu->readback && gpu->readback_width==width && gpu->readback_height==height) return 0;
+    if (gpu->readback) {
+        if (gpu->pixels) ID3D12Resource_Unmap(gpu->readback,0,NULL);
+        ID3D12Resource_Release(gpu->readback);
+        gpu->readback=NULL;
+        gpu->pixels=NULL;
+    }
+    D3D12_RESOURCE_DESC image={.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        .Width=width,.Height=height,.DepthOrArraySize=1,.MipLevels=1,
+        .Format=DXGI_FORMAT_B8G8R8A8_UNORM,.SampleDesc.Count=1};
+    UINT64 size;
+    ID3D12Device_GetCopyableFootprints(gpu->device,&image,0,1,0,&gpu->footprint,NULL,NULL,&size);
+    D3D12_RESOURCE_DESC buffer={.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER,
+        .Width=size,.Height=1,.DepthOrArraySize=1,.MipLevels=1,
+        .SampleDesc.Count=1,.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+    D3D12_HEAP_PROPERTIES heap={.Type=D3D12_HEAP_TYPE_READBACK};
+    if (FAILED(ID3D12Device_CreateCommittedResource(gpu->device,&heap,D3D12_HEAP_FLAG_NONE,
+            &buffer,D3D12_RESOURCE_STATE_COPY_DEST,NULL,&IID_ID3D12Resource,(void **)&gpu->readback))) return -1;
+    if (FAILED(ID3D12Resource_Map(gpu->readback,0,NULL,&gpu->pixels))) {
+        ID3D12Resource_Release(gpu->readback);
+        gpu->readback=NULL;
+        return -1;
+    }
+    gpu->readback_width=width;
+    gpu->readback_height=height;
+    return 0;
+}
+
+static int gpu_copy(struct display_gpu *gpu, struct display_gpu_slot *slot,
+                    const struct drm_asb_gpu_acquire *frame,unsigned targets)
+{
+    capture_changing(gpu->capture);
+    if ((targets&GPU_COPY_READBACK) && gpu_prepare_readback(gpu,frame->width,frame->height)<0) return -1;
     if (gpu_commands(gpu, slot) < 0) return -1;
     if (frame->adapter_luid != gpu->adapter_luid ||
         FAILED(ID3D12Device_OpenSharedHandle(gpu->device, (HANDLE)(uintptr_t)frame->fd,
             &IID_ID3D12Resource, (void **)&slot->source))) return -1;
-    if (readback) {
+    if (targets&GPU_COPY_VIEWER) {
+        if (FAILED(ID3D12CommandQueue_Wait(gpu->queue, slot->fence, slot->free_value))) return -1;
+        ID3D12GraphicsCommandList_CopyResource(slot->commands, slot->texture, slot->source);
+    }
+    if (targets&GPU_COPY_READBACK) {
         D3D12_TEXTURE_COPY_LOCATION source = {.pResource = slot->source,
             .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
         D3D12_TEXTURE_COPY_LOCATION target = {.pResource = gpu->readback,
             .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, .PlacedFootprint = gpu->footprint};
         ID3D12GraphicsCommandList_CopyTextureRegion(slot->commands, &target, 0, 0, 0, &source, NULL);
-    } else {
-        if (FAILED(ID3D12CommandQueue_Wait(gpu->queue, slot->fence, slot->free_value))) return -1;
-        ID3D12GraphicsCommandList_CopyResource(slot->commands, slot->texture, slot->source);
     }
     if (FAILED(ID3D12GraphicsCommandList_Close(slot->commands))) return -1;
     ID3D12CommandList *commands[] = {(ID3D12CommandList *)slot->commands};
     ID3D12CommandQueue_ExecuteCommandLists(gpu->queue, 1, commands);
     slot->copy_value = gpu->copied;
     if (FAILED(ID3D12CommandQueue_Signal(gpu->queue, gpu->complete, gpu->copied))) return -1;
-    if (!readback) {
+    if (targets&GPU_COPY_VIEWER) {
         if (FAILED(ID3D12CommandQueue_Signal(gpu->queue, slot->fence, slot->free_value + 1))) return -1;
         slot->free_value += 2;
     }
@@ -440,19 +487,19 @@ static int gpu_copy(struct display_gpu *gpu, struct display_gpu_slot *slot,
 
 int display_gpu_frame(struct display_gpu *gpu)
 {
-    if (!gpu || !gpu->connected) return -1;
-    struct display_gpu_slot *slot = &gpu->slots[gpu->next];
-    uint64_t completed = ID3D12Fence_GetCompletedValue(slot->fence);
-    if (completed == UINT64_MAX) return -1;
-    if (completed < slot->free_value) return 0;
+    if (!gpu || !gpu->connected) return 0;
+    struct display_gpu_slot *slot=&gpu->slots[gpu->next];
+    uint64_t completed=ID3D12Fence_GetCompletedValue(slot->fence);
+    if (completed==UINT64_MAX) return -1;
+    if (completed<slot->free_value) return 0;
     struct drm_asb_gpu_acquire frame;
-    int result = gpu_acquire(gpu, &frame);
-    if (result <= 0) return result;
-    if (frame.width != gpu->width || frame.height != gpu->height) result = -2;
-    else result = gpu_copy(gpu, slot, &frame, false) < 0 ? -1 : 1;
+    int result=gpu_acquire(gpu,&frame);
+    if (result<=0) return result;
+    if (frame.width!=gpu->width || frame.height!=gpu->height) result=-2;
+    else result=gpu_copy(gpu,slot,&frame,GPU_COPY_VIEWER)<0?-1:1;
     close(frame.fd);
-    if (result < 0) ID3D12CommandQueue_Signal(gpu->queue, gpu->complete, gpu->copied);
-    if (result > 0) gpu->next = (gpu->next + 1) % DISPLAY_GPU_SLOTS;
+    if (result<0) ID3D12CommandQueue_Signal(gpu->queue,gpu->complete,gpu->copied);
+    if (result>0) gpu->next=(gpu->next+1)%DISPLAY_GPU_SLOTS;
     return result;
 }
 
@@ -465,30 +512,7 @@ int display_gpu_readback(struct display_gpu *gpu, const void **pixels,
     if (result == -2) return 0;
     if (result < 0) return -1;
     if (!result) goto done;
-    if (!gpu->readback || gpu->readback_width != frame.width || gpu->readback_height != frame.height) {
-        if (gpu->readback) {
-            ID3D12Resource_Unmap(gpu->readback, 0, NULL);
-            ID3D12Resource_Release(gpu->readback);
-            gpu->readback = NULL;
-            gpu->pixels = NULL;
-        }
-        D3D12_RESOURCE_DESC image = {.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            .Width = frame.width, .Height = frame.height, .DepthOrArraySize = 1, .MipLevels = 1,
-            .Format = DXGI_FORMAT_B8G8R8A8_UNORM, .SampleDesc.Count = 1};
-        UINT64 size;
-        ID3D12Device_GetCopyableFootprints(gpu->device, &image, 0, 1, 0, &gpu->footprint, NULL, NULL, &size);
-        D3D12_RESOURCE_DESC buffer = {.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
-            .Width = size, .Height = 1, .DepthOrArraySize = 1, .MipLevels = 1,
-            .SampleDesc.Count = 1, .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
-        D3D12_HEAP_PROPERTIES heap = {.Type = D3D12_HEAP_TYPE_READBACK};
-        if (FAILED(ID3D12Device_CreateCommittedResource(gpu->device, &heap, D3D12_HEAP_FLAG_NONE,
-                &buffer, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource,
-                (void **)&gpu->readback)) ||
-            FAILED(ID3D12Resource_Map(gpu->readback, 0, NULL, &gpu->pixels))) goto fail;
-        gpu->readback_width = frame.width;
-        gpu->readback_height = frame.height;
-    }
-    if (gpu_copy(gpu, &gpu->slots[0], &frame, true) < 0 ||
+    if (gpu_copy(gpu, &gpu->capture_slot, &frame, GPU_COPY_READBACK) < 0 ||
         gpu_wait(gpu, gpu->complete, gpu->copied) < 0) goto fail;
     close(frame.fd);
 done:
@@ -501,4 +525,213 @@ fail:
     close(frame.fd);
     ID3D12CommandQueue_Signal(gpu->queue, gpu->complete, gpu->copied);
     return -1;
+}
+
+struct display_gpu_capture {
+    pthread_mutex_t lock;
+    int wanted,offered,shared,headless,drm_fd,event;
+    uint64_t generation,offered_generation,sequence,value;
+    uint32_t width,height,stride;
+    ID3D12Device *device;
+    ID3D12Resource *source;
+    ID3D12Fence *fence;
+    struct display_gpu *reader;
+    int submitted;
+    ID3D12Resource *held;
+    void *mapped;
+};
+
+static void capture_changing(struct display_gpu_capture *capture)
+{
+    if (capture && __atomic_load_n(&capture->wanted,__ATOMIC_ACQUIRE))
+        __atomic_add_fetch(&capture->generation,1,__ATOMIC_RELEASE);
+}
+
+struct display_gpu_capture *display_gpu_capture_create(void)
+{
+    struct display_gpu_capture *capture=calloc(1,sizeof(*capture));
+    if (capture) {
+        pthread_mutex_init(&capture->lock,NULL);
+        capture->drm_fd=-1;
+        capture->event=eventfd(0,EFD_CLOEXEC|EFD_NONBLOCK);
+        if (capture->event<0) {
+            pthread_mutex_destroy(&capture->lock);free(capture);return NULL;
+        }
+    }
+    return capture;
+}
+
+static void capture_release(struct display_gpu_capture *capture)
+{
+    if (capture->mapped) ID3D12Resource_Unmap(capture->held,0,NULL);
+    if (capture->held) ID3D12Resource_Release(capture->held);
+    if (capture->source) ID3D12Resource_Release(capture->source);
+    if (capture->fence) ID3D12Fence_Release(capture->fence);
+    if (capture->device) ID3D12Device_Release(capture->device);
+    if (capture->drm_fd>=0) close(capture->drm_fd);
+    capture->mapped=NULL;capture->held=NULL;capture->source=NULL;
+    capture->fence=NULL;capture->device=NULL;capture->drm_fd=-1;
+}
+
+void display_gpu_capture_end(struct display_gpu_capture *capture)
+{
+    __atomic_store_n(&capture->wanted,0,__ATOMIC_RELEASE);
+    pthread_mutex_lock(&capture->lock);
+    if (capture->reader && capture->submitted)
+        gpu_wait(capture->reader,capture->reader->complete,capture->reader->copied);
+    capture_release(capture);
+    capture->offered=capture->submitted=0;
+    pthread_mutex_unlock(&capture->lock);
+}
+
+void display_gpu_capture_destroy(struct display_gpu_capture *capture)
+{
+    if (!capture) return;
+    display_gpu_capture_end(capture);
+    display_gpu_destroy(capture->reader);
+    close(capture->event);
+    pthread_mutex_destroy(&capture->lock);
+    free(capture);
+}
+
+void display_gpu_capture_begin(struct display_gpu_capture *capture)
+{
+    display_gpu_capture_end(capture);
+    __atomic_store_n(&capture->wanted,1,__ATOMIC_RELEASE);
+    uint64_t notification=1;
+    ssize_t notified=write(capture->event,&notification,sizeof(notification));
+    (void)notified;
+}
+
+int display_gpu_capture_event(struct display_gpu_capture *capture)
+{
+    return capture?capture->event:-1;
+}
+
+void display_gpu_capture_offer(struct display_gpu *gpu,struct display_gpu_capture *capture,int shared)
+{
+    if (!capture) return;
+    if (gpu) gpu->capture=capture;
+    if (!__atomic_load_n(&capture->wanted,__ATOMIC_ACQUIRE) ||
+        pthread_mutex_trylock(&capture->lock)) return;
+    uint64_t notification;
+    while (read(capture->event,&notification,sizeof(notification))>0) {}
+    if (!capture->offered) {
+        capture->offered_generation=__atomic_load_n(&capture->generation,__ATOMIC_ACQUIRE);
+        capture->shared=shared>0;
+        if (gpu && gpu->device && gpu->registered) {
+            capture->headless=shared<0;
+            capture->device=gpu->device;ID3D12Device_AddRef(capture->device);
+            capture->drm_fd=fcntl(gpu->drm_fd,F_DUPFD_CLOEXEC,0);
+            capture->fence=gpu->complete;ID3D12Fence_AddRef(capture->fence);
+            capture->value=gpu->copied;capture->sequence=gpu->sequence;
+            if (shared>0 && gpu->sequence) {
+                unsigned last=(gpu->next+DISPLAY_GPU_SLOTS-1)%DISPLAY_GPU_SLOTS;
+                capture->source=gpu->slots[last].texture;
+                capture->width=gpu->width;capture->height=gpu->height;
+            } else if (!capture->headless) {
+                capture->source=gpu->readback;
+                capture->width=gpu->readback_width;capture->height=gpu->readback_height;
+                capture->stride=gpu->footprint.Footprint.RowPitch;
+            }
+            if (capture->source) ID3D12Resource_AddRef(capture->source);
+            if (capture->drm_fd<0 || (!capture->source && !capture->headless)) {
+                capture_release(capture);
+                pthread_mutex_unlock(&capture->lock);
+                return;
+            }
+        }
+        capture->offered=1;
+    }
+    pthread_mutex_unlock(&capture->lock);
+}
+
+static int capture_reader(struct display_gpu_capture *capture)
+{
+    if (capture->reader && capture->reader->device!=capture->device) {
+        display_gpu_destroy(capture->reader);capture->reader=NULL;
+    }
+    if (capture->reader) return 0;
+    struct display_gpu *reader=calloc(1,sizeof(*reader));
+    if (!reader) return -1;
+    reader->drm_fd=fcntl(capture->drm_fd,F_DUPFD_CLOEXEC,0);
+    reader->dxg_fd=open("/dev/dxg",O_RDWR|O_CLOEXEC);
+    reader->event_fd=eventfd(0,EFD_CLOEXEC|EFD_NONBLOCK);
+    reader->copy_fd=-1;reader->capture_slot.free_fd=-1;
+    for (unsigned i=0;i<DISPLAY_GPU_SLOTS;++i) reader->slots[i].free_fd=-1;
+    reader->d3d12_lib=dlopen("libd3d12.so",RTLD_NOW|RTLD_LOCAL);
+    reader->device=capture->device;ID3D12Device_AddRef(reader->device);
+    D3D12_COMMAND_QUEUE_DESC queue={0};
+    if (reader->drm_fd<0 || reader->dxg_fd<0 || reader->event_fd<0 || !reader->d3d12_lib ||
+        FAILED(ID3D12Device_CreateCommandQueue(reader->device,&queue,&IID_ID3D12CommandQueue,(void **)&reader->queue)) ||
+        FAILED(ID3D12Device_CreateFence(reader->device,0,D3D12_FENCE_FLAG_SHARED,&IID_ID3D12Fence,(void **)&reader->complete)) ||
+        gpu_native(reader,(ID3D12DeviceChild *)reader->complete,&reader->native_complete)<0) {
+        display_gpu_destroy(reader);return -1;
+    }
+    reader->copy_fd=reader->native_complete.fd;
+    struct drm_asb_gpu_query query={0};
+    if (gpu_ioctl(reader->drm_fd,DRM_IOCTL_ASB_GPU_QUERY,&query)<0) {
+        display_gpu_destroy(reader);return -1;
+    }
+    reader->adapter_luid=query.adapter_luid;
+    capture->reader=reader;
+    return 0;
+}
+
+int display_gpu_capture_valid(struct display_gpu_capture *capture)
+{
+    return capture->offered_generation==__atomic_load_n(&capture->generation,__ATOMIC_ACQUIRE);
+}
+
+int display_gpu_capture_poll(struct display_gpu_capture *capture,const void **pixels,
+    uint32_t *width,uint32_t *height,uint32_t *stride,uint64_t *sequence,int *shared)
+{
+    pthread_mutex_lock(&capture->lock);
+    int offered=capture->offered;
+    pthread_mutex_unlock(&capture->lock);
+    if (!offered) return 0;
+    if (!capture->device) return 2;
+    if (capture->headless) {
+        if (capture_reader(capture)<0) return -1;
+        if (!display_gpu_active(capture->reader)) return 2;
+        capture->reader->sequence=0;
+        int result=display_gpu_readback(capture->reader,pixels,width,height,stride);
+        *sequence=capture->reader->sequence;*shared=0;
+        return result;
+    }
+    uint64_t completed=ID3D12Fence_GetCompletedValue(capture->fence);
+    if (completed==UINT64_MAX) return -1;
+    if (completed<capture->value) return 0;
+    if (!capture->shared) {
+        if (!capture->mapped) {
+            capture->held=capture->source;ID3D12Resource_AddRef(capture->held);
+            if (FAILED(ID3D12Resource_Map(capture->held,0,NULL,&capture->mapped))) return -1;
+        }
+        *pixels=capture->mapped;*stride=capture->stride;
+    } else {
+        if (capture_reader(capture)<0) return -1;
+        struct display_gpu *reader=capture->reader;
+        if (!capture->submitted) {
+            if (gpu_prepare_readback(reader,capture->width,capture->height)<0 ||
+                gpu_commands(reader,&reader->capture_slot)<0) return -1;
+            D3D12_TEXTURE_COPY_LOCATION source={.pResource=capture->source,
+                .Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            D3D12_TEXTURE_COPY_LOCATION target={.pResource=reader->readback,
+                .Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,.PlacedFootprint=reader->footprint};
+            ID3D12GraphicsCommandList_CopyTextureRegion(reader->capture_slot.commands,&target,0,0,0,&source,NULL);
+            if (FAILED(ID3D12GraphicsCommandList_Close(reader->capture_slot.commands))) return -1;
+            ID3D12CommandList *commands[]={(ID3D12CommandList *)reader->capture_slot.commands};
+            ID3D12CommandQueue_ExecuteCommandLists(reader->queue,1,commands);
+            reader->capture_slot.copy_value=++reader->copied;
+            if (FAILED(ID3D12CommandQueue_Signal(reader->queue,reader->complete,reader->copied))) return -1;
+            capture->submitted=1;
+        }
+        completed=ID3D12Fence_GetCompletedValue(reader->complete);
+        if (completed==UINT64_MAX) return -1;
+        if (completed<reader->copied) return 0;
+        *pixels=reader->pixels;*stride=reader->footprint.Footprint.RowPitch;
+    }
+    *width=capture->width;*height=capture->height;
+    *sequence=capture->sequence;*shared=capture->shared;
+    return 1;
 }
