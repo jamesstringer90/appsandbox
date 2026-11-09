@@ -202,6 +202,7 @@ typedef struct {
     UINT64 fence_waiting;
     BOOL ready;
     BOOL acquired;
+    ULONGLONG screenshot_yielded;
 } IddSharedSlot;
 
 struct VmDisplayIdd {
@@ -251,6 +252,7 @@ struct VmDisplayIdd {
     BOOL                    shared_disabled;
     BOOL                    shared_resize;
     BOOL                    shared_refresh;
+    BOOL                    shared_screenshot;
     UINT                    shared_refresh_rate;
     UINT                    shared_width;
     UINT                    shared_height;
@@ -1486,6 +1488,7 @@ static void idd_shared_release(VmDisplayIdd *d)
     d->shared_ready = FALSE;
     d->shared_resize = FALSE;
     d->shared_refresh = FALSE;
+    d->shared_screenshot = FALSE;
     d->shared_refresh_rate = 0;
     ZeroMemory(&d->size_request, sizeof(d->size_request));
     d->shared_next = 0;
@@ -1509,7 +1512,8 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
     UINT64 session, value;
     HRESULT hr;
     EnterCriticalSection(&d->frame_cs);
-    if (d->stop || !d->shared_ready || d->shared_slots[d->shared_next].acquired) {
+    if (d->stop || !d->shared_ready || d->shared_slots[d->shared_next].acquired ||
+        d->shared_slots[d->shared_next].screenshot_yielded) {
         LeaveCriticalSection(&d->frame_cs);
         return S_FALSE;
     }
@@ -1601,6 +1605,7 @@ static DWORD WINAPI idd_shared_thread_proc(LPVOID parameter)
         DWORD count = 1, wait, timeout;
         UINT i;
         BOOL can_acquire;
+        BOOL screenshot_pending = FALSE;
         BOOL render = InterlockedExchange(&d->render_requested, 0) != 0;
         if (InterlockedCompareExchange(&d->gpu_refresh_requested, 0, 0)) {
             d3d_refresh_gpu(d);
@@ -1613,6 +1618,23 @@ static DWORD WINAPI idd_shared_thread_proc(LPVOID parameter)
             render = TRUE;
         }
         EnterCriticalSection(&d->frame_cs);
+        for (i = 0; i < DISPLAY_GPU_SLOTS; ++i) {
+            IddSharedSlot *slot = &d->shared_slots[i];
+            if (!slot->screenshot_yielded) continue;
+            HRESULT hr = slot->mutex->lpVtbl->AcquireSync(slot->mutex, 1, 0);
+            if (hr == S_OK) {
+                slot->screenshot_yielded = 0;
+                slot->acquired = TRUE;
+                if ((int)i != d->shared_front && (int)i != d->shared_pending)
+                    hr = idd_shared_unlock(d, slot);
+                render = TRUE;
+            } else if (hr == (HRESULT)WAIT_TIMEOUT &&
+                GetTickCount64() - slot->screenshot_yielded < 2000) {
+                screenshot_pending = TRUE;
+                continue;
+            }
+            if (hr != S_OK) { idd_shared_fail(d); break; }
+        }
         render = render || (d->frame_dirty && d->rtv != NULL);
         LeaveCriticalSection(&d->frame_cs);
         timeout = render || d->render_pending ? 0 : 16;
@@ -1624,13 +1646,14 @@ static DWORD WINAPI idd_shared_thread_proc(LPVOID parameter)
         if (render || d->render_pending) d3d_render_frame(d);
         if (d->stop) break;
         EnterCriticalSection(&d->frame_cs);
-        can_acquire = d->shared_ready && !d->shared_slots[d->shared_next].acquired;
+        can_acquire = d->shared_ready && !d->shared_slots[d->shared_next].acquired &&
+            !d->shared_slots[d->shared_next].screenshot_yielded;
         LeaveCriticalSection(&d->frame_cs);
         if (can_acquire && !d->render_pending) continue;
         if (d->render_pending && d->present_event) {
             events[count++] = d->present_event;
         }
-        wait = WaitForMultipleObjects(count, events, FALSE, 1000);
+        wait = WaitForMultipleObjects(count, events, FALSE, screenshot_pending ? 1 : 1000);
         if (count == 2 && wait == WAIT_OBJECT_0 + 1) d->present_ready = TRUE;
         else if (wait == WAIT_TIMEOUT) InterlockedExchange(&d->render_requested, 1);
         else if (wait == WAIT_FAILED) d3d_recover(d);
@@ -2287,7 +2310,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
     shared = d->shared_ready;
     if (shared) {
         d->frame_dirty = FALSE;
-        if (d->shared_pending >= 0) {
+        if (d->shared_pending >= 0 && !d->shared_slots[d->shared_pending].screenshot_yielded) {
             if (!d->shared_slots[d->shared_pending].acquired) goto shared_error;
             if (d->shared_front >= 0) {
                 IddSharedSlot *old = &d->shared_slots[d->shared_front];
@@ -2298,7 +2321,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
             d->shared_pending = -1;
             frame_uploaded = TRUE;
         }
-        if (d->shared_front < 0) {
+        if (d->shared_front < 0 || !d->shared_slots[d->shared_front].acquired) {
             d->present_ready = d->present_event != NULL;
             LeaveCriticalSection(&d->frame_cs);
             return;
@@ -2752,6 +2775,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             query.reserved = _wcsicmp(d->os_type, L"windows") == 0
                 ? DISPLAY_GPU_CAP_RESIZE : DISPLAY_GPU_CAP_FENCE | DISPLAY_GPU_CAP_RESIZE;
             query.reserved |= DISPLAY_GPU_CAP_REFRESH;
+            query.reserved |= DISPLAY_GPU_CAP_SNAPSHOT;
             query.session = ((UINT64)GetCurrentProcessId() << 32) |
                             (UINT32)InterlockedIncrement(&gpu_session_id);
             d->shared_session = query.session;
@@ -2798,6 +2822,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     EnterCriticalSection(&d->frame_cs);
                     d->shared_resize = (packet.reserved & DISPLAY_GPU_CAP_RESIZE) != 0;
                     d->shared_refresh = (packet.reserved & DISPLAY_GPU_CAP_REFRESH) != 0;
+                    d->shared_screenshot = (packet.reserved & DISPLAY_GPU_CAP_SNAPSHOT) != 0;
                     d->shared_refresh_rate = d->shared_refresh ? (UINT)packet.handle : 60;
                     d->shared_width = packet.width;
                     d->shared_height = packet.height;
@@ -2830,6 +2855,23 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->shared_ready = ready;
                     if (ready) SetEvent(d->shared_wake);
                     LeaveCriticalSection(&d->frame_cs);
+                } else if (packet.type == DISPLAY_GPU_SNAPSHOT && !broker) {
+                    HRESULT status = S_FALSE;
+                    EnterCriticalSection(&d->frame_cs);
+                    if (d->shared_screenshot && d->shared_ready && packet.slot < DISPLAY_GPU_SLOTS) {
+                        IddSharedSlot *slot = &d->shared_slots[packet.slot];
+                        if (slot->acquired && slot->mutex && !slot->screenshot_yielded) {
+                            status = slot->mutex->lpVtbl->ReleaseSync(slot->mutex, 2);
+                            if (status == S_OK) {
+                                slot->acquired = FALSE;
+                                slot->screenshot_yielded = GetTickCount64();
+                                SetEvent(d->shared_wake);
+                            }
+                        }
+                    }
+                    LeaveCriticalSection(&d->frame_cs);
+                    packet.status = status;
+                    if (!idd_send_gpu(s, &packet)) break;
                 } else if (packet.type == DISPLAY_GPU_RESIZED) {
                     if (packet.status != S_OK) {
                         d->size_reconnect_until = 0;
@@ -3280,6 +3322,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
 
+    if (d && (msg==WM_MOUSEMOVE || msg==WM_NCMOUSEMOVE)) agent_overlay_pointer_activity(d->agent_overlay);
     if (d && !d->mouse_buttons && agent_overlay_mouse(d->agent_overlay, msg, wp, lp)) return 0;
 
     if (d && d->mouse_sync_pending &&

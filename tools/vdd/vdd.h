@@ -206,6 +206,7 @@ typedef struct _VDD_GPU_SLOT {
     IDXGIKeyedMutex*     pMutex;
     HANDLE              hTexture;
     BOOL                bOfferSeen;
+    UINT64              sequence;
 } VDD_GPU_SLOT;
 
 typedef struct _VDD_SWAP_PROC {
@@ -252,6 +253,7 @@ typedef struct _VDD_SWAP_PROC {
     BOOL                bGpuSourceKnown;
     BOOL                bGpuSourceCompatible;
     BOOL                gpuResizeSupported;
+    BOOL                gpuScreenshotSupported;
     BOOL                gpuModeNotified;
     DisplayGpuPacket    gpuControl;
     UINT                gpuControlBytes;

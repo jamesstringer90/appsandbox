@@ -537,6 +537,12 @@ static DWORD WINAPI VddGpuIoThread(LPVOID parameter)
             InterlockedExchange(&proc->gpuIoFailed, 1);
             break;
         }
+        DisplayGpuPacket handoff = {};
+        if (asb_vdd_screenshot_take_handoff(&proc->screenshot, &handoff) &&
+            VddSendAll(proc->hGpuIoConn, (const char*)&handoff, sizeof(handoff)) != 0) {
+            InterlockedExchange(&proc->gpuIoFailed, 1);
+            break;
+        }
         int ready = asb_poll(proc->hGpuIoConn, 0);
         if (ready < 0) {
             InterlockedExchange(&proc->gpuIoFailed, 1);
@@ -554,7 +560,13 @@ static DWORD WINAPI VddGpuIoThread(LPVOID parameter)
         DisplayGpuPacket request = proc->gpuControl;
         proc->gpuControlBytes = 0;
         if (request.magic != DISPLAY_GPU_MAGIC || request.version != DISPLAY_GPU_VERSION ||
-            request.type != DISPLAY_GPU_RESIZE || request.session != proc->gpuSession) {
+            request.session != proc->gpuSession) {
+            InterlockedExchange(&proc->gpuIoFailed, 1);
+            break;
+        }
+        if (request.type == DISPLAY_GPU_SNAPSHOT && proc->gpuScreenshotSupported &&
+            asb_vdd_screenshot_reply(&proc->screenshot, &request)) continue;
+        if (request.type != DISPLAY_GPU_RESIZE) {
             InterlockedExchange(&proc->gpuIoFailed, 1);
             break;
         }
@@ -631,6 +643,7 @@ static BOOL VddSendGpuPacket(VDD_SWAP_PROC* proc, UINT type, HRESULT status, UIN
     packet.slot = slot;
     if (type == DISPLAY_GPU_CAPS) {
         packet.reserved = proc->pOwner->hDisplayWork ? DISPLAY_GPU_CAP_RESIZE : 0;
+        packet.reserved |= DISPLAY_GPU_CAP_SNAPSHOT;
         if (proc->pOwner->hDisplayWork && !asb_transport_is_ivshmem()) {
             packet.reserved |= DISPLAY_GPU_CAP_REFRESH;
             packet.handle = WdfObjectGet_MonitorContextWrapper(proc->hMonitor)->modes[0].refresh;
@@ -683,6 +696,10 @@ static BOOL VddReleaseGpuTexture(VDD_SWAP_PROC* proc, BOOL preserve)
                 key = 1;
                 hr = last->pMutex->AcquireSync(key, 0);
             }
+            if (hr == (HRESULT)WAIT_TIMEOUT && proc->gpuScreenshotSupported) {
+                key = 2;
+                hr = last->pMutex->AcquireSync(key, 0);
+            }
             if (hr == S_OK) {
                 proc->pDeviceContext->CopyResource(proc->pStagingTex, last->pTexture);
                 proc->pDeviceContext->Flush();
@@ -705,6 +722,7 @@ static BOOL VddReleaseGpuTexture(VDD_SWAP_PROC* proc, BOOL preserve)
         slot->hTexture = NULL;
     }
     proc->bGpuPoolReady = FALSE;
+    InterlockedExchange(&proc->screenshot.handoffState, ASB_SCREENSHOT_HANDOFF_IDLE);
     proc->gpuNextSlot = 0;
     proc->gpuLastSlot = 0;
     proc->bGpuHasFrame = FALSE;
@@ -738,6 +756,7 @@ static void VddPollGpuControl(VDD_SWAP_PROC* proc)
         if (packet.version != DISPLAY_GPU_VERSION) continue;
         if (packet.type == DISPLAY_GPU_QUERY && packet.session && !proc->gpuSession) {
             proc->gpuSession = packet.session;
+            proc->gpuScreenshotSupported = (packet.reserved & DISPLAY_GPU_CAP_SNAPSHOT) != 0;
             proc->gpuResizeSupported = (packet.reserved & DISPLAY_GPU_CAP_RESIZE) != 0 &&
                 (!memory || (packet.reserved & DISPLAY_GPU_CAP_IVSHMEM) != 0);
         } else if (memory && packet.type == DISPLAY_GPU_RESIZE && proc->bGpuCapsSent) {
@@ -821,6 +840,7 @@ static BOOL VddPublishGpuFrame(VDD_SWAP_PROC* proc, ID3D11Texture2D* source)
             hr = slot->pMutex->ReleaseSync(1);
             if (hr != S_OK) break;
             proc->gpuLastSlot = index;
+            slot->sequence = proc->desktopFrameSeq;
             proc->gpuNextSlot = (index + 1) % DISPLAY_GPU_SLOTS;
             proc->gpuBlockedSince = 0;
             ++proc->frameSeq;
@@ -1052,7 +1072,6 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
     }
 
     BOOL bHasFrame = FALSE;
-    BOOL bSurfaceReady = FALSE;
     BOOL bSentFullFrame = FALSE;   /* TRUE after first full frame sent to current client */
 
 
@@ -1064,6 +1083,9 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             break;
         if (FAILED(proc->pDevice->GetDeviceRemovedReason())) break;
 
+        if (proc->hGpuIoThread && proc->screenshot.handoffState &&
+            GetTickCount64() >= proc->screenshot.handoffDeadline)
+            InterlockedExchange(&proc->gpuIoFailed, 1);
         if (proc->hGpuIoThread && InterlockedCompareExchange(&proc->gpuIoFailed, 0, 0)) {
             VddStopGpuIo(proc, FALSE);
             bHasFrame = VddReleaseGpuTexture(proc, TRUE);
@@ -1100,6 +1122,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 proc->frameSeq = 0;
                 proc->gpuSession = 0;
                 proc->gpuResizeSupported = FALSE;
+                proc->gpuScreenshotSupported = FALSE;
                 proc->bGpuCapsSent = FALSE;
                 proc->bGpuPoolFailed = FALSE;
                 ZeroMemory(proc->gpuSlots, sizeof(proc->gpuSlots));
@@ -1110,6 +1133,12 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
         }
 
         if (!proc->bGpuPoolReady) VddPollGpuControl(proc);
+        if (proc->bGpuPoolReady &&
+            InterlockedCompareExchange(&proc->screenshot.handoffState, 0, 0) == ASB_SCREENSHOT_HANDOFF_READY &&
+            proc->screenshot.handoff.slot < DISPLAY_GPU_SLOTS) {
+            VDD_GPU_SLOT* slot = &proc->gpuSlots[proc->screenshot.handoff.slot];
+            asb_vdd_screenshot_handoff(&proc->screenshot, slot->pMutex, slot->pTexture, slot->sequence);
+        }
         if (proc->bGpuPoolReady && proc->bGpuPendingFrame) {
             ID3D11Texture2D* pending = proc->pGpuPendingTex;
             pending->AddRef();
@@ -1129,18 +1158,9 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             }
         }
 
-        BOOL bHoldCurrent = proc->screenshot.screenshotRequested && proc->bGpuPoolReady &&
-            proc->screenshot.current && !bSurfaceReady &&
-            WaitForSingleObject(proc->hAvailableEvent, 0) == WAIT_TIMEOUT;
-        if (!bHoldCurrent) {
-            bSurfaceReady = FALSE;
-            asb_vdd_screenshot_release_frame(&proc->screenshot);
-        }
         /* Use v2 acquire when available */
 #pragma warning(suppress: 4127)
-        if (bHoldCurrent) {
-            hr = E_PENDING;
-        } else if (IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
+        if (IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
             IDARG_IN_RELEASEANDACQUIREBUFFER2 bufferInArgs = { 0 };
             IDARG_OUT_RELEASEANDACQUIREBUFFER2 buffer = { 0 };
             bufferInArgs.Size = sizeof(bufferInArgs);
@@ -1158,10 +1178,12 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 proc->bGpuPendingFrame ? proc->pGpuPendingTex : NULL,
                 proc->bGpuHasFrame ? cached->pMutex : NULL,
                 proc->bGpuHasFrame ? cached->pTexture : NULL,
-                proc->desktopFrameSeq, proc->bGpuPoolReady);
+                proc->desktopFrameSeq, proc->bGpuPoolReady,
+                proc->gpuScreenshotSupported ? proc->gpuSession : 0, proc->gpuLastSlot);
+            if (proc->hGpuIoWake && proc->screenshot.handoffState == ASB_SCREENSHOT_HANDOFF_QUEUED)
+                SetEvent(proc->hGpuIoWake);
             DWORD waitResult = WaitForMultipleObjects(waitCount, waitHandles, FALSE,
-                proc->bGpuPendingFrame ? 1 : 100);
-            if (waitResult == WAIT_OBJECT_0) bSurfaceReady = TRUE;
+                proc->bGpuPendingFrame || proc->screenshot.handoffState ? 1 : 100);
             if (waitResult == WAIT_OBJECT_0 + 1) {
                 break;  /* Terminate */
             }
@@ -1260,7 +1282,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                     BOOL hadGpuTexture = proc->bGpuPoolReady;
                     if (VddPublishGpuFrame(proc, pTexture)) {
                         asb_vdd_screenshot_frame(&proc->screenshot, pTexture,
-                            proc->desktopFrameSeq, TRUE);
+                            proc->desktopFrameSeq, TRUE, 0);
                         bHasFrame = FALSE;
                         pTexture->Release();
                         pTexture = nullptr;
@@ -1404,7 +1426,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                     }
 
                     asb_vdd_screenshot_frame(&proc->screenshot, pTexture,
-                        proc->desktopFrameSeq, FALSE);
+                        proc->desktopFrameSeq, FALSE, 0);
                     pTexture->Release();
                 }
             }

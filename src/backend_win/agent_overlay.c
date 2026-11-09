@@ -27,6 +27,9 @@ struct AgentOverlay {
     RECT bounds,menu_bounds;
     wchar_t context_json[4096];
     ULONGLONG context_check;
+    ULONGLONG pointer_next;
+    POINT pointer;
+    BOOL pointer_known;
     UINT32 work_id;
     UINT mouse_buttons;
     BYTE key_down[256];
@@ -452,6 +455,18 @@ void agent_overlay_resize(AgentOverlay *s)
 BOOL agent_overlay_hit_test(AgentOverlay *s,POINT point)
 {
     return s && menu_visible(s) && PtInRect(&s->menu_bounds,point);
+}
+
+void agent_overlay_pointer_activity(AgentOverlay *s)
+{
+    POINT point;
+    if (!s || !menu_visible(s) || !GetCursorPos(&point)) return;
+    if (s->pointer_known && point.x==s->pointer.x && point.y==s->pointer.y) return;
+    s->pointer=point;s->pointer_known=TRUE;
+    ULONGLONG now=GetTickCount64();
+    if (now<s->pointer_next) return;
+    s->pointer_next=now+50;
+    s->webview->lpVtbl->PostWebMessageAsJson(s->webview,L"{\"type\":\"pointer_activity\"}");
 }
 
 UINT32 agent_overlay_work_id(AgentOverlay *s)

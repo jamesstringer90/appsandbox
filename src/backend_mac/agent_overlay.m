@@ -30,6 +30,7 @@
     id _monitor;
     NSRect _menu;
     uint64_t _identity;
+    NSTimeInterval _pointerNext;
     BOOL _ready,_closed,_hovered,_updating;
 }
 
@@ -120,10 +121,16 @@
     NSPoint point=[view convertPoint:window.mouseLocationOutsideOfEventStream fromView:nil];
     BOOL key=event.type==NSEventTypeKeyDown || event.type==NSEventTypeKeyUp || event.type==NSEventTypeFlagsChanged;
     BOOL inside=NSPointInRect(point,view.bounds);
-    if (!key && !inside) return NO;
-    double x=point.x,y=NSHeight(view.bounds)-point.y;
     BOOL menu=!(_status.flags&ASB_STATUS_AGENT_FINISHED) &&
         (_status.flags&(ASB_STATUS_AGENT_HAS_CONTROL|ASB_STATUS_AGENT_WAITING));
+    BOOL moving=event.type==NSEventTypeMouseMoved || event.type==NSEventTypeLeftMouseDragged ||
+        event.type==NSEventTypeRightMouseDragged || event.type==NSEventTypeOtherMouseDragged;
+    if (menu && moving && event.timestamp>=_pointerNext) {
+        _pointerNext=event.timestamp+0.05;
+        [self post:@{@"type":@"pointer_activity"} completion:nil];
+    }
+    if (!key && !inside) return NO;
+    double x=point.x,y=NSHeight(view.bounds)-point.y;
     BOOL hit=menu && _ready && NSPointInRect(NSMakePoint(x,y),_menu);
     if (hit) {
         NSString *kind=@"move";
@@ -154,7 +161,7 @@
 - (void)maskLayout:(NSDictionary *)layout
 {
     CGMutablePathRef shapes=CGPathCreateMutable();CGAffineTransform transform=[self cssTransform];
-    CGPathAddRoundedRect(shapes,&transform,NSRectToCGRect(_menu),10,10);
+    CGPathAddRoundedRect(shapes,&transform,NSRectToCGRect(_menu),6,6);
     if ([layout[@"cursor"] boolValue]) {
         NSString *source=layout[@"cursorPath"];
         if ([source isKindOfClass:NSString.class] && source.length<512) {

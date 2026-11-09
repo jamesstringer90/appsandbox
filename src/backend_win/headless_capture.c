@@ -15,7 +15,8 @@ ASB_API DWORD asb_capture(const AsbHeadlessTarget *target,DWORD timeout,AsbCaptu
     if (!error && (r->magic!=ASB_SCREENSHOT_REPLY_MAGIC || r->version!=ASB_SCREENSHOT_VERSION || r->request_id!=request.request_id)) error=ERROR_INVALID_DATA;
     if (!error) error=r->status;
     if (!error && (!r->width || !r->height || r->width>7680 || r->height>4320 ||
-        r->stride!=r->width*4 || r->data_size!=r->stride*r->height)) error=ERROR_INVALID_DATA;
+        r->stride!=r->width*4 || r->data_size!=r->stride*r->height ||
+        (r->flags&~ASB_SCREENSHOT_GPU_SHARED))) error=ERROR_INVALID_DATA;
     if (!error) {
         capture->pixels=malloc(r->data_size);
         if (!capture->pixels) error=ERROR_NOT_ENOUGH_MEMORY;

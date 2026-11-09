@@ -105,13 +105,10 @@ static HRESULT prepare(AsbVddScreenshot *s,UINT width,UINT height)
 }
 
 void asb_vdd_screenshot_frame(AsbVddScreenshot *s,ID3D11Texture2D *source,
-                             UINT64 sequence,BOOL shared)
+                             UINT64 sequence,BOOL shared,UINT64 generation)
 {
     BOOL wanted=InterlockedCompareExchange(&s->screenshotRequested,0,0);
-    if (wanted && shared && !s->current) {
-        ID3D11Texture2D_AddRef(source);
-        s->current=source;
-    }
+    if (InterlockedCompareExchange(&s->screenshotError,0,0)) wanted=FALSE;
     D3D11_TEXTURE2D_DESC desc={0};
     if (!s->width || wanted) {
         ID3D11Texture2D_GetDesc(source,&desc);
@@ -120,7 +117,8 @@ void asb_vdd_screenshot_frame(AsbVddScreenshot *s,ID3D11Texture2D *source,
     }
     if (!wanted || InterlockedCompareExchange(&s->offered,0,0) ||
         !TryAcquireSRWLockExclusive(&s->screenshotLock)) return;
-    if (s->screenshotRequested && !s->offered && s->mirror &&
+    if (s->screenshotRequested && !s->screenshotError && !s->offered && s->mirror &&
+        (!generation || generation==s->screenshotGeneration) &&
         s->mirrorWidth==desc.Width && s->mirrorHeight==desc.Height &&
         IDXGIKeyedMutex_AcquireSync(s->writerMutex,0,0)==S_OK) {
         ID3D11DeviceContext_CopyResource(s->pDeviceContext,
@@ -142,37 +140,97 @@ void asb_vdd_screenshot_frame(AsbVddScreenshot *s,ID3D11Texture2D *source,
 
 void asb_vdd_screenshot_poll(AsbVddScreenshot *s,ID3D11Texture2D *cached,
     ID3D11Texture2D *pending,IDXGIKeyedMutex *mutex,ID3D11Texture2D *latest,
-    UINT64 sequence,BOOL shared)
+    UINT64 sequence,BOOL shared,UINT64 session,UINT slot)
 {
-    if (!sequence || !cached || !InterlockedCompareExchange(&s->screenshotRequested,0,0) ||
+    if (!sequence || !cached || InterlockedCompareExchange(&s->screenshotError,0,0) ||
+        !InterlockedCompareExchange(&s->screenshotRequested,0,0) ||
         InterlockedCompareExchange(&s->offered,0,0)) return;
-    if (shared && s->current) asb_vdd_screenshot_frame(s,s->current,sequence,TRUE);
-    else if (!shared) asb_vdd_screenshot_frame(s,cached,sequence,FALSE);
-    else if (pending) asb_vdd_screenshot_frame(s,pending,sequence,TRUE);
-    else if (mutex && latest && IDXGIKeyedMutex_AcquireSync(mutex,0,0)==S_OK) {
-        asb_vdd_screenshot_frame(s,latest,sequence,TRUE);
-        IDXGIKeyedMutex_ReleaseSync(mutex,0);
+    if (!shared) asb_vdd_screenshot_frame(s,cached,sequence,FALSE,0);
+    else if (pending) asb_vdd_screenshot_frame(s,pending,sequence,TRUE,0);
+    else if (mutex && latest) {
+        UINT64 key=0;
+        HRESULT hr=IDXGIKeyedMutex_AcquireSync(mutex,key,0);
+        if (hr==(HRESULT)WAIT_TIMEOUT) {
+            key=1;
+            hr=IDXGIKeyedMutex_AcquireSync(mutex,key,0);
+        }
+        if (hr==S_OK) {
+            asb_vdd_screenshot_frame(s,latest,sequence,TRUE,0);
+            IDXGIKeyedMutex_ReleaseSync(mutex,key);
+        } else if (hr==(HRESULT)WAIT_TIMEOUT && session &&
+            !InterlockedCompareExchange(&s->handoffState,0,0)) {
+            ZeroMemory(&s->handoff,sizeof(s->handoff));
+            s->handoff.magic=DISPLAY_GPU_MAGIC;
+            s->handoff.version=DISPLAY_GPU_VERSION;
+            s->handoff.type=DISPLAY_GPU_SNAPSHOT;
+            s->handoff.session=session;
+            s->handoff.slot=slot;
+            s->handoff.handle=s->screenshotGeneration;
+            s->handoffDeadline=GetTickCount64()+2000;
+            InterlockedExchange(&s->handoffState,ASB_SCREENSHOT_HANDOFF_QUEUED);
+        }
     }
 }
 
-void asb_vdd_screenshot_release_frame(AsbVddScreenshot *s)
+BOOL asb_vdd_screenshot_take_handoff(AsbVddScreenshot *s,DisplayGpuPacket *packet)
 {
-    if (s->current) ID3D11Texture2D_Release(s->current);
-    s->current=NULL;
+    if (InterlockedCompareExchange(&s->handoffState,ASB_SCREENSHOT_HANDOFF_WAITING,
+        ASB_SCREENSHOT_HANDOFF_QUEUED)!=ASB_SCREENSHOT_HANDOFF_QUEUED) return FALSE;
+    if (!InterlockedCompareExchange(&s->screenshotRequested,0,0)) {
+        InterlockedExchange(&s->handoffState,ASB_SCREENSHOT_HANDOFF_IDLE);
+        return FALSE;
+    }
+    *packet=s->handoff;
+    return TRUE;
+}
+
+BOOL asb_vdd_screenshot_reply(AsbVddScreenshot *s,const DisplayGpuPacket *packet)
+{
+    if (InterlockedCompareExchange(&s->handoffState,0,0)!=ASB_SCREENSHOT_HANDOFF_WAITING ||
+        packet->slot!=s->handoff.slot || packet->handle!=s->handoff.handle ||
+        packet->session!=s->handoff.session) return FALSE;
+    s->handoff.status=packet->status;
+    InterlockedExchange(&s->handoffState,ASB_SCREENSHOT_HANDOFF_READY);
+    return TRUE;
+}
+
+void asb_vdd_screenshot_handoff(AsbVddScreenshot *s,IDXGIKeyedMutex *mutex,
+    ID3D11Texture2D *texture,UINT64 sequence)
+{
+    if (InterlockedCompareExchange(&s->handoffState,0,0)!=ASB_SCREENSHOT_HANDOFF_READY) return;
+    HRESULT hr=(HRESULT)s->handoff.status;
+    if (s->handoff.status==S_OK && mutex && texture) {
+        hr=IDXGIKeyedMutex_AcquireSync(mutex,2,0);
+        if (hr==(HRESULT)WAIT_TIMEOUT) return;
+        if (hr==S_OK) {
+            asb_vdd_screenshot_frame(s,texture,sequence,TRUE,s->handoff.handle);
+            hr=IDXGIKeyedMutex_ReleaseSync(mutex,1);
+        }
+    }
+    if (hr!=S_OK) {
+        if (!TryAcquireSRWLockExclusive(&s->screenshotLock)) return;
+        if (s->screenshotRequested && !s->offered &&
+            s->handoff.handle==s->screenshotGeneration)
+            InterlockedExchange(&s->screenshotError,hr==S_FALSE?ERROR_BUSY:(LONG)hr);
+        ReleaseSRWLockExclusive(&s->screenshotLock);
+    }
+    InterlockedExchange(&s->handoffState,ASB_SCREENSHOT_HANDOFF_IDLE);
 }
 
 static DWORD capture(AsbVddScreenshot *s,DWORD timeout,AsbScreenshotReply *reply,BYTE **pixels)
 {
     ULONGLONG deadline=GetTickCount64()+timeout;
     DWORD error=ERROR_TIMEOUT;
-    InterlockedExchange(&s->screenshotRequested,1);
     while (GetTickCount64()<deadline && WaitForSingleObject(s->hTerminateEvent,0)!=WAIT_OBJECT_0) {
+        DWORD failure=(DWORD)InterlockedCompareExchange(&s->screenshotError,0,0);
+        if (failure) { error=failure;break; }
         UINT width=(UINT)InterlockedCompareExchange(&s->width,0,0);
         UINT height=(UINT)InterlockedCompareExchange(&s->height,0,0);
         if (!width || !height) { WaitForSingleObject(s->hTerminateEvent,2);continue; }
         if (width>7680 || height>4320) { error=ERROR_INVALID_DATA;break; }
         HRESULT hr=prepare(s,width,height);
         if (FAILED(hr)) { error=(DWORD)hr;break; }
+        InterlockedExchange(&s->screenshotRequested,1);
         hr=IDXGIKeyedMutex_AcquireSync(s->readerMutex,1,0);
         if (hr==(HRESULT)WAIT_TIMEOUT) { WaitForSingleObject(s->hTerminateEvent,2);continue; }
         if (hr!=S_OK) { error=(DWORD)hr;break; }
@@ -218,6 +276,7 @@ static uint32_t capture_request(void *context,const AsbScreenshotRequest *reques
     ScreenshotClient *client=context;
     AsbVddScreenshot *s=client->screenshot;
     AcquireSRWLockExclusive(&s->screenshotLock);
+    InterlockedExchange(&s->screenshotError,0);
     ++s->screenshotGeneration;
     ReleaseSRWLockExclusive(&s->screenshotLock);
     uint32_t error=capture(s,request->timeout_ms,reply,pixels);
@@ -265,7 +324,6 @@ void asb_vdd_screenshot_destroy(AsbVddScreenshot *s)
         WaitForSingleObject(s->hScreenshotThread,INFINITE);
         CloseHandle(s->hScreenshotThread);
     }
-    asb_vdd_screenshot_release_frame(s);
     release_images(s);
     if (s->readerContext) ID3D11DeviceContext_Release(s->readerContext);
     if (s->readerDevice) ID3D11Device_Release(s->readerDevice);

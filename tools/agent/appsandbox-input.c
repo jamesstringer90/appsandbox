@@ -12,7 +12,6 @@
 
 #include "../transport/asb_transport.h"
 #include "../../src/core/protocol.h"
-#include "../../src/core/input_unicode.h"
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -157,10 +156,20 @@ static BOOL is_function_key(UINT32 vk)
            vk == VK_SLEEP || (vk >= VK_BROWSER_BACK && vk <= VK_LAUNCH_APP2);
 }
 
+static UINT unicode_utf16(UINT32 scalar, WORD units[2])
+{
+    if (!scalar || scalar > 0x10ffff || (scalar >= 0xd800 && scalar <= 0xdfff)) return 0;
+    if (scalar <= 0xffff) { units[0] = (WORD)scalar; return 1; }
+    scalar -= 0x10000;
+    units[0] = (WORD)(0xd800 + (scalar >> 10));
+    units[1] = (WORD)(0xdc00 + (scalar & 0x3ff));
+    return 2;
+}
+
 static void inject_unicode(const InputPacket *pkt)
 {
-    uint16_t units[2];
-    UINT count = asb_unicode_utf16(pkt->param1, units);
+    WORD units[2];
+    UINT count = unicode_utf16(pkt->param1, units);
     INPUT events[4] = {0};
     if (!count || pkt->param2 || pkt->param3)
         return;

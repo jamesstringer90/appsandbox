@@ -190,7 +190,6 @@
         A5B2A000000000000000000F = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "src/backend_mac/agent_overlay.h"; sourceTree = SOURCE_ROOT; };
         A5B2A0000000000000000010 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "src/core/input_router.c"; sourceTree = SOURCE_ROOT; };
         A5B2A0000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "src/core/input_router.h"; sourceTree = SOURCE_ROOT; };
-        A5B2A0000000000000000013 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "src/core/input_unicode.h"; sourceTree = SOURCE_ROOT; };
         A5B2A0000000000000000018 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "tools/transport/asb_capture_service.c"; sourceTree = SOURCE_ROOT; };
         A5B2A0000000000000000020 = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ImageIO.framework; path = System/Library/Frameworks/ImageIO.framework; sourceTree = SDKROOT; };
 
@@ -456,7 +455,6 @@
 			children = (
                 A5B2A0000000000000000010,
                 A5B2A0000000000000000012,
-                A5B2A0000000000000000013,
 
                 A5BF00000000000000000011,
                 A5BF00000000000000000012,
