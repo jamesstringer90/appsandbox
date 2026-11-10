@@ -758,7 +758,6 @@ static void idd_forward_key(VmDisplayIdd *d, DWORD vk, DWORD scan, BOOL ext, BOO
 {
     UINT32 type = INPUT_KEY, index = vk;
     InputPacket pkt;
-    if (agent_overlay_key(d->agent_overlay,vk,scan,ext,up)) return;
     AcquireSRWLockExclusive(&d->input_lock);
     if (d->keyboard_version == INPUT_KEYBOARD_VERSION) {
         type = INPUT_KEY_PHYSICAL;

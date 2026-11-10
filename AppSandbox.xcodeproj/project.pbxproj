@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+        A5B3D0000000000000000001 = {isa = PBXBuildFile; fileRef = A5B3D0000000000000000002; };
         A5B3C0000000000000000002 = {isa = PBXBuildFile; fileRef = A5B3C0000000000000000001; };
         A5B3C0000000000000000003 = {isa = PBXBuildFile; fileRef = A5B2A0000000000000000018; };
         A5B2A0000000000000000023 = {isa = PBXBuildFile; fileRef = A5B2A0000000000000000022; };
@@ -177,6 +178,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+        A5B3D0000000000000000002 = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOSurface.framework; path = System/Library/Frameworks/IOSurface.framework; sourceTree = SDKROOT; };
         A5B3C0000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = src/backend_mac/headless_capture_native.m; sourceTree = SOURCE_ROOT; };
         A5B2A0000000000000000022 = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
         A5B2A0000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "src/backend_mac/headless_input.c"; sourceTree = SOURCE_ROOT; };
@@ -306,6 +308,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                A5B3D0000000000000000001,
                 A5B2A000000000000000001A,
                 A5B2A000000000000000001B,
                 A5B2A0000000000000000023,
@@ -525,6 +528,7 @@
 		7008000000000000000000AA /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+                A5B3D0000000000000000002,
                 A5B2A0000000000000000022,
                 A5B2A0000000000000000020,
 

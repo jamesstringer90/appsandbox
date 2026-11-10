@@ -46,7 +46,6 @@ fill="currentColor" stroke="white" stroke-width="1.5" stroke-linejoin="round"/><
 const cursor=document.getElementById('cursor'), take=document.getElementById('take');
 const menu=document.getElementById('menu'), stop=document.getElementById('stop');
 let pressed=null, fadeTimer=0;
-const heldKeys=new Map();
 function resetAppearance() {
   clearTimeout(fadeTimer);
   fadeTimer=0;
@@ -64,7 +63,6 @@ function pointerActivity() {
 }
 function clearInput() {
   pressed=null;
-  heldKeys.clear();
   take.classList.remove('hovered');
   stop.classList.remove('hovered');
 }
@@ -81,20 +79,11 @@ function activate(button) {
 }
 function receiveInput(s) {
   if(s.kind==='leave' || s.kind==='cancel') { clearInput(); return; }
+  if(!['move','down','up','wheel','hwheel'].includes(s.kind)) return;
   if(menu.style.display==='none' || !contains(menu,s.x,s.y)) { clearInput(); return; }
   const target=contains(take,s.x,s.y)?take:contains(stop,s.x,s.y)?stop:null;
   take.classList.toggle('hovered',target===take);
   stop.classList.toggle('hovered',target===stop);
-  if(s.kind==='key') {
-    if(s.key!==13 && s.key!==32) return;
-    if(!s.up) { if(!heldKeys.has(s.key)) heldKeys.set(s.key,target); }
-    else {
-      const original=heldKeys.get(s.key);
-      heldKeys.delete(s.key);
-      if(target && original===target) activate(target);
-    }
-    return;
-  }
   if(s.kind==='down' && s.button===0) pressed=target;
   else if(s.kind==='up' && s.button===0) {
     const original=pressed;

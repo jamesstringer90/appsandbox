@@ -729,11 +729,11 @@ static NSDictionary *input_status_object(const AsbMacHeadlessTarget *target,cons
     NSMutableDictionary *result=[@{@"vmId":@(identity),@"vm":@(target->name),
         @"state":(s->flags&ASB_STATUS_AGENT_HAS_CONTROL)?@"agent":(s->flags&ASB_STATUS_USER_PAUSED)?@"user":@"available",
         @"generation":@(s->generation),@"work_id":@(s->work_id),
-        @"agent_has_control":@((s->flags&ASB_STATUS_AGENT_HAS_CONTROL)!=0),
-        @"agent_waiting_for_control":@((s->flags&ASB_STATUS_AGENT_WAITING)!=0),
-        @"user_has_control":@((s->flags&ASB_STATUS_USER_HAS_CONTROL)!=0),
-        @"agent_finished":@((s->flags&ASB_STATUS_AGENT_FINISHED)!=0),
-        @"agent_cancelled":@((s->flags&ASB_STATUS_AGENT_CANCELLED)!=0),@"revoked":@((s->flags&ASB_STATUS_USER_PAUSED)!=0),
+        @"agent_has_control":@((BOOL)((s->flags&ASB_STATUS_AGENT_HAS_CONTROL)!=0)),
+        @"agent_waiting_for_control":@((BOOL)((s->flags&ASB_STATUS_AGENT_WAITING)!=0)),
+        @"user_has_control":@((BOOL)((s->flags&ASB_STATUS_USER_HAS_CONTROL)!=0)),
+        @"agent_finished":@((BOOL)((s->flags&ASB_STATUS_AGENT_FINISHED)!=0)),
+        @"agent_cancelled":@((BOOL)((s->flags&ASB_STATUS_AGENT_CANCELLED)!=0)),@"revoked":@((BOOL)((s->flags&ASB_STATUS_USER_PAUSED)!=0)),
         @"viewer_open":@(open),@"viewer_focused":@(focused),
         @"cursor":s->x==UINT32_MAX || s->y==UINT32_MAX?(id)NSNull.null:@{@"xNormalized":@(s->x),@"yNormalized":@(s->y),@"range":@65535}} mutableCopy];
     if (!(s->flags&ASB_STATUS_AGENT_FINISHED)) {
@@ -785,6 +785,14 @@ static uint32_t execute_input(const AsbMacHeadlessTarget *target,AsbMacInput *se
         else error=asb_api_parse_input(&json,actions,&count);
     }
     for (int i=0;i<count && !error;++i) {
+        if (!strcasecmp(target->os_type,"macOS")) {
+            if (actions[i].type==INPUT_UNICODE) { error=120;break; }
+            if (actions[i].type==INPUT_KEY_PHYSICAL) {
+                InputPacket packet={INPUT_MAGIC,INPUT_KEY_PHYSICAL,0,(uint32_t)actions[i].scan,
+                    actions[i].extended?INPUT_KEY_EXTENDED:0};
+                if (asb_mac_key_code(&packet)<0) { error=120;break; }
+            }
+        }
         if (actions[i].type==ASB_API_TEXT) for (const wchar_t *p=actions[i].text;*p && !error;++p) {
             InputPacket packets[8];unsigned n;error=asb_mac_text_packets((uint32_t)*p,packets,&n);
         }
@@ -826,7 +834,7 @@ static uint32_t service_execute(ServiceCall *call,NSDictionary *body,id *result)
             AsbMacSshOutput output;error=asb_mac_ssh_read(target->id,session,body[@"timeoutMs"]?[body[@"timeoutMs"] unsignedIntValue]:1000,&output);
             if (error) return error;
             snprintf(ssh,sizeof(ssh),"ssh-%016llx",(unsigned long long)session);
-            *result=@{@"vmId":@(vm),@"sshSessionId":@(ssh),@"running":@(output.running!=0),@"exitCode":@(output.exit_code),
+            *result=@{@"vmId":@(vm),@"sshSessionId":@(ssh),@"running":@((BOOL)(output.running!=0)),@"exitCode":@(output.exit_code),
                 @"stdinError":@(output.stdin_error),@"stdoutBase64":[[NSData dataWithBytes:output.stdout_bytes length:output.stdout_size] base64EncodedStringWithOptions:0],
                 @"stderrBase64":[[NSData dataWithBytes:output.stderr_bytes length:output.stderr_size] base64EncodedStringWithOptions:0]};
             asb_mac_ssh_output_free(&output);return 0;
@@ -842,9 +850,8 @@ static uint32_t service_execute(ServiceCall *call,NSDictionary *body,id *result)
         } else return ASB_INVALID;
         if (error) return error;
         snprintf(ssh,sizeof(ssh),"ssh-%016llx",(unsigned long long)session);
-        *result=@{@"vmId":@(vm),@"sshSessionId":@(ssh),@"closed":@(!strcmp(operation,"ssh_close"))};return 0;
+        *result=@{@"vmId":@(vm),@"sshSessionId":@(ssh),@"closed":@((BOOL)!strcmp(operation,"ssh_close"))};return 0;
     }
-    if (!strcasecmp(target->os_type,"macOS") && strcmp(operation,"input_status") && strcmp(operation,"screenshot")) return 120;
     if (!strcmp(operation,"screenshot")) {
         unsigned char *pixels=NULL;AsbScreenshotReply reply;uint64_t start=asb_mac_milliseconds();
         uint32_t error=asb_mac_capture(target,body[@"timeoutMs"]?[body[@"timeoutMs"] unsignedIntValue]:5000,&reply,&pixels);
@@ -853,7 +860,7 @@ static uint32_t service_execute(ServiceCall *call,NSDictionary *body,id *result)
             if (!png) error=ASB_DATA;
             else *result=@{@"metadata":@{@"vmId":@(vm),@"vm":@(target->name),@"osType":@(target->os_type),
                 @"width":@(reply.width),@"height":@(reply.height),@"stride":@(reply.stride),@"frameSeq":@(reply.frame_seq),
-                @"gpuSharingActive":@((reply.flags&ASB_SCREENSHOT_GPU_SHARED)!=0),@"elapsedMs":@(asb_mac_milliseconds()-start)},
+                @"gpuSharingActive":@((BOOL)((reply.flags&ASB_SCREENSHOT_GPU_SHARED)!=0)),@"elapsedMs":@(asb_mac_milliseconds()-start)},
                 @"image":@{@"mimeType":@"image/png",@"data":[png base64EncodedStringWithOptions:0]}};
         }
         free(pixels);return error;
@@ -866,7 +873,20 @@ static uint32_t service_execute(ServiceCall *call,NSDictionary *body,id *result)
             !copy_label(body,@"vendor",labels.vendor,sizeof(labels.vendor),80) ||
             !copy_label(body,@"model",labels.model,sizeof(labels.model),80) ||
             !copy_label(body,@"purpose",labels.purpose,sizeof(labels.purpose),300)) error=ASB_INVALID;
-        else error=asb_mac_input_claim(session,&labels);
+        else {
+            BOOL native=!strcasecmp(target->os_type,"macOS");
+            asb_mac_input_status(session,&status);
+            BOOL transfer=!(status.flags&(ASB_STATUS_AGENT_HAS_CONTROL|ASB_STATUS_USER_PAUSED|ASB_STATUS_AGENT_CANCELLED));
+            __block VzDisplayWindow *display=nil;
+            if (native) on_main(^{
+                AsbVmMac *vm=asb_mac_vm_find_by_id(target->id);
+                if (vm && vm->run_id==target->run_id && vm->display && !vm->display.userClosed && vm->display.window.visible) {
+                    display=vm->display;if (transfer) [display prepareForAgentInput];
+                }
+            });
+            error=asb_mac_input_claim(session,&labels);
+            if (display && transfer) on_main(^{ [display finishPreparingForAgentInput]; });
+        }
     } else if (!strcmp(operation,"finish")) error=asb_mac_input_control(session,ASB_INPUT_AGENT_END,0);
     else if (!strcmp(operation,"input")) {
         asb_mac_input_status(session,&status);
@@ -882,7 +902,8 @@ static uint32_t service_execute(ServiceCall *call,NSDictionary *body,id *result)
     } else if (strcmp(operation,"input_status")) error=ASB_INVALID;
     if (!error) {
         asb_mac_input_status(session,&status);NSDictionary *control=input_status_object(target,&status);
-        *result=!strcmp(operation,"input")?@{@"handledActions":@([body[@"actions"] count]),@"acknowledgement":@"injector_processed",@"control":control}:control;
+        *result=!strcmp(operation,"input")?@{@"handledActions":@([body[@"actions"] count]),
+            @"acknowledgement":!strcasecmp(target->os_type,"macOS")?@"virtual_device_dispatched":@"injector_processed",@"control":control}:control;
     }
     asb_mac_input_release(session);return error;
 }
@@ -1015,8 +1036,8 @@ static int handle_request(int fd, HttpReq *r) {
                 name=@(vm->name);
                 char id[ASB_TEMPLATE_ID_TEXT_SIZE];asb_template_id_format(identity,id);
                 info=@{@"id":@(id),@"name":name,@"osType":@(vm->os_type),@"hddGb":@(vm->hdd_gb),
-                    @"ready":@(vm->template_ready),@"state":vm->template_ready?@"ready":@"building",
-                    @"building":@(!vm->template_ready),@"progress":@(vm->template_ready?100:vm->install_progress)};
+                    @"ready":@((BOOL)vm->template_ready),@"state":vm->template_ready?@"ready":@"building",
+                    @"building":@((BOOL)!vm->template_ready),@"progress":@(vm->template_ready?100:vm->install_progress)};
                 if (!strcmp(r->method,"DELETE")) rc=asb_mac_template_delete(identity);
             }
         });

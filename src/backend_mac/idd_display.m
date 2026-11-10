@@ -471,7 +471,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
     NSRect frame = NSMakeRect(0, 0, 1280, 720);
     NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                               NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
-    NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
+    NSWindow *window = [[AsbViewerWindow alloc] initWithContentRect:frame
                                                   styleMask:style
                                                     backing:NSBackingStoreBuffered
                                                       defer:NO];
@@ -658,7 +658,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
 }
 
 - (NSEvent *)handleViewerEvent:(NSEvent *)event {
-    if ([_agentOverlay handleEvent:event]) return nil;
+    BOOL key=event.type==NSEventTypeKeyDown || event.type==NSEventTypeKeyUp || event.type==NSEventTypeFlagsChanged;
+    if (!key && [_agentOverlay handleViewerMouseEvent:event]) return nil;
     if (_stop) return event;
     BOOL contextClick = event.type == NSEventTypeRightMouseDown ||
         (event.type == NSEventTypeLeftMouseDown && (event.modifierFlags & NSEventModifierFlagControl));
@@ -691,7 +692,10 @@ static __weak IddDisplayWindow *g_mouseOwner;
     if (_eventMonitor) return;
     __weak IddDisplayWindow *weakSelf = self;
     _eventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:
-        NSEventMaskKeyDown | NSEventMaskKeyUp | NSEventMaskFlagsChanged | NSEventMaskRightMouseDown | NSEventMaskLeftMouseDown
+        NSEventMaskKeyDown | NSEventMaskKeyUp | NSEventMaskFlagsChanged |
+        NSEventMaskMouseMoved | NSEventMaskLeftMouseDown | NSEventMaskLeftMouseUp |
+        NSEventMaskRightMouseDown | NSEventMaskRightMouseUp | NSEventMaskOtherMouseDown | NSEventMaskOtherMouseUp |
+        NSEventMaskLeftMouseDragged | NSEventMaskRightMouseDragged | NSEventMaskOtherMouseDragged | NSEventMaskScrollWheel
         handler:^NSEvent *(NSEvent *event) {
             IddDisplayWindow *owner = weakSelf;
             return owner ? [owner handleViewerEvent:event] : event;

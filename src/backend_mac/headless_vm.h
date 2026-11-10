@@ -37,6 +37,7 @@ void *asb_mac_channel_create(void *,void *,void *);
 void *asb_mac_channel_display(void *);
 int asb_mac_input_versions(int,int (*)(void *),void *,int *,int *);
 int asb_mac_channel_connect(const AsbMacHeadlessTarget *,unsigned,unsigned);
+int asb_mac_native_input_connect(const AsbMacHeadlessTarget *);
 void asb_mac_channel_retain(void *);
 void asb_mac_channel_release(void *);
 uint32_t asb_mac_channel_read(int,void *,size_t);

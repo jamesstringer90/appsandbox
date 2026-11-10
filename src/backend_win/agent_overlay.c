@@ -32,7 +32,6 @@ struct AgentOverlay {
     BOOL pointer_known;
     UINT32 work_id;
     UINT mouse_buttons;
-    BYTE key_down[256];
     EventRegistrationToken message_token;
     BOOL has_message_token;
     AsbDCompDevice *device;
@@ -526,30 +525,11 @@ BOOL agent_overlay_mouse(AgentOverlay *s,UINT message,WPARAM keys,LPARAM positio
     return TRUE;
 }
 
-BOOL agent_overlay_key(AgentOverlay *s,UINT key,UINT scan,BOOL extended,BOOL up)
-{
-    POINT point;
-    wchar_t json[256];
-    BOOL hit;
-    if (!s || key>=ARRAYSIZE(s->key_down)) return FALSE;
-    hit=GetCursorPos(&point) && ScreenToClient(s->render,&point) && agent_overlay_hit_test(s,point);
-    if (up && s->key_down[key]) {
-        s->key_down[key]=FALSE;
-        if (!hit) return TRUE;
-    } else if (up || !hit) return FALSE;
-    if (!up) s->key_down[key]=TRUE;
-    swprintf_s(json,ARRAYSIZE(json),L"{\"type\":\"input\",\"kind\":\"key\",\"key\":%u,\"scan\":%u,\"extended\":%s,\"up\":%s,\"x\":%.3f,\"y\":%.3f}",
-        key,scan,extended?L"true":L"false",up?L"true":L"false",point.x/s->dpi,point.y/s->dpi);
-    s->webview->lpVtbl->PostWebMessageAsJson(s->webview,json);
-    return TRUE;
-}
-
 void agent_overlay_cancel_input(AgentOverlay *s)
 {
     if (!s) return;
     leave(s);
     s->mouse_buttons=0;
-    ZeroMemory(s->key_down,sizeof(s->key_down));
     if (GetCapture()==s->render) ReleaseCapture();
     if (s->webview) s->webview->lpVtbl->PostWebMessageAsJson(s->webview,L"{\"type\":\"input\",\"kind\":\"cancel\"}");
 }

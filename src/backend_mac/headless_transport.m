@@ -41,6 +41,8 @@ int asb_mac_channel_connect(const AsbMacHeadlessTarget *target,unsigned channel,
     @autoreleasepool {
         AsbChannelContext *context=(__bridge AsbChannelContext *)target->channel;
         if (!context || [NSThread isMainThread]) return -1;
+        if (channel==3 && !strcasecmp(target->os_type,"macOS"))
+            return asb_mac_native_input_connect(target);
         int fd=-1;
         if (context.memory) fd=[context.memory connectChannel:(int)channel timeoutMs:(int)timeout];
         else if (context.device) {

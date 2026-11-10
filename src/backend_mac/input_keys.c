@@ -1,4 +1,6 @@
 #include "input_keys.h"
+#include <dispatch/dispatch.h>
+#include <pthread.h>
 
 const uint16_t asb_mac_scan_codes[128] = {
     [kVK_ANSI_A]=0x1e, [kVK_ANSI_S]=0x1f, [kVK_ANSI_D]=0x20, [kVK_ANSI_F]=0x21,
@@ -43,7 +45,16 @@ const uint16_t asb_mac_scan_codes[128] = {
     [kVK_JIS_Kana]=0xe0f2, [kVK_JIS_Eisu]=0xe0f1
 };
 
-uint32_t asb_mac_text_packets(uint32_t scalar,InputPacket packets[8],unsigned *count)
+int asb_mac_key_code(const InputPacket *packet)
+{
+    if (packet->type!=INPUT_KEY_PHYSICAL || !packet->param2 || packet->param2>255 ||
+        (packet->param3&~(INPUT_KEY_EXTENDED|INPUT_KEY_UP))) return -1;
+    uint16_t scan=(uint16_t)packet->param2 | ((packet->param3&INPUT_KEY_EXTENDED)?0xe000:0);
+    for (unsigned key=0;key<128;++key) if (asb_mac_scan_codes[key]==scan) return (int)key;
+    return -1;
+}
+
+static uint32_t text_packets_main(uint32_t scalar,InputPacket packets[8],unsigned *count)
 {
     *count=0;uint16_t scan=0;unsigned modifiers=0;
     if (scalar=='\n' || scalar=='\r') scan=0x1c;
@@ -77,4 +88,17 @@ uint32_t asb_mac_text_packets(uint32_t scalar,InputPacket packets[8],unsigned *c
     packets[(*count)++]=(InputPacket){INPUT_MAGIC,INPUT_KEY_PHYSICAL,0,scan&255,flags|INPUT_KEY_UP};
     for (int i=2;i>=0;--i) if (modifiers&(1u<<i)) packets[(*count)++]=(InputPacket){INPUT_MAGIC,INPUT_KEY_PHYSICAL,0,keys[i],INPUT_KEY_UP};
     return 0;
+}
+
+typedef struct { uint32_t scalar;InputPacket *packets;unsigned *count;uint32_t error; } TextMapping;
+static void map_text_on_main(void *context)
+{
+    TextMapping *mapping=context;
+    mapping->error=text_packets_main(mapping->scalar,mapping->packets,mapping->count);
+}
+uint32_t asb_mac_text_packets(uint32_t scalar,InputPacket packets[8],unsigned *count)
+{
+    if (pthread_main_np()) return text_packets_main(scalar,packets,count);
+    TextMapping mapping={scalar,packets,count,0};
+    dispatch_sync_f(dispatch_get_main_queue(),&mapping,map_text_on_main);return mapping.error;
 }

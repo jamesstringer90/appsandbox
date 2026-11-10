@@ -11,7 +11,6 @@ void agent_overlay_resize(AgentOverlay *overlay);
 BOOL agent_overlay_hit_test(AgentOverlay *overlay, POINT point);
 void agent_overlay_pointer_activity(AgentOverlay *overlay);
 BOOL agent_overlay_mouse(AgentOverlay *overlay, UINT message, WPARAM keys, LPARAM position);
-BOOL agent_overlay_key(AgentOverlay *overlay, UINT key, UINT scan, BOOL extended, BOOL up);
 void agent_overlay_cancel_input(AgentOverlay *overlay);
 UINT32 agent_overlay_work_id(AgentOverlay *overlay);
 

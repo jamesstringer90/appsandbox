@@ -2,8 +2,9 @@
 #import <WebKit/WebKit.h>
 #import <QuartzCore/QuartzCore.h>
 #include "headless_vm.h"
-#import <Carbon/Carbon.h>
 #include <math.h>
+
+NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
 
 @interface AsbOverlayWebView:WKWebView
 @end
@@ -14,6 +15,48 @@
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event;return NO; }
 - (BOOL)performKeyEquivalent:(NSEvent *)event { (void)event;return NO; }
 - (BOOL)canBecomeKeyView { return NO; }
+- (NSTextInputContext *)inputContext { return nil; }
+- (void)addTrackingArea:(NSTrackingArea *)area { (void)area; }
+- (void)removeTrackingArea:(NSTrackingArea *)area { (void)area; }
+- (void)addGestureRecognizer:(NSGestureRecognizer *)recognizer { (void)recognizer; }
+- (void)removeGestureRecognizer:(NSGestureRecognizer *)recognizer { (void)recognizer; }
+- (void)setGestureRecognizers:(NSArray<NSGestureRecognizer *> *)recognizers { (void)recognizers;[super setGestureRecognizers:@[]]; }
+- (void)registerForDraggedTypes:(NSArray<NSPasteboardType> *)types { (void)types; }
+- (void)mouseDown:(NSEvent *)event { (void)event; }
+- (void)mouseUp:(NSEvent *)event { (void)event; }
+- (void)rightMouseDown:(NSEvent *)event { (void)event; }
+- (void)rightMouseUp:(NSEvent *)event { (void)event; }
+- (void)otherMouseDown:(NSEvent *)event { (void)event; }
+- (void)otherMouseUp:(NSEvent *)event { (void)event; }
+- (void)mouseMoved:(NSEvent *)event { (void)event; }
+- (void)mouseDragged:(NSEvent *)event { (void)event; }
+- (void)rightMouseDragged:(NSEvent *)event { (void)event; }
+- (void)otherMouseDragged:(NSEvent *)event { (void)event; }
+- (void)mouseEntered:(NSEvent *)event { (void)event; }
+- (void)mouseExited:(NSEvent *)event { (void)event; }
+- (void)scrollWheel:(NSEvent *)event { (void)event; }
+- (void)keyDown:(NSEvent *)event { (void)event; }
+- (void)keyUp:(NSEvent *)event { (void)event; }
+- (void)flagsChanged:(NSEvent *)event { (void)event; }
+- (void)magnifyWithEvent:(NSEvent *)event { (void)event; }
+- (void)rotateWithEvent:(NSEvent *)event { (void)event; }
+- (void)swipeWithEvent:(NSEvent *)event { (void)event; }
+- (void)smartMagnifyWithEvent:(NSEvent *)event { (void)event; }
+- (void)pressureChangeWithEvent:(NSEvent *)event { (void)event; }
+- (void)tabletPoint:(NSEvent *)event { (void)event; }
+- (void)tabletProximity:(NSEvent *)event { (void)event; }
+- (BOOL)isAccessibilityElement { return NO; }
+- (NSArray *)accessibilityChildren { return @[]; }
+@end
+
+@implementation AsbViewerWindow
+- (BOOL)makeFirstResponder:(NSResponder *)responder {
+    if ([responder isKindOfClass:NSView.class]) {
+        for (NSView *view=(NSView *)responder;view;view=view.superview)
+            if ([view isKindOfClass:AsbOverlayWebView.class]) return NO;
+    }
+    return [super makeFirstResponder:responder];
+}
 @end
 
 @interface AsbAgentOverlay()<WKScriptMessageHandler,WKNavigationDelegate>
@@ -27,7 +70,8 @@
     AsbMacInput *_input;
     AsbMacInputStatus _status;
     NSTimer *_timer;
-    id _monitor;
+    NSMutableArray *_observers;
+    unsigned _mouseButtons,_viewerButtons;
     NSRect _menu;
     uint64_t _identity;
     NSTimeInterval _pointerNext;
@@ -49,24 +93,37 @@
     [messages addScriptMessageHandler:self name:@"agentOverlay"];
     configuration.userContentController=messages;
     _web=[[AsbOverlayWebView alloc] initWithFrame:view.bounds configuration:configuration];
+    _web.inspectable=NO;
     _web.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
     _web.underPageBackgroundColor=NSColor.clearColor;
-    _web.wantsLayer=YES;_mask=[CAShapeLayer layer];_mask.fillColor=NSColor.blackColor.CGColor;
-    _web.layer.mask=_mask;
+    _web.wantsLayer=YES;_web.layer.opaque=NO;_web.layer.backgroundColor=NSColor.clearColor.CGColor;
+    _web.layer.name=AsbAgentOverlayLayerName;
+    if ([_web respondsToSelector:NSSelectorFromString(@"_setDrawsBackground:")]) {
+        [_web setValue:@NO forKey:@"drawsBackground"];
+    } else {
+        NSLog(@"AppSandbox overlay: transparent WebKit backing is unavailable; using clipped rendering");
+        _mask=[CAShapeLayer layer];_mask.fillColor=NSColor.blackColor.CGColor;
+        _web.layer.mask=_mask;
+    }
     _web.navigationDelegate=self;_web.hidden=YES;
+    view.wantsLayer=YES;
     [view addSubview:_web positioned:NSWindowAbove relativeTo:nil];
+    [_web setAccessibilityElement:NO];
+    [_web setAccessibilityChildren:@[]];
     NSURL *directory=[NSBundle.mainBundle.resourceURL URLByAppendingPathComponent:@"web" isDirectory:YES];
     [_web loadFileURL:[directory URLByAppendingPathComponent:@"agent-overlay.html"] allowingReadAccessToURL:directory];
     __weak AsbAgentOverlay *weakSelf=self;
     _timer=[NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *timer) { (void)timer;[weakSelf refresh]; }];
     [[NSRunLoop mainRunLoop] addTimer:_timer forMode:NSRunLoopCommonModes];
-    NSEventMask mask=NSEventMaskMouseMoved|NSEventMaskLeftMouseDown|NSEventMaskLeftMouseUp|NSEventMaskRightMouseDown|
-        NSEventMaskRightMouseUp|NSEventMaskOtherMouseDown|NSEventMaskOtherMouseUp|NSEventMaskLeftMouseDragged|
-        NSEventMaskRightMouseDragged|NSEventMaskOtherMouseDragged|NSEventMaskScrollWheel|NSEventMaskKeyDown|
-        NSEventMaskKeyUp|NSEventMaskFlagsChanged;
-    _monitor=[NSEvent addLocalMonitorForEventsMatchingMask:mask handler:^NSEvent *(NSEvent *event) {
-        return [weakSelf handleEvent:event]?nil:event;
-    }];
+    _observers=[NSMutableArray array];
+    NSNotificationCenter *nc=NSNotificationCenter.defaultCenter;
+    for (NSNotificationName name in @[NSWindowDidResignKeyNotification,NSWindowWillCloseNotification]) {
+        [_observers addObject:[nc addObserverForName:name object:view.window queue:nil usingBlock:^(NSNotification *note) {
+            (void)note;[weakSelf cancelInput];
+        }]];
+    }
+    [_observers addObject:[nc addObserverForName:NSApplicationDidResignActiveNotification object:NSApp queue:nil
+        usingBlock:^(NSNotification *note) { (void)note;[weakSelf cancelInput]; }]];
     return self;
 }
 
@@ -77,6 +134,12 @@
     NSString *json=[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     [_web evaluateJavaScript:[NSString stringWithFormat:@"window.__asbOverlayMessage(%@)",json]
         completionHandler:^(id value,NSError *error) { (void)value;(void)error;if (completion) completion(); }];
+}
+
+- (void)cancelInput
+{
+    _hovered=NO;_mouseButtons=_viewerButtons=0;
+    [self post:@{@"type":@"input",@"kind":@"cancel"} completion:nil];
 }
 
 - (void)refresh
@@ -95,6 +158,7 @@
     BOOL menu=!finished && (active || (_status.flags&ASB_STATUS_AGENT_WAITING));
     BOOL cursor=!finished && _status.x<=65535 && _status.y<=65535;
     _web.hidden=!_ready || !(menu || cursor);
+    if (!menu && _hovered) [self cancelInput];
     if (_updating || !_ready) return;
     NSSize bounds=_view.bounds.size;double x=0,y=0;
     if (cursor) {
@@ -110,16 +174,15 @@
         completion:^{ AsbAgentOverlay *strongSelf=weakSelf;if (strongSelf) strongSelf->_updating=NO; }];
 }
 
-- (BOOL)handleEvent:(NSEvent *)event
+- (BOOL)handleViewerMouseEvent:(NSEvent *)event
 {
     NSView *view=_view;NSWindow *window=view.window;
     if (_closed || !window || event.window!=window) return NO;
-    NSResponder *responder=window.firstResponder;
-    if ([responder isKindOfClass:NSView.class] && [(NSView *)responder isDescendantOf:_web]) [window makeFirstResponder:view];
     asb_mac_input_status(_input,&_status);
     self.blocksInput=!(_status.flags&ASB_STATUS_USER_HAS_CONTROL);
-    NSPoint point=[view convertPoint:window.mouseLocationOutsideOfEventStream fromView:nil];
     BOOL key=event.type==NSEventTypeKeyDown || event.type==NSEventTypeKeyUp || event.type==NSEventTypeFlagsChanged;
+    if (key) return NO;
+    NSPoint point=[view convertPoint:event.locationInWindow fromView:nil];
     BOOL inside=NSPointInRect(point,view.bounds);
     BOOL menu=!(_status.flags&ASB_STATUS_AGENT_FINISHED) &&
         (_status.flags&(ASB_STATUS_AGENT_HAS_CONTROL|ASB_STATUS_AGENT_WAITING));
@@ -129,23 +192,33 @@
         _pointerNext=event.timestamp+0.05;
         [self post:@{@"type":@"pointer_activity"} completion:nil];
     }
-    if (!key && !inside) return NO;
+    BOOL down=event.type==NSEventTypeLeftMouseDown || event.type==NSEventTypeRightMouseDown || event.type==NSEventTypeOtherMouseDown;
+    BOOL up=event.type==NSEventTypeLeftMouseUp || event.type==NSEventTypeRightMouseUp || event.type==NSEventTypeOtherMouseUp;
+    unsigned button=(unsigned)event.buttonNumber;
+    unsigned bit=(down || up) && button<32?1u<<button:0;
+    if (_viewerButtons) {
+        if (up) _viewerButtons&=~bit;
+        return self.blocksInput;
+    }
+    BOOL ownedUp=up && (_mouseButtons&bit);
+    if (up) _mouseButtons&=~bit;
     double x=point.x,y=NSHeight(view.bounds)-point.y;
-    BOOL hit=menu && _ready && NSPointInRect(NSMakePoint(x,y),_menu);
+    BOOL hit=inside && menu && _ready && NSPointInRect(NSMakePoint(x,y),_menu);
     if (hit) {
         NSString *kind=@"move";
-        BOOL down=event.type==NSEventTypeLeftMouseDown || event.type==NSEventTypeRightMouseDown || event.type==NSEventTypeOtherMouseDown;
-        BOOL up=event.type==NSEventTypeLeftMouseUp || event.type==NSEventTypeRightMouseUp || event.type==NSEventTypeOtherMouseUp;
-        if (key) kind=@"key";else if (down) kind=@"down";else if (up) kind=@"up";
+        if (up && !ownedUp) return self.blocksInput;
+        if (down) _mouseButtons|=bit;
+        if (down) kind=@"down";else if (up) kind=@"up";
         else if (event.type==NSEventTypeScrollWheel) kind=@"wheel";
-        unsigned code=key?(event.keyCode==kVK_Return?13:event.keyCode==kVK_Space?32:0):0;
-        [self post:@{@"type":@"input",@"kind":kind,@"x":@(x),@"y":@(y),@"button":@(key?0:event.buttonNumber),
-            @"key":@(code),@"up":@(event.type==NSEventTypeKeyUp),
+        [self post:@{@"type":@"input",@"kind":kind,@"x":@(x),@"y":@(y),@"button":@(event.buttonNumber),
             @"delta":@(event.type==NSEventTypeScrollWheel?event.scrollingDeltaY:0)} completion:nil];
         _hovered=YES;return YES;
     }
     if (_hovered) { [self post:@{@"type":@"input",@"kind":@"leave"} completion:nil];_hovered=NO; }
+    if (ownedUp || _mouseButtons) return YES;
+    if (!inside) return NO;
     if (self.blocksInput) return YES;
+    if (down) _viewerButtons|=bit;
     return NO;
 }
 
@@ -160,6 +233,7 @@
 
 - (void)maskLayout:(NSDictionary *)layout
 {
+    if (!_mask) return;
     CGMutablePathRef shapes=CGPathCreateMutable();CGAffineTransform transform=[self cssTransform];
     CGPathAddRoundedRect(shapes,&transform,NSRectToCGRect(_menu),6,6);
     if ([layout[@"cursor"] boolValue]) {
@@ -212,7 +286,14 @@
     uint32_t control=[command isEqualToString:@"take_control"]?ASB_INPUT_USER_REVOKE:
         [command isEqualToString:@"return_control"]?ASB_INPUT_USER_GRANT:
         [command isEqualToString:@"stop_agent"]?ASB_INPUT_USER_CANCEL:0;
-    if (control && _status.work_id) { asb_mac_input_control(_input,control,_status.work_id);[self refresh]; }
+    asb_mac_input_status(_input,&_status);
+    BOOL unfinished=!(_status.flags&ASB_STATUS_AGENT_FINISHED);
+    BOOL active=(_status.flags&ASB_STATUS_AGENT_HAS_CONTROL)!=0;
+    BOOL waiting=(_status.flags&ASB_STATUS_AGENT_WAITING)!=0;
+    if (!unfinished || !_status.work_id || !control ||
+        (control==ASB_INPUT_USER_GRANT && !waiting) || (control==ASB_INPUT_USER_REVOKE && !active)) return;
+    if (control==ASB_INPUT_USER_GRANT && self.prepareForAgentInput) self.prepareForAgentInput();
+    asb_mac_input_control(_input,control,_status.work_id);[self refresh];
 }
 
 - (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)action decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler
@@ -225,7 +306,8 @@
 {
     if (_closed) return;_closed=YES;
     [_timer invalidate];_timer=nil;
-    if (_monitor) [NSEvent removeMonitor:_monitor];_monitor=nil;
+    for (id observer in _observers) [NSNotificationCenter.defaultCenter removeObserver:observer];
+    _observers=nil;
     [_web.configuration.userContentController removeScriptMessageHandlerForName:@"agentOverlay"];
     _web.navigationDelegate=nil;[_web removeFromSuperview];_web=nil;
     asb_mac_input_release(_input);_input=NULL;
