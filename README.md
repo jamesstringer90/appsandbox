@@ -19,7 +19,7 @@ Windows features:
 - Host to client hot-key support
 - Provision and boot with / without internet
 - Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support
-- Headless mode: a scriptable local HTTP/JSON API + dependency-free Python SDK (`asb.py`) for creating and driving GPU-accelerated VMs programmatically
+- Local API, MCP server, and Python SDK
 
 Mac features:
 - macOS or Windows 11 ARM VM support
@@ -30,7 +30,7 @@ Mac features:
 - SSH via virtio-vsock (no network required)
 - Dynamic display sizing (optional on Windows)
 - Provision and boot with / without internet
-- Headless mode: the same scriptable local HTTP/JSON API + Python SDK (`asb.py`) as on Windows, for driving macOS and Windows 11 VMs programmatically
+- Local API, MCP server, and Python SDK
 
 Requirements:
 Windows 11 with an x64 Processor or macOS 27 or newer (M Series)
@@ -40,9 +40,8 @@ Windows 11 with an x64 Processor or macOS 27 or newer (M Series)
 App Sandbox creates and runs full desktop virtual machines — Windows 11, Ubuntu, and
 macOS. It is free and open-source (MIT), distributed as prebuilt binaries (EV-signed on
 Windows, Apple-Developer-signed on macOS) on its
-[Releases](https://github.com/jamesstringer90/appsandbox/releases) page. It is driven two
-ways: from a graphical UI, or programmatically through the local API with a
-dependency-free Python SDK (`asb.py`). Either way you pick an OS, point it at an installer
+[Releases](https://github.com/jamesstringer90/appsandbox/releases) page. Use the graphical
+UI or automate it through the API, MCP server, or Python SDK. Pick an OS and an installer
 image, and App Sandbox provisions the disk, runs an unattended install, and boots the
 guest. You supply a Windows or Ubuntu ISO; macOS guests download their restore image
 automatically. It runs on a Windows 11 (x64) PC or an Apple Silicon Mac, including laptops.
@@ -67,21 +66,10 @@ Virtual Machine Platform is the same Windows feature WSL2 uses.
 - Scripting the VM lifecycle from code — create, snapshot, branch, SSH into, and delete
   GPU-accelerated VMs — with the Python SDK.
 
-**Headless API.** The GUI automatically exposes the local HTTP/JSON API on `127.0.0.1`.
-`appsandbox.exe --headless` (or
-`sudo /Applications/AppSandbox.app/Contents/MacOS/AppSandbox --headless` on macOS)
-runs the same core without the management UI or automatic viewers. `-headless` is
-also supported; only one core process can run at a time. The stdlib-only Python SDK
-(`asb.py`) wraps it: create GPU-accelerated VMs (GPU-PV is a `gpuMode` create option), SSH
-in over an auto-deployed key (Windows, Ubuntu, or macOS guests), snapshot and branch them,
-open the live display, and run several at once — how many run concurrently is bounded by host
-CPU, RAM, and GPU memory, not by a fixed limit. The daemon is single-host — it drives VMs on
-the machine it runs on and does not provision cloud VMs; for CI, run it on a self-hosted
-runner. Snapshots and branches are Windows-host-only. Templates support Windows guests
-on both hosts and macOS guests on Mac hosts, avoiding a fresh OS installation. A VM persists
-until deleted. A snapshot is a disk-state checkpoint taken with the VM stopped, and a branch
-forks a writable disk from it to run divergent actions. The full API reference and runnable
-examples are in [`tools/headless-api/`](tools/headless-api/).
+**API and MCP.** App Sandbox supports automation through a local HTTP API, MCP
+server, and Python SDK on Windows and macOS, with the GUI or in headless mode.
+See the [API, MCP, and Python SDK documentation](tools/headless-api/README.md)
+for setup and usage.
 
 **How it works:** this repo also aims to be a working example of creating full desktop VMs
 programmatically with the Windows HCS/HCN APIs and Apple's Virtualization.framework. On
@@ -128,12 +116,12 @@ See the [contribution guidelines](CONTRIBUTING.md) for details.
 
 AppSandbox is licensed under the [MIT License](LICENSE) — Copyright (c) 2026 James Stringer.
 
-It bundles third-party components that are **not** covered by the MIT license and
-retain their own terms — most notably the Microsoft WSL2 `dxgkrnl` GPU driver
-(GPL-2.0) and the embedded XZ decoder (0BSD). See
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list. AppSandbox's
-own Linux DRM kernel module (`tools/linux/asb_drm/`) is dual-licensed MIT OR
-GPL-2.0 so it can resolve the kernel's GPL-only symbols.
+Guest drivers and bundled third-party components retain their own licenses,
+including [asb-dxgkrnl](https://github.com/jamesstringer90/asb-dxgkrnl),
+[asb-mesa](https://github.com/jamesstringer90/asb-mesa), and QEMU.
+AppSandbox's Linux DRM module (`tools/linux/asb_drm/`) is dual-licensed MIT OR
+GPL-2.0. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for component
+licenses and source links.
 
 ## Acknowledgements
 

@@ -36,8 +36,6 @@
 #include <stdarg.h>
 
 #define ASB_API_VERSION  "v1"
-#define DEFAULT_PORT     8787
-#define PORT_TRIES       20
 #define BODY_MAX         ASB_API_BODY_MAX
 #define REQ_HDR_MAX      16384
 
@@ -352,13 +350,9 @@ static NSString *validate_create_mac(NSString *name, NSString *os,
     NSString *passwordError = asb_mac_validate_password(os, password);
     if (passwordError) return passwordError;
 
-    /* numeric ranges (0 = unset -> the core fills a default). The even-RAM
-       rule is kept for interface parity with the GUI/Windows daemon. */
-    if (ram_mb != 0) {
-        if (ram_mb < 512)    return @"RAM must be at least 512 MB.";
-        if (ram_mb % 2 != 0) return @"RAM must be 2 MB-aligned (an even number of MB).";
-    }
-    if (hdd_gb != 0 && hdd_gb < 1)       return @"Disk size must be at least 1 GB.";
+    const char *resource_error=ram_mb?asb_api_validate_ram_mb(ram_mb):NULL;
+    if (!resource_error && hdd_gb) resource_error=asb_api_validate_hdd_gb(hdd_gb,0);
+    if (resource_error) return @(resource_error);
     if (cpu_cores != 0 && cpu_cores < 1) return @"CPU cores must be at least 1.";
     if (gpu_mode < 0 || gpu_mode > 1)    return @"gpuMode must be 0 (None) or 1 (Default).";
     if (net_mode != 1) return @"networkMode must be 1 (NAT) on macOS; other modes are not implemented.";
@@ -857,8 +851,11 @@ static uint32_t service_execute(ServiceCall *call,NSDictionary *body,id *result)
         uint32_t error=asb_mac_capture(target,body[@"timeoutMs"]?[body[@"timeoutMs"] unsignedIntValue]:5000,&reply,&pixels);
         if (!error) {
             NSData *png=capture_png(&reply,pixels);
+            const AsbApiGuestOs *guest=asb_api_guest_os_utf8(target->os_type);
+            NSString *os_type=guest?[[NSString alloc] initWithBytes:guest->id length:wcslen(guest->id)*sizeof(wchar_t) encoding:NSUTF32LittleEndianStringEncoding]:@(target->os_type);
+            NSString *os_name=guest?[[NSString alloc] initWithBytes:guest->name length:wcslen(guest->name)*sizeof(wchar_t) encoding:NSUTF32LittleEndianStringEncoding]:@(target->os_type);
             if (!png) error=ASB_DATA;
-            else *result=@{@"metadata":@{@"vmId":@(vm),@"vm":@(target->name),@"osType":@(target->os_type),
+            else *result=@{@"metadata":@{@"vmId":@(vm),@"vm":@(target->name),@"osType":os_type,@"osName":os_name,
                 @"width":@(reply.width),@"height":@(reply.height),@"stride":@(reply.stride),@"frameSeq":@(reply.frame_seq),
                 @"gpuSharingActive":@((BOOL)((reply.flags&ASB_SCREENSHOT_GPU_SHARED)!=0)),@"elapsedMs":@(asb_mac_milliseconds()-start)},
                 @"image":@{@"mimeType":@"image/png",@"data":[png base64EncodedStringWithOptions:0]}};
@@ -1035,7 +1032,9 @@ static int handle_request(int fd, HttpReq *r) {
                 identity = vm->unique_id;
                 name=@(vm->name);
                 char id[ASB_TEMPLATE_ID_TEXT_SIZE];asb_template_id_format(identity,id);
-                info=@{@"id":@(id),@"name":name,@"osType":@(vm->os_type),@"hddGb":@(vm->hdd_gb),
+                const AsbApiGuestOs *guest=asb_api_guest_os_utf8(vm->os_type);
+                info=@{@"id":@(id),@"name":name,@"osType":guest?[[NSString alloc] initWithBytes:guest->id length:wcslen(guest->id)*sizeof(wchar_t) encoding:NSUTF32LittleEndianStringEncoding]:@(vm->os_type),
+                    @"osName":guest?[[NSString alloc] initWithBytes:guest->name length:wcslen(guest->name)*sizeof(wchar_t) encoding:NSUTF32LittleEndianStringEncoding]:@(vm->os_type),@"hddGb":@(vm->hdd_gb),
                     @"ready":@((BOOL)vm->template_ready),@"state":vm->template_ready?@"ready":@"building",
                     @"building":@((BOOL)!vm->template_ready),@"progress":@(vm->template_ready?100:vm->install_progress)};
                 if (!strcmp(r->method,"DELETE")) rc=asb_mac_template_delete(identity);
@@ -1068,6 +1067,8 @@ static int handle_request(int fd, HttpReq *r) {
                               [NSCharacterSet whitespaceAndNewlineCharacterSet]];
             if (!b[@"name"]) name = @"";
             NSString *os   = b[@"osType"] ?: @"";
+            const AsbApiGuestOs *guest_os=asb_api_guest_os_utf8(os.UTF8String);
+            if (guest_os) os=@(guest_os->backend_utf8);
             NSString *img  = b[@"imagePath"] ? [b[@"imagePath"] description] : @"";
             if (b[@"diskDirectory"] && ![b[@"diskDirectory"] isKindOfClass:[NSString class]]) {
                 send_err(fd, 400, "Bad Request", @"invalid_arg", @"diskDirectory must be a string.");
@@ -1223,9 +1224,10 @@ static int handle_request(int fd, HttpReq *r) {
                 }
                 if (b[@"ramMb"]) {
                     int iv = [b[@"ramMb"] intValue];
-                    if (iv < 512 || iv % 2 != 0) {
+                    const char *error=asb_api_validate_ram_mb(iv);
+                    if (error) {
                         send_err(fd, 400, "Bad Request", @"invalid_arg",
-                                 @"RAM must be 2 MB-aligned and at least 512 MB");
+                                 @(error));
                         return 0;
                     }
                 }
@@ -1487,9 +1489,14 @@ static void *server_thread(void *param) {
 }
 
 static int http_start(int *out_port) {
-    for (int port = DEFAULT_PORT; port < DEFAULT_PORT + PORT_TRIES; port++) {
+    int preferred = asb_mac_get_api_port();
+    if (preferred < 1 || preferred > 65535) {
+        hlog(@"FATAL: ApiPort must be an integer from 1 to 65535 in vms.cfg [Settings].");
+        return 0;
+    }
+    for (int port = preferred; port <= 65535; port++) {
         int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (fd < 0) return 0;
+        if (fd < 0) { hlog(@"socket failed: %s", strerror(errno));return 0; }
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         struct sockaddr_in a;
@@ -1497,19 +1504,21 @@ static int http_start(int *out_port) {
         a.sin_family = AF_INET;
         a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   /* loopback only */
         a.sin_port = htons((uint16_t)port);
-        if (bind(fd, (struct sockaddr *)&a, sizeof(a)) == 0 &&
-            listen(fd, 16) == 0) {
-            int flags = fcntl(fd, F_GETFL, 0);
-            if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { close(fd); continue; }
-            g_listen_fd = fd;
-            *out_port = port;
-            hlog(@"listening on http://127.0.0.1:%d/", port);
-            return 1;
+        if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(fd, 16) != 0) {
+            int error = errno;
+            close(fd);
+            if (error != EADDRINUSE) { hlog(@"HTTP listener on port %d failed: %s", port, strerror(error));return 0; }
+            continue;
         }
-        close(fd);
-        hlog(@"port %d unavailable; trying next", port);
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            int error = errno;close(fd);hlog(@"fcntl on port %d failed: %s", port, strerror(error));return 0;
+        }
+        g_listen_fd = fd;
+        *out_port = port;
+        return 1;
     }
-    hlog(@"FATAL: no free port in %d..%d.", DEFAULT_PORT, DEFAULT_PORT + PORT_TRIES - 1);
+    hlog(@"FATAL: no free port in %d..65535.", preferred);
     return 0;
 }
 
@@ -1541,6 +1550,7 @@ int asb_api_start(int with_gui) {
     }
     g_api_started = YES;
     write_discovery(port);
+    asb_api_log_endpoints((unsigned)port);
     return 1;
 }
 

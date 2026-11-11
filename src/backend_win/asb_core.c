@@ -28,6 +28,7 @@
 #include <io.h>
 #include <stdlib.h>
 #include <shlobj.h>
+#include <aclapi.h>
 #include <stdarg.h>
 #include <virtdisk.h>
 #pragma comment(lib, "virtdisk.lib")
@@ -216,6 +217,7 @@ static void stop_template_copies(void)
 
 static wchar_t g_last_iso_path[MAX_PATH] = { 0 };
 static BOOL g_suppress_tray_warn = FALSE;
+static int g_api_port = ASB_API_DEFAULT_PORT;
 
 static CRITICAL_SECTION g_cs;
 static BOOL g_initialized = FALSE;
@@ -598,6 +600,47 @@ static BOOL ensure_appsandbox_ssh_key(wchar_t *pubkey_out, int cap)
 
 /* ---- Persistence: save VM list ---- */
 
+static DWORD config_allow_user_write(const wchar_t *path)
+{
+    HANDLE file=INVALID_HANDLE_VALUE,token=NULL;
+    TOKEN_USER *user=NULL;
+    PSECURITY_DESCRIPTOR descriptor=NULL;
+    PACL previous=NULL,updated=NULL;
+    DWORD error=ERROR_SUCCESS,size=0;
+    BY_HANDLE_FILE_INFORMATION info;
+    file=CreateFileW(path,READ_CONTROL|WRITE_DAC|FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT,NULL);
+    if (file==INVALID_HANDLE_VALUE) { error=GetLastError();goto done; }
+    if (!GetFileInformationByHandle(file,&info)) { error=GetLastError();goto done; }
+    if ((info.dwFileAttributes&(FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_DIRECTORY)) ||
+        info.nNumberOfLinks!=1) { error=ERROR_INVALID_DATA;goto done; }
+    if (!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token)) { error=GetLastError();goto done; }
+    GetTokenInformation(token,TokenUser,NULL,0,&size);
+    if (!size) { error=GetLastError();goto done; }
+    user=malloc(size);
+    if (!user) { error=ERROR_NOT_ENOUGH_MEMORY;goto done; }
+    if (!GetTokenInformation(token,TokenUser,user,size,&size)) { error=GetLastError();goto done; }
+    error=GetSecurityInfo(file,SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,NULL,NULL,&previous,NULL,&descriptor);
+    if (error || !previous) goto done;
+    EXPLICIT_ACCESSW access={0};
+    access.grfAccessPermissions=FILE_GENERIC_READ|FILE_GENERIC_WRITE|DELETE;
+    access.grfAccessMode=GRANT_ACCESS;
+    access.grfInheritance=NO_INHERITANCE;
+    access.Trustee.TrusteeForm=TRUSTEE_IS_SID;
+    access.Trustee.TrusteeType=TRUSTEE_IS_USER;
+    access.Trustee.ptstrName=(LPWSTR)user->User.Sid;
+    error=SetEntriesInAclW(1,&access,previous,&updated);
+    if (!error) error=SetSecurityInfo(file,SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,NULL,NULL,updated,NULL);
+done:
+    if (updated) LocalFree(updated);
+    if (descriptor) LocalFree(descriptor);
+    free(user);
+    if (token) CloseHandle(token);
+    if (file!=INVALID_HANDLE_VALUE) CloseHandle(file);
+    return error;
+}
+
 static BOOL save_vm_list(void)
 {
     if (g_config_load_failed) return FALSE;
@@ -622,14 +665,12 @@ static BOOL save_vm_list(void)
         return FALSE;
     }
 
-    if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn) {
-        fwprintf(f, L"[Settings]\n");
-        if (g_last_iso_path[0] != L'\0')
-            fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
-        if (g_suppress_tray_warn)
-            fwprintf(f, L"SuppressTrayWarn=1\n");
-        fwprintf(f, L"\n");
-    }
+    fwprintf(f, L"[Settings]\nApiPort=%d\n", g_api_port);
+    if (g_last_iso_path[0] != L'\0')
+        fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
+    if (g_suppress_tray_warn)
+        fwprintf(f, L"SuppressTrayWarn=1\n");
+    fwprintf(f, L"\n");
 
     for (i = 0; i < g_template_count; i++) {
         fwprintf(f, L"[Template]\n");
@@ -690,6 +731,13 @@ static BOOL save_vm_list(void)
 
     BOOL ok = !ferror(f) && fflush(f) == 0 && _commit(_fileno(f)) == 0;
     if (fclose(f) != 0) ok = FALSE;
+    if (ok) {
+        DWORD error=config_allow_user_write(temporary);
+        if (error) {
+            asb_log(L"Cannot grant the current user write access to VM configuration (%lu).",error);
+            ok=FALSE;
+        }
+    }
     if (ok && MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         return TRUE;
     DeleteFileW(temporary);
@@ -735,6 +783,9 @@ static void load_vm_list(void)
     wchar_t record_ids[ASB_MAX_VMS][ASB_TEMPLATE_ID_TEXT_SIZE]={0};
 
     get_config_path(path, MAX_PATH);
+    DWORD access_error=config_allow_user_write(path);
+    if (access_error && access_error!=ERROR_FILE_NOT_FOUND && access_error!=ERROR_PATH_NOT_FOUND)
+        asb_log(L"Cannot grant the current user write access to VM configuration (%lu).",access_error);
     if (_wfopen_s(&f, path, L"rb") != 0 || !f) return;
     (void)fread(bom, 1, sizeof(bom), f);
     fclose(f);
@@ -796,6 +847,8 @@ static void load_vm_list(void)
                 wcscpy_s(g_last_iso_path, MAX_PATH, line + 12);
             else if (wcsncmp(line, L"SuppressTrayWarn=", 17) == 0)
                 g_suppress_tray_warn = (_wtoi(line + 17) != 0);
+            else if (wcsncmp(line, L"ApiPort=", 8) == 0)
+                g_api_port = asb_api_parse_port(line + 8);
             continue;
         }
 
@@ -3364,6 +3417,11 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     }
 
     AsbVmConfig selected=*config;
+    const AsbApiGuestOs *guest=asb_api_guest_os(selected.os_type);
+    if (!guest) return E_INVALIDARG;
+    if (!wcscmp(guest->backend,L"macOS")) return E_NOTIMPL;
+    selected.os_type=guest->backend;
+    config=&selected;
     if (!selected.template_id && selected.template_name && selected.template_name[0]) {
         selected.template_id=asb_template_id_by_name(selected.template_name);
         if (!selected.template_id) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
@@ -3374,7 +3432,6 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
         int index=asb_template_index_by_id(selected.template_id);
         if (index<0) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
         selected.template_name=g_templates[index].name;
-        config=&selected;
     }
 
     effective_os = config->os_type;
@@ -3435,9 +3492,24 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     cfg.is_template = is_template_create;
 
     /* Defaults */
-    if (cfg.hdd_gb == 0) cfg.hdd_gb = from_template?asb_template_hdd_gb(template_idx):ASB_API_DEFAULT_HDD_GB;
+    DWORD minimum_hdd=_wcsicmp(cfg.os_type,L"Linux")==0?ASB_API_MIN_LINUX_HDD_GB:ASB_API_MIN_HDD_GB;
+    if (cfg.hdd_gb == 0) cfg.hdd_gb = from_template?asb_template_hdd_gb(template_idx):minimum_hdd;
     if (!cfg.hdd_gb) return E_FAIL;
-    if (cfg.ram_mb == 0) cfg.ram_mb = ASB_API_DEFAULT_RAM_MB;
+    if (!config->hdd_gb && cfg.hdd_gb<minimum_hdd) cfg.hdd_gb=minimum_hdd;
+    if (cfg.ram_mb == 0) {
+        MEMORYSTATUSEX memory={0};memory.dwLength=sizeof(memory);
+        if (!GlobalMemoryStatusEx(&memory)) return HRESULT_FROM_WIN32(GetLastError());
+        cfg.ram_mb=asb_api_default_ram_mb(memory.ullTotalPhys/(1024ULL*1024ULL));
+    }
+    const char *resource_error=asb_api_validate_ram_mb((int)cfg.ram_mb);
+    if (!resource_error) resource_error=asb_api_validate_hdd_gb((int)cfg.hdd_gb,_wcsicmp(cfg.os_type,L"Linux")==0);
+    if (resource_error) {
+        wchar_t message[128];
+        swprintf_s(message,ARRAYSIZE(message),L"%S",resource_error);
+        asb_log(L"Error: %S",resource_error);
+        asb_alert(message);
+        return E_INVALIDARG;
+    }
     if (cfg.cpu_cores == 0) cfg.cpu_cores = ASB_API_DEFAULT_CPU_CORES;
 
     /* Linux defaults: respect the UI's gpu_mode (GPU-PV works via
@@ -4323,7 +4395,7 @@ ASB_API HRESULT asb_vm_set_ram(AsbVm vm, DWORD ram_mb)
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     if (VM_AT(idx).running || VM_AT(idx).building_vhdx || VM_AT(idx).starting) return E_ACCESSDENIED;
-    if (ram_mb < 512 || ram_mb%2) return E_INVALIDARG;
+    if (asb_api_validate_ram_mb((int)ram_mb)) return E_INVALIDARG;
     VM_AT(idx).ram_mb = ram_mb;
     save_vm_list();
     notify_state(vm, VM_AT(idx).running, g_state_ud);
@@ -4789,6 +4861,11 @@ ASB_API void asb_set_suppress_tray_warn(BOOL suppress)
 ASB_API BOOL asb_get_suppress_tray_warn(void)
 {
     return g_suppress_tray_warn;
+}
+
+ASB_API int asb_get_api_port(void)
+{
+    return g_api_port;
 }
 
 /* ---- Internal access (for UI layer) ---- */

@@ -244,6 +244,7 @@ static char *tool_error(const char *message)
 static const char *instructions=
     "AppSandbox exposes one host MCP backed by the same API used for VM operations. "
     "Discover VMs with vm_list and templates with template_list. Use their explicit vm_id or template_id. "
+    "Use windows11 for Windows 11, ubuntu2604lts for Ubuntu 26.04 LTS, and macos27 for macOS 27. No other Linux distribution or version is supported. Use osName and capabilities.guestOsNames for display labels. "
     "Set openDisplay to false for windowless starts. "
     "Before desktop input call input_request_control with your identity, model vendor, exact model identifier, "
     "and a purpose of at most 300 characters. Use unknown when vendor or model information is unavailable. "

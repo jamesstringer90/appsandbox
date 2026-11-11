@@ -3,12 +3,16 @@
 #define STR "{\"type\":\"string\"}"
 #define INT "{\"type\":\"integer\"}"
 #define BOOL "{\"type\":\"boolean\"}"
+#define OS_TYPE "{\"type\":\"string\",\"description\":\"windows11, ubuntu2604lts, or macos27. These identify Windows 11, Ubuntu 26.04 LTS, and macOS 27. Other Linux distributions and versions are unsupported.\"}"
+#define IMAGE "{\"type\":\"string\",\"description\":\"Host path to a Windows or Ubuntu installer ISO. Omit for macos27: AppSandbox automatically downloads and caches the macOS restore image. Omit when using a template.\"}"
+#define RAM "{\"type\":\"integer\",\"minimum\":0,\"description\":\"Even MB, at least 4096. Omitted or zero uses half host RAM, capped at 12288 MB with a 4096 MB floor. Explicit allocations may exceed the default cap.\"}"
+#define DISK "{\"type\":\"integer\",\"minimum\":0,\"description\":\"Ubuntu 26.04 LTS: minimum and default 40 GB. Windows/macOS: minimum and default 64 GB. Omitted or zero uses the default or the larger template disk size.\"}"
 #define VM "\"vm_id\":{\"type\":\"string\",\"pattern\":\"^vm-[0-9a-f]{16}$\"}"
 #define TEMPLATE "\"template_id\":{\"type\":\"string\",\"pattern\":\"^template-[0-9a-f]{16}$\"}"
 #define OP(name,description,method,path,properties,required) \
     "{\"name\":\"" name "\",\"description\":\"" description "\",\"method\":\"" method "\",\"path\":\"" path "\",\"inputSchema\":{\"type\":\"object\",\"properties\":{" properties "},\"required\":[" required "],\"additionalProperties\":false}}"
-#define CONFIG "\"name\":" STR ",\"osType\":" STR ",\"imagePath\":" STR ",\"diskDirectory\":" STR ",\"templateName\":" STR ",\"templateId\":" STR ",\"ramMb\":" INT ",\"hddGb\":" INT ",\"cpuCores\":" INT ",\"gpuMode\":" INT ",\"gpuId\":" STR ",\"networkMode\":" INT ",\"netAdapter\":" STR ",\"adminUser\":" STR ",\"adminPass\":" STR ",\"testMode\":" BOOL ",\"sshEnabled\":" BOOL ",\"sshDeployKey\":" BOOL ",\"isTemplate\":" BOOL
-#define EDIT "\"ramMb\":" INT ",\"cpuCores\":" INT ",\"gpuMode\":" INT ",\"gpuId\":" STR ",\"networkMode\":" INT
+#define CONFIG "\"name\":" STR ",\"osType\":" OS_TYPE ",\"imagePath\":" IMAGE ",\"diskDirectory\":" STR ",\"templateName\":" STR ",\"templateId\":" STR ",\"ramMb\":" RAM ",\"hddGb\":" DISK ",\"cpuCores\":" INT ",\"gpuMode\":" INT ",\"gpuId\":" STR ",\"networkMode\":" INT ",\"netAdapter\":" STR ",\"adminUser\":" STR ",\"adminPass\":" STR ",\"testMode\":" BOOL ",\"sshEnabled\":" BOOL ",\"sshDeployKey\":" BOOL ",\"isTemplate\":" BOOL
+#define EDIT "\"ramMb\":{\"type\":\"integer\",\"minimum\":4096,\"description\":\"Even MB, at least 4096.\"},\"cpuCores\":" INT ",\"gpuMode\":" INT ",\"gpuId\":" STR ",\"networkMode\":" INT
 #define INPUT_ACTIONS "\"actions\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":128,\"items\":{\"type\":\"object\",\"properties\":{\"type\":{\"enum\":[\"move\",\"click\",\"button\",\"text\",\"unicode\",\"key\",\"scroll\"]},\"x\":" INT ",\"y\":" INT ",\"width\":" INT ",\"height\":" INT ",\"button\":" INT ",\"text\":" STR ",\"scan\":" INT ",\"down\":" BOOL ",\"extended\":" BOOL ",\"delta\":" INT "},\"required\":[\"type\"],\"additionalProperties\":false}}"
 
 const char *asb_api_operations_json(void)

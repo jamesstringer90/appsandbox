@@ -265,6 +265,7 @@ ASB_API void asb_set_last_iso_path(const wchar_t *path);
 ASB_API const wchar_t *asb_get_last_iso_path(void);
 ASB_API void asb_set_suppress_tray_warn(BOOL suppress);
 ASB_API BOOL asb_get_suppress_tray_warn(void);
+ASB_API int asb_get_api_port(void);
 
 /* Set HINSTANCE (needed by modules that use ui_get_instance). */
 ASB_API void asb_set_hinstance(HINSTANCE hInst);

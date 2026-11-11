@@ -104,6 +104,7 @@ int asb_mac_template_delete(AsbTemplateId template_id);
 int  asb_mac_vm_edit(AsbVmId vm_id, const char *field, const char *value);
 
 void asb_mac_save(void);
+int asb_mac_get_api_port(void);
 
 /* Send a mute/unmute command to the VM's guest agent. Called from the
  * display window's open/close hooks so the guest stops/starts driving

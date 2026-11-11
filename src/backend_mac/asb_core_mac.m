@@ -30,6 +30,7 @@
 #include "headless_vm.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -43,6 +44,7 @@ static int g_vm_count = 0;
 static BOOL g_config_load_failed;
 static uint64_t g_next_run_id;
 static char g_last_ipsw_path[1024] = {0};
+static int g_api_port = ASB_API_DEFAULT_PORT;
 
 static void clear_admin_password(AsbVmMac *vm) {
     volatile unsigned char *bytes = (volatile unsigned char *)vm->admin_pass;
@@ -242,11 +244,11 @@ static BOOL save_vm_list(void) {
         return NO;
     }
 
+    fprintf(f, "[Settings]\nApiPort=%d\n", g_api_port);
     if (g_last_ipsw_path[0]) {
-        fprintf(f, "[Settings]\n");
         fprintf(f, "LastIpswPath=%s\n", g_last_ipsw_path);
-        fprintf(f, "\n");
     }
+    fprintf(f, "\n");
 
     for (int i = 0; i < g_vm_count; i++) {
         fprintf(f, "[VM]\n");
@@ -333,6 +335,10 @@ static void load_vm_list(void) {
         if (in_settings) {
             if (strncmp(line, "LastIpswPath=", 13) == 0)
                 strlcpy(g_last_ipsw_path, line + 13, sizeof(g_last_ipsw_path));
+            else if (strncmp(line, "ApiPort=", 8) == 0) {
+                wchar_t value[2048];
+                g_api_port=mbstowcs(value,line+8,2048)!=(size_t)-1?asb_api_parse_port(value):0;
+            }
             continue;
         }
 
@@ -1400,6 +1406,10 @@ int asb_mac_vm_create(const char *name, const char *os_type,
                        BOOL is_template,
                        AsbTemplateId template_id,
                        const char *template_name) {
+    const AsbApiGuestOs *guest=asb_api_guest_os_utf8(os_type);
+    if (!guest) return BACKEND_ERR_INVALID_ARG;
+    if (!strcmp(guest->backend_utf8,"Linux")) return BACKEND_ERR_NOT_IMPLEMENTED;
+    os_type=guest->backend_utf8;
     if (!name || !os_type || (template_id && template_name && template_name[0]) ||
         gpu_mode < 0 || gpu_mode > 1 || network_mode != 1)
         return BACKEND_ERR_INVALID_ARG;
@@ -1411,7 +1421,14 @@ int asb_mac_vm_create(const char *name, const char *os_type,
         post_alert(0, "Select a ready template matching the guest OS.");
         return BACKEND_ERR_INVALID_ARG;
     }
-    if (source && hdd_gb == 0) hdd_gb = source->hdd_gb;
+    if (!ram_mb) ram_mb=(int)asb_api_default_ram_mb((uint64_t)[HostInfo hostRamMb]);
+    if (!hdd_gb) hdd_gb=source?MAX(source->hdd_gb,ASB_API_MIN_HDD_GB):ASB_API_DEFAULT_HDD_GB;
+    const char *resource_error=asb_api_validate_ram_mb(ram_mb);
+    if (!resource_error) resource_error=asb_api_validate_hdd_gb(hdd_gb,0);
+    if (resource_error) {
+        post_alert(0,"%s",resource_error);
+        return BACKEND_ERR_INVALID_ARG;
+    }
     if (source && hdd_gb < source->hdd_gb) {
         post_alert(0, "This template requires a disk size of at least %d GB.", source->hdd_gb);
         return BACKEND_ERR_INVALID_ARG;
@@ -1475,8 +1492,8 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     strlcpy(vm->name, name, sizeof(vm->name));
     strlcpy(vm->os_type, os_type, sizeof(vm->os_type));
     strlcpy(vm->disk_directory, diskDirectory.UTF8String, sizeof(vm->disk_directory));
-    vm->ram_mb = ram_mb > 0 ? ram_mb : ASB_API_DEFAULT_RAM_MB;
-    vm->hdd_gb = hdd_gb > 0 ? hdd_gb : ASB_API_DEFAULT_HDD_GB;
+    vm->ram_mb = ram_mb;
+    vm->hdd_gb = hdd_gb;
     vm->cpu_cores = cpu_cores > 0 ? cpu_cores : ASB_API_DEFAULT_CPU_CORES;
     vm->gpu_mode = gpu_mode;
     vm->network_mode = network_mode;
@@ -2045,7 +2062,7 @@ int asb_mac_vm_edit(AsbVmId vm_id, const char *field, const char *value) {
 
     if (strcmp(field, "ramMb") == 0) {
         int ram = atoi(value);
-        if (ram < 512 || ram % 2) return BACKEND_ERR_INVALID_ARG;
+        if (asb_api_validate_ram_mb(ram)) return BACKEND_ERR_INVALID_ARG;
         g_vms[idx].ram_mb = ram;
     } else if (strcmp(field, "cpuCores") == 0) {
         int cores = atoi(value);
@@ -2084,6 +2101,10 @@ void asb_mac_save(void) {
     save_vm_list();
 }
 
+int asb_mac_get_api_port(void) {
+    return g_api_port;
+}
+
 void asb_mac_set_headless(BOOL headless) {
     g_headless = headless;
     vz_vm_set_no_audio(headless);
@@ -2107,10 +2128,12 @@ NSDictionary *asb_mac_vm_snapshot(const AsbVmMac *vm) {
     asb_resource_id_format(vm->unique_id,vm->is_template,id);
     char template_id[ASB_TEMPLATE_ID_TEXT_SIZE]={0};
     if (vm->is_template) asb_template_id_format(vm->unique_id,template_id);
+    const AsbApiGuestOs *guest=asb_api_guest_os_utf8(vm->os_type);
     return @{
         @"id":              @(id),
         @"name":            [NSString stringWithUTF8String:vm->name],
-        @"osType":          [NSString stringWithUTF8String:vm->os_type],
+        @"osType":          guest?[[NSString alloc] initWithBytes:guest->id length:wcslen(guest->id)*sizeof(wchar_t) encoding:NSUTF32LittleEndianStringEncoding]:@(vm->os_type),
+        @"osName":          guest?[[NSString alloc] initWithBytes:guest->name length:wcslen(guest->name)*sizeof(wchar_t) encoding:NSUTF32LittleEndianStringEncoding]:@(vm->os_type),
         @"diskDirectory":   [VmDir diskDirectoryForVm:@(vm->name)].URLByDeletingLastPathComponent.path,
         @"state":           @(asb_mac_vm_state(vm)),
         @"building":        @(asb_mac_vm_is_building(vm)),
@@ -2155,10 +2178,12 @@ NSArray<NSDictionary *> *asb_mac_templates(void) {
     for (int i = 0; i < g_vm_count; ++i) {
         AsbVmMac *vm = &g_vms[i];
         if (!vm->template_ready) continue;
+        const AsbApiGuestOs *guest=asb_api_guest_os_utf8(vm->os_type);
         char identity[ASB_TEMPLATE_ID_TEXT_SIZE];
         asb_template_id_format(vm->unique_id, identity);
         [templates addObject:@{ @"id": @(identity), @"name": @(vm->name),
-                                @"osType": @(vm->os_type), @"hddGb": @(vm->hdd_gb),
+                                @"osType": guest?[[NSString alloc] initWithBytes:guest->id length:wcslen(guest->id)*sizeof(wchar_t) encoding:NSUTF32LittleEndianStringEncoding]:@(vm->os_type),
+                                @"osName": guest?[[NSString alloc] initWithBytes:guest->name length:wcslen(guest->name)*sizeof(wchar_t) encoding:NSUTF32LittleEndianStringEncoding]:@(vm->os_type), @"hddGb": @(vm->hdd_gb),
                                 @"ready":@YES,@"state":@"ready",@"building":@NO,@"progress":@100 }];
     }
     return templates;

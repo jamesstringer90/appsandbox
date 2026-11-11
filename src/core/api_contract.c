@@ -1,10 +1,23 @@
 #include "api_contract.h"
 #include "api_operations.h"
+#include "asb_events.h"
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+
+void asb_api_log_endpoints(unsigned port)
+{
+    const char *names[]={"API","MCP"},*paths[]={"/v1","/mcp"};
+    for (unsigned i=0;i<2;++i) {
+        char message[128];
+        snprintf(message,sizeof(message),"%s: http://127.0.0.1:%u%s",names[i],port,paths[i]);
+        CoreVmEvent event={0};
+        event.type=CORE_VM_EVENT_LOG;event.str_value=message;
+        asb_events_emit(&event);
+    }
+}
 
 static char *write_string(char *out,const char *text)
 {
@@ -406,25 +419,26 @@ const char *asb_api_capabilities_json(int windows_host)
 {
     return windows_host?
         "{\"snapshots\":true,\"templates\":true,\"screenshots\":true,\"input\":true,\"sshSessions\":true,\"gpuSelection\":true,"
-        "\"guestOs\":[\"Windows\",\"Linux\"],\"templateGuestOs\":[\"Windows\"],\"networkModes\":[0,1,2,3]}":
+        "\"guestOs\":[\"windows11\",\"ubuntu2604lts\"],\"guestOsNames\":{\"windows11\":\"Windows 11\",\"ubuntu2604lts\":\"Ubuntu 26.04 LTS\"},"
+        "\"templateGuestOs\":[\"windows11\"],\"networkModes\":[0,1,2,3]}":
         "{\"snapshots\":false,\"templates\":true,\"screenshots\":true,\"input\":true,\"sshSessions\":true,\"gpuSelection\":false,"
-        "\"guestOs\":[\"Windows\",\"macOS\"],\"templateGuestOs\":[\"Windows\",\"macOS\"],\"networkModes\":[1]}";
+        "\"guestOs\":[\"windows11\",\"macos27\"],\"guestOsNames\":{\"windows11\":\"Windows 11\",\"macos27\":\"macOS 27\"},"
+        "\"templateGuestOs\":[\"windows11\",\"macos27\"],\"networkModes\":[1]}";
 }
 
 uint32_t asb_api_guest_support(int windows_host,const wchar_t *os_type,int is_template)
 {
-    wchar_t lower[16];size_t length=os_type?wcslen(os_type):0;
-    if (!length || length>=16) return 87;
-    for (size_t i=0;i<=length;++i) lower[i]=os_type[i]>='A' && os_type[i]<='Z'?os_type[i]+('a'-'A'):os_type[i];
-    if (!wcscmp(lower,L"windows")) return 0;
-    if (!wcscmp(lower,L"linux")) return windows_host && !is_template?0:120;
-    if (!wcscmp(lower,L"macos")) return windows_host?120:0;
+    const AsbApiGuestOs *guest=asb_api_guest_os(os_type);
+    if (!guest) return 87;
+    if (!wcscmp(guest->backend,L"Windows")) return 0;
+    if (!wcscmp(guest->backend,L"Linux")) return windows_host && !is_template?0:120;
+    if (!wcscmp(guest->backend,L"macOS")) return windows_host?120:0;
     return 87;
 }
 
 const char *asb_api_vm_fields_json(void)
 {
-    return "[\"id\",\"name\",\"osType\",\"diskDirectory\",\"state\",\"running\","
+    return "[\"id\",\"name\",\"osType\",\"osName\",\"diskDirectory\",\"state\",\"running\","
         "\"agentOnline\",\"installComplete\",\"building\",\"progress\",\"sshState\","
         "\"sshPort\",\"ramMb\",\"hddGb\",\"cpuCores\",\"gpuMode\",\"networkMode\","
         "\"displayOpen\",\"gpuId\",\"gpuName\"]";

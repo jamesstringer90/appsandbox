@@ -52,7 +52,7 @@ print("baseline templates:", sorted(base_tpls), flush=True)
 
 try:
     print("=== create a Windows template ===")
-    code, _ = c.create(name=TPL, osType="Windows", imagePath=ISO_WIN, ramMb=4000, hddGb=64,
+    code, _ = c.create(name=TPL, osType="windows11", imagePath=ISO_WIN, ramMb=4096, hddGb=64,
                        cpuCores=4, gpuMode=1, networkMode=1, adminUser="user", adminPass="test123",
                        testMode=True, isTemplate=True)
     check("template create -> 202", code == 202, "code=%s" % code)
@@ -85,10 +85,10 @@ try:
     check("template finalized: now in /templates", TPL in tpl_names(), "templates=%s" % sorted(tpl_names()))
     check("template left the /vms list", TPL not in names())
     t = next((t for t in c.templates() if t["name"] == TPL), None)
-    check("template osType == Windows", bool(t) and t.get("osType") == "Windows", "t=%s" % t)
+    check("template osType == Windows", bool(t) and t.get("osType") == "windows11", "t=%s" % t)
 
     print("\n=== create a VM FROM the template ===")
-    code, _ = c.create(name=FROMTPL, osType="Windows", templateName=TPL, ramMb=4000, hddGb=64,
+    code, _ = c.create(name=FROMTPL, osType="windows11", templateName=TPL, ramMb=4096, hddGb=64,
                        cpuCores=2, adminUser="user", adminPass="test123", testMode=True)
     check("create-from-template -> 202", code == 202, "code=%s" % code)
     s = c.wait_online(FROMTPL, timeout=1800)   # boots from the generalized template all the way to online

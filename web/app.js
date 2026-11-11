@@ -92,7 +92,7 @@ if (hostBridge.isMac) {
  * Windows host: macOS unavailable (Apple Virtualization is Mac-only).
  * macOS host:   Linux unavailable (Windows IS supported — QEMU+ivshmem). */
 {
-    var unavailable = hostBridge.isMac ? ['Linux'] : ['macOS'];
+    var unavailable = hostBridge.isMac ? ['ubuntu2604lts'] : ['macos27'];
     unavailable.forEach(function(v) {
         var opt = document.querySelector('#os-type option[value="' + v + '"]');
         if (opt) opt.remove();
@@ -102,14 +102,15 @@ if (hostBridge.isMac) {
 function applyOsTypeUI() {
     var modal = document.getElementById('create-vm-overlay');
     var osType = document.getElementById('os-type').value;
-    var isWindows = osType === 'Windows';
-    var isLinux = osType === 'Linux';
+    var isWindows = osType === 'windows11';
+    var isLinux = osType === 'ubuntu2604lts';
     var selected = currentTemplates.find(function(t) { return t.name === document.getElementById('template-select').value; });
     if (selected && selected.osType !== osType) selectTemplate('', templateDefaultLabel());
     modal.querySelectorAll('.templates-supported').forEach(function(el) {
-        el.style.display = (isWindows || osType === 'macOS') ? '' : 'none';
+        el.style.display = (isWindows || osType === 'macos27') ? '' : 'none';
     });
     populateTemplates(currentTemplates);
+    updateDiskMinimum();
     var winOnly = modal.querySelectorAll('.win-only');
     var needsIso = modal.querySelectorAll('.needs-iso');
     var needsWindows = modal.querySelectorAll('.needs-windows');
@@ -122,8 +123,8 @@ function applyOsTypeUI() {
        guest on EITHER host (a Windows-on-Mac VM uses it too), hidden otherwise. */
     for (var w = 0; w < needsWindows.length; w++) needsWindows[w].style.display = isWindows ? '' : 'none';
     /* ISO picker shows for both Windows and Linux now. */
-    for (var j = 0; j < needsIso.length; j++) needsIso[j].style.display = (isWindows || isLinux || osType === 'macOS') ? '' : 'none';
-    document.getElementById('image-path').placeholder = osType === 'macOS' ? 'Latest macOS restore image (or select IPSW)...' : 'Path to ISO...';
+    for (var j = 0; j < needsIso.length; j++) needsIso[j].style.display = (isWindows || isLinux) ? '' : 'none';
+    document.getElementById('macos-image-source').style.display = osType === 'macos27' ? '' : 'none';
     /* Linux distribution dropdown is dormant — kept in the DOM but always
        hidden so the cloud-image code path can be revived without
        re-adding the markup. */
@@ -195,9 +196,9 @@ function onFullState(msg) {
 function alignRamMb(mb) { return mb - (mb % 2); }
 
 function applySmartDefaults(info) {
-    var ram = Math.min(Math.floor(info.hostRamMb / 2), 16384);
+    var ram = Math.min(Math.floor(info.hostRamMb / 2), 12288);
     var cores = Math.min(Math.floor(info.hostCores / 2), 8);
-    if (ram < 512) ram = 512;
+    if (ram < 4096) ram = 4096;
     if (cores < 1) cores = 1;
     document.getElementById('ram-size').value = alignRamMb(ram);
     document.getElementById('cpu-cores').value = cores;
@@ -384,7 +385,7 @@ function populateTemplates(templates) {
 
         var nameSpan = document.createElement('span');
         nameSpan.className = 'tpl-name';
-        nameSpan.textContent = t.name + ' [' + t.osType + ']';
+        nameSpan.textContent = t.name + ' [' + (t.osName || t.osType) + ']';
         item.appendChild(nameSpan);
 
         var delBtn = document.createElement('span');
@@ -399,7 +400,7 @@ function populateTemplates(templates) {
         item.appendChild(delBtn);
 
         item.addEventListener('click', function() {
-            selectTemplate(t.name, t.name + ' [' + t.osType + ']');
+            selectTemplate(t.name, t.name + ' [' + (t.osName || t.osType) + ']');
         });
         list.appendChild(item);
     });
@@ -426,11 +427,18 @@ function selectTemplate(value, label) {
     }
     var template = currentTemplates.find(function(t) { return t.name === value; });
     selectedTemplateId = template ? template.id || null : null;
-    var disk = document.getElementById('hdd-size');
-    if (template && template.hddGb) {
-        disk.value = Math.max(Number(disk.value), template.hddGb);
-    }
+    updateDiskMinimum();
     updateCreateButtons();
+}
+
+function updateDiskMinimum() {
+    var minimum = document.getElementById('os-type').value === 'ubuntu2604lts' ? 40 : 64;
+    var template = currentTemplates.find(function(t) { return t.id === selectedTemplateId; });
+    if (template && template.hddGb) minimum = Math.max(minimum, template.hddGb);
+    var disk = document.getElementById('hdd-size');
+    if (Number(disk.value) === Number(disk.min)) disk.value = minimum;
+    disk.min = minimum;
+    if (template) disk.value = Math.max(Number(disk.value), minimum);
 }
 
 function closeTemplateDropdown() {
@@ -540,7 +548,7 @@ document.getElementById('disk-location-overlay').addEventListener('click', funct
 
 function createValidationError(isTemplate) {
     var osType = document.getElementById('os-type').value;
-    if (isTemplate && osType !== 'Windows' && osType !== 'macOS')
+    if (isTemplate && osType !== 'windows11' && osType !== 'macos27')
         return 'Templates require a Windows or macOS guest.';
     if (isTemplate && document.getElementById('template-select').value)
         return 'Select an OS image to build a new template.';
@@ -553,8 +561,8 @@ function createValidationError(isTemplate) {
         return 'Passwords do not match.';
 
     var numericFields = [
-        ['hdd-size', 'Disk size must be a whole number of at least 1 GB.'],
-        ['ram-size', 'RAM must be an even number of at least 512 MB.'],
+        ['hdd-size', 'Disk size must be a whole number of at least ' + document.getElementById('hdd-size').min + ' GB.'],
+        ['ram-size', 'RAM must be an even number of at least 4096 MB.'],
         ['cpu-cores', 'CPU cores must be a whole number of at least 1.']
     ];
     for (var i = 0; i < numericFields.length; i++) {
@@ -568,9 +576,9 @@ function createValidationError(isTemplate) {
     if (diskSpacePending && !diskKnown) return 'Checking disk folder...';
 
     var hasImage = document.getElementById('image-path').value.trim() !== '';
-    var hasTemplate = (osType === 'Windows' || osType === 'macOS') &&
+    var hasTemplate = (osType === 'windows11' || osType === 'macos27') &&
         document.getElementById('template-select').value !== '';
-    if (osType !== 'macOS' && !hasImage && (isTemplate || !hasTemplate))
+    if (osType !== 'macos27' && !hasImage && (isTemplate || !hasTemplate))
         return 'Select an OS image or an available template.';
     return null;
 }
@@ -663,7 +671,7 @@ function gatherConfig() {
     var gpu = selectedGpu('gpu-mode');
     /* Same ISO-picker path for Windows and Linux. The cloud-image
        Linux-version dropdown is dormant (see applyOsTypeUI). */
-    var imagePath = document.getElementById('image-path').value.trim();
+    var imagePath = osType === 'macos27' ? undefined : document.getElementById('image-path').value.trim();
     return {
         name:        document.getElementById('vm-name').value.trim(),
         osType:      osType,
@@ -710,12 +718,12 @@ function clearCreateForm() {
 function validateVmName(name) {
     if (!name) return 'VM name is required.';
     var osSelect = document.getElementById('os-type');
-    var osType = osSelect ? osSelect.value : 'Windows';
-    if (osType === 'macOS') {
+    var osType = osSelect ? osSelect.value : 'windows11';
+    if (osType === 'macos27') {
         if (name.length > 63) return 'VM name cannot exceed 63 characters (macOS LocalHostName limit).';
-    } else if (osType === 'Linux') {
-        if (name.length > 63) return 'VM name cannot exceed 63 characters (Linux hostname limit).';
-        if (/[A-Z]/.test(name)) return 'Linux hostname must be lowercase.';
+    } else if (osType === 'ubuntu2604lts') {
+        if (name.length > 63) return 'VM name cannot exceed 63 characters (Ubuntu hostname limit).';
+        if (/[A-Z]/.test(name)) return 'Ubuntu hostname must be lowercase.';
     } else { /* Windows */
         if (name.length > 15) return 'VM name cannot exceed 15 characters (NetBIOS limit).';
     }
@@ -747,13 +755,13 @@ function validateUsername(name, isTemplate) {
         return 'Username contains invalid Unicode.';
     }
     var osSelect = document.getElementById('os-type');
-    var osType = osSelect ? osSelect.value : 'Windows';
-    if (osType === 'Linux') {
+    var osType = osSelect ? osSelect.value : 'windows11';
+    if (osType === 'ubuntu2604lts') {
         /* Ubuntu 26.04's installer grammar and reserved-usernames list.
            https://github.com/canonical/subiquity/tree/26.04 */
-        if (name.length > 32) return 'Username cannot exceed 32 characters (Linux limit).';
+        if (name.length > 32) return 'Username cannot exceed 32 characters (Ubuntu limit).';
         if (!/^[a-z_][a-z0-9_-]*$/.test(name))
-            return 'Linux username: lowercase letters, digits, _ and - only; start with a letter or _.';
+            return 'Ubuntu username: lowercase letters, digits, _ and - only; start with a letter or _.';
         var linuxReserved = (
             'root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats nobody ' +
             'adm tty disk kmem dialout fax voice cdrom floppy tape sudo audio dip operator src shadow utmp video ' +
@@ -767,7 +775,7 @@ function validateUsername(name, isTemplate) {
         if (linuxReserved.indexOf(name) >= 0) return 'Username is a reserved name.';
         return null;
     }
-    if (osType === 'macOS') {
+    if (osType === 'macos27') {
         if (bytes > 63) return 'Username is too long (max 63 UTF-8 bytes in AppSandbox).';
         if (/\s/.test(name)) return 'Username cannot contain spaces (macOS short account name).';
         if (/[\x00-\x1f\x7f\ufffe\uffff/\\:]/.test(name)) return 'Username contains invalid characters.';
@@ -800,12 +808,12 @@ function validatePassword(pass) {
         return 'Password contains invalid Unicode.';
     }
     var osSelect = document.getElementById('os-type');
-    var osType = osSelect ? osSelect.value : 'Windows';
-    if (osType === 'Linux') {
+    var osType = osSelect ? osSelect.value : 'windows11';
+    if (osType === 'ubuntu2604lts') {
         if (Array.from(pass).length < 6)
             return 'Password must be at least 6 characters (Ubuntu minimum).';
         if (bytes > 255) return 'Password is too long (max 255 bytes).';
-    } else if (osType === 'macOS') {
+    } else if (osType === 'macos27') {
         if (Array.from(pass).length < 4)
             return 'Password must be at least 4 characters (macOS minimum).';
         if (bytes > 127) return 'Password is too long (max 127 UTF-8 bytes in AppSandbox).';
@@ -856,7 +864,7 @@ function openCreateModal() {
     onSshToggle();   /* re-grey "Deploy SSH key" to match the cleared SSH checkbox */
     /* Reset OS type to Windows on each open. Valid on both hosts (a Mac host
        supports Windows via QEMU); the user can switch to macOS on a Mac. */
-    document.getElementById('os-type').value = 'Windows';
+    document.getElementById('os-type').value = 'windows11';
 
     /* Smart defaults (RAM/cores) from latest host info */
     if (lastHostInfo) applySmartDefaults(lastHostInfo);
@@ -976,9 +984,9 @@ function updateStatusCell(td, vm) {
     } else if (vm.running && !vm.installComplete && !vm.isTemplate) {
         needsSpinner = true;
         var defaultLabel;
-        if (vm.osType === 'macOS')      defaultLabel = 'Installing macOS ';
-        else if (vm.osType === 'Linux') defaultLabel = 'Installing Linux ';
-        else                            defaultLabel = 'Installing Windows ';
+        if (vm.osType === 'macos27')      defaultLabel = 'Installing macOS 27 ';
+        else if (vm.osType === 'ubuntu2604lts') defaultLabel = 'Installing Ubuntu 26.04 LTS ';
+        else                            defaultLabel = 'Installing Windows 11 ';
         label = (vm.installStatus && vm.installStatus.length > 0)
             ? (vm.installStatus + ' ')
             : defaultLabel;
@@ -1053,14 +1061,14 @@ function buildRowCells(vm, i, statusTd) {
 
     var cells = [
         makeCell(vm.name),
-        makeCell(vm.osType),
+        makeCell(vm.osName || vm.osType),
         statusTd,
         agentTd,
         makeCell(vm.cpuCores, 'Number of virtual CPU cores assigned to this VM'),
         makeCell(vm.ramMb + ' MB', 'Memory allocated to this VM, in megabytes'),
         makeCell(vm.hddGb + ' GB', 'Virtual disk size, in gigabytes'),
         makeCell(vm.gpuName || (vm.gpuMode === 1 ? 'Default GPU' : 'None'),
-            hostBridge.isMac && vm.osType === 'Windows'
+            hostBridge.isMac && vm.osType === 'windows11'
                 ? 'Windows software rendering (WARP) on the CPU'
                 : 'GPU passed through to the VM via GPU-PV, or None'),
         makeCell(netNames[vm.networkMode] || 'None',
@@ -1141,7 +1149,7 @@ function renderVmTable() {
             vm.running, vm.starting, vm.buildingVhdx, vm.shuttingDown, vm.agentOnline,
             vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort,
-            vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
+            vm.osType, vm.osName, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode,
             selectedSnap.get(vm.id) || 'current',
             /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
@@ -1236,7 +1244,7 @@ function openEditVmModal(idx) {
     editVmState = { id: vm.id, name: vm.name, initial: Object.assign({}, vm), previousFocus: rowCache[vm.id].querySelector('.edit') };
     document.getElementById('edit-vm-title').textContent = 'Edit ' + vm.name;
     document.getElementById('edit-ram-size').value = vm.ramMb;
-    document.getElementById('edit-ram-size').min = hostBridge.isMac ? 512 : 4000;
+    document.getElementById('edit-ram-size').min = 4096;
     document.getElementById('edit-cpu-cores').value = vm.cpuCores;
     setGpuSelection('edit-gpu-mode', vm);
     document.getElementById('edit-net-mode').value = String(vm.networkMode);
@@ -1277,7 +1285,7 @@ function editVmValues() {
 function editVmValidationError(values) {
     if (!Number.isInteger(values.cpuCores) || values.cpuCores < 1 || values.cpuCores > 2147483647)
         return 'CPU cores must be a whole number of at least 1.';
-    var minRam = hostBridge.isMac ? 512 : 4000;
+    var minRam = 4096;
     if (values.ramMb !== editVmState.initial.ramMb &&
         (!Number.isInteger(values.ramMb) || values.ramMb < minRam || values.ramMb > 2147483647))
         return 'RAM must be a whole number of at least ' + minRam + ' MB.';

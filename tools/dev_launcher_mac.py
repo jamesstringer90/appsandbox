@@ -1,11 +1,9 @@
 import ctypes
 import fcntl
-import json
 import os
 from pathlib import Path
 import pwd
 import select
-import shlex
 import socket
 import stat
 import subprocess
@@ -162,11 +160,43 @@ class Host:
     def elevate(self, command):
         if os.geteuid() == 0:
             result = subprocess.run(command, capture_output=True, text=True)
-        else:
-            script = 'do shell script %s with administrator privileges' % json.dumps('exec ' + shlex.join(command), ensure_ascii=False)
-            result = subprocess.run(['/usr/bin/osascript', '-e', script], capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or 'The launcher could not be authorized.')
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or 'The launcher could not be authorized.')
+            return
+
+        class AuthorizationItem(ctypes.Structure):
+            _fields_ = [('name', ctypes.c_char_p), ('valueLength', ctypes.c_size_t),
+                        ('value', ctypes.c_void_p), ('flags', ctypes.c_uint32)]
+
+        class AuthorizationRights(ctypes.Structure):
+            _fields_ = [('count', ctypes.c_uint32), ('items', ctypes.POINTER(AuthorizationItem))]
+
+        security = ctypes.CDLL('/System/Library/Frameworks/Security.framework/Security')
+        security.AuthorizationCreate.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+                                                 ctypes.POINTER(ctypes.c_void_p)]
+        security.AuthorizationCopyRights.argtypes = [ctypes.c_void_p, ctypes.POINTER(AuthorizationRights),
+                                                     ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+        security.AuthorizationExecuteWithPrivileges.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
+                                                               ctypes.POINTER(ctypes.c_char_p), ctypes.c_void_p]
+        security.AuthorizationFree.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        authorization = ctypes.c_void_p()
+        interaction_allowed, extend_rights = 1, 2
+        status = security.AuthorizationCreate(None, None, 0, ctypes.byref(authorization))
+        try:
+            if status == 0:
+                item = AuthorizationItem(b'system.privilege.admin', 0, None, 0)
+                rights = AuthorizationRights(1, ctypes.pointer(item))
+                status = security.AuthorizationCopyRights(authorization, ctypes.byref(rights), None,
+                                                          interaction_allowed | extend_rights, None)
+            if status == 0:
+                arguments = (ctypes.c_char_p * len(command))(*(os.fsencode(arg) for arg in command[1:]), None)
+                status = security.AuthorizationExecuteWithPrivileges(authorization, os.fsencode(command[0]),
+                                                                    0, arguments, None)
+        finally:
+            if authorization:
+                security.AuthorizationFree(authorization, 0)
+        if status:
+            raise RuntimeError('The launcher could not be authorized (Authorization error %d).' % status)
 
     def detach(self, identity):
         if os.fork():
