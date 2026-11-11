@@ -1413,7 +1413,7 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     }
     if (source && hdd_gb == 0) hdd_gb = source->hdd_gb;
     if (source && hdd_gb < source->hdd_gb) {
-        post_alert(0, "The instance disk cannot be smaller than the template disk.");
+        post_alert(0, "This template requires a disk size of at least %d GB.", source->hdd_gb);
         return BACKEND_ERR_INVALID_ARG;
     }
     NSString *username = admin_user ? [NSString stringWithUTF8String:admin_user] : nil;

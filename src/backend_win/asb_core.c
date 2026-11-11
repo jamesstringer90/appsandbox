@@ -3194,8 +3194,12 @@ static const wchar_t *validate_template_capacity(int index,DWORD hdd_gb)
                     hr, g_templates[index].vhdx_path);
             return L"Cannot read the selected template's virtual disk size.";
         }
-        if (hdd_gb && (ULONGLONG)hdd_gb * 1024ULL * 1024ULL * 1024ULL < parent_bytes)
-            return L"HDD size cannot be smaller than the template's virtual disk size.";
+        if (hdd_gb && (ULONGLONG)hdd_gb * 1024ULL * 1024ULL * 1024ULL < parent_bytes) {
+            static __declspec(thread) wchar_t error[128];
+            ULONGLONG required_gb=(parent_bytes+((1ULL<<30)-1))>>30;
+            swprintf_s(error,ARRAYSIZE(error),L"This template requires a disk size of at least %llu GB.",required_gb);
+            return error;
+        }
         return NULL;
     }
     return L"The selected template was not found.";
