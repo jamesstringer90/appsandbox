@@ -749,11 +749,11 @@ static DWORD ssh_operation(const AsbHeadlessTarget *target,const wchar_t *operat
                 char *text=utf8(value);
                 if (!text) error=ERROR_INVALID_PARAMETER;
                 else { bytes=(BYTE *)text;size=(DWORD)strlen(text); }
-            } else if (!CryptStringToBinaryW(value,0,CRYPT_STRING_BASE64|CRYPT_STRING_STRICT,NULL,&size,NULL,NULL) || size>65536) error=ERROR_INVALID_PARAMETER;
+            } else if (value[0] && (!CryptStringToBinaryW(value,0,CRYPT_STRING_BASE64|CRYPT_STRING_STRICT,NULL,&size,NULL,NULL) || size>65536)) error=ERROR_INVALID_PARAMETER;
             else {
                 bytes=malloc(size?size:1);
                 if (!bytes) error=ERROR_NOT_ENOUGH_MEMORY;
-                else if (!CryptStringToBinaryW(value,0,CRYPT_STRING_BASE64|CRYPT_STRING_STRICT,bytes,&size,NULL,NULL)) error=ERROR_INVALID_PARAMETER;
+                else if (size && !CryptStringToBinaryW(value,0,CRYPT_STRING_BASE64|CRYPT_STRING_STRICT,bytes,&size,NULL,NULL)) error=ERROR_INVALID_PARAMETER;
             }
         }
         if (!error) error=asb_ssh_write(target->id,session,bytes,size,close_stdin);
