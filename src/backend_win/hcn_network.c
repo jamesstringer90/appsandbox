@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <objbase.h>
 #include <iphlpapi.h>
+#include <netioapi.h>
+#include <ws2tcpip.h>
 
 #pragma comment(lib, "iphlpapi.lib")
 
@@ -166,6 +168,132 @@ static BOOL get_default_adapter_name(wchar_t *out, size_t out_len)
     }
 
     HeapFree(GetProcessHeap(), 0, addrs);
+    return FALSE;
+}
+
+typedef struct {
+    wchar_t ipv4[512];
+    wchar_t ipv6[512];
+} ExternalDnsServers;
+
+/* Preserve the selected NIC's resolvers when HCN creates the host-side
+   vEthernet adapter for a Transparent network. */
+static BOOL hcn_capture_adapter_dns(const wchar_t *adapter_name, ExternalDnsServers *dns)
+{
+    ULONG size = 15000;
+    PIP_ADAPTER_ADDRESSES addrs, adapter;
+    DWORD ret;
+    PIP_ADAPTER_DNS_SERVER_ADDRESS server;
+
+    ZeroMemory(dns, sizeof(*dns));
+    addrs = (PIP_ADAPTER_ADDRESSES)HeapAlloc(GetProcessHeap(), 0, size);
+    if (!addrs) return FALSE;
+    ret = GetAdaptersAddresses(AF_UNSPEC,
+        GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+        NULL, addrs, &size);
+    if (ret == ERROR_BUFFER_OVERFLOW) {
+        HeapFree(GetProcessHeap(), 0, addrs);
+        addrs = (PIP_ADAPTER_ADDRESSES)HeapAlloc(GetProcessHeap(), 0, size);
+        if (!addrs) return FALSE;
+        ret = GetAdaptersAddresses(AF_UNSPEC,
+            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+            NULL, addrs, &size);
+    }
+    if (ret != NO_ERROR) {
+        HeapFree(GetProcessHeap(), 0, addrs);
+        return FALSE;
+    }
+
+    for (adapter = addrs; adapter; adapter = adapter->Next) {
+        if (_wcsicmp(adapter->FriendlyName, adapter_name) != 0) continue;
+        for (server = adapter->FirstDnsServerAddress; server; server = server->Next) {
+            wchar_t address[INET6_ADDRSTRLEN];
+            wchar_t *list = NULL;
+            size_t list_size = 0;
+            if (!server->Address.lpSockaddr) continue;
+            if (server->Address.lpSockaddr->sa_family == AF_INET) {
+                list = dns->ipv4; list_size = ARRAYSIZE(dns->ipv4);
+                if (!InetNtopW(AF_INET,
+                        &((SOCKADDR_IN *)server->Address.lpSockaddr)->sin_addr,
+                        address, ARRAYSIZE(address))) continue;
+            } else if (server->Address.lpSockaddr->sa_family == AF_INET6) {
+                list = dns->ipv6; list_size = ARRAYSIZE(dns->ipv6);
+                if (!InetNtopW(AF_INET6,
+                        &((SOCKADDR_IN6 *)server->Address.lpSockaddr)->sin6_addr,
+                        address, ARRAYSIZE(address))) continue;
+            } else {
+                continue;
+            }
+            if (list[0]) wcscat_s(list, list_size, L",");
+            wcscat_s(list, list_size, address);
+        }
+        break;
+    }
+    HeapFree(GetProcessHeap(), 0, addrs);
+    return dns->ipv4[0] || dns->ipv6[0];
+}
+
+static BOOL hcn_apply_dns_to_host_vnic(const wchar_t *adapter_name,
+                                       const ExternalDnsServers *dns)
+{
+    wchar_t vnic_name[320];
+    ULONG attempt;
+
+    if (!dns->ipv4[0] && !dns->ipv6[0]) return FALSE;
+    swprintf_s(vnic_name, ARRAYSIZE(vnic_name), L"vEthernet (%s)", adapter_name);
+
+    /* HCN creates the host-side adapter shortly after the network. */
+    for (attempt = 0; attempt < 50; attempt++) {
+        ULONG size = 15000;
+        PIP_ADAPTER_ADDRESSES addrs, adapter;
+        DWORD ret;
+        addrs = (PIP_ADAPTER_ADDRESSES)HeapAlloc(GetProcessHeap(), 0, size);
+        if (!addrs) return FALSE;
+        ret = GetAdaptersAddresses(AF_UNSPEC,
+            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+            NULL, addrs, &size);
+        if (ret == ERROR_BUFFER_OVERFLOW) {
+            HeapFree(GetProcessHeap(), 0, addrs);
+            addrs = (PIP_ADAPTER_ADDRESSES)HeapAlloc(GetProcessHeap(), 0, size);
+            if (!addrs) return FALSE;
+            ret = GetAdaptersAddresses(AF_UNSPEC,
+                GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+                NULL, addrs, &size);
+        }
+        if (ret == NO_ERROR) {
+            for (adapter = addrs; adapter; adapter = adapter->Next) {
+                if (_wcsicmp(adapter->FriendlyName, vnic_name) == 0) {
+                    GUID interface_guid;
+                    DNS_INTERFACE_SETTINGS settings;
+                    BOOL ok = TRUE;
+                    if (ConvertInterfaceLuidToGuid(&adapter->Luid, &interface_guid) != NO_ERROR) {
+                        HeapFree(GetProcessHeap(), 0, addrs);
+                        return FALSE;
+                    }
+                    if (dns->ipv4[0]) {
+                        ZeroMemory(&settings, sizeof(settings));
+                        settings.Version = DNS_INTERFACE_SETTINGS_VERSION1;
+                        settings.Flags = DNS_SETTING_NAMESERVER;
+                        settings.NameServer = (PWSTR)dns->ipv4;
+                        if (SetInterfaceDnsSettings(interface_guid, &settings) != NO_ERROR)
+                            ok = FALSE;
+                    }
+                    if (dns->ipv6[0]) {
+                        ZeroMemory(&settings, sizeof(settings));
+                        settings.Version = DNS_INTERFACE_SETTINGS_VERSION1;
+                        settings.Flags = DNS_SETTING_NAMESERVER | DNS_SETTING_IPV6;
+                        settings.NameServer = (PWSTR)dns->ipv6;
+                        if (SetInterfaceDnsSettings(interface_guid, &settings) != NO_ERROR)
+                            ok = FALSE;
+                    }
+                    HeapFree(GetProcessHeap(), 0, addrs);
+                    return ok;
+                }
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, addrs);
+        Sleep(100);
+    }
     return FALSE;
 }
 
@@ -407,6 +535,8 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
     void *network = NULL;
     PWSTR error_record = NULL;
     HRESULT hr;
+    ExternalDnsServers host_dns;
+    BOOL have_host_dns;
 
     if (!g_hcn_dll || !pfnCreateNet)
         return E_NOT_VALID_STATE;
@@ -431,6 +561,7 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
         }
     }
 
+    have_host_dns = hcn_capture_adapter_dns(adapter, &host_dns);
     swprintf_s(settings, 2048,
         L"{"
         L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
@@ -440,6 +571,12 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
         L"}", adapter);
 
     hr = pfnCreateNet(network_id, settings, &network, &error_record);
+    if (SUCCEEDED(hr) && have_host_dns) {
+        if (hcn_apply_dns_to_host_vnic(adapter, &host_dns))
+            ui_log(L"Preserved host DNS on vEthernet (%s).", adapter);
+        else
+            ui_log(L"Warning: could not preserve host DNS on vEthernet (%s).", adapter);
+    }
 
     if (error_record) {
         if (FAILED(hr)) ui_log(L"HCN External error: %s", error_record);
