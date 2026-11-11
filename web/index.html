@@ -70,9 +70,9 @@
             <label for="os-type">OS Type:</label>
             <div class="form-row">
                 <select id="os-type" onchange="applyOsTypeUI()">
-                    <option value="Windows" selected>Windows</option>
-                    <option value="Linux">Linux</option>
-                    <option value="macOS">macOS</option>
+                    <option value="windows11" selected>Windows 11</option>
+                    <option value="ubuntu2604lts">Ubuntu 26.04 LTS</option>
+                    <option value="macos27">macOS 27</option>
                 </select>
             </div>
 
@@ -82,10 +82,11 @@
                 <span class="field-warn" id="vm-name-warn"></span>
             </div>
 
-            <label class="needs-iso">OS Image:</label>
-            <div class="image-row needs-iso">
-                <input type="text" id="image-path" placeholder="Path to ISO..." autocorrect="off" autocapitalize="off" spellcheck="false">
-                <button id="btn-browse" onclick="sendCmd('browseImage')">Browse...</button>
+            <label>OS Image:</label>
+            <div class="image-row">
+                <span id="macos-image-source" style="display:none">Automatic download</span>
+                <input type="text" id="image-path" class="needs-iso" placeholder="Path to ISO..." autocorrect="off" autocapitalize="off" spellcheck="false">
+                <button id="btn-browse" class="needs-iso" onclick="sendCmd('browseImage')">Browse...</button>
                 <span class="or-separator templates-supported">OR</span>
                 <label class="templates-supported" style="text-align:left">Template:</label>
                 <div class="template-dropdown templates-supported" id="template-dropdown">
@@ -105,14 +106,14 @@
 
             <label for="hdd-size">HDD Size:</label>
             <div class="form-row">
-                <input type="number" id="hdd-size" value="64" min="1" class="input-sm"> GB
+                <input type="number" id="hdd-size" value="64" min="64" class="input-sm"> GB
                 <button id="btn-disk-location" class="disk-location-btn" aria-haspopup="dialog" title="HDD Location" onclick="openDiskLocationModal()">HDD location...</button>
                 <span class="host-info" id="host-hdd"></span>
             </div>
 
             <label for="ram-size">RAM Size:</label>
             <div class="form-row">
-                <input type="number" id="ram-size" value="16384" min="512" step="2" class="input-sm"> MB
+                <input type="number" id="ram-size" value="12288" min="4096" step="2" class="input-sm"> MB
                 <span class="host-info" id="host-ram"></span>
             </div>
 
@@ -201,7 +202,7 @@
             <div class="form-grid">
                 <label for="edit-ram-size">RAM Size:</label>
                 <div class="form-row">
-                    <input type="number" id="edit-ram-size" min="512" step="2" class="input-sm" aria-describedby="edit-vm-warn"> MB
+                    <input type="number" id="edit-ram-size" min="4096" step="2" class="input-sm" aria-describedby="edit-vm-warn"> MB
                     <span class="host-info" id="edit-host-ram"></span>
                 </div>
 

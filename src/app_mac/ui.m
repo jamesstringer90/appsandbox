@@ -16,6 +16,7 @@
 
 #include "asb_types.h"
 #include "asb_events.h"
+#include "api_contract.h"
 #include "headless.h"
 
 #pragma mark - Static state
@@ -222,6 +223,8 @@ static AsbVmId vmIdForMessage(NSDictionary *msg) {
 static void handleCreateVm(NSDictionary *msg) {
     NSString *name      = msg[@"name"];
     NSString *osType    = msg[@"osType"] ?: @"macOS";
+    const AsbApiGuestOs *guest=asb_api_guest_os_utf8(osType.UTF8String);
+    if (guest) osType=@(guest->backend_utf8);
     NSString *image     = msg[@"imagePath"];
     NSString *diskDirectory = msg[@"diskDirectory"] ?: @"";
     NSString *adminUser = msg[@"adminUser"];

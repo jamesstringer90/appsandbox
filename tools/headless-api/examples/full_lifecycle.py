@@ -13,9 +13,9 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import asb
 
-OS_TYPE = "Windows" if (len(sys.argv) > 1 and sys.argv[1].lower().startswith("win")) else "Linux"
+OS_TYPE = "windows11" if (len(sys.argv) > 1 and sys.argv[1].lower().startswith("win")) else "ubuntu2604lts"
 NAME = "demo-vm"
-ISO = (r"C:\ISOs\ubuntu-24.04.iso" if OS_TYPE == "Linux"
+ISO = (r"C:\ISOs\ubuntu-26.04.iso" if OS_TYPE == "ubuntu2604lts"
        else r"C:\ISOs\Win11_24H2.iso")   # <-- edit to a real ISO path
 
 c = asb.connect()
@@ -26,7 +26,7 @@ if NAME in {v["name"] for v in c.list()}:
 
 # --- create: validated exactly like the GUI; async + auto-starts ---
 code, body = c.create(name=NAME, osType=OS_TYPE, imagePath=ISO,
-                      ramMb=4096, hddGb=24, cpuCores=2,
+                      ramMb=4096, hddGb=40 if OS_TYPE == "ubuntu2604lts" else 64, cpuCores=2,
                       gpuMode=1, networkMode=1,        # 1 = paravirtual GPU, NAT
                       adminUser="user", adminPass="test123",
                       testMode=True, sshEnabled=False)

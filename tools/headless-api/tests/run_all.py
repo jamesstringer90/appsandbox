@@ -42,23 +42,23 @@ if IS_MAC:
         os.rename(CACHED_IPSW, ORIG_IPSW)
         print("IPSW: moved cached restore.ipsw aside -> brk-mac1 will download fresh")
     SPECS = [
-        {"name": "brk-mac1", "os_type": "macOS", "ram": 4096, "hdd": 64, "cores": 2,
+        {"name": "brk-mac1", "os_type": "macos27", "ram": 4096, "hdd": 64, "cores": 2,
          "image": ""},   # imageless -> daemon fetches the latest IPSW (download test)
-        {"name": "brk-mac2", "os_type": "macOS", "ram": 4096, "hdd": 64, "cores": 2,
+        {"name": "brk-mac2", "os_type": "macos27", "ram": 4096, "hdd": 64, "cores": 2,
          # concurrent installer; if there was no original cache to install
          # from, gate on brk-mac1's REPORTED download progress (the daemon
          # streams it in installStatus) rather than racing the shared fetch.
          "image": ORIG_IPSW if os.path.exists(ORIG_IPSW) else "",
          "await_download_of": None if os.path.exists(ORIG_IPSW) else "brk-mac1"},
-        {"name": "brk-win1", "os_type": "Windows", "ram": 4096, "hdd": 64, "cores": 2,
+        {"name": "brk-win1", "os_type": "windows11", "ram": 4096, "hdd": 64, "cores": 2,
          # Windows-on-Mac: QEMU+HVF+ivshmem disk build from the ISO, runs CONCURRENTLY
          # with the two macOS guests. Image via ASB_ISO_WINDOWS (helpers.ISO_WIN).
          "image": helpers.ISO_WIN},
     ]
 else:
     SPECS = [
-        {"name": "brk-lin", "os_type": "Linux",   "ram": 4096, "hdd": 64, "cores": 2},
-        {"name": "brk-win", "os_type": "Windows", "ram": 4096, "hdd": 64, "cores": 2},
+        {"name": "brk-lin", "os_type": "ubuntu2604lts",   "ram": 4096, "hdd": 64, "cores": 2},
+        {"name": "brk-win", "os_type": "windows11", "ram": 4096, "hdd": 64, "cores": 2},
     ]
 RUN_STATIC = True
 RUN_TEMPLATE = not IS_MAC   # template create -> sysprep -> from-template (Windows-only)

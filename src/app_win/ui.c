@@ -8,6 +8,7 @@
 #include "ui.h"
 #include "asb_core.h"
 #include "asb_events.h"
+#include "api_contract.h"
 #include "headless.h"
 #include "resource.h"
 #include "hcs_vm.h"
@@ -325,7 +326,8 @@ static void build_vm_json(JsonBuilder *jb, int i)
     asb_resource_id_format_w(v->unique_id,v->is_template,id);
     jb_string(jb, L"id", id);
     jb_string(jb, L"name", v->name);
-    jb_string(jb, L"osType", v->os_type);
+    jb_string(jb, L"osType", asb_api_guest_os_type(v->os_type));
+    jb_string(jb, L"osName", asb_api_guest_os_name(v->os_type));
     asb_vm_disk_directory(asb_vm_get(i), disk_directory, MAX_PATH);
     jb_string(jb, L"diskDirectory", disk_directory);
     jb_bool(jb, L"running", v->running);
@@ -558,7 +560,9 @@ static void send_templates(void)
         asb_template_id_format_w(asb_template_id(i),template_id);
         jb_string(&jb,L"id",template_id);
         jb_string(&jb, L"name", asb_template_name(i));
-        jb_string(&jb, L"osType", asb_template_os_type(i));
+        jb_string(&jb, L"osType", asb_api_guest_os_type(asb_template_os_type(i)));
+        jb_string(&jb, L"osName", asb_api_guest_os_name(asb_template_os_type(i)));
+        jb_int(&jb, L"hddGb", (int)asb_template_hdd_gb(i));
         jb_object_end(&jb);
     }
     jb_array_end(&jb);
@@ -636,7 +640,9 @@ static void send_full_state(void)
             asb_template_id_format_w(asb_template_id(i),template_id);
             jb_string(&jb,L"id",template_id);
             jb_string(&jb, L"name", asb_template_name(i));
-            jb_string(&jb, L"osType", asb_template_os_type(i));
+            jb_string(&jb, L"osType", asb_api_guest_os_type(asb_template_os_type(i)));
+            jb_string(&jb, L"osName", asb_api_guest_os_name(asb_template_os_type(i)));
+            jb_int(&jb, L"hddGb", (int)asb_template_hdd_gb(i));
             jb_object_end(&jb);
         }
         jb_array_end(&jb);
@@ -1123,6 +1129,8 @@ static void handle_webview2_message(const wchar_t *json)
 
         json_get_string(json, L"name", name_buf, 256);
         json_get_string(json, L"osType", os_buf, 32);
+        const AsbApiGuestOs *guest=asb_api_guest_os(os_buf);
+        if (guest) wcscpy_s(os_buf,ARRAYSIZE(os_buf),guest->backend);
         json_get_string(json, L"imagePath", img_buf, MAX_PATH);
         json_get_string(json, L"templateName", tpl_buf, 256);
         if (!json_get_string(json, L"adminUser", user_buf, ARRAYSIZE(user_buf))) {

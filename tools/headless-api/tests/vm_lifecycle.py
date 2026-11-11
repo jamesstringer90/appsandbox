@@ -32,20 +32,20 @@ import helpers
 
 def run_vm_lifecycle(spec):
     name = spec["name"]
-    os_type = spec.get("os_type", "Linux")
+    os_type = spec.get("os_type", "ubuntu2604lts")
     ram = spec.get("ram", 4096)
-    hdd = spec.get("hdd", 24)
+    hdd = spec.get("hdd", 40 if os_type == "ubuntu2604lts" else 64)
     cores = spec.get("cores", 2)
     image = spec.get("image")            # explicit per-spec override (may be "")
     if image is None:
-        if os_type == "Linux":
+        if os_type == "ubuntu2604lts":
             image = helpers.ISO_LIN
-        elif os_type == "Windows":
+        elif os_type == "windows11":
             image = helpers.ISO_WIN
         else:                            # macOS: IPSW; "" = cached/auto-fetched
             image = helpers.IPSW_MAC
-    ONLINE_T = 600 if os_type == "Linux" else 1800   # boot-to-online budget
-    GRACE_T  = 240 if os_type == "Linux" else 600    # graceful-shutdown budget
+    ONLINE_T = 600 if os_type == "ubuntu2604lts" else 1800   # boot-to-online budget
+    GRACE_T  = 240 if os_type == "ubuntu2604lts" else 600    # graceful-shutdown budget
     # The build/install/download phase is stall-based -- it fails only after
     # BUILD_STALL seconds of zero observable movement, however long a healthy
     # download/install takes. EXCEPTION: a Windows guest's first boot (OOBE +
@@ -55,7 +55,7 @@ def run_vm_lifecycle(spec):
     # signal-less window. It can run 10+ minutes (longer under concurrent
     # multi-VM load), so give Windows a real budget; Linux/macOS stream live
     # progress and keep the tight 600 s stall.
-    BUILD_STALL = 3600 if os_type == "Windows" else 600
+    BUILD_STALL = 3600 if os_type == "windows11" else 600
 
     c = asb.connect()
     caps = c.version().get("capabilities", {})
@@ -182,7 +182,7 @@ def run_vm_lifecycle(spec):
         while time.time() < deadline and not c.display_ready(name):
             time.sleep(2)
         ready = c.display_ready(name)
-        if not ready and os_type == "Linux":
+        if not ready and os_type == "ubuntu2604lts":
             print("  SKIP  [%s] display open/close -- Linux guest readiness needs the pushed agent" % name, flush=True)
         else:
             check("display ready when online", ready, "display_status=%s" % c.display_status(name))

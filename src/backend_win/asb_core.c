@@ -3365,6 +3365,11 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     }
 
     AsbVmConfig selected=*config;
+    const AsbApiGuestOs *guest=asb_api_guest_os(selected.os_type);
+    if (!guest) return E_INVALIDARG;
+    if (!wcscmp(guest->backend,L"macOS")) return E_NOTIMPL;
+    selected.os_type=guest->backend;
+    config=&selected;
     if (!selected.template_id && selected.template_name && selected.template_name[0]) {
         selected.template_id=asb_template_id_by_name(selected.template_name);
         if (!selected.template_id) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
@@ -3375,7 +3380,6 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
         int index=asb_template_index_by_id(selected.template_id);
         if (index<0) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
         selected.template_name=g_templates[index].name;
-        config=&selected;
     }
 
     effective_os = config->os_type;
@@ -3436,9 +3440,22 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     cfg.is_template = is_template_create;
 
     /* Defaults */
-    if (cfg.hdd_gb == 0) cfg.hdd_gb = from_template?asb_template_hdd_gb(template_idx):ASB_API_DEFAULT_HDD_GB;
+    DWORD minimum_hdd=_wcsicmp(cfg.os_type,L"Linux")==0?ASB_API_MIN_LINUX_HDD_GB:ASB_API_MIN_HDD_GB;
+    if (cfg.hdd_gb == 0) cfg.hdd_gb = from_template?asb_template_hdd_gb(template_idx):minimum_hdd;
     if (!cfg.hdd_gb) return E_FAIL;
-    if (cfg.ram_mb == 0) cfg.ram_mb = ASB_API_DEFAULT_RAM_MB;
+    if (!config->hdd_gb && cfg.hdd_gb<minimum_hdd) cfg.hdd_gb=minimum_hdd;
+    if (cfg.ram_mb == 0) {
+        MEMORYSTATUSEX memory={0};memory.dwLength=sizeof(memory);
+        if (!GlobalMemoryStatusEx(&memory)) return HRESULT_FROM_WIN32(GetLastError());
+        cfg.ram_mb=asb_api_default_ram_mb(memory.ullTotalPhys/(1024ULL*1024ULL));
+    }
+    const char *resource_error=asb_api_validate_ram_mb((int)cfg.ram_mb);
+    if (!resource_error) resource_error=asb_api_validate_hdd_gb((int)cfg.hdd_gb,_wcsicmp(cfg.os_type,L"Linux")==0);
+    if (resource_error) {
+        asb_log(L"Error: %S",resource_error);
+        asb_alert(L"%S",resource_error);
+        return E_INVALIDARG;
+    }
     if (cfg.cpu_cores == 0) cfg.cpu_cores = ASB_API_DEFAULT_CPU_CORES;
 
     /* Linux defaults: respect the UI's gpu_mode (GPU-PV works via
@@ -4324,7 +4341,7 @@ ASB_API HRESULT asb_vm_set_ram(AsbVm vm, DWORD ram_mb)
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     if (VM_AT(idx).running || VM_AT(idx).building_vhdx || VM_AT(idx).starting) return E_ACCESSDENIED;
-    if (ram_mb < 512 || ram_mb%2) return E_INVALIDARG;
+    if (asb_api_validate_ram_mb((int)ram_mb)) return E_INVALIDARG;
     VM_AT(idx).ram_mb = ram_mb;
     save_vm_list();
     notify_state(vm, VM_AT(idx).running, g_state_ud);

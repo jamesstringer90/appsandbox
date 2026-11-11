@@ -22,10 +22,87 @@ uint32_t asb_api_perform_input(const AsbApiInputAction *,int,void *,const AsbApi
 
 #define ASB_API_BODY_MAX 65535
 #define ASB_API_DEFAULT_PORT 51152
-#define ASB_API_DEFAULT_RAM_MB 4096
+#define ASB_API_MIN_RAM_MB 4096
+#define ASB_API_DEFAULT_RAM_MAX_MB 12288
+#define ASB_API_MIN_HDD_GB 64
+#define ASB_API_MIN_LINUX_HDD_GB 40
 #define ASB_API_DEFAULT_HDD_GB 64
 #define ASB_API_DEFAULT_CPU_CORES 4
 #define ASB_API_DEFAULT_NETWORK_MODE 1
+
+static inline unsigned asb_api_default_ram_mb(uint64_t host_ram_mb)
+{
+    uint64_t ram=host_ram_mb/2;
+    if (ram>ASB_API_DEFAULT_RAM_MAX_MB) ram=ASB_API_DEFAULT_RAM_MAX_MB;
+    if (ram<ASB_API_MIN_RAM_MB) ram=ASB_API_MIN_RAM_MB;
+    return (unsigned)(ram-ram%2);
+}
+
+static inline const char *asb_api_validate_ram_mb(int ram_mb)
+{
+    if (ram_mb<ASB_API_MIN_RAM_MB) return "RAM must be at least 4096 MB.";
+    if (ram_mb%2) return "RAM must be 2 MB-aligned (an even number of MB).";
+    return NULL;
+}
+
+static inline const char *asb_api_validate_hdd_gb(int hdd_gb,int linux_guest)
+{
+    if (linux_guest) return hdd_gb<ASB_API_MIN_LINUX_HDD_GB?"Disk size must be at least 40 GB.":NULL;
+    return hdd_gb<ASB_API_MIN_HDD_GB?"Disk size must be at least 64 GB.":NULL;
+}
+
+typedef struct {
+    const wchar_t *id,*backend,*name;
+    const char *backend_utf8;
+} AsbApiGuestOs;
+
+static inline const AsbApiGuestOs *asb_api_guest_os(const wchar_t *os_type)
+{
+    static const AsbApiGuestOs types[]={
+        {L"windows11",L"Windows",L"Windows 11","Windows"},
+        {L"ubuntu2604lts",L"Linux",L"Ubuntu 26.04 LTS","Linux"},
+        {L"macos27",L"macOS",L"macOS 27","macOS"}
+    };
+    if (!os_type) return NULL;
+    for (unsigned i=0;i<sizeof(types)/sizeof(*types);++i) {
+        const wchar_t *aliases[]={types[i].id,types[i].backend};
+        for (unsigned j=0;j<2;++j) {
+            const wchar_t *a=os_type,*b=aliases[j];
+            for (;;) {
+                wchar_t left=*a++,right=*b++;
+                if (left>=L'A' && left<=L'Z') left+=L'a'-L'A';
+                if (right>=L'A' && right<=L'Z') right+=L'a'-L'A';
+                if (left!=right) break;
+                if (!left) return &types[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+static inline const AsbApiGuestOs *asb_api_guest_os_utf8(const char *os_type)
+{
+    wchar_t wide[32];unsigned i=0;
+    if (!os_type) return NULL;
+    for (;i<31 && os_type[i];++i) {
+        if ((unsigned char)os_type[i]>127) return NULL;
+        wide[i]=(unsigned char)os_type[i];
+    }
+    if (os_type[i]) return NULL;
+    wide[i]=0;return asb_api_guest_os(wide);
+}
+
+static inline const wchar_t *asb_api_guest_os_type(const wchar_t *os_type)
+{
+    const AsbApiGuestOs *guest=asb_api_guest_os(os_type);
+    return guest?guest->id:os_type;
+}
+
+static inline const wchar_t *asb_api_guest_os_name(const wchar_t *os_type)
+{
+    const AsbApiGuestOs *guest=asb_api_guest_os(os_type);
+    return guest?guest->name:os_type;
+}
 
 int asb_api_validate_body(const wchar_t *body);
 void asb_api_log_endpoints(unsigned port);

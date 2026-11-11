@@ -263,7 +263,9 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos += sprintf_s(out + pos, cap - pos, "{\"id\":\"%s\",\"name\":", id);
     pos  = append_wstr(out, cap, pos, v->name);
     pos += sprintf_s(out + pos, cap - pos, ",\"osType\":");
-    pos  = append_wstr(out, cap, pos, v->os_type);
+    pos  = append_wstr(out, cap, pos, asb_api_guest_os_type(v->os_type));
+    pos += sprintf_s(out + pos, cap - pos, ",\"osName\":");
+    pos  = append_wstr(out, cap, pos, asb_api_guest_os_name(v->os_type));
     asb_vm_disk_directory((AsbVm)v, disk_directory, MAX_PATH);
     pos += sprintf_s(out + pos, cap - pos, ",\"diskDirectory\":");
     pos = append_wstr(out, cap, pos, disk_directory);
@@ -297,7 +299,9 @@ static int append_template_json(char *out,int cap,int pos,AsbTemplateId id)
     pos+=sprintf_s(out+pos,cap-pos,"{\"id\":\"%s\",\"name\":",text);
     pos=append_wstr(out,cap,pos,index>=0?asb_template_name(index):builder->name);
     pos+=sprintf_s(out+pos,cap-pos,",\"osType\":");
-    pos=append_wstr(out,cap,pos,index>=0?asb_template_os_type(index):builder->os_type);
+    pos=append_wstr(out,cap,pos,asb_api_guest_os_type(index>=0?asb_template_os_type(index):builder->os_type));
+    pos+=sprintf_s(out+pos,cap-pos,",\"osName\":");
+    pos=append_wstr(out,cap,pos,asb_api_guest_os_name(index>=0?asb_template_os_type(index):builder->os_type));
     pos+=sprintf_s(out+pos,cap-pos,",\"hddGb\":%lu,\"ready\":%s,\"state\":\"%s\",\"building\":%s,\"progress\":%d}",
         index>=0?asb_template_hdd_gb(index):builder->hdd_gb,index>=0?"true":"false",
         index>=0?"ready":"building",index>=0?"false":"true",index>=0?100:builder->vhdx_progress);
@@ -924,12 +928,13 @@ static void headless_execute(const AsbHeadlessTarget *target,const wchar_t *oper
         if (!error) {
             char *image=NULL;error=png(&capture,&image);
             if (!error) {
-                char id[ASB_VM_ID_TEXT_SIZE],meta[1024],name[1024],os[128];
+                char id[ASB_VM_ID_TEXT_SIZE],meta[1024],name[1024],os[128],os_name[128];
                 asb_vm_id_format(target->id,id);
                 WideCharToMultiByte(CP_UTF8,0,target->name,-1,name,sizeof(name),NULL,NULL);
-                WideCharToMultiByte(CP_UTF8,0,target->os_type,-1,os,sizeof(os),NULL,NULL);
-                sprintf_s(meta,sizeof(meta),"{\"vmId\":\"%s\",\"vm\":\"%s\",\"osType\":\"%s\",\"width\":%u,\"height\":%u,\"stride\":%u,\"frameSeq\":%llu,\"gpuSharingActive\":%s,\"elapsedMs\":%llu}",
-                    id,name,os,capture.header.width,capture.header.height,capture.header.stride,capture.header.frame_seq,capture.header.flags&ASB_SCREENSHOT_GPU_SHARED?"true":"false",GetTickCount64()-start);
+                WideCharToMultiByte(CP_UTF8,0,asb_api_guest_os_type(target->os_type),-1,os,sizeof(os),NULL,NULL);
+                WideCharToMultiByte(CP_UTF8,0,asb_api_guest_os_name(target->os_type),-1,os_name,sizeof(os_name),NULL,NULL);
+                sprintf_s(meta,sizeof(meta),"{\"vmId\":\"%s\",\"vm\":\"%s\",\"osType\":\"%s\",\"osName\":\"%s\",\"width\":%u,\"height\":%u,\"stride\":%u,\"frameSeq\":%llu,\"gpuSharingActive\":%s,\"elapsedMs\":%llu}",
+                    id,name,os,os_name,capture.header.width,capture.header.height,capture.header.stride,capture.header.frame_seq,capture.header.flags&ASB_SCREENSHOT_GPU_SHARED?"true":"false",GetTickCount64()-start);
                 size_t size=strlen(image)+strlen(meta)+100;
                 result->json=malloc(size);
                 if (!result->json) error=ERROR_NOT_ENOUGH_MEMORY;
@@ -1157,7 +1162,7 @@ static const char *validate_create(const wchar_t *name, const wchar_t *os,
 
     is_linux = (_wcsicmp(os, L"Linux") == 0);
     is_win   = (_wcsicmp(os, L"Windows") == 0);
-    if (!is_linux && !is_win) return "Only Windows and Linux guests are supported on a Windows host.";
+    if (!is_linux && !is_win) return "Only Windows 11 and Ubuntu 26.04 LTS guests are supported on a Windows host.";
     from_template = (tpl && tpl[0] != L'\0');
 
     /* name / hostname */
@@ -1189,13 +1194,9 @@ static const char *validate_create(const wchar_t *name, const wchar_t *os,
     if (is_template && from_template)        return "Cannot create a template from another template.";
     if (is_template && !is_win)              return "Templates are only supported for Windows.";
 
-    /* numeric ranges (HTML: ram>=512 step2, hdd>=1, cpu>=1; enums). 0 = unset
-       -> the core fills a default, so only check explicitly-provided values. */
-    if (ram_mb != 0) {
-        if (ram_mb < 512)    return "RAM must be at least 512 MB.";
-        if (ram_mb % 2 != 0) return "RAM must be 2 MB-aligned (an even number of MB).";
-    }
-    if (hdd_gb != 0 && hdd_gb < 1)       return "Disk size must be at least 1 GB.";
+    const char *resource_error=ram_mb?asb_api_validate_ram_mb(ram_mb):NULL;
+    if (!resource_error && hdd_gb) resource_error=asb_api_validate_hdd_gb(hdd_gb,is_linux);
+    if (resource_error) return resource_error;
     if (cpu_cores != 0 && cpu_cores < 1) return "CPU cores must be at least 1.";
     if (gpu_mode < 0 || gpu_mode > 1)    return "gpuMode must be 0 (None) or 1 (Default GPU).";
     if (net_mode < 0 || net_mode > 3)    return "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal).";
@@ -1330,6 +1331,8 @@ static int handle_request(PHTTP_REQUEST req)
             cfg.network_mode=ASB_API_DEFAULT_NETWORK_MODE;
             api_json_get_string(body, L"name", name, 256);
             api_json_get_string(body, L"osType", os, 32);
+            const AsbApiGuestOs *guest=asb_api_guest_os(os);
+            if (guest) wcscpy_s(os,ARRAYSIZE(os),guest->backend);
             api_json_get_string(body, L"imagePath", img, MAX_PATH);
             api_json_get_string(body, L"templateName", tpl, 256);
             wchar_t template_id_text[ASB_TEMPLATE_ID_TEXT_SIZE]={0};
@@ -1553,13 +1556,15 @@ static int handle_request(PHTTP_REQUEST req)
                 if (!validate_body(body)) {
                     send_err(req->RequestId,400,"Bad Request","invalid_arg","Invalid field types or JSON body.");return 0;
                 }
-                if ((api_json_get_int(body,L"ramMb",&iv) && (iv<512 || iv%2)) ||
-                    (api_json_get_int(body,L"cpuCores",&iv) && iv<1) ||
+                if (api_json_get_int(body,L"ramMb",&iv)) {
+                    const char *error=asb_api_validate_ram_mb(iv);
+                    if (error) { send_err(req->RequestId,400,"Bad Request","invalid_arg",error);return 0; }
+                }
+                if ((api_json_get_int(body,L"cpuCores",&iv) && iv<1) ||
                     (api_json_get_int(body,L"networkMode",&iv) && (iv<0 || iv>3))) {
                     send_err(req->RequestId,400,"Bad Request","invalid_arg","Invalid RAM, CPU, or network setting.");return 0;
                 }
                 if (api_json_get_int(body, L"ramMb", &iv)) {
-                    if (iv < 512 || iv % 2 != 0) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "RAM must be 2 MB-aligned and at least 512 MB"); return 0; }
                     hr = asb_vm_set_ram(vm, (DWORD)iv);
                 }
                 if (api_json_get_int(body, L"cpuCores", &iv)) {
