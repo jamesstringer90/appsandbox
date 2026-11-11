@@ -95,6 +95,7 @@ typedef struct {
     BOOL           callbacks_dead;       /* TRUE if HCS ServiceDisconnect received */
     BOOL           hyperv_video_off;     /* TRUE after guest disables Hyper-V Video adapter */
     volatile BOOL  shutdown_requested;   /* TRUE after graceful shutdown sent */
+    volatile LONG  exit_cleanup;         /* TRUE while the exit callback tears the VM down; it already reads as stopped */
     ULONGLONG      shutdown_time;        /* GetTickCount64() when shutdown requested */
     volatile ULONGLONG last_heartbeat;   /* GetTickCount64() of last agent heartbeat */
     HANDLE      idd_probe_thread;        /* Background VDD availability probe */
