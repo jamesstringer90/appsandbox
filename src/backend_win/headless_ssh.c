@@ -166,7 +166,7 @@ ASB_API DWORD asb_ssh_write(AsbVmId vm,UINT64 id,const BYTE *bytes,DWORD count,B
     SshSession *s=find(vm,id);
     if (!s) return ERROR_NOT_FOUND;
     AcquireSRWLockExclusive(&s->lock);
-    DWORD error=s->closing?ERROR_OPERATION_ABORTED:s->close_stdin || !s->stdin_pipe?ERROR_BROKEN_PIPE:s->error;
+    DWORD error=s->closing?ERROR_NOT_FOUND:s->close_stdin || !s->stdin_pipe?ERROR_BROKEN_PIPE:s->error;
     if (!error && count>sizeof(s->pending)-(s->tail-s->head)) error=ERROR_BUSY;
     if (!error) {
         for (DWORD i=0;i<count;++i) s->pending[s->tail++%sizeof(s->pending)]=bytes[i];
@@ -197,7 +197,7 @@ ASB_API DWORD asb_ssh_read(AsbVmId vm,UINT64 id,DWORD timeout,AsbSshOutput *out)
     DWORD error=0;
     do {
         AcquireSRWLockExclusive(&s->lock);
-        if (s->closing) error=ERROR_OPERATION_ABORTED;
+        if (s->closing) error=ERROR_NOT_FOUND;
         if (!error) error=read_pipe(s->stdout_pipe,&out->stdout_bytes,&out->stdout_size);
         if (!error) error=read_pipe(s->stderr_pipe,&out->stderr_bytes,&out->stderr_size);
         DWORD code=STILL_ACTIVE;
