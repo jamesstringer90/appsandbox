@@ -216,6 +216,7 @@ static void stop_template_copies(void)
 
 static wchar_t g_last_iso_path[MAX_PATH] = { 0 };
 static BOOL g_suppress_tray_warn = FALSE;
+static int g_api_port = ASB_API_DEFAULT_PORT;
 
 static CRITICAL_SECTION g_cs;
 static BOOL g_initialized = FALSE;
@@ -622,14 +623,12 @@ static BOOL save_vm_list(void)
         return FALSE;
     }
 
-    if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn) {
-        fwprintf(f, L"[Settings]\n");
-        if (g_last_iso_path[0] != L'\0')
-            fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
-        if (g_suppress_tray_warn)
-            fwprintf(f, L"SuppressTrayWarn=1\n");
-        fwprintf(f, L"\n");
-    }
+    fwprintf(f, L"[Settings]\nApiPort=%d\n", g_api_port);
+    if (g_last_iso_path[0] != L'\0')
+        fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
+    if (g_suppress_tray_warn)
+        fwprintf(f, L"SuppressTrayWarn=1\n");
+    fwprintf(f, L"\n");
 
     for (i = 0; i < g_template_count; i++) {
         fwprintf(f, L"[Template]\n");
@@ -796,6 +795,8 @@ static void load_vm_list(void)
                 wcscpy_s(g_last_iso_path, MAX_PATH, line + 12);
             else if (wcsncmp(line, L"SuppressTrayWarn=", 17) == 0)
                 g_suppress_tray_warn = (_wtoi(line + 17) != 0);
+            else if (wcsncmp(line, L"ApiPort=", 8) == 0)
+                g_api_port = asb_api_parse_port(line + 8);
             continue;
         }
 
@@ -4789,6 +4790,11 @@ ASB_API void asb_set_suppress_tray_warn(BOOL suppress)
 ASB_API BOOL asb_get_suppress_tray_warn(void)
 {
     return g_suppress_tray_warn;
+}
+
+ASB_API int asb_get_api_port(void)
+{
+    return g_api_port;
 }
 
 /* ---- Internal access (for UI layer) ---- */

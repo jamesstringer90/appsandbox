@@ -24,6 +24,8 @@ static __weak WKWebView *g_webView;
 
 
 static BOOL g_initialized;
+static BOOL g_web_ready;
+static NSMutableArray<NSDictionary *> *g_pending_messages;
 static unsigned g_subscription;
 static BOOL g_refresh_pending;
 
@@ -43,13 +45,19 @@ static NSString *escapeForJsCall(NSString *json) {
 }
 
 static void postToJs(NSDictionary *message) {
-    WKWebView *wv = g_webView;
-    if (!wv || !message) return;
-    NSString *json = JSONStringFromObject(message);
-    NSString *literal = escapeForJsCall(json);
-    NSString *script = [NSString stringWithFormat:
-        @"window.onHostMessage && window.onHostMessage(JSON.parse(%@[0]))", literal];
+    if (!message) return;
     dispatch_async(dispatch_get_main_queue(), ^{
+        WKWebView *wv = g_webView;
+        if (!wv) return;
+        if (!g_web_ready) {
+            if (!g_pending_messages) g_pending_messages = [NSMutableArray array];
+            if (g_pending_messages.count < 64) [g_pending_messages addObject:message];
+            return;
+        }
+        NSString *json = JSONStringFromObject(message);
+        NSString *literal = escapeForJsCall(json);
+        NSString *script = [NSString stringWithFormat:
+            @"window.onHostMessage && window.onHostMessage(JSON.parse(%@[0]))", literal];
         [wv evaluateJavaScript:script completionHandler:nil];
     });
 }
@@ -152,6 +160,8 @@ static void AsbEventCallback(const CoreVmEvent *event, void *context) {
 
 void ui_shutdown(void) {
     g_initialized = NO;
+    g_web_ready = NO;
+    g_pending_messages = nil;
     asb_events_unsubscribe(g_subscription);
     asb_api_stop();
     g_webView = nil;
@@ -175,6 +185,10 @@ static void cleanupStaleSshScripts(void) {
 }
 
 void ui_set_webview(WKWebView *webView) {
+    if (g_webView != webView) {
+        g_web_ready = NO;
+        g_pending_messages = nil;
+    }
     g_webView = webView;
     if (g_initialized) return;
     g_initialized = YES;
@@ -368,6 +382,12 @@ void ui_handle_message(NSString *json) {
     if (action.length == 0) return;
 
     if ([action isEqualToString:@"uiReady"] || [action isEqualToString:@"getState"]) {
+        if ([action isEqualToString:@"uiReady"]) {
+            g_web_ready = YES;
+            NSArray<NSDictionary *> *pending = g_pending_messages;
+            g_pending_messages = nil;
+            for (NSDictionary *message in pending) postToJs(message);
+        }
         sendFullState();
     } else if ([action isEqualToString:@"setMinSize"]) {
         /* The mac window manager handles minimum sizes itself. */

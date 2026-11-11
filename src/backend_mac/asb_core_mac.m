@@ -30,6 +30,7 @@
 #include "headless_vm.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -43,6 +44,7 @@ static int g_vm_count = 0;
 static BOOL g_config_load_failed;
 static uint64_t g_next_run_id;
 static char g_last_ipsw_path[1024] = {0};
+static int g_api_port = ASB_API_DEFAULT_PORT;
 
 static void clear_admin_password(AsbVmMac *vm) {
     volatile unsigned char *bytes = (volatile unsigned char *)vm->admin_pass;
@@ -242,11 +244,11 @@ static BOOL save_vm_list(void) {
         return NO;
     }
 
+    fprintf(f, "[Settings]\nApiPort=%d\n", g_api_port);
     if (g_last_ipsw_path[0]) {
-        fprintf(f, "[Settings]\n");
         fprintf(f, "LastIpswPath=%s\n", g_last_ipsw_path);
-        fprintf(f, "\n");
     }
+    fprintf(f, "\n");
 
     for (int i = 0; i < g_vm_count; i++) {
         fprintf(f, "[VM]\n");
@@ -333,6 +335,10 @@ static void load_vm_list(void) {
         if (in_settings) {
             if (strncmp(line, "LastIpswPath=", 13) == 0)
                 strlcpy(g_last_ipsw_path, line + 13, sizeof(g_last_ipsw_path));
+            else if (strncmp(line, "ApiPort=", 8) == 0) {
+                wchar_t value[2048];
+                g_api_port=mbstowcs(value,line+8,2048)!=(size_t)-1?asb_api_parse_port(value):0;
+            }
             continue;
         }
 
@@ -2082,6 +2088,10 @@ int asb_mac_template_delete(AsbTemplateId template_id)
 
 void asb_mac_save(void) {
     save_vm_list();
+}
+
+int asb_mac_get_api_port(void) {
+    return g_api_port;
 }
 
 void asb_mac_set_headless(BOOL headless) {

@@ -36,8 +36,6 @@
 #include <stdarg.h>
 
 #define ASB_API_VERSION  "v1"
-#define DEFAULT_PORT     8787
-#define PORT_TRIES       20
 #define BODY_MAX         ASB_API_BODY_MAX
 #define REQ_HDR_MAX      16384
 
@@ -1487,9 +1485,14 @@ static void *server_thread(void *param) {
 }
 
 static int http_start(int *out_port) {
-    for (int port = DEFAULT_PORT; port < DEFAULT_PORT + PORT_TRIES; port++) {
+    int preferred = asb_mac_get_api_port();
+    if (preferred < 1 || preferred > 65535) {
+        hlog(@"FATAL: ApiPort must be an integer from 1 to 65535 in vms.cfg [Settings].");
+        return 0;
+    }
+    for (int port = preferred; port <= 65535; port++) {
         int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (fd < 0) return 0;
+        if (fd < 0) { hlog(@"socket failed: %s", strerror(errno));return 0; }
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         struct sockaddr_in a;
@@ -1497,19 +1500,21 @@ static int http_start(int *out_port) {
         a.sin_family = AF_INET;
         a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   /* loopback only */
         a.sin_port = htons((uint16_t)port);
-        if (bind(fd, (struct sockaddr *)&a, sizeof(a)) == 0 &&
-            listen(fd, 16) == 0) {
-            int flags = fcntl(fd, F_GETFL, 0);
-            if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { close(fd); continue; }
-            g_listen_fd = fd;
-            *out_port = port;
-            hlog(@"listening on http://127.0.0.1:%d/", port);
-            return 1;
+        if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(fd, 16) != 0) {
+            int error = errno;
+            close(fd);
+            if (error != EADDRINUSE) { hlog(@"HTTP listener on port %d failed: %s", port, strerror(error));return 0; }
+            continue;
         }
-        close(fd);
-        hlog(@"port %d unavailable; trying next", port);
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            int error = errno;close(fd);hlog(@"fcntl on port %d failed: %s", port, strerror(error));return 0;
+        }
+        g_listen_fd = fd;
+        *out_port = port;
+        return 1;
     }
-    hlog(@"FATAL: no free port in %d..%d.", DEFAULT_PORT, DEFAULT_PORT + PORT_TRIES - 1);
+    hlog(@"FATAL: no free port in %d..65535.", preferred);
     return 0;
 }
 
@@ -1541,6 +1546,7 @@ int asb_api_start(int with_gui) {
     }
     g_api_started = YES;
     write_discovery(port);
+    asb_api_log_endpoints((unsigned)port);
     return 1;
 }
 

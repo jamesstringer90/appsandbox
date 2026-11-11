@@ -1,10 +1,23 @@
 #include "api_contract.h"
 #include "api_operations.h"
+#include "asb_events.h"
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+
+void asb_api_log_endpoints(unsigned port)
+{
+    const char *names[]={"API","MCP"},*paths[]={"/v1","/mcp"};
+    for (unsigned i=0;i<2;++i) {
+        char message[128];
+        snprintf(message,sizeof(message),"%s: http://127.0.0.1:%u%s",names[i],port,paths[i]);
+        CoreVmEvent event={0};
+        event.type=CORE_VM_EVENT_LOG;event.str_value=message;
+        asb_events_emit(&event);
+    }
+}
 
 static char *write_string(char *out,const char *text)
 {

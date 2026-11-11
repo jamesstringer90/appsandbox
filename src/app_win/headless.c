@@ -48,7 +48,6 @@
 #define ASB_VERSION_SHORT 0.0.0
 #endif
 #define ASB_PRODUCT_VER  ASB_VER_STR(ASB_VERSION_SHORT)
-#define DEFAULT_PORT     8787
 
 /* forward decls (used by the event callbacks defined below) */
 static void broadcast_event(const char *json);
@@ -1957,6 +1956,11 @@ static int http_start(int *out_port)
 {
     HTTPAPI_VERSION ver = HTTPAPI_VERSION_2;
     HTTP_BINDING_INFO binding; ULONG r; int port;
+    int preferred = asb_get_api_port();
+    if (preferred < 1 || preferred > 65535) {
+        hlog(L"FATAL: ApiPort must be an integer from 1 to 65535 in vms.cfg [Settings].");
+        return 0;
+    }
 
     r = HttpInitialize(ver, HTTP_INITIALIZE_SERVER, NULL);
     if (r) { hlog(L"HttpInitialize failed (%lu)", r); return 0; }
@@ -1973,12 +1977,14 @@ static int http_start(int *out_port)
     r = HttpSetUrlGroupProperty(g_url_group, HttpServerBindingProperty, &binding, sizeof(binding));
     if (r) { hlog(L"HttpSetUrlGroupProperty failed (%lu)", r); return 0; }
 
-    for (port = DEFAULT_PORT; port < DEFAULT_PORT + 20; port++) {
+    for (port = preferred; port <= 65535; port++) {
         wchar_t url[64];
         swprintf_s(url, 64, L"http://127.0.0.1:%d/", port);
         r = HttpAddUrlToUrlGroup(g_url_group, url, 0, 0);
-        if (r == NO_ERROR) { *out_port = port; hlog(L"listening on %s", url); return 1; }
-        hlog(L"HttpAddUrlToUrlGroup %s failed (%lu); trying next port", url, r);
+        if (r == NO_ERROR) { *out_port = port; return 1; }
+        if (r != ERROR_ALREADY_EXISTS && r != ERROR_SHARING_VIOLATION) {
+            hlog(L"HttpAddUrlToUrlGroup %s failed (%lu)", url, r);return 0;
+        }
     }
     hlog(L"FATAL: no free port found.");
     return 0;
@@ -2132,6 +2138,7 @@ BOOL asb_api_start(HINSTANCE instance, HWND owner)
     g_server_thread = CreateThread(NULL, 0, api_thread, NULL, 0, NULL);
     if (!g_server_thread) { asb_api_stop(); return FALSE; }
     if (!write_discovery(port)) { asb_api_stop(); return FALSE; }
+    asb_api_log_endpoints((unsigned)port);
     return TRUE;
 }
 
