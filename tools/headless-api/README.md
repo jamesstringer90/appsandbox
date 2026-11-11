@@ -16,7 +16,11 @@ for vm in c.list():
 
 ## Start AppSandbox
 
-Open the GUI, or launch the headless host from an elevated terminal.
+**The regular AppSandbox GUI automatically starts both the API and MCP server.**
+Open AppSandbox normally to use either service. Headless mode is optional and
+runs the same services without the management window.
+
+To run in headless mode, launch the host from an elevated terminal.
 
 Windows: open PowerShell or Windows Terminal with **Run as administrator**, then
 run the command below. The headless host must run with administrator privileges

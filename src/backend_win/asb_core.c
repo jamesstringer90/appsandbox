@@ -28,6 +28,7 @@
 #include <io.h>
 #include <stdlib.h>
 #include <shlobj.h>
+#include <aclapi.h>
 #include <stdarg.h>
 #include <virtdisk.h>
 #pragma comment(lib, "virtdisk.lib")
@@ -599,6 +600,47 @@ static BOOL ensure_appsandbox_ssh_key(wchar_t *pubkey_out, int cap)
 
 /* ---- Persistence: save VM list ---- */
 
+static DWORD config_allow_user_write(const wchar_t *path)
+{
+    HANDLE file=INVALID_HANDLE_VALUE,token=NULL;
+    TOKEN_USER *user=NULL;
+    PSECURITY_DESCRIPTOR descriptor=NULL;
+    PACL previous=NULL,updated=NULL;
+    DWORD error=ERROR_SUCCESS,size=0;
+    BY_HANDLE_FILE_INFORMATION info;
+    file=CreateFileW(path,READ_CONTROL|WRITE_DAC|FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT,NULL);
+    if (file==INVALID_HANDLE_VALUE) { error=GetLastError();goto done; }
+    if (!GetFileInformationByHandle(file,&info)) { error=GetLastError();goto done; }
+    if ((info.dwFileAttributes&(FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_DIRECTORY)) ||
+        info.nNumberOfLinks!=1) { error=ERROR_INVALID_DATA;goto done; }
+    if (!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token)) { error=GetLastError();goto done; }
+    GetTokenInformation(token,TokenUser,NULL,0,&size);
+    if (!size) { error=GetLastError();goto done; }
+    user=malloc(size);
+    if (!user) { error=ERROR_NOT_ENOUGH_MEMORY;goto done; }
+    if (!GetTokenInformation(token,TokenUser,user,size,&size)) { error=GetLastError();goto done; }
+    error=GetSecurityInfo(file,SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,NULL,NULL,&previous,NULL,&descriptor);
+    if (error || !previous) goto done;
+    EXPLICIT_ACCESSW access={0};
+    access.grfAccessPermissions=FILE_GENERIC_READ|FILE_GENERIC_WRITE|DELETE;
+    access.grfAccessMode=GRANT_ACCESS;
+    access.grfInheritance=NO_INHERITANCE;
+    access.Trustee.TrusteeForm=TRUSTEE_IS_SID;
+    access.Trustee.TrusteeType=TRUSTEE_IS_USER;
+    access.Trustee.ptstrName=(LPWSTR)user->User.Sid;
+    error=SetEntriesInAclW(1,&access,previous,&updated);
+    if (!error) error=SetSecurityInfo(file,SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,NULL,NULL,updated,NULL);
+done:
+    if (updated) LocalFree(updated);
+    if (descriptor) LocalFree(descriptor);
+    free(user);
+    if (token) CloseHandle(token);
+    if (file!=INVALID_HANDLE_VALUE) CloseHandle(file);
+    return error;
+}
+
 static BOOL save_vm_list(void)
 {
     if (g_config_load_failed) return FALSE;
@@ -689,6 +731,13 @@ static BOOL save_vm_list(void)
 
     BOOL ok = !ferror(f) && fflush(f) == 0 && _commit(_fileno(f)) == 0;
     if (fclose(f) != 0) ok = FALSE;
+    if (ok) {
+        DWORD error=config_allow_user_write(temporary);
+        if (error) {
+            asb_log(L"Cannot grant the current user write access to VM configuration (%lu).",error);
+            ok=FALSE;
+        }
+    }
     if (ok && MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         return TRUE;
     DeleteFileW(temporary);
@@ -734,6 +783,9 @@ static void load_vm_list(void)
     wchar_t record_ids[ASB_MAX_VMS][ASB_TEMPLATE_ID_TEXT_SIZE]={0};
 
     get_config_path(path, MAX_PATH);
+    DWORD access_error=config_allow_user_write(path);
+    if (access_error && access_error!=ERROR_FILE_NOT_FOUND && access_error!=ERROR_PATH_NOT_FOUND)
+        asb_log(L"Cannot grant the current user write access to VM configuration (%lu).",access_error);
     if (_wfopen_s(&f, path, L"rb") != 0 || !f) return;
     (void)fread(bom, 1, sizeof(bom), f);
     fclose(f);
@@ -3452,8 +3504,10 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     const char *resource_error=asb_api_validate_ram_mb((int)cfg.ram_mb);
     if (!resource_error) resource_error=asb_api_validate_hdd_gb((int)cfg.hdd_gb,_wcsicmp(cfg.os_type,L"Linux")==0);
     if (resource_error) {
+        wchar_t message[128];
+        swprintf_s(message,ARRAYSIZE(message),L"%S",resource_error);
         asb_log(L"Error: %S",resource_error);
-        asb_alert(L"%S",resource_error);
+        asb_alert(message);
         return E_INVALIDARG;
     }
     if (cfg.cpu_cores == 0) cfg.cpu_cores = ASB_API_DEFAULT_CPU_CORES;
