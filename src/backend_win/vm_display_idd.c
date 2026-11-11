@@ -39,12 +39,15 @@
 #include "vm_display_idd.h"
 #include "asb_core.h"
 #include "../core/protocol.h"
+#include "../../tools/transport/asb_automation.h"
 #include "vm_clipboard.h"
 #include "vm_agent.h"
 #include "hcs_vm.h"
 #include "ui.h"
 #include "resource.h"
 #include "gpu_broker.h"
+#include "agent_overlay.h"
+#include "headless_vm.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -124,6 +127,7 @@ typedef struct AudioFrameHeader {
 #define WM_IDD_INPUT_READY      (WM_USER + 102)
 #define WM_IDD_CURSOR_CHANGED   (WM_USER + 103)
 #define WM_IDD_DISPLAY_SIZE     (WM_USER + 104)
+#define WM_IDD_TAKE_CONTROL     (WM_USER + 105)
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -198,9 +202,11 @@ typedef struct {
     UINT64 fence_waiting;
     BOOL ready;
     BOOL acquired;
+    ULONGLONG screenshot_yielded;
 } IddSharedSlot;
 
 struct VmDisplayIdd {
+    AsbInputSession *input;
     UINT64       vm_id;
     UINT_PTR     token;
     wchar_t      vm_name[256];     /* copy of vm->name for safe logging after VM teardown */
@@ -233,6 +239,9 @@ struct VmDisplayIdd {
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11SamplerState      *sampler;
+    AgentOverlay           *agent_overlay;
+    UINT                    pending_agent_command;
+    UINT32                  pending_agent_work;
     IddSharedSlot            shared_slots[DISPLAY_GPU_SLOTS];
     int                     shared_front;
     int                     shared_pending;
@@ -243,6 +252,7 @@ struct VmDisplayIdd {
     BOOL                    shared_disabled;
     BOOL                    shared_resize;
     BOOL                    shared_refresh;
+    BOOL                    shared_screenshot;
     UINT                    shared_refresh_rate;
     UINT                    shared_width;
     UINT                    shared_height;
@@ -288,8 +298,9 @@ struct VmDisplayIdd {
     ULONGLONG      mouse_sync_deadline;
     POINT          mouse_sync_origin;
     SOCKET         mouse_sync_socket;
-    InputPacket    mouse_reply;
-    int            mouse_reply_size;
+    volatile LONG  agent_control;
+    volatile LONG  agent_x, agent_y;
+    LONG           agent_waiting, agent_finished;
     BOOL           mouse_in;        /* TRUE while cursor is inside the render area */
     BOOL           tracking;        /* TrackMouseEvent active */
 
@@ -550,45 +561,14 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
 
 /* ---- Send input packet to guest ---- */
 
-static BOOL send_input_locked(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
+static BOOL send_input_locked(VmDisplayIdd *d,UINT32 type,UINT32 p1,UINT32 p2,UINT32 p3)
 {
-    InputPacket pkt;
-    SOCKET s;
-    int ret;
-
-    s = d->input_socket;
-    if (s == INVALID_SOCKET) return FALSE;
-
-    pkt.magic  = INPUT_MAGIC;
-    pkt.type   = type;
-    pkt.param1 = p1;
-    pkt.param2 = p2;
-    pkt.param3 = p3;
-
-    /* Non-blocking send — drop packet if buffer full rather than stall the UI */
-    ret = send(s, (const char *)&pkt, (int)sizeof(pkt), 0);
-    if (ret == SOCKET_ERROR) {
-        int err = WSAGetLastError();
-        if (err == WSAEWOULDBLOCK) {
-            return FALSE;
-        }
-        idd_log(d, L"INPUT SEND ERR %d - flagging for reconnect.", err);
-        d->input_socket = INVALID_SOCKET;
-        PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
-        return FALSE;
-    }
-    if (ret != (int)sizeof(pkt)) {
-        /* Partial send on a stream socket: the guest reads fixed-size 20-byte
-           InputPackets, so a truncated packet permanently misaligns the wire.
-           Flag for reconnect so the channel resynchronises. */
-        idd_log(d, L"INPUT SEND short (%d/%d) - flagging for reconnect.",
-                ret, (int)sizeof(pkt));
-        d->input_socket = INVALID_SOCKET;
-        PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
-        return FALSE;
-    }
-
-    return TRUE;
+    if (!d->input) return FALSE;
+    if (type==ASB_INPUT_USER_GRANT || type==ASB_INPUT_USER_REVOKE || type==ASB_INPUT_USER_CANCEL)
+        return !asb_input_control(d->input,type,p1);
+    InputPacket packet={INPUT_MAGIC,type,p1,p2,p3};
+    DWORD error=asb_input_send(d->input,FALSE,0,&packet);
+    return !error || error==ERROR_ACCESS_DENIED;
 }
 
 static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
@@ -620,7 +600,7 @@ static void idd_cancel_mouse_sync(VmDisplayIdd *d)
 static void idd_update_relative_mouse(VmDisplayIdd *d)
 {
     POINT pt = {0};
-    BOOL active = !d->stop && d->frame_connected &&
+    BOOL active = !d->stop && d->frame_connected && d->agent_control!=ASB_CONTROL_AGENT &&
                    d->mouse_version >= INPUT_MOUSE_VERSION &&
                    d->input_socket != INVALID_SOCKET && d->input_focused &&
                    !d->input_menu_active && !d->input_sizing &&
@@ -1040,45 +1020,46 @@ static void idd_resume_absolute_mouse(VmDisplayIdd *d, const InputPacket *reply)
 
 static void idd_poll_mouse_position(VmDisplayIdd *d)
 {
-    InputPacket reply;
-    BOOL received = FALSE, disconnected = FALSE;
-    if (!d->mouse_sync_pending) return;
-    idd_update_relative_mouse(d);
-    if (!d->mouse_sync_pending) return;
+    InputPacket position_reply={0},packet;
+    BOOL received=FALSE,changed=FALSE;
+    ULONGLONG now=GetTickCount64();
+    if (d->mouse_sync_pending) idd_update_relative_mouse(d);
     AcquireSRWLockExclusive(&d->input_lock);
-    if (d->input_socket != INVALID_SOCKET && d->input_socket == d->mouse_sync_socket) {
-        for (int i = 0; i < 16; i++) {
-            int n = recv(d->input_socket, (char *)&d->mouse_reply + d->mouse_reply_size,
-                         (int)sizeof(InputPacket) - d->mouse_reply_size, 0);
-            if (n <= 0) {
-                disconnected = n == 0 || WSAGetLastError() != WSAEWOULDBLOCK;
-                if (disconnected) {
-                    d->input_socket = INVALID_SOCKET;
-                    PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
-                }
-                break;
-            }
-            d->mouse_reply_size += n;
-            if (d->mouse_reply_size != sizeof(InputPacket)) continue;
-            d->mouse_reply_size = 0;
-            if (d->mouse_reply.magic == INPUT_MAGIC &&
-                d->mouse_reply.type == INPUT_MOUSE_POSITION_REPLY &&
-                d->mouse_reply.param3 == d->mouse_sync_id) {
-                reply = d->mouse_reply;
-                received = TRUE;
-                break;
-            }
-        }
-    } else {
-        disconnected = TRUE;
+    AsbInputStatus status;
+    asb_input_status(d->input,&status);
+    LONG state=status.flags&ASB_STATUS_AGENT_HAS_CONTROL?ASB_CONTROL_AGENT:
+        status.flags&ASB_STATUS_USER_PAUSED?ASB_CONTROL_USER:ASB_CONTROL_AVAILABLE;
+    LONG waiting=!!(status.flags&ASB_STATUS_AGENT_WAITING);
+    LONG finished=!!(status.flags&ASB_STATUS_AGENT_FINISHED);
+    if (waiting!=d->agent_waiting || finished!=d->agent_finished) changed=TRUE;
+    d->agent_waiting=waiting;d->agent_finished=finished;
+    if (InterlockedExchange(&d->agent_control,state)!=state) {
+        changed=TRUE;
+        PostMessageW(d->hwnd,WM_IDD_TITLE_CHANGED,0,0);
+        PostMessageW(d->hwnd,WM_IDD_INPUT_READY,0,0);
     }
+    if (InterlockedExchange(&d->agent_x,(LONG)status.x)!=(LONG)status.x) changed=TRUE;
+    if (InterlockedExchange(&d->agent_y,(LONG)status.y)!=(LONG)status.y) changed=TRUE;
+    while (asb_input_poll(d->input,&packet)) {
+        if (packet.type==INPUT_MOUSE_POSITION_REPLY && d->mouse_sync_pending &&
+            d->input_socket==d->mouse_sync_socket && packet.param3==d->mouse_sync_id) {
+            position_reply=packet;received=TRUE;
+        }
+    }
+    if (d->pending_agent_command && d->input) {
+        asb_input_control(d->input,d->pending_agent_command,d->pending_agent_work);
+        d->pending_agent_command=0;
+    }
+    BOOL disconnected=d->input_socket==INVALID_SOCKET;
     ReleaseSRWLockExclusive(&d->input_lock);
-    if (disconnected)
-        idd_cancel_mouse_sync(d);
-    else if (received)
-        idd_resume_absolute_mouse(d, &reply);
-    else if (GetTickCount64() >= d->mouse_sync_deadline)
-        idd_resume_absolute_mouse(d, NULL);
+    if (disconnected) idd_cancel_mouse_sync(d);
+    else if (received) idd_resume_absolute_mouse(d,&position_reply);
+    else if (d->mouse_sync_pending && now>=d->mouse_sync_deadline) idd_resume_absolute_mouse(d,NULL);
+    if (changed && d->agent_overlay) {
+        UINT size=(UINT)InterlockedCompareExchange(&d->rendered_size,0,0);
+        agent_overlay_update(d->agent_overlay,d->agent_control,d->agent_x,d->agent_y,
+            LOWORD(size),HIWORD(size),d->agent_waiting,d->agent_finished);
+    }
 }
 
 /* ---- Reliable recv: read exactly `len` bytes ---- */
@@ -1166,113 +1147,39 @@ static SOCKET connect_to_hv_service(const GUID *vm_runtime_id, const GUID *servi
     return s;
 }
 
-static SOCKET connect_input(VmDisplayIdd *d)
-{
-    static volatile LONG request_id;
-    GUID svc;
-    UINT32 ready = 0;
-    InputPacket queries[] = {
-        { INPUT_MAGIC, INPUT_KEYBOARD_QUERY, INPUT_KEYBOARD_VERSION, 0, 0 },
-        { INPUT_MAGIC, INPUT_MOUSE_QUERY, INPUT_MOUSE_NORMALIZED_VERSION, 0, 0 }
-    };
-    InputPacket reply = {0};
-    int got = 0, version = 1, mouse_version = 0;
-    BOOL keyboard_reply = FALSE, mouse_reply = FALSE;
-    ULONGLONG deadline;
-    u_long nonblock = 1;
-    DWORD zero_timeout = 0;
-    hcs_service_guid(d->os_type, 3, &svc);
-    SOCKET s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
-    if (s == INVALID_SOCKET) return s;
-    if (!recv_exact(d, s, &ready, sizeof(ready), FALSE) || ready != INPUT_READY_MAGIC)
-        goto failed;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
-    if (ioctlsocket(s, FIONBIO, &nonblock) != 0) goto failed;
-    queries[0].param2 = queries[1].param2 = (UINT32)InterlockedIncrement(&request_id);
-    if (send(s, (const char *)queries, sizeof(queries), 0) != sizeof(queries))
-        goto failed;
-    /* Old helpers ignore the query. A late or incomplete reply cannot change
-       the mode after the socket has been made available to the window thread. */
-    deadline = GetTickCount64() + 500;
-    while ((!keyboard_reply || !mouse_reply) && !d->stop) {
-        fd_set read_set;
-        struct timeval timeout;
-        LONGLONG remaining = (LONGLONG)(deadline - GetTickCount64());
-        if (remaining <= 0) break;
-        timeout.tv_sec = 0;
-        timeout.tv_usec = (long)remaining * 1000;
-        FD_ZERO(&read_set);
-        FD_SET(s, &read_set);
-        int result = select(0, &read_set, NULL, NULL, &timeout);
-        if (result == SOCKET_ERROR) goto failed;
-        if (result == 0) break;
-        int n = recv(s, (char *)&reply + got, (int)sizeof(reply) - got, 0);
-        if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
-        if (n <= 0) goto failed;
-        got += n;
-        if (got == sizeof(reply)) {
-            if (reply.magic == INPUT_MAGIC && reply.param2 == queries[0].param2 &&
-                reply.param3 == 0) {
-                if (reply.type == INPUT_KEYBOARD_REPLY) {
-                    keyboard_reply = TRUE;
-                    if (reply.param1 == INPUT_KEYBOARD_VERSION)
-                        version = INPUT_KEYBOARD_VERSION;
-                } else if (reply.type == INPUT_MOUSE_REPLY) {
-                    mouse_reply = TRUE;
-                    if (reply.param1 >= INPUT_MOUSE_VERSION &&
-                        reply.param1 <= INPUT_MOUSE_NORMALIZED_VERSION)
-                        mouse_version = (int)reply.param1;
-                }
-            }
-            got = 0;
-        }
-    }
-    if (d->stop) goto failed;
-    AcquireSRWLockExclusive(&d->input_lock);
-    ZeroMemory(d->held_down, sizeof(d->held_down));
-    d->keyboard_version = version;
-    d->mouse_version = mouse_version;
-    d->mouse_reply = reply;
-    d->mouse_reply_size = got;
-    d->input_socket = s;
-    ReleaseSRWLockExclusive(&d->input_lock);
-    PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
-    idd_log(d, L"Input connected + ready (keyboard v%d).", version);
-    return s;
-failed:
-    closesocket(s);
-    return INVALID_SOCKET;
-}
-
 static DWORD WINAPI idd_input_thread_proc(LPVOID param)
 {
-    VmDisplayIdd *d = (VmDisplayIdd *)param;
-    SOCKET input_s = INVALID_SOCKET;
-    ULONGLONG retry_at = 0;
-
+    VmDisplayIdd *d=param;
+    AsbHeadlessTarget target={0};
+    target.id=d->vm_id;target.runtime=d->runtime_id;
+    wcscpy_s(target.name,ARRAYSIZE(target.name),d->vm_name);
+    wcscpy_s(target.os_type,ARRAYSIZE(target.os_type),d->os_type);
+    AsbInputSession *input=asb_input_session(&target);
+    asb_input_viewer(input,TRUE);
+    AcquireSRWLockExclusive(&d->input_lock);
+    d->input=input;
+    ReleaseSRWLockExclusive(&d->input_lock);
     while (!d->stop) {
+        AsbInputStatus status;
+        asb_input_status(input,&status);
         AcquireSRWLockExclusive(&d->input_lock);
-        if (input_s != INVALID_SOCKET && d->input_socket == INVALID_SOCKET) {
-            closesocket(input_s);
-            input_s = INVALID_SOCKET;
-        }
+        BOOL changed=d->input_socket!=status.connection || d->keyboard_version!=(int)status.keyboard_version;
+        if (changed) ZeroMemory(d->held_down,sizeof(d->held_down));
+        d->input_socket=status.connection;
+        d->keyboard_version=status.keyboard_version?status.keyboard_version:1;
+        d->mouse_version=status.mouse_version;
         ReleaseSRWLockExclusive(&d->input_lock);
-        if (input_s == INVALID_SOCKET && GetTickCount64() >= retry_at) {
-            input_s = connect_input(d);
-            retry_at = input_s == INVALID_SOCKET ? GetTickCount64() + 1000 : 0;
-        }
+        if (changed) PostMessageW(d->hwnd,WM_IDD_INPUT_READY,0,0);
         Sleep(100);
     }
-
     AcquireSRWLockExclusive(&d->input_lock);
-    d->input_socket = INVALID_SOCKET;
-    d->keyboard_version = 1;
-    d->mouse_version = 0;
-    ZeroMemory(d->held_down, sizeof(d->held_down));
-    if (input_s != INVALID_SOCKET) closesocket(input_s);
+    d->input=NULL;d->input_socket=INVALID_SOCKET;
+    d->keyboard_version=1;d->mouse_version=0;
+    ZeroMemory(d->held_down,sizeof(d->held_down));
     ReleaseSRWLockExclusive(&d->input_lock);
-    PostMessageW(d->hwnd, WM_IDD_INPUT_READY, 0, 0);
-    idd_log(d, L"Input disconnected.");
+    asb_input_viewer(input,FALSE);
+    asb_input_release(input);
+    PostMessageW(d->hwnd,WM_IDD_INPUT_READY,0,0);
     return 0;
 }
 
@@ -1580,6 +1487,7 @@ static void idd_shared_release(VmDisplayIdd *d)
     d->shared_ready = FALSE;
     d->shared_resize = FALSE;
     d->shared_refresh = FALSE;
+    d->shared_screenshot = FALSE;
     d->shared_refresh_rate = 0;
     ZeroMemory(&d->size_request, sizeof(d->size_request));
     d->shared_next = 0;
@@ -1603,7 +1511,8 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
     UINT64 session, value;
     HRESULT hr;
     EnterCriticalSection(&d->frame_cs);
-    if (d->stop || !d->shared_ready || d->shared_slots[d->shared_next].acquired) {
+    if (d->stop || !d->shared_ready || d->shared_slots[d->shared_next].acquired ||
+        d->shared_slots[d->shared_next].screenshot_yielded) {
         LeaveCriticalSection(&d->frame_cs);
         return S_FALSE;
     }
@@ -1695,6 +1604,7 @@ static DWORD WINAPI idd_shared_thread_proc(LPVOID parameter)
         DWORD count = 1, wait, timeout;
         UINT i;
         BOOL can_acquire;
+        BOOL screenshot_pending = FALSE;
         BOOL render = InterlockedExchange(&d->render_requested, 0) != 0;
         if (InterlockedCompareExchange(&d->gpu_refresh_requested, 0, 0)) {
             d3d_refresh_gpu(d);
@@ -1707,6 +1617,23 @@ static DWORD WINAPI idd_shared_thread_proc(LPVOID parameter)
             render = TRUE;
         }
         EnterCriticalSection(&d->frame_cs);
+        for (i = 0; i < DISPLAY_GPU_SLOTS; ++i) {
+            IddSharedSlot *slot = &d->shared_slots[i];
+            if (!slot->screenshot_yielded) continue;
+            HRESULT hr = slot->mutex->lpVtbl->AcquireSync(slot->mutex, 1, 0);
+            if (hr == S_OK) {
+                slot->screenshot_yielded = 0;
+                slot->acquired = TRUE;
+                if ((int)i != d->shared_front && (int)i != d->shared_pending)
+                    hr = idd_shared_unlock(d, slot);
+                render = TRUE;
+            } else if (hr == (HRESULT)WAIT_TIMEOUT &&
+                GetTickCount64() - slot->screenshot_yielded < 2000) {
+                screenshot_pending = TRUE;
+                continue;
+            }
+            if (hr != S_OK) { idd_shared_fail(d); break; }
+        }
         render = render || (d->frame_dirty && d->rtv != NULL);
         LeaveCriticalSection(&d->frame_cs);
         timeout = render || d->render_pending ? 0 : 16;
@@ -1718,13 +1645,14 @@ static DWORD WINAPI idd_shared_thread_proc(LPVOID parameter)
         if (render || d->render_pending) d3d_render_frame(d);
         if (d->stop) break;
         EnterCriticalSection(&d->frame_cs);
-        can_acquire = d->shared_ready && !d->shared_slots[d->shared_next].acquired;
+        can_acquire = d->shared_ready && !d->shared_slots[d->shared_next].acquired &&
+            !d->shared_slots[d->shared_next].screenshot_yielded;
         LeaveCriticalSection(&d->frame_cs);
         if (can_acquire && !d->render_pending) continue;
         if (d->render_pending && d->present_event) {
             events[count++] = d->present_event;
         }
-        wait = WaitForMultipleObjects(count, events, FALSE, 1000);
+        wait = WaitForMultipleObjects(count, events, FALSE, screenshot_pending ? 1 : 1000);
         if (count == 2 && wait == WAIT_OBJECT_0 + 1) d->present_ready = TRUE;
         else if (wait == WAIT_TIMEOUT) InterlockedExchange(&d->render_requested, 1);
         else if (wait == WAIT_FAILED) d3d_recover(d);
@@ -2381,7 +2309,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
     shared = d->shared_ready;
     if (shared) {
         d->frame_dirty = FALSE;
-        if (d->shared_pending >= 0) {
+        if (d->shared_pending >= 0 && !d->shared_slots[d->shared_pending].screenshot_yielded) {
             if (!d->shared_slots[d->shared_pending].acquired) goto shared_error;
             if (d->shared_front >= 0) {
                 IddSharedSlot *old = &d->shared_slots[d->shared_front];
@@ -2392,7 +2320,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
             d->shared_pending = -1;
             frame_uploaded = TRUE;
         }
-        if (d->shared_front < 0) {
+        if (d->shared_front < 0 || !d->shared_slots[d->shared_front].acquired) {
             d->present_ready = d->present_event != NULL;
             LeaveCriticalSection(&d->frame_cs);
             return;
@@ -2846,6 +2774,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             query.reserved = _wcsicmp(d->os_type, L"windows") == 0
                 ? DISPLAY_GPU_CAP_RESIZE : DISPLAY_GPU_CAP_FENCE | DISPLAY_GPU_CAP_RESIZE;
             query.reserved |= DISPLAY_GPU_CAP_REFRESH;
+            query.reserved |= DISPLAY_GPU_CAP_SNAPSHOT;
             query.session = ((UINT64)GetCurrentProcessId() << 32) |
                             (UINT32)InterlockedIncrement(&gpu_session_id);
             d->shared_session = query.session;
@@ -2892,6 +2821,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     EnterCriticalSection(&d->frame_cs);
                     d->shared_resize = (packet.reserved & DISPLAY_GPU_CAP_RESIZE) != 0;
                     d->shared_refresh = (packet.reserved & DISPLAY_GPU_CAP_REFRESH) != 0;
+                    d->shared_screenshot = (packet.reserved & DISPLAY_GPU_CAP_SNAPSHOT) != 0;
                     d->shared_refresh_rate = d->shared_refresh ? (UINT)packet.handle : 60;
                     d->shared_width = packet.width;
                     d->shared_height = packet.height;
@@ -2924,6 +2854,23 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->shared_ready = ready;
                     if (ready) SetEvent(d->shared_wake);
                     LeaveCriticalSection(&d->frame_cs);
+                } else if (packet.type == DISPLAY_GPU_SNAPSHOT && !broker) {
+                    HRESULT status = S_FALSE;
+                    EnterCriticalSection(&d->frame_cs);
+                    if (d->shared_screenshot && d->shared_ready && packet.slot < DISPLAY_GPU_SLOTS) {
+                        IddSharedSlot *slot = &d->shared_slots[packet.slot];
+                        if (slot->acquired && slot->mutex && !slot->screenshot_yielded) {
+                            status = slot->mutex->lpVtbl->ReleaseSync(slot->mutex, 2);
+                            if (status == S_OK) {
+                                slot->acquired = FALSE;
+                                slot->screenshot_yielded = GetTickCount64();
+                                SetEvent(d->shared_wake);
+                            }
+                        }
+                    }
+                    LeaveCriticalSection(&d->frame_cs);
+                    packet.status = status;
+                    if (!idd_send_gpu(s, &packet)) break;
                 } else if (packet.type == DISPLAY_GPU_RESIZED) {
                     if (packet.status != S_OK) {
                         d->size_reconnect_until = 0;
@@ -3186,6 +3133,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     wchar_t title[300];
     MSG msg;
+    HRESULT apartment = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     ensure_idd_class(d->hInstance);
 
@@ -3208,6 +3156,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     if (!d->hwnd) {
         ui_log(L"IDD: CreateWindowEx failed (0x%08X)", GetLastError());
         d->open = FALSE;
+        if (SUCCEEDED(apartment)) CoUninitialize();
         return 1;
     }
 
@@ -3298,6 +3247,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         d->shared_disabled = TRUE;
         d->render_retry_at = GetTickCount64() + 1000;
     }
+    if (SUCCEEDED(apartment))
+        d->agent_overlay = agent_overlay_create(d->render_hwnd, d->hwnd, WM_IDD_TAKE_CONTROL,d->vm_id);
 
     /* Start the recv thread now that the window and D3D11 are ready */
     d->shared_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
@@ -3319,10 +3270,13 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         d->shared_fence_event = NULL;
         if (d->shared_wake) CloseHandle(d->shared_wake);
         d->shared_wake = NULL;
+        agent_overlay_destroy(d->agent_overlay);
+        d->agent_overlay = NULL;
         d3d_cleanup(d);
         DestroyWindow(d->hwnd);
         d->hwnd = NULL;
         d->open = FALSE;
+        if (SUCCEEDED(apartment)) CoUninitialize();
         return 1;
     }
 
@@ -3338,6 +3292,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    if (SUCCEEDED(apartment)) CoUninitialize();
     return 0;
 }
 
@@ -3366,12 +3321,23 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
 
+    if (d && (msg==WM_MOUSEMOVE || msg==WM_NCMOUSEMOVE)) agent_overlay_pointer_activity(d->agent_overlay);
+    if (d && !d->mouse_buttons && agent_overlay_mouse(d->agent_overlay, msg, wp, lp)) return 0;
+
     if (d && d->mouse_sync_pending &&
         (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
          msg == WM_MBUTTONDOWN || msg == WM_MOUSEWHEEL))
         idd_resume_absolute_mouse(d, NULL);
 
     switch (msg) {
+    case WM_IDD_TAKE_CONTROL:
+        if (d) {
+            if (wp == ASB_INPUT_USER_GRANT || wp == ASB_INPUT_USER_REVOKE || wp == ASB_INPUT_USER_CANCEL) {
+                d->pending_agent_command=(UINT)wp;
+                d->pending_agent_work=(UINT32)lp;
+            }
+        }
+        return 0;
     case WM_INITMENU:
         if (d) {
             BOOL enabled;
@@ -3500,6 +3466,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             d->log_list_hwnd = NULL;
 
             /* Clean up D3D11 */
+            agent_overlay_destroy(d->agent_overlay);
+            d->agent_overlay = NULL;
             d3d_cleanup(d);
             if (d->shared_fence_event) CloseHandle(d->shared_fence_event);
         d->shared_fence_event = NULL;
@@ -3524,6 +3492,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         KillTimer(hwnd, IDT_PRESENT);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) {
+            agent_overlay_destroy(d->agent_overlay);
+            d->agent_overlay = NULL;
             d->stop = TRUE;
             idd_update_relative_mouse(d);
         }
@@ -3565,6 +3535,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             GetClientRect(hwnd, &rc);
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
+            agent_overlay_resize(d->agent_overlay);
             idd_request_render(d, TRUE);
             if (d->size_mode == DISPLAY_SIZE_WINDOW) idd_update_display_size(d, FALSE);
             if (d->relative_mouse) {
@@ -3578,6 +3549,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DISPLAYCHANGE:
     case WM_MOVE:
+        if (d) agent_overlay_resize(d->agent_overlay);
         if (d && d->size_mode == DISPLAY_SIZE_WINDOW && !d->input_sizing)
             idd_update_display_size(d, FALSE);
         if (d && d->relative_mouse) {
@@ -3622,7 +3594,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == IDT_PRESENT && d) {
             if (d->size_update_pending && !d->input_sizing && !IsIconic(hwnd))
                 idd_update_display_size(d, FALSE);
-            if (d->mouse_sync_pending) idd_poll_mouse_position(d);
+            idd_poll_mouse_position(d);
+            {
+                UINT size = (UINT)InterlockedCompareExchange(&d->rendered_size, 0, 0);
+                agent_overlay_update(d->agent_overlay, d->agent_control, d->agent_x, d->agent_y,
+                    LOWORD(size), HIWORD(size), d->agent_waiting, d->agent_finished);
+            }
             if ((!d->shared_ready && d->frame_dirty) || !d->device ||
                 (!d->rtv && !IsIconic(hwnd)))
                 idd_request_render(d, FALSE);
@@ -3722,6 +3699,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             d->input_focused = (LOWORD(wp) != WA_INACTIVE);
             if (!d->input_focused) {
+                agent_overlay_cancel_input(d->agent_overlay);
                 idd_flush_held_keys(d);
                 idd_flush_mouse_buttons(d);
             }
@@ -3800,7 +3778,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            if (d && (!d->cursor_visible || d->mouse_sync_pending))
+            POINT point;
+            BOOL menu = d && GetCursorPos(&point) && ScreenToClient(d->render_hwnd, &point) &&
+                agent_overlay_hit_test(d->agent_overlay, point);
+            if (menu)
+                SetCursor(LoadCursorW(NULL, IDC_HAND));
+            else if (d && d->agent_control == ASB_CONTROL_AGENT)
+                SetCursor(LoadCursorW(NULL, IDC_ARROW));
+            else if (d && (!d->cursor_visible || d->mouse_sync_pending))
                 SetCursor(NULL);
             else if (d && d->guest_cursor)
                 SetCursor(d->guest_cursor);
@@ -3925,6 +3910,8 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->shared_pending     = -1;
     d->clipboard          = NULL;
     d->cursor_visible     = TRUE;
+    d->agent_control = d->agent_x = d->agent_y = -1;
+    d->agent_finished = TRUE;
 
     /* Load the per-VM display setting, creating display_settings.json with
        the default (off) if this VM doesn't have one yet. The hook itself is

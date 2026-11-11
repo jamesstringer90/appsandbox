@@ -14,8 +14,12 @@
    it to report displayOpen and to reap a self-closed window before reopening. */
 @property (nonatomic) BOOL userClosed;
 @property (nonatomic, readonly) uint64_t vmId;
+@property (nonatomic, strong, readonly) VZVirtualMachineView *vmView;
 
 - (instancetype)initWithVzVm:(VzVm *)vm vmId:(uint64_t)vmId;
+- (instancetype)initWithVzVm:(VzVm *)vm vmId:(uint64_t)vmId offscreen:(BOOL)offscreen;
 - (void)showDisplay;
+- (void)prepareForAgentInput;
+- (void)finishPreparingForAgentInput;
 
 @end

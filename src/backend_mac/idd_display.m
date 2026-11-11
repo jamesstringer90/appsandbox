@@ -21,6 +21,8 @@
 #import "asb_core_mac.h"
 #import "asb_ivshmem_transport.h"
 #import "vm_dir.h"
+#import "agent_overlay.h"
+#include "headless_vm.h"
 #import <AudioToolbox/AudioToolbox.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -145,48 +147,7 @@ static void build_keymap(void)
 }
 
 /* Set-1 make codes; 0xe000 marks the Windows E0 prefix. */
-static const uint16_t g_scan[128] = {
-    [kVK_ANSI_A]=0x1e, [kVK_ANSI_S]=0x1f, [kVK_ANSI_D]=0x20, [kVK_ANSI_F]=0x21,
-    [kVK_ANSI_H]=0x23, [kVK_ANSI_G]=0x22, [kVK_ANSI_Z]=0x2c, [kVK_ANSI_X]=0x2d,
-    [kVK_ANSI_C]=0x2e, [kVK_ANSI_V]=0x2f, [kVK_ANSI_B]=0x30, [kVK_ANSI_Q]=0x10,
-    [kVK_ANSI_W]=0x11, [kVK_ANSI_E]=0x12, [kVK_ANSI_R]=0x13, [kVK_ANSI_Y]=0x15,
-    [kVK_ANSI_T]=0x14, [kVK_ANSI_U]=0x16, [kVK_ANSI_I]=0x17, [kVK_ANSI_O]=0x18,
-    [kVK_ANSI_P]=0x19, [kVK_ANSI_L]=0x26, [kVK_ANSI_J]=0x24, [kVK_ANSI_K]=0x25,
-    [kVK_ANSI_N]=0x31, [kVK_ANSI_M]=0x32,
-    [kVK_ANSI_1]=0x02, [kVK_ANSI_2]=0x03, [kVK_ANSI_3]=0x04, [kVK_ANSI_4]=0x05,
-    [kVK_ANSI_5]=0x06, [kVK_ANSI_6]=0x07, [kVK_ANSI_7]=0x08, [kVK_ANSI_8]=0x09,
-    [kVK_ANSI_9]=0x0a, [kVK_ANSI_0]=0x0b,
-    [kVK_ANSI_Equal]=0x0d, [kVK_ANSI_Minus]=0x0c,
-    [kVK_ANSI_LeftBracket]=0x1a, [kVK_ANSI_RightBracket]=0x1b,
-    [kVK_ANSI_Quote]=0x28, [kVK_ANSI_Semicolon]=0x27, [kVK_ANSI_Backslash]=0x2b,
-    [kVK_ANSI_Comma]=0x33, [kVK_ANSI_Slash]=0x35, [kVK_ANSI_Period]=0x34,
-    [kVK_ANSI_Grave]=0x29, [kVK_ISO_Section]=0x56,
-    [kVK_Return]=0x1c, [kVK_Tab]=0x0f, [kVK_Space]=0x39,
-    [kVK_Delete]=0x0e, [kVK_Escape]=0x01,
-    [kVK_Command]=0xe05b, [kVK_RightCommand]=0xe05c,
-    [kVK_Shift]=0x2a, [kVK_RightShift]=0x36, [kVK_CapsLock]=0x3a,
-    [kVK_Option]=0x38, [kVK_RightOption]=0xe038,
-    [kVK_Control]=0x1d, [kVK_RightControl]=0xe01d,
-    [kVK_ANSI_Keypad0]=0x52, [kVK_ANSI_Keypad1]=0x4f, [kVK_ANSI_Keypad2]=0x50,
-    [kVK_ANSI_Keypad3]=0x51, [kVK_ANSI_Keypad4]=0x4b, [kVK_ANSI_Keypad5]=0x4c,
-    [kVK_ANSI_Keypad6]=0x4d, [kVK_ANSI_Keypad7]=0x47, [kVK_ANSI_Keypad8]=0x48,
-    [kVK_ANSI_Keypad9]=0x49, [kVK_ANSI_KeypadDecimal]=0x53,
-    [kVK_ANSI_KeypadMultiply]=0x37, [kVK_ANSI_KeypadPlus]=0x4e,
-    [kVK_ANSI_KeypadMinus]=0x4a, [kVK_ANSI_KeypadDivide]=0xe035,
-    [kVK_ANSI_KeypadEnter]=0xe01c, [kVK_ANSI_KeypadClear]=0x45,
-    [0x34]=0xe01c, [0x6e]=0xe05d,
-    [kVK_F1]=0x3b, [kVK_F2]=0x3c, [kVK_F3]=0x3d, [kVK_F4]=0x3e,
-    [kVK_F5]=0x3f, [kVK_F6]=0x40, [kVK_F7]=0x41, [kVK_F8]=0x42,
-    [kVK_F9]=0x43, [kVK_F10]=0x44, [kVK_F11]=0x57, [kVK_F12]=0x58,
-    [kVK_F13]=0x64, [kVK_F14]=0x65, [kVK_F15]=0x66, [kVK_F16]=0x67,
-    [kVK_F17]=0x68, [kVK_F18]=0x69, [kVK_F19]=0x6a, [kVK_F20]=0x6b,
-    [kVK_Help]=0xe052, [kVK_Home]=0xe047, [kVK_End]=0xe04f,
-    [kVK_PageUp]=0xe049, [kVK_PageDown]=0xe051, [kVK_ForwardDelete]=0xe053,
-    [kVK_LeftArrow]=0xe04b, [kVK_RightArrow]=0xe04d,
-    [kVK_UpArrow]=0xe048, [kVK_DownArrow]=0xe050,
-    [kVK_JIS_Yen]=0x7d, [kVK_JIS_Underscore]=0x73,
-    [kVK_JIS_Kana]=0xe0f2, [kVK_JIS_Eisu]=0xe0f1
-};
+#include "input_keys.h"
 
 static BOOL idd_modifier_down(NSEventModifierFlags flags, unsigned short kc) {
     NSEventModifierFlags side = 0, pair = 0, common = 0;
@@ -205,73 +166,11 @@ static BOOL idd_modifier_down(NSEventModifierFlags flags, unsigned short kc) {
     return (flags & (side | pair)) ? (flags & side) != 0 : YES;
 }
 
-static int idd_input_versions(int fd, volatile int *stop, int *keyboardVersion, int *mouseVersion) {
-    InputPacket queries[] = {
-        { INPUT_MAGIC, INPUT_KEYBOARD_QUERY, INPUT_KEYBOARD_VERSION, arc4random() | 1u, 0 },
-        { INPUT_MAGIC, INPUT_MOUSE_QUERY, INPUT_MOUSE_NORMALIZED_VERSION, arc4random() | 1u, 0 }
-    };
-    uint8_t received[sizeof(uint32_t) + sizeof(InputPacket)];
-    size_t sent = 0, count = 0;
-    BOOL greeted = NO, keyboardReplied = NO, mouseReplied = NO;
-    *keyboardVersion = 1;
-    *mouseVersion = 0;
-    struct timespec start, now;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    while (!*stop) {
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        int64_t left = 500000 - ((now.tv_sec - start.tv_sec) * 1000000
-                            + (now.tv_nsec - start.tv_nsec) / 1000);
-        if (left <= 0) break;
-        fd_set reads, writes;
-        FD_ZERO(&reads); FD_SET(fd, &reads);
-        FD_ZERO(&writes); if (sent < sizeof(queries)) FD_SET(fd, &writes);
-        struct timeval timeout = { 0, (suseconds_t)(left < 50000 ? left : 50000) };
-        int ready = select(fd + 1, &reads, &writes, NULL, &timeout);
-        if (ready < 0) { if (errno == EINTR) continue; return 0; }
-        if (FD_ISSET(fd, &writes)) {
-            ssize_t n = send(fd, (uint8_t *)queries + sent, sizeof(queries) - sent, MSG_DONTWAIT);
-            if (n > 0) sent += (size_t)n;
-            else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) return 0;
-        }
-        if (FD_ISSET(fd, &reads)) {
-            ssize_t n = recv(fd, received + count, sizeof(received) - count, 0);
-            if (n == 0) return 0;
-            if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
-                return 0;
-            }
-            count += (size_t)n;
-            if (!greeted && count >= sizeof(uint32_t)) {
-                uint32_t magic;
-                memcpy(&magic, received, sizeof(magic));
-                if (magic != INPUT_READY_MAGIC) return sent == sizeof(queries);
-                greeted = YES;
-                count -= sizeof(magic);
-                memmove(received, received + sizeof(magic), count);
-            }
-            if (greeted && count >= sizeof(InputPacket)) {
-                InputPacket reply;
-                memcpy(&reply, received, sizeof(reply));
-                count -= sizeof(reply);
-                memmove(received, received + sizeof(reply), count);
-                if (reply.magic == INPUT_MAGIC && reply.param3 == 0) {
-                    if (reply.type == INPUT_KEYBOARD_REPLY && reply.param2 == queries[0].param2) {
-                        *keyboardVersion = reply.param1 == INPUT_KEYBOARD_VERSION ? INPUT_KEYBOARD_VERSION : 1;
-                        keyboardReplied = YES;
-                    } else if (reply.type == INPUT_MOUSE_REPLY && reply.param2 == queries[1].param2) {
-                        *mouseVersion = reply.param1 >= INPUT_MOUSE_VERSION &&
-                            reply.param1 <= INPUT_MOUSE_NORMALIZED_VERSION ? (int)reply.param1 : 0;
-                        mouseReplied = YES;
-                    }
-                }
-            }
-        }
-        if (sent == sizeof(queries) && keyboardReplied && mouseReplied)
-            return *mouseVersion >= INPUT_MOUSE_VERSION && count ? 0 : 1;
-    }
-    if (*mouseVersion >= INPUT_MOUSE_VERSION && count) return 0;
-    return sent && sent < sizeof(queries) ? 0 : 1;
+static int idd_input_stopped(void *context)
+{
+    return *(volatile int *)context!=0;
 }
+
 /* extended-key keycodes (arrows + nav + fwd-delete) */
 static int is_extended(unsigned short kc)
 {
@@ -447,6 +346,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
 @end
 
 @implementation IddDisplayWindow {
+    AsbMacInput *_asbInput;
+    AsbAgentOverlay *_agentOverlay;
     /* ch2 framebuffer, reconstructed from the VDD wire stream by the reader thread. The reader writes
        _fb (+ bumps _fbSeq under _fbLock); the render timer copies it once into a GPU surface when _fbSeq
        advances, so the GPU never races the reader. */
@@ -570,7 +471,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
     NSRect frame = NSMakeRect(0, 0, 1280, 720);
     NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                               NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
-    NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
+    NSWindow *window = [[AsbViewerWindow alloc] initWithContentRect:frame
                                                   styleMask:style
                                                     backing:NSBackingStoreBuffered
                                                       defer:NO];
@@ -757,6 +658,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
 }
 
 - (NSEvent *)handleViewerEvent:(NSEvent *)event {
+    BOOL key=event.type==NSEventTypeKeyDown || event.type==NSEventTypeKeyUp || event.type==NSEventTypeFlagsChanged;
+    if (!key && [_agentOverlay handleViewerMouseEvent:event]) return nil;
     if (_stop) return event;
     BOOL contextClick = event.type == NSEventTypeRightMouseDown ||
         (event.type == NSEventTypeLeftMouseDown && (event.modifierFlags & NSEventModifierFlagControl));
@@ -789,7 +692,10 @@ static __weak IddDisplayWindow *g_mouseOwner;
     if (_eventMonitor) return;
     __weak IddDisplayWindow *weakSelf = self;
     _eventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:
-        NSEventMaskKeyDown | NSEventMaskKeyUp | NSEventMaskFlagsChanged | NSEventMaskRightMouseDown | NSEventMaskLeftMouseDown
+        NSEventMaskKeyDown | NSEventMaskKeyUp | NSEventMaskFlagsChanged |
+        NSEventMaskMouseMoved | NSEventMaskLeftMouseDown | NSEventMaskLeftMouseUp |
+        NSEventMaskRightMouseDown | NSEventMaskRightMouseUp | NSEventMaskOtherMouseDown | NSEventMaskOtherMouseUp |
+        NSEventMaskLeftMouseDragged | NSEventMaskRightMouseDragged | NSEventMaskOtherMouseDragged | NSEventMaskScrollWheel
         handler:^NSEvent *(NSEvent *event) {
             IddDisplayWindow *owner = weakSelf;
             return owner ? [owner handleViewerEvent:event] : event;
@@ -814,7 +720,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 }
 
 - (void)updateKeyboardCapture {
-    BOOL capture = _transmitHotkeys && !_stop && !_trackingMenus && _eventMonitor && NSApp.isActive &&
+    BOOL capture = !_agentOverlay.blocksInput && _transmitHotkeys && !_stop && !_trackingMenus && _eventMonitor && NSApp.isActive &&
         self.window.isKeyWindow && self.window.firstResponder == self.view && !self.window.attachedSheet;
     if (!capture) { [self releaseKeyboardCapture]; return; }
     if (_hotkeysCaptured) return;
@@ -848,6 +754,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 }
 
 - (void)forwardKeyEvent:(NSEvent *)event {
+    if (_agentOverlay.blocksInput) return;
     [self flushMove];
     unsigned short kc = event.keyCode;
     if (kc >= 128) return;
@@ -867,8 +774,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
             if (KBGetLayoutType(keyboardType) == kKeyboardISO)
                 position = kVK_ISO_Section + kVK_ANSI_Grave - kc;
         }
-        scan = g_scan[position] & 0xff;
-        extended = (g_scan[position] & 0xff00) == 0xe000;
+        scan = asb_mac_scan_codes[position] & 0xff;
+        extended = (asb_mac_scan_codes[position] & 0xff00) == 0xe000;
         vk = g_vk[kc];
         if (event.type == NSEventTypeFlagsChanged) {
             if (kc == kVK_CapsLock) {
@@ -1020,6 +927,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 }
 
 - (void)updateMouseCapture {
+    if (_agentOverlay.blocksInput) { [self releaseMouseCapture];return; }
     pthread_mutex_lock(&_inqLock);
     BOOL ready = _inputReady && _mouseVersion >= INPUT_MOUSE_VERSION &&
         ((!_relativeMouse && !_mousePositionRequest) || _mouseCaptureConnection == _inputConnection);
@@ -1174,6 +1082,13 @@ static __weak IddDisplayWindow *g_mouseOwner;
 }
 
 - (void)showDisplay {
+    if (!_asbInput) {
+        AsbMacHeadlessTarget target={0};
+        if (asb_mac_target(self.vmId,&target)) {
+            _asbInput=asb_mac_input_session(&target);asb_mac_channel_release(target.channel);
+        }
+    }
+    if (!_agentOverlay) _agentOverlay=[[AsbAgentOverlay alloc] initWithView:self.view vmId:self.vmId];
     self.userClosed = NO;
     asb_events_changed();
     [self showWindow:nil];
@@ -1215,6 +1130,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
 /* Render-timer body (main thread): flush a coalesced move, mirror the guest HW cursor onto the
    macOS cursor, and copy a freshly reconstructed frame into the render buffer + redraw. */
 - (void)renderTick {
+    asb_mac_input_dimensions(self.vmId,[self frameWidth],[self frameHeight]);
+    if (_agentOverlay.blocksInput) { [self releaseMouseCapture];[self releaseKeyboardCapture]; }
     [self updateMouseCapture];
     [self flushMove];
     [self.view updateGuestCursor];
@@ -1654,7 +1571,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 - (void)inputLoop {
     __weak IddDisplayWindow *weakSelf = self;
     while (!_stop) {
-        int fd = [_transport connectChannel:ASB_CH_INPUT timeoutMs:2000];
+        int fd = asb_mac_input_viewer(_asbInput);
         if (fd < 0) { if (_stop) break; usleep(200000); continue; }
         /* EPIPE not SIGPIPE: when the transport pump tears this slot down on guest-acceptor death it
            closes our socketpair peer, so a send here must fail with EPIPE (-> reconnect), never signal. */
@@ -1665,7 +1582,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
            returns EAGAIN instantly (-> drop) and only a real error/EOF triggers reconnect. */
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
         int keyboardVersion = 1, mouseVersion = 0;
-        if (!idd_input_versions(fd, &_stop, &keyboardVersion, &mouseVersion) || _stop) {
+        if (!asb_mac_input_versions(fd,idd_input_stopped,(void *)&_stop,&keyboardVersion,&mouseVersion) || _stop) {
             close(fd);
             if (!_stop) usleep(100000);
             continue;
@@ -2302,6 +2219,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 #pragma mark - Teardown
 
 - (void)teardown {
+    [_agentOverlay invalidate];_agentOverlay=nil;
     if (_stop) return;
     [self releaseMouseCapture];
     [self releaseKeyboardCapture];
@@ -2352,6 +2270,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
 - (void)dealloc {
     [self teardown];
+    asb_mac_input_release(_asbInput);
     for (int i = 0; i < IDD_SURF_COUNT; i++) {
         _surfTex[i] = nil;
         if (_surf[i]) { CFRelease(_surf[i]); _surf[i] = NULL; }

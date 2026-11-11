@@ -20,6 +20,18 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="vdd.cpp" />
+    <ClCompile Include="screenshot.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WppEnabled>false</WppEnabled>
+      <EnablePREfast>false</EnablePREfast>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="..\transport\asb_capture_service.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WppEnabled>false</WppEnabled>
+      <EnablePREfast>false</EnablePREfast>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
     <!-- ivshmem transport (Windows-VMs-on-Mac frame path). Plain C; no WPP/PREfast. -->
     <ClCompile Include="..\transport\asb_transport.c">
       <CompileAs>CompileAsC</CompileAs>
@@ -30,6 +42,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="vdd.h" />
+    <ClInclude Include="screenshot.h" />
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>

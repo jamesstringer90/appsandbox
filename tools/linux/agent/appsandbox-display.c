@@ -41,6 +41,7 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 #include "display-gpu.h"
+#include "asb_capture_socket.h"
 #include "asb_drm_uapi.h"
 
 #define VSOCK_PORT      2
@@ -105,7 +106,7 @@ static int vsock_listen(unsigned port)
         agent_log("bind :%u: %s", port, strerror(errno));
         close(s); return -1;
     }
-    if (listen(s, 1) < 0) {
+    if (listen(s, port==ASB_CH_SCREENSHOT?8:1) < 0) {
         agent_log("listen: %s", strerror(errno));
         close(s); return -1;
     }
@@ -264,6 +265,59 @@ static int drm_acquire_fb(struct capture_ctx *c)
 out:
     drmModeFreePlaneResources(pres);
     return rc;
+}
+
+struct screenshot_capture {
+    AsbCaptureSocket *service;
+    struct capture_ctx cpu;
+    struct display_gpu_capture *gpu;
+    uint64_t sequence;
+};
+
+static uint64_t screenshot_time(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC,&now);
+    return (uint64_t)now.tv_sec*1000+now.tv_nsec/1000000;
+}
+
+static uint32_t screenshot_capture_frame(void *context,const AsbScreenshotRequest *request,
+    AsbScreenshotReply *reply,unsigned char **output)
+{
+    struct screenshot_capture *capture=context;
+    uint64_t deadline=screenshot_time()+request->timeout_ms;
+    uint32_t error=1460;
+    display_gpu_capture_begin(capture->gpu);
+    while (!g_stop && screenshot_time()<deadline) {
+        const void *pixels=NULL;
+        uint32_t width=0,height=0,stride=0;
+        uint64_t sequence=0;
+        int shared=0;
+        int result=display_gpu_capture_poll(capture->gpu,&pixels,&width,&height,&stride,&sequence,&shared);
+        if (result<0) { error=21;break; }
+        if (result==2) {
+            if (drm_acquire_fb(&capture->cpu)==0) {
+                pixels=capture->cpu.mem;width=capture->cpu.width;height=capture->cpu.height;
+                stride=capture->cpu.stride;sequence=++capture->sequence;result=1;
+            } else result=0;
+        }
+        if (result==1) {
+            reply->width=width;reply->height=height;
+            unsigned char *copy=NULL;
+            error=asb_capture_pack(pixels,stride,reply,&copy);
+            if (error) break;
+            if (!display_gpu_capture_valid(capture->gpu)) {
+                free(copy);display_gpu_capture_begin(capture->gpu);continue;
+            }
+            reply->frame_seq=sequence;
+            reply->capture_time_ms=screenshot_time();reply->flags=shared?ASB_SCREENSHOT_GPU_SHARED:0;
+            *output=copy;error=0;break;
+        }
+        struct timespec delay={.tv_nsec=2000000};
+        nanosleep(&delay,NULL);
+    }
+    display_gpu_capture_end(capture->gpu);
+    return g_stop?995:error;
 }
 
 /* ---- Cursor plane: discover + emit ASCR on change ----
@@ -804,7 +858,7 @@ static int display_resize(int fd, int client_fd, struct display_config *config,
 }
 
 static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu,
-                          struct display_config *config)
+                          struct display_config *config,struct screenshot_capture *capture)
 {
     struct capture_ctx ctx = {.fd = drm_fd, .dma_fd = -1};
     struct cursor_state cur;
@@ -914,6 +968,7 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu,
                 if (send_frame(client_fd, &ctx, ++seq) < 0) break;
             }
         }
+        display_gpu_capture_offer(*gpu,capture->gpu,shared);
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         int64_t remaining = (next.tv_sec - now.tv_sec) * 1000000000LL + next.tv_nsec - now.tv_nsec;
@@ -942,7 +997,7 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu,
 static int display_session(int argc, char **argv)
 {
     if (argc < 3) return 1;
-    int accelerated = 0;
+    int accelerated = 0, queried = 0;
     for (int i = 0; i < 8 && !accelerated; ++i) {
         char path[64];
         snprintf(path, sizeof(path), "/dev/dri/card%d", i);
@@ -951,10 +1006,13 @@ static int display_session(int argc, char **argv)
         drmDropMaster(fd);
         struct drm_asb_gpu_query query = {0};
         if (ioctl(fd, DRM_IOCTL_ASB_GPU_QUERY, &query) == 0 &&
-            query.version == ASB_DRM_GPU_VERSION && (query.capabilities & ASB_DRM_GPU_CAP_PRESENT))
-            accelerated = 1;
+            query.version == ASB_DRM_GPU_VERSION) {
+            queried = 1;
+            accelerated |= !!(query.capabilities & ASB_DRM_GPU_CAP_PRESENT);
+        }
         close(fd);
     }
+    if (!queried) accelerated = access("/run/appsandbox/gpu-present", F_OK) == 0;
     if (accelerated) {
         unsetenv("LIBGL_ALWAYS_SOFTWARE");
         setenv("GALLIUM_DRIVER", "d3d12", 1);
@@ -1013,6 +1071,7 @@ int main(int argc, char **argv)
         sigaction(SIGTERM, &sa, NULL);
     }
 
+    unlink("/run/appsandbox/gpu-present");
     display_wait_runtime();
     int drm_fd = capture_open();
     if (drm_fd < 0) return 1;
@@ -1023,11 +1082,24 @@ int main(int argc, char **argv)
     if (config.fallback.refresh > 60) config.fallback.refresh = 60;
     struct display_gpu *gpu = display_gpu_create(drm_fd);
     agent_log("GPU presenter: %s", gpu ? "ready" : "unavailable");
-    sd_notify(0, "READY=1");
+
+    int screenshot_listener=vsock_listen(ASB_CH_SCREENSHOT);
+    struct screenshot_capture capture={.cpu={.fd=drm_fd,.dma_fd=-1}};
+    if (screenshot_listener>=0) {
+        capture.gpu=display_gpu_capture_create();
+        if (capture.gpu) capture.service=asb_capture_socket_start(screenshot_listener,&capture,screenshot_capture_frame);
+        else close(screenshot_listener);
+    }
+    if (capture.service) agent_log("independent screenshot listener on vsock :%u",ASB_CH_SCREENSHOT);
+    else {
+        display_gpu_capture_destroy(capture.gpu);capture.gpu=NULL;
+        agent_log("Screenshot service unavailable; continuing normal display output.");
+    }
 
     int srv = vsock_listen(VSOCK_PORT);
-    if (srv < 0) return 1;
+    if (srv < 0) { asb_capture_socket_stop(capture.service);display_gpu_capture_destroy(capture.gpu);display_gpu_destroy(gpu);close(drm_fd);return 1; }
     agent_log("listening on vsock :%u", VSOCK_PORT);
+    sd_notify(0, "READY=1");
 
     while (!g_stop) {
         if (gpu && !display_gpu_healthy(gpu)) {
@@ -1036,8 +1108,10 @@ int main(int argc, char **argv)
             display_config_fallback(drm_fd, &config);
         }
         display_config_expire(drm_fd, &config, -1, 0);
-        struct pollfd pending = {.fd = srv, .events = POLLIN};
-        if (poll(&pending, 1, 1000) <= 0) continue;
+        display_gpu_capture_offer(gpu,capture.gpu,-1);
+        struct pollfd pending[]={{.fd=srv,.events=POLLIN},
+            {.fd=display_gpu_capture_event(capture.gpu),.events=POLLIN}};
+        if (poll(pending,2,1000)<=0 || !(pending[0].revents&POLLIN)) continue;
         struct sockaddr_vm peer;
         socklen_t plen = sizeof(peer);
         int c = accept(srv, (struct sockaddr *)&peer, &plen);
@@ -1049,11 +1123,14 @@ int main(int argc, char **argv)
         agent_log("client connected (cid=%u)", peer.svm_cid);
         struct timeval timeout = {.tv_sec = 2};
         setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-        capture_loop(c, drm_fd, &gpu, &config);
+        capture_loop(c, drm_fd, &gpu, &config,&capture);
         close(c);
     }
 
     close(srv);
+    asb_capture_socket_stop(capture.service);
+    drm_release_fb(&capture.cpu);
+    display_gpu_capture_destroy(capture.gpu);
     display_gpu_destroy(gpu);
     close(drm_fd);
     return 0;

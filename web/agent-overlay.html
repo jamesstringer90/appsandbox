@@ -1,0 +1,137 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy"
+content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<style>
+:root { --bg:#1e1e1e; --ctrl-bg:#2d2d2d; --ctrl-border:#3e3e3e; --text:#e6e6e6;
+  --text-dim:#888; --accent:#4ea6f5; --warning:#dcc800; --radius:4px; }
+html,body { margin:0; width:100%; height:100%; overflow:hidden; background:transparent;
+  pointer-events:none; user-select:none; font-family:'Segoe UI',sans-serif; font-size:13px; }
+#cursor { position:absolute; display:none; color:var(--accent); pointer-events:none; opacity:1; }
+#cursor.paused { color:var(--warning); }
+#cursor svg { width:25px; height:34px; filter:drop-shadow(1px 2px 1px #0009); }
+#label { position:absolute; left:25px; top:3px; border:1px solid var(--ctrl-border); border-radius:var(--radius);
+  padding:2px 6px; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  background:var(--ctrl-bg); font-size:11px; font-weight:600; line-height:15px; color:var(--text); }
+#menu { display:none; position:absolute; box-sizing:border-box; right:16px; top:16px;
+  width:360px; max-width:calc(100% - 32px); max-height:calc(100% - 32px); overflow:auto; padding:20px;
+  border:1px solid #555; border-radius:6px; background:#2a2a2a; color:var(--text); pointer-events:none;
+  opacity:0.7; transition:opacity 3s ease-out; color-scheme:dark; }
+#menu.appearing { animation:menu-appear 3s ease-out; }
+#menu.mouse-active { opacity:1; transition-duration:150ms; }
+@keyframes menu-appear { from { opacity:1; } to { opacity:0.7; } }
+#identity { font-size:14px; font-weight:700; line-height:20px; margin-bottom:12px; overflow-wrap:anywhere; }
+#menu.paused #identity { color:var(--warning); }
+#model { color:#bbb; font-size:12px; line-height:18px; margin-top:4px; overflow-wrap:anywhere; }
+#purpose-label { color:var(--text-dim); font-size:12px; margin-top:12px; }
+#purpose { color:#bbb; font-size:12px; line-height:18px; margin:4px 0 16px;
+  white-space:pre-wrap; overflow-wrap:anywhere; max-height:108px; overflow:hidden; }
+#buttons { display:flex; justify-content:flex-end; gap:8px; }
+button { box-sizing:border-box; height:26px; padding:4px 12px; border:1px solid var(--ctrl-border);
+  border-radius:var(--radius); background:var(--ctrl-bg); color:var(--text); font:12px 'Segoe UI',sans-serif; }
+#take { background:#1a3a5a; border-color:#2a5a8a; color:#88bbff; }
+#take.hovered { background:#2a4a6a; }
+#stop { background:#5a1a1a; border-color:#8a2a2a; color:#ff8888; }
+#stop.hovered { background:#6a2a2a; }
+@media(max-width:340px) { #buttons { flex-direction:column; } #stop { width:100%; } }
+</style></head><body inert>
+<div id="cursor" aria-hidden="true"><svg viewBox="0 0 25 34"><path
+d="M2 2 L2 26 L8 21 L13 32 L18 30 L13 19 L22 18 Z"
+fill="currentColor" stroke="white" stroke-width="1.5" stroke-linejoin="round"/></svg>
+<span id="label">API</span></div>
+<div id="menu"><div id="identity"></div><div id="model"></div>
+<div id="purpose-label">What the agent is doing:</div><div id="purpose"></div>
+<div id="buttons"><button id="take" tabindex="-1">Take control</button>
+<button id="stop" tabindex="-1">Stop agent</button></div></div>
+<script>
+const cursor=document.getElementById('cursor'), take=document.getElementById('take');
+const menu=document.getElementById('menu'), stop=document.getElementById('stop');
+let pressed=null, fadeTimer=0;
+function resetAppearance() {
+  clearTimeout(fadeTimer);
+  fadeTimer=0;
+  menu.classList.remove('appearing','mouse-active');
+}
+function pointerActivity() {
+  if(menu.style.display!=='block') return;
+  menu.classList.remove('appearing');
+  menu.classList.toggle('mouse-active',true);
+  clearTimeout(fadeTimer);
+  fadeTimer=setTimeout(()=>{
+    menu.classList.remove('mouse-active');
+    fadeTimer=0;
+  },150);
+}
+function clearInput() {
+  pressed=null;
+  take.classList.remove('hovered');
+  stop.classList.remove('hovered');
+}
+function contains(element,x,y) {
+  const r=element.getBoundingClientRect();
+  return x>=r.left && x<r.right && y>=r.top && y<r.bottom;
+}
+function activate(button) {
+  if(menu.style.display==='none') return;
+  menu.style.display='none';
+  clearInput();
+  resetAppearance();
+  window.chrome.webview.postMessage(button===take?take.dataset.command:'stop_agent');
+}
+function receiveInput(s) {
+  if(s.kind==='leave' || s.kind==='cancel') { clearInput(); return; }
+  if(!['move','down','up','wheel','hwheel'].includes(s.kind)) return;
+  if(menu.style.display==='none' || !contains(menu,s.x,s.y)) { clearInput(); return; }
+  const target=contains(take,s.x,s.y)?take:contains(stop,s.x,s.y)?stop:null;
+  take.classList.toggle('hovered',target===take);
+  stop.classList.toggle('hovered',target===stop);
+  if(s.kind==='down' && s.button===0) pressed=target;
+  else if(s.kind==='up' && s.button===0) {
+    const original=pressed;
+    pressed=null;
+    if(target && target===original) activate(target);
+  } else if(s.kind==='wheel') menu.scrollTop-=s.delta;
+  else if(s.kind==='hwheel') menu.scrollLeft+=s.delta;
+}
+for(const type of ['pointerdown','pointerup','pointermove','pointercancel','mousedown','mouseup','mousemove',
+  'click','dblclick','auxclick','contextmenu','wheel','touchstart','touchmove','touchend',
+  'keydown','keyup','keypress','beforeinput','input','compositionstart','compositionupdate','compositionend',
+  'dragstart','dragover','drop']) {
+  window.addEventListener(type,e=>{
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  },{capture:true,passive:false});
+}
+function layout() {
+  if(menu.style.display==='none') return;
+  const m=menu.getBoundingClientRect();
+  const c=cursor.getBoundingClientRect(), l=document.getElementById('label').getBoundingClientRect();
+  window.chrome.webview.postMessage('layout:'+JSON.stringify({x:Math.round(m.x),y:Math.round(m.y),
+    width:Math.round(m.width),height:Math.round(m.height),cursor:cursor.style.display!=='none',
+    cx:c.x,cy:c.y,cursorPath:cursor.querySelector('path').getAttribute('d'),
+    label:{x:l.x,y:l.y,width:l.width,height:l.height}}));
+}
+new ResizeObserver(layout).observe(menu);
+window.chrome.webview.addEventListener('message', e => {
+  const s=e.data;
+  if(s.type==='input') { receiveInput(s); return; }
+  if(s.type==='pointer_activity') { pointerActivity(); return; }
+  const wasVisible=menu.style.display==='block';
+  cursor.style.display=s.showCursor?'block':'none';
+  cursor.style.transform=`translate(${s.x}px,${s.y}px)`;
+  cursor.classList.toggle('paused',!s.active);
+  menu.style.display=s.menu?'block':'none';
+  if(s.menu && !wasVisible) menu.classList.toggle('appearing',true);
+  menu.classList.toggle('paused',!s.active);
+  if(!s.menu) { clearInput(); resetAppearance(); }
+  const identity=s.context?.identity?.trim() || 'API';
+  document.getElementById('identity').textContent=s.active?
+    `${identity} has control of the mouse and keyboard.`:`${identity} wants to continue.`;
+  document.getElementById('label').textContent=identity;
+  document.getElementById('model').textContent=`Vendor: ${s.context?.vendor || 'unknown'} · Model: ${s.context?.model || 'unknown'}`;
+  document.getElementById('purpose').textContent=s.context?.purpose || '';
+  take.textContent=s.active?'Take control':'Return control';
+  take.dataset.command=s.active?'take_control':'return_control';
+  requestAnimationFrame(layout);
+});
+window.chrome.webview.postMessage('ready');
+</script></body></html>

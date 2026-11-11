@@ -26,6 +26,8 @@
 
 #include "asb_types.h"
 #include "asb_events.h"
+#include "api_contract.h"
+#include "headless_vm.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -81,6 +83,7 @@ static void post_event(int type, AsbVmId vm_id, int int_value, const char *str_v
     const char *vm_name = vm ? vm->name : NULL;
     CoreVmEvent event = {0};
     event.vm_id = vm_id; event.type = type; event.int_value = int_value; event.str_value = str_value;
+    event.is_template=vm && vm->is_template;
     if (vm_name) strlcpy(event.vm_name, vm_name, sizeof(event.vm_name));
     asb_events_emit(&event);
 }
@@ -118,10 +121,14 @@ static void post_list_changed(void) {
 
 static int vm_index_by_name(const char *name) {
     if (!name) return -1;
+    int found=-1;
     for (int i = 0; i < g_vm_count; i++) {
-        if (strcmp(g_vms[i].name, name) == 0) return i;
+        if (strcasecmp(g_vms[i].name, name) == 0) {
+            if (found>=0) return -1;
+            found=i;
+        }
     }
-    return -1;
+    return found;
 }
 
 static int vm_index_of(AsbVmId vm_id) {
@@ -243,8 +250,8 @@ static BOOL save_vm_list(void) {
 
     for (int i = 0; i < g_vm_count; i++) {
         fprintf(f, "[VM]\n");
-        char id[ASB_VM_ID_TEXT_SIZE];
-        asb_vm_id_format(g_vms[i].unique_id, id);
+        char id[ASB_TEMPLATE_ID_TEXT_SIZE];
+        asb_resource_id_format(g_vms[i].unique_id,g_vms[i].is_template,id);
         fprintf(f, "Id=%s\n", id);
         fprintf(f, "Name=%s\n", g_vms[i].name);
         fprintf(f, "OsType=%s\n", g_vms[i].os_type);
@@ -298,6 +305,8 @@ static void load_vm_list(void) {
     char line[2048];
     AsbVmMac *vm = NULL;
     BOOL in_settings = NO;
+    int identities_changed=0;
+    char record_ids[ASB_MAX_VMS][ASB_TEMPLATE_ID_TEXT_SIZE]={0};
 
     while (fgets(line, sizeof(line), f)) {
         size_t len = strlen(line);
@@ -329,8 +338,11 @@ static void load_vm_list(void) {
 
         if (!vm) continue;
 
-        if (strncmp(line, "Id=", 3) == 0)
-            vm->unique_id = asb_vm_id_parse(line + 3);
+        if (strncmp(line, "Id=", 3) == 0) {
+            record_ids[g_vm_count-1][0]=0;
+            if (strlen(line+3)<ASB_TEMPLATE_ID_TEXT_SIZE)
+                strlcpy(record_ids[g_vm_count-1],line+3,ASB_TEMPLATE_ID_TEXT_SIZE);
+        }
         else if (strncmp(line, "Name=", 5) == 0)
             strlcpy(vm->name, line + 5, sizeof(vm->name));
         else if (strncmp(line, "OsType=", 7) == 0)
@@ -383,10 +395,12 @@ static void load_vm_list(void) {
 
     fclose(f);
     AsbVmId ids[ASB_MAX_VMS];
-    for (int i = 0; i < g_vm_count; ++i) ids[i] = g_vms[i].unique_id;
+    for (int i = 0; i < g_vm_count; ++i)
+        ids[i]=asb_resource_id_load(record_ids[i],g_vms[i].is_template,&identities_changed);
     int migrated = asb_vm_ids_ensure(ids, (size_t)g_vm_count);
-    if (migrated > 0) {
-        for (int i = 0; i < g_vm_count; ++i) g_vms[i].unique_id = ids[i];
+    if (migrated<0) { g_config_load_failed=YES;g_vm_count=0;return; }
+    for (int i=0;i<g_vm_count;++i) g_vms[i].unique_id=ids[i];
+    if (migrated || identities_changed) {
         if (!save_vm_list()) {
             g_config_load_failed = YES;
             g_vm_count = 0;
@@ -413,6 +427,7 @@ void asb_mac_init(void) {
 }
 
 void asb_mac_cleanup(void) {
+    asb_mac_input_forget(0);
     if (!g_initialized) return;
     g_initialized = NO;
     [IsoPatchMac stopWorkers];
@@ -459,6 +474,30 @@ AsbVmMac *asb_mac_vm_find(const char *name) {
 AsbVmMac *asb_mac_vm_find_by_id(AsbVmId vm_id) {
     int idx = vm_index_of(vm_id);
     return idx >= 0 ? &g_vms[idx] : NULL;
+}
+
+int asb_mac_target(uint64_t identity,AsbMacHeadlessTarget *target)
+{
+    if (![NSThread isMainThread] || !target) return 0;
+    AsbVmMac *vm=asb_mac_vm_find_by_id(identity);
+    if (!vm || vm->is_template || !vm->running || vm->shutting_down) return 0;
+    int index=vm_index_of(identity);void *memory=NULL,*device=NULL,*display=NULL;
+    if (!strcasecmp(vm->os_type,"Windows")) memory=(__bridge void *)g_transport_refs[index];
+    else {
+        VzVm *machine=g_vz_refs[index];
+        for (id entry in machine.machine.socketDevices) if ([entry isKindOfClass:[VZVirtioSocketDevice class]]) { device=(__bridge void *)entry;break; }
+        for (VZGraphicsDevice *graphics in machine.machine.graphicsDevices)
+            if (graphics.displays.count) { display=(__bridge void *)graphics.displays.firstObject;break; }
+    }
+    if (!memory && !device && !display) return 0;
+    memset(target,0,sizeof(*target));target->id=identity;target->run_id=vm->run_id;
+    target->channel=asb_mac_channel_create(memory,device,display);target->ssh_port=(unsigned)vm->ssh_port;
+    strlcpy(target->name,vm->name,sizeof(target->name));strlcpy(target->os_type,vm->os_type,sizeof(target->os_type));
+    strlcpy(target->user,vm->admin_user[0]?vm->admin_user:"user",sizeof(target->user));
+    NSString *key=asb_mac_ssh_key_path();
+    strlcpy(target->key,key.fileSystemRepresentation,sizeof(target->key));
+    strlcpy(target->known_hosts,[[key.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"known_hosts"] fileSystemRepresentation],sizeof(target->known_hosts));
+    return target->channel!=NULL;
 }
 
 /* ---- Agent resources ---- */
@@ -532,6 +571,7 @@ static void start_clipboard_for(int idx) {
 
 static void stop_agent_for(int idx) {
     if (idx < 0 || idx >= g_vm_count) return;
+    asb_mac_input_forget(g_vms[idx].unique_id);
     stop_clipboard_for(idx);
     stop_ssh_proxy_for(idx);
     VmAgentMac *agent = g_agent_refs[idx];
@@ -849,7 +889,7 @@ static void handle_qemu_state_change(int idx, QemuVmState st) {
         post_event(CORE_VM_EVENT_STATE_CHANGED, g_vms[idx].unique_id, 0, NULL);
         post_list_changed();
         if (g_vms[idx].is_template && g_vms[idx].template_cancelled)
-            asb_mac_vm_delete(g_vms[idx].unique_id);
+            asb_mac_template_delete(g_vms[idx].unique_id);
     } else if (st == QemuVmStateRunning) {
         g_vms[idx].shutting_down = NO;
         g_vms[idx].starting = NO;
@@ -1358,27 +1398,29 @@ int asb_mac_vm_create(const char *name, const char *os_type,
                        BOOL ssh_deploy_key,
                        BOOL test_mode,
                        BOOL is_template,
-                       AsbVmId template_id,
+                       AsbTemplateId template_id,
                        const char *template_name) {
-    if (!name || !os_type || gpu_mode < 0 || gpu_mode > 1 || network_mode != 1)
+    if (!name || !os_type || (template_id && template_name && template_name[0]) ||
+        gpu_mode < 0 || gpu_mode > 1 || network_mode != 1)
         return BACKEND_ERR_INVALID_ARG;
     AsbVmMac *source = template_id ? asb_mac_vm_find_by_id(template_id)
         : template_name && template_name[0] ? asb_mac_vm_find(template_name) : NULL;
+    if ((template_id || (template_name && template_name[0])) && !source) return BACKEND_ERR_NOT_FOUND;
     if ((template_id || (template_name && template_name[0])) &&
-        (is_template || !source || !source->template_ready || strcasecmp(source->os_type, os_type) != 0)) {
+        (is_template || !source->is_template || !source->template_ready || strcasecmp(source->os_type, os_type) != 0)) {
         post_alert(0, "Select a ready template matching the guest OS.");
         return BACKEND_ERR_INVALID_ARG;
     }
     if (source && hdd_gb == 0) hdd_gb = source->hdd_gb;
     if (source && hdd_gb < source->hdd_gb) {
-        post_alert(0, "The instance disk cannot be smaller than the template disk.");
+        post_alert(0, "This template requires a disk size of at least %d GB.", source->hdd_gb);
         return BACKEND_ERR_INVALID_ARG;
     }
     NSString *username = admin_user ? [NSString stringWithUTF8String:admin_user] : nil;
     NSString *usernameError = (admin_user && !username)
         ? @"Username contains invalid Unicode."
         : asb_mac_validate_username([NSString stringWithUTF8String:os_type], username,
-                                   [NSString stringWithUTF8String:name]);
+                                   is_template?nil:[NSString stringWithUTF8String:name]);
     if (usernameError) {
         post_alert(0, "%s", usernameError.UTF8String);
         return BACKEND_ERR_INVALID_ARG;
@@ -1392,7 +1434,9 @@ int asb_mac_vm_create(const char *name, const char *os_type,
         post_alert(0, "%s", passwordError.UTF8String);
         return BACKEND_ERR_INVALID_ARG;
     }
-    if (vm_index_by_name(name) >= 0) {
+    BOOL duplicate_name=NO;
+    for (int i=0;i<g_vm_count;++i) if (!strcasecmp(g_vms[i].name,name)) duplicate_name=YES;
+    if (duplicate_name) {
         post_alert(0, "A VM named '%s' already exists", name);
         return BACKEND_ERR_INVALID_ARG;
     }
@@ -1431,9 +1475,9 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     strlcpy(vm->name, name, sizeof(vm->name));
     strlcpy(vm->os_type, os_type, sizeof(vm->os_type));
     strlcpy(vm->disk_directory, diskDirectory.UTF8String, sizeof(vm->disk_directory));
-    vm->ram_mb = ram_mb > 0 ? ram_mb : 8192;
-    vm->hdd_gb = hdd_gb > 0 ? hdd_gb : 64;
-    vm->cpu_cores = cpu_cores > 0 ? cpu_cores : 4;
+    vm->ram_mb = ram_mb > 0 ? ram_mb : ASB_API_DEFAULT_RAM_MB;
+    vm->hdd_gb = hdd_gb > 0 ? hdd_gb : ASB_API_DEFAULT_HDD_GB;
+    vm->cpu_cores = cpu_cores > 0 ? cpu_cores : ASB_API_DEFAULT_CPU_CORES;
     vm->gpu_mode = gpu_mode;
     vm->network_mode = network_mode;
     vm_mac_address(vm);
@@ -1894,10 +1938,11 @@ int asb_mac_vm_stop(AsbVmId vm_id, int force) {
     return BACKEND_OK;
 }
 
-int asb_mac_vm_delete(AsbVmId vm_id) {
+static int delete_instance(AsbVmId vm_id,BOOL template_resource) {
     if (!vm_id) return BACKEND_ERR_INVALID_ARG;
     int idx = vm_index_of(vm_id);
     if (idx < 0) return BACKEND_ERR_NOT_FOUND;
+    if (!!g_vms[idx].is_template!=!!template_resource) return BACKEND_ERR_INVALID_ARG;
     for (int i = 0; i < g_vm_count; ++i) {
         if (g_vms[i].template_source == vm_id) {
             post_alert(vm_id, "Template is being copied; wait for instance creation to finish.");
@@ -2023,6 +2068,16 @@ int asb_mac_vm_edit(AsbVmId vm_id, const char *field, const char *value) {
     return BACKEND_OK;
 }
 
+int asb_mac_vm_delete(AsbVmId vm_id)
+{
+    return delete_instance(vm_id,NO);
+}
+
+int asb_mac_template_delete(AsbTemplateId template_id)
+{
+    return delete_instance(template_id,YES);
+}
+
 /* ---- Public: persistence / callbacks ---- */
 
 void asb_mac_save(void) {
@@ -2048,8 +2103,10 @@ const char *asb_mac_vm_state(const AsbVmMac *vm) {
 
 NSDictionary *asb_mac_vm_snapshot(const AsbVmMac *vm) {
     BOOL isWindows = strcasecmp(vm->os_type, "Windows") == 0;
-    char id[ASB_VM_ID_TEXT_SIZE];
-    asb_vm_id_format(vm->unique_id, id);
+    char id[ASB_TEMPLATE_ID_TEXT_SIZE];
+    asb_resource_id_format(vm->unique_id,vm->is_template,id);
+    char template_id[ASB_TEMPLATE_ID_TEXT_SIZE]={0};
+    if (vm->is_template) asb_template_id_format(vm->unique_id,template_id);
     return @{
         @"id":              @(id),
         @"name":            [NSString stringWithUTF8String:vm->name],
@@ -2058,11 +2115,11 @@ NSDictionary *asb_mac_vm_snapshot(const AsbVmMac *vm) {
         @"state":           @(asb_mac_vm_state(vm)),
         @"building":        @(asb_mac_vm_is_building(vm)),
         @"progress":        @(vm->install_progress < 0 ? 0 : vm->install_progress),
-        @"displayOpen":     @(vm->display != nil && !vm->display.userClosed),
+        @"displayOpen":     @((BOOL)(vm->display != nil && !vm->display.userClosed)),
         @"running":         @(vm->running),
         @"starting":        @(vm->starting),
-        @"shuttingDown":    @(vm->shutting_down ? YES : NO),
-        @"agentOnline":     @(vm->agent_online ? YES : NO),
+        @"shuttingDown":    @(vm->shutting_down),
+        @"agentOnline":     @(vm->agent_online),
         @"ramMb":           @(vm->ram_mb),
         @"hddGb":           @(vm->hdd_gb),
         @"cpuCores":        @(vm->cpu_cores),
@@ -2072,18 +2129,19 @@ NSDictionary *asb_mac_vm_snapshot(const AsbVmMac *vm) {
         @"networkMode":     @(vm->network_mode),
         @"netAdapter":      @"",
         @"isTemplate":      @(vm->is_template),
+        @"templateId":      @(template_id),
         @"hypervVideoOff":  @NO,
-        @"buildingVhdx":    @(!vm->disk_built && vm->install_progress >= 0),
-        @"vhdxStaging":     @(!vm->disk_built && vm->install_progress >= 0 &&
-                              strstr(vm->install_status, "Staging") != NULL),
+        @"buildingVhdx":    @((BOOL)(!vm->disk_built && vm->install_progress >= 0)),
+        @"vhdxStaging":     @((BOOL)(!vm->disk_built && vm->install_progress >= 0 &&
+                              strstr(vm->install_status, "Staging") != NULL)),
         @"vhdxProgress":    @(vm->install_progress < 0 ? 0 : vm->install_progress),
-        @"installComplete": @(vm->install_complete ? YES : NO),
+        @"installComplete": @(vm->install_complete),
         @"installStatus":   [NSString stringWithUTF8String:vm->install_status],
-        @"sshEnabled":      @(vm->ssh_enabled ? YES : NO),
+        @"sshEnabled":      @(vm->ssh_enabled),
         @"sshPort":         @(vm->ssh_port),
         @"sshState":        @((vm->ssh_key_deployed && vm->ssh_state == 2) ? 4 : vm->ssh_state),
-        @"sshDeployKey":    @(vm->ssh_deploy_key ? YES : NO),
-        @"sshKeyDeployed":  @(vm->ssh_key_deployed ? YES : NO),
+        @"sshDeployKey":    @(vm->ssh_deploy_key),
+        @"sshKeyDeployed":  @(vm->ssh_key_deployed),
         @"snapCurrent":     @(-1),
         @"snapCurrentBranch": @(-1),
         @"hasSnapshots":    @NO,
@@ -2097,10 +2155,11 @@ NSArray<NSDictionary *> *asb_mac_templates(void) {
     for (int i = 0; i < g_vm_count; ++i) {
         AsbVmMac *vm = &g_vms[i];
         if (!vm->template_ready) continue;
-        char identity[ASB_VM_ID_TEXT_SIZE];
-        asb_vm_id_format(vm->unique_id, identity);
+        char identity[ASB_TEMPLATE_ID_TEXT_SIZE];
+        asb_template_id_format(vm->unique_id, identity);
         [templates addObject:@{ @"id": @(identity), @"name": @(vm->name),
-                                @"osType": @(vm->os_type), @"hddGb": @(vm->hdd_gb) }];
+                                @"osType": @(vm->os_type), @"hddGb": @(vm->hdd_gb),
+                                @"ready":@YES,@"state":@"ready",@"building":@NO,@"progress":@100 }];
     }
     return templates;
 }

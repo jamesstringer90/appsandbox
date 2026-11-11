@@ -11,7 +11,14 @@
 #import "AppDelegate.h"
 #include "asb_types.h"
 #include "asb_events.h"
+#include "api_contract.h"
+#include "api_operations.h"
+#include "mcp_server.h"
+#include "headless_vm.h"
+#include "input_keys.h"
+#include <ImageIO/ImageIO.h>
 #include <stdatomic.h>
+#include <time.h>
 
 #include <sys/socket.h>
 #include <sys/file.h>
@@ -31,7 +38,7 @@
 #define ASB_API_VERSION  "v1"
 #define DEFAULT_PORT     8787
 #define PORT_TRIES       20
-#define BODY_MAX         8192
+#define BODY_MAX         ASB_API_BODY_MAX
 #define REQ_HDR_MAX      16384
 
 /* ---- Logging ---- */
@@ -187,6 +194,8 @@ static BOOL             g_api_started = NO;
 static BOOL             g_gui_mode = NO;
 static AppDelegate     *g_headless_delegate;
 static unsigned         g_api_subscription;
+static AsbMcp *g_mcp;
+static _Atomic int g_mcp_count;
 
 typedef struct ApiClient { int fd; struct ApiClient *next; } ApiClient;
 static ApiClient *g_clients, *g_serving_client;
@@ -230,22 +239,24 @@ static void headless_event_cb(const CoreVmEvent *event, void *context) {
     int type = event->type, int_value = event->int_value;
     const char *vm_name = event->vm_name, *str_value = event->str_value;
     NSString *name = vm_name ? @(vm_name) : @"";
-    char idText[ASB_VM_ID_TEXT_SIZE];
-    asb_vm_id_format(event->vm_id, idText);
+    char idText[ASB_TEMPLATE_ID_TEXT_SIZE];
+    if (event->is_template) asb_template_id_format(event->vm_id,idText);
+    else asb_vm_id_format(event->vm_id, idText);
     switch (type) {
     case CORE_VM_EVENT_STATE_CHANGED:
         hlog(@"[event] state    : %-20s running=%d", vm_name ?: "", int_value);
-        broadcast_event(json_str(@{ @"event": @"vmStateChanged", @"id": @(idText), @"name": name,
+        broadcast_event(json_str(@{ @"event": event->is_template?@"templateStateChanged":@"vmStateChanged", @"id": @(idText), @"name": name,
                                     @"running": int_value ? @YES : @NO }));
         dispatch_async(dispatch_get_main_queue(), ^{ if (!g_stop_all) fix_tree_ownership_soon(); });
         break;
     case CORE_VM_EVENT_LIST_CHANGED:
+    case CORE_VM_EVENT_AGENT_STATUS:
         broadcast_event(@"{\"event\":\"vmListChanged\"}");
         dispatch_async(dispatch_get_main_queue(), ^{ if (!g_stop_all) fix_tree_ownership_soon(); });
         break;
     case CORE_VM_EVENT_PROGRESS:
         hlog(@"[event] progress : %-20s %3d%%", vm_name ?: "", int_value);
-        broadcast_event(json_str(@{ @"event": @"vmProgress", @"id": @(idText), @"name": name,
+        broadcast_event(json_str(@{ @"event": event->is_template?@"templateProgress":@"vmProgress", @"id": @(idText), @"name": name,
                                     @"progress": @(int_value), @"staging": @NO }));
         break;
     case CORE_VM_EVENT_ALERT:
@@ -284,6 +295,8 @@ static void write_discovery(int port) {
         @"pid":        @(getpid()),
         @"version":    product_version(),
         @"apiVersion": @ASB_API_VERSION,
+        @"mcpEndpoint": [NSString stringWithFormat:@"http://127.0.0.1:%d/mcp", port],
+        @"mcpTransport": @"streamable-http",
     };
     NSString *path = discovery_path();
     [json_str(d) writeToFile:path atomically:YES
@@ -307,7 +320,7 @@ static NSString *validate_create_mac(NSString *name, NSString *os,
                                      id user, id password,
                                      int ram_mb, int hdd_gb, int cpu_cores,
                                      int gpu_mode, int net_mode,
-                                     NSString *disk_directory) {
+                                     NSString *disk_directory,BOOL is_template) {
     BOOL is_mac = [os.lowercaseString isEqualToString:@"macos"];
     BOOL is_win = [os.lowercaseString isEqualToString:@"windows"];
     if (!is_mac && !is_win)
@@ -333,7 +346,7 @@ static NSString *validate_create_mac(NSString *name, NSString *os,
     if (asb_mac_vm_find(name.UTF8String))
         return @"A VM with this name already exists.";
 
-    NSString *usernameError = asb_mac_validate_username(os, user, name);
+    NSString *usernameError = asb_mac_validate_username(os, user, is_template?nil:name);
     if (usernameError) return usernameError;
 
     NSString *passwordError = asb_mac_validate_password(os, password);
@@ -359,6 +372,7 @@ typedef struct {
     char method[8];
     char path[1024];
     char auth[128];        /* raw Authorization header value */
+    char mcp_session[64],mcp_protocol[32],origin[256];
     char body[BODY_MAX + 1];
 } HttpReq;
 
@@ -393,8 +407,9 @@ static void send_json(int fd, int status, const char *reason, NSString *body) {
 
 static void send_err(int fd, int status, const char *reason,
                      NSString *code, NSString *msg) {
-    send_json(fd, status, reason,
-              json_str(@{ @"error": @{ @"code": code, @"message": msg } }));
+    char *body=asb_api_error_json(code.UTF8String,msg.UTF8String);
+    send_json(fd,status,reason,body?@(body):@"{\"error\":{\"code\":\"operation_failed\",\"message\":\"Operation failed.\"}}");
+    free(body);
 }
 
 /* 202 action result / error -- the macOS analogue of the Windows send_hr.
@@ -402,27 +417,27 @@ static void send_err(int fd, int status, const char *reason,
    success and idempotent no-ops -> 202; unknown VM -> 404; bad input -> 400;
    anything else -> 500 (details arrive via the alert event, as on Windows). */
 static void send_rc(int fd, const char *action, NSString *name, AsbVmId vm_id, int rc) {
-    char idText[ASB_VM_ID_TEXT_SIZE];
-    asb_vm_id_format(vm_id, idText);
+    char idText[ASB_TEMPLATE_ID_TEXT_SIZE];
+    if (strstr(action,"Template")) asb_template_id_format(vm_id,idText);
+    else asb_vm_id_format(vm_id, idText);
     if (rc == BACKEND_OK || rc == BACKEND_ERR_ALREADY_RUNNING ||
         rc == BACKEND_ERR_NOT_RUNNING) {
         send_json(fd, 202, "Accepted",
                   json_str(@{ @"ok": @YES, @"accepted": @YES,
                               @"action": @(action), @"id": @(idText), @"name": name }));
-    } else if (rc == BACKEND_ERR_NOT_FOUND) {
-        send_err(fd, 404, "Not Found", @"not_found", @"no such VM");
-    } else if (rc == BACKEND_ERR_INVALID_ARG) {
-        send_err(fd, 400, "Bad Request", @"invalid_arg", @"invalid argument");
     } else {
-        send_json(fd, 500, "Internal Server Error",
-                  json_str(@{ @"ok": @NO, @"action": @(action), @"id": @(idText), @"name": name,
-                              @"error": @{ @"rc": @(rc) } }));
+        int status=rc==BACKEND_ERR_INVALID_ARG?400:rc==BACKEND_ERR_NOT_FOUND?404:
+            rc==BACKEND_ERR_NOT_READY?409:rc==BACKEND_ERR_NOT_IMPLEMENTED?501:500;
+        NSString *code=status==400?@"invalid_arg":status==404?@"not_found":status==409?@"conflict":status==501?@"not_supported":@"operation_failed";
+        NSString *message=status==400?@"Invalid argument.":status==404?@"Resource not found.":status==409?@"Operation conflicts with the resource state.":
+            status==501?@"Operation is not supported by this host.":@"Operation failed.";
+        send_err(fd,status,"Operation Failed",code,message);
     }
 }
 
 static void send_501(int fd, NSString *what) {
-    send_err(fd, 501, "Not Implemented", @"not_supported",
-             [NSString stringWithFormat:@"%@ are not supported on macOS", what]);
+    (void)what;
+    send_err(fd,501,"Not Implemented",@"not_supported",@"Operation is not supported by this host.");
 }
 
 /* Read one request: headers (<=16K) then Content-Length body (<=8K). */
@@ -447,12 +462,35 @@ static int read_request(int fd, HttpReq *r) {
 
     /* headers */
     long content_length = 0;
+    int have_length=0;
     for (char *line = strstr(buf, "\r\n"); line && line < hdr_end; ) {
         line += 2;
         char *eol = strstr(line, "\r\n");
         if (!eol) break;
-        if (strncasecmp(line, "Content-Length:", 15) == 0)
-            content_length = strtol(line + 15, NULL, 10);
+        if (strncasecmp(line, "Content-Length:", 15) == 0) {
+            char *end;
+            if (have_length++) return -1;
+            const char *start=line+15;
+            while (start<eol && (*start==' ' || *start=='\t')) ++start;
+            if (start==eol || *start<'0' || *start>'9') return -1;
+            errno=0;
+            content_length=strtol(start,&end,10);
+            while (end<eol && (*end==' ' || *end=='\t')) ++end;
+            if (errno || end!=eol || content_length>BODY_MAX) return -1;
+        }
+        else if (strncasecmp(line,"Transfer-Encoding:",18)==0) return -1;
+        else if (strncasecmp(line,"Mcp-Session-Id:",15)==0 ||
+                 strncasecmp(line,"Mcp-Protocol-Version:",21)==0 ||
+                 strncasecmp(line,"Origin:",7)==0) {
+            char *target;size_t capacity;const char *value;
+            if (!strncasecmp(line,"Mcp-Session-Id:",15)) { target=r->mcp_session;capacity=sizeof(r->mcp_session);value=line+15; }
+            else if (!strncasecmp(line,"Mcp-Protocol-Version:",21)) { target=r->mcp_protocol;capacity=sizeof(r->mcp_protocol);value=line+21; }
+            else { target=r->origin;capacity=sizeof(r->origin);value=line+7; }
+            while (value<eol && (*value==' ' || *value=='\t')) ++value;
+            size_t length=(size_t)(eol-value);
+            if (target[0] || length>=capacity) return -1;
+            memcpy(target,value,length);target[length]=0;
+        }
         else if (strncasecmp(line, "Authorization:", 14) == 0) {
             const char *v = line + 14;
             while (*v == ' ') v++;
@@ -464,32 +502,106 @@ static int read_request(int fd, HttpReq *r) {
         line = eol;
     }
 
-    if (content_length < 0) content_length = 0;
-    if (content_length > BODY_MAX) content_length = BODY_MAX;   /* hard cap */
-
     int have = pos - body_start;
     if (have > (int)content_length) have = (int)content_length;
     if (have > 0) memcpy(r->body, buf + body_start, (size_t)have);
     while (have < content_length) {
         ssize_t n = recv(fd, r->body + have, (size_t)(content_length - have), 0);
-        if (n <= 0) break;
+        if (n <= 0) return -1;
         have += (int)n;
     }
     r->body[have > 0 ? have : 0] = 0;
+    if (memchr(r->body,0,(size_t)have)) return -1;
     return 0;
 }
 
 static NSDictionary *parse_body(const HttpReq *r) {
-    if (!r->body[0]) return @{};
+    if (!r->body[0]) return asb_api_validate_request(r->method,r->path,L"{}")?@{}:nil;
     NSData *d = [NSData dataWithBytes:r->body length:strlen(r->body)];
+    NSString *text=[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (!text) return nil;
+    wchar_t *wide=calloc(text.length+1,sizeof(*wide));
+    if (!wide) return nil;
+    for (NSUInteger i=0;i<text.length;++i) wide[i]=[text characterAtIndex:i];
+    int valid=asb_api_validate_request(r->method,r->path,wide);
+    free(wide);
+    if (!valid) return nil;
     id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-    return [obj isKindOfClass:[NSDictionary class]] ? obj : @{};
+    return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
 }
 
 static int auth_ok(const HttpReq *r) {
     char expect[64];
     snprintf(expect, sizeof(expect), "Bearer %s", g_token);
     return strcmp(r->auth, expect) == 0;   /* exact, case-sensitive */
+}
+
+static uint64_t mcp_event_cursor(void *context)
+{
+    (void)context;
+    pthread_mutex_lock(&g_ev_mu);uint64_t cursor=(uint64_t)g_ev_seq;pthread_mutex_unlock(&g_ev_mu);
+    return cursor;
+}
+
+static int mcp_read_events(void *context,uint64_t *cursor,unsigned timeout,unsigned limit,char **json)
+{
+    (void)context;
+    size_t capacity=64*8192+512,position=0;char *output=malloc(capacity);
+    if (!output) return 500;
+    struct timespec deadline;clock_gettime(CLOCK_REALTIME,&deadline);
+    deadline.tv_sec+=timeout/1000;deadline.tv_nsec+=(long)(timeout%1000)*1000000;
+    if (deadline.tv_nsec>=1000000000) { ++deadline.tv_sec;deadline.tv_nsec-=1000000000; }
+    unsigned count=0,dropped=0;
+    pthread_mutex_lock(&g_ev_mu);
+    while (*cursor==(uint64_t)g_ev_seq && !g_stop_all && timeout)
+        if (pthread_cond_timedwait(&g_ev_cv,&g_ev_mu,&deadline)==ETIMEDOUT) break;
+    if ((uint64_t)g_ev_seq-*cursor>EV_CAP) {
+        dropped=(unsigned)((uint64_t)g_ev_seq-*cursor-EV_CAP);*cursor=(uint64_t)g_ev_seq-EV_CAP;
+    }
+    position+=(size_t)snprintf(output,capacity,"{\"events\":[");
+    while (*cursor<(uint64_t)g_ev_seq && count<limit) {
+        const char *event=g_ev_ring[(*cursor)++%EV_CAP];
+        if (!event) continue;
+        size_t length=strlen(event);
+        if (position+length+512>=capacity) { --*cursor;break; }
+        if (count++) output[position++]=',';
+        memcpy(output+position,event,length);position+=length;
+    }
+    snprintf(output+position,capacity-position,
+        "],\"subscribed\":true,\"connected\":%s,\"streamEnded\":%s,\"streamError\":null,\"droppedEvents\":%u,\"pendingEvents\":%llu}",
+        g_stop_all?"false":"true",g_stop_all?"true":"false",dropped,(unsigned long long)((uint64_t)g_ev_seq-*cursor));
+    pthread_mutex_unlock(&g_ev_mu);*json=output;return 200;
+}
+
+typedef struct { ApiClient *client;HttpReq request; } McpCall;
+
+static void *mcp_thread(void *context)
+{
+    McpCall *call=context;AsbMcpResponse result;
+    pthread_detach(pthread_self());
+    asb_mcp_request(g_mcp,call->request.method,call->request.mcp_session,call->request.mcp_protocol,call->request.body,&result);
+    const char *body=result.json?result.json:"";char header[512];
+    int length=snprintf(header,sizeof(header),
+        "HTTP/1.1 %d MCP\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nCache-Control: no-store\r\nConnection: close\r\n%s%s%s%s\r\n",
+        result.status,strlen(body),result.session[0]?"Mcp-Session-Id: ":"",result.session,result.session[0]?"\r\n":"",
+        result.status==405?"Allow: POST, DELETE\r\n":"");
+    send_raw(call->client->fd,header,(size_t)length);send_raw(call->client->fd,body,strlen(body));
+    free(result.json);client_close(call->client);free(call);--g_mcp_count;
+    return NULL;
+}
+
+static int mcp_dispatch(int fd,const HttpReq *request)
+{
+    if (!auth_ok(request)) { send_err(fd,401,"Unauthorized",@"unauthorized",@"A valid API bearer token is required.");return 0; }
+    if (!asb_mcp_origin_allowed(g_mcp,request->origin)) { send_err(fd,403,"Forbidden",@"invalid_origin",@"Origin is not allowed.");return 0; }
+    if (g_mcp_count>=64) { send_err(fd,503,"Unavailable",@"busy",@"MCP request limit reached.");return 0; }
+    McpCall *call=calloc(1,sizeof(*call));pthread_t thread;
+    if (!call) { send_err(fd,503,"Unavailable",@"busy",@"MCP worker allocation failed.");return 0; }
+    call->client=g_serving_client;call->request=*request;++g_mcp_count;
+    if (pthread_create(&thread,NULL,mcp_thread,call)) {
+        --g_mcp_count;free(call);send_err(fd,503,"Unavailable",@"thread",@"MCP worker creation failed.");return 0;
+    }
+    return 2;
 }
 
 /* Run a block synchronously on the main queue (where the core lives). */
@@ -596,8 +708,256 @@ static void cleanup_and_exit(int code) {
 
 /* ---- Request dispatch. Returns 1 if the daemon should stop. ---- */
 
+static NSDictionary *api_vm_snapshot(const AsbVmMac *vm)
+{
+    NSDictionary *snapshot=asb_mac_vm_snapshot(vm);
+    NSArray *fields=[NSJSONSerialization JSONObjectWithData:[@(asb_api_vm_fields_json()) dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+    NSMutableDictionary *result=[NSMutableDictionary dictionary];
+    for (NSString *field in fields) result[field]=snapshot[field] ?: @"";
+    return result;
+}
+
+typedef struct { ApiClient *client;AsbMacHeadlessTarget target;char operation[32],body[BODY_MAX+1]; } ServiceCall;
+static _Atomic unsigned g_service_count;
+
+static NSDictionary *input_status_object(const AsbMacHeadlessTarget *target,const AsbMacInputStatus *s)
+{
+    char identity[ASB_VM_ID_TEXT_SIZE];asb_vm_id_format(target->id,identity);
+    __block BOOL open=NO,focused=NO;
+    on_main(^{ AsbVmMac *vm=asb_mac_vm_find_by_id(target->id);open=vm && vm->display && !vm->display.userClosed;
+        focused=open && vm->display.window.isKeyWindow; });
+    NSMutableDictionary *result=[@{@"vmId":@(identity),@"vm":@(target->name),
+        @"state":(s->flags&ASB_STATUS_AGENT_HAS_CONTROL)?@"agent":(s->flags&ASB_STATUS_USER_PAUSED)?@"user":@"available",
+        @"generation":@(s->generation),@"work_id":@(s->work_id),
+        @"agent_has_control":@((BOOL)((s->flags&ASB_STATUS_AGENT_HAS_CONTROL)!=0)),
+        @"agent_waiting_for_control":@((BOOL)((s->flags&ASB_STATUS_AGENT_WAITING)!=0)),
+        @"user_has_control":@((BOOL)((s->flags&ASB_STATUS_USER_HAS_CONTROL)!=0)),
+        @"agent_finished":@((BOOL)((s->flags&ASB_STATUS_AGENT_FINISHED)!=0)),
+        @"agent_cancelled":@((BOOL)((s->flags&ASB_STATUS_AGENT_CANCELLED)!=0)),@"revoked":@((BOOL)((s->flags&ASB_STATUS_USER_PAUSED)!=0)),
+        @"viewer_open":@(open),@"viewer_focused":@(focused),
+        @"cursor":s->x==UINT32_MAX || s->y==UINT32_MAX?(id)NSNull.null:@{@"xNormalized":@(s->x),@"yNormalized":@(s->y),@"range":@65535}} mutableCopy];
+    if (!(s->flags&ASB_STATUS_AGENT_FINISHED)) {
+        result[@"identity"]=@(s->identity);result[@"vendor"]=@(s->vendor);result[@"model"]=@(s->model);result[@"purpose"]=@(s->purpose);
+    }
+    return result;
+}
+
+static NSData *capture_png(AsbScreenshotReply *reply,unsigned char *pixels)
+{
+    for (uint32_t i=3;i<reply->data_size;i+=4) pixels[i]=255;
+    CGColorSpaceRef color=CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef provider=CGDataProviderCreateWithData(NULL,pixels,reply->data_size,NULL);
+    CGImageRef image=provider?CGImageCreate(reply->width,reply->height,8,32,reply->stride,color,
+        kCGBitmapByteOrder32Little|kCGImageAlphaPremultipliedFirst,provider,NULL,false,kCGRenderingIntentDefault):NULL;
+    NSMutableData *data=[NSMutableData data];
+    CGImageDestinationRef destination=image?CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data,CFSTR("public.png"),1,NULL):NULL;
+    BOOL ok=NO;
+    if (destination) { CGImageDestinationAddImage(destination,image,NULL);ok=CGImageDestinationFinalize(destination);CFRelease(destination); }
+    if (image) CGImageRelease(image);if (provider) CGDataProviderRelease(provider);CGColorSpaceRelease(color);
+    return ok?data:nil;
+}
+
+typedef struct { AsbMacInput *session;uint32_t lease; } InputExecution;
+static uint32_t input_send_packet(void *context,const InputPacket *packet)
+{
+    InputExecution *e=context;return asb_mac_input_send(e->session,1,e->lease,packet);
+}
+static uint32_t input_text_packet(void *context,uint32_t scalar)
+{
+    InputPacket packets[8];unsigned count=0;uint32_t error=asb_mac_text_packets(scalar,packets,&count);
+    for (unsigned i=0;i<count && !error;++i) error=input_send_packet(context,&packets[i]);
+    return error;
+}
+static uint32_t input_barrier(void *context)
+{
+    InputExecution *e=context;return asb_mac_input_barrier(e->session,e->lease,10000);
+}
+static void input_sleep(unsigned ms) { usleep(ms*1000); }
+
+static uint32_t execute_input(const AsbMacHeadlessTarget *target,AsbMacInput *session,NSDictionary *body,uint32_t lease)
+{
+    NSString *source=json_str(body);wchar_t *wide=calloc(source.length+1,sizeof(*wide));
+    ApiJsonToken *tokens=calloc(8192,sizeof(*tokens));ApiJson json;AsbApiInputAction actions[128]={0};int count=0;
+    uint32_t error=wide && tokens?0:ASB_MEMORY;
+    if (!error) {
+        for (NSUInteger i=0;i<source.length;++i) wide[i]=[source characterAtIndex:i];
+        if (!api_json_parse(&json,wide,tokens,8192)) error=ASB_INVALID;
+        else error=asb_api_parse_input(&json,actions,&count);
+    }
+    for (int i=0;i<count && !error;++i) {
+        if (!strcasecmp(target->os_type,"macOS")) {
+            if (actions[i].type==INPUT_UNICODE) { error=120;break; }
+            if (actions[i].type==INPUT_KEY_PHYSICAL) {
+                InputPacket packet={INPUT_MAGIC,INPUT_KEY_PHYSICAL,0,(uint32_t)actions[i].scan,
+                    actions[i].extended?INPUT_KEY_EXTENDED:0};
+                if (asb_mac_key_code(&packet)<0) { error=120;break; }
+            }
+        }
+        if (actions[i].type==ASB_API_TEXT) for (const wchar_t *p=actions[i].text;*p && !error;++p) {
+            InputPacket packets[8];unsigned n;error=asb_mac_text_packets((uint32_t)*p,packets,&n);
+        }
+        if (actions[i].type==INPUT_MOUSE_MOVE || actions[i].type==ASB_API_CLICK)
+            asb_mac_input_dimensions(target->id,(unsigned)actions[i].width,(unsigned)actions[i].height);
+    }
+    if (!error) {
+        error=asb_mac_input_begin_batch(session);
+        if (!error) {
+            InputExecution context={session,lease};AsbApiInputOps ops={input_send_packet,input_text_packet,input_barrier,input_sleep};
+            error=asb_api_perform_input(actions,count,&context,&ops);asb_mac_input_end_batch(session);
+        }
+    }
+    for (int i=0;i<count;++i) free(actions[i].text);
+    free(wide);free(tokens);return error;
+}
+
+static int copy_label(NSDictionary *body,NSString *key,char *out,size_t capacity,unsigned limit)
+{
+    NSString *value=[body[key] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSData *scalars=[value dataUsingEncoding:NSUTF32LittleEndianStringEncoding];
+    if (!value.length || scalars.length/4>limit) return 0;
+    const char *bytes=value.UTF8String;if (!bytes || strlen(bytes)>=capacity) return 0;
+    memcpy(out,bytes,strlen(bytes)+1);return 1;
+}
+
+static uint32_t service_execute(ServiceCall *call,NSDictionary *body,id *result)
+{
+    const AsbMacHeadlessTarget *target=&call->target;const char *operation=call->operation;
+    char vm[ASB_VM_ID_TEXT_SIZE],ssh[24];asb_vm_id_format(target->id,vm);
+    if (!strncmp(operation,"ssh_",4)) {
+        uint64_t session=target->ssh_session;uint32_t error=0;
+        if (!strcmp(operation,"ssh_open")) {
+            NSString *command=body[@"command"] ?: @"";
+            if (command.length>16384) return ASB_INVALID;
+            error=asb_mac_ssh_open(target,command.UTF8String,&session);
+        } else if (!strcmp(operation,"ssh_close")) error=asb_mac_ssh_close(target->id,session);
+        else if (!strcmp(operation,"ssh_read")) {
+            AsbMacSshOutput output;error=asb_mac_ssh_read(target->id,session,body[@"timeoutMs"]?[body[@"timeoutMs"] unsignedIntValue]:1000,&output);
+            if (error) return error;
+            snprintf(ssh,sizeof(ssh),"ssh-%016llx",(unsigned long long)session);
+            *result=@{@"vmId":@(vm),@"sshSessionId":@(ssh),@"running":@((BOOL)(output.running!=0)),@"exitCode":@(output.exit_code),
+                @"stdinError":@(output.stdin_error),@"stdoutBase64":[[NSData dataWithBytes:output.stdout_bytes length:output.stdout_size] base64EncodedStringWithOptions:0],
+                @"stderrBase64":[[NSData dataWithBytes:output.stderr_bytes length:output.stderr_size] base64EncodedStringWithOptions:0]};
+            asb_mac_ssh_output_free(&output);return 0;
+        } else if (!strcmp(operation,"ssh_write")) {
+            if (body[@"stdin"] && body[@"stdinBase64"]) return ASB_INVALID;
+            NSData *bytes=body[@"stdin"]?[body[@"stdin"] dataUsingEncoding:NSUTF8StringEncoding]:
+                body[@"stdinBase64"]?[[NSData alloc] initWithBase64EncodedString:body[@"stdinBase64"] options:0]:[NSData data];
+            if (!bytes || bytes.length>65536) return ASB_INVALID;
+            error=asb_mac_ssh_write(target->id,session,bytes.bytes,bytes.length,[body[@"closeStdin"] boolValue]);
+            if (error) return error;
+            snprintf(ssh,sizeof(ssh),"ssh-%016llx",(unsigned long long)session);
+            *result=@{@"vmId":@(vm),@"sshSessionId":@(ssh),@"queuedBytes":@(bytes.length),@"stdinClosing":@([body[@"closeStdin"] boolValue])};return 0;
+        } else return ASB_INVALID;
+        if (error) return error;
+        snprintf(ssh,sizeof(ssh),"ssh-%016llx",(unsigned long long)session);
+        *result=@{@"vmId":@(vm),@"sshSessionId":@(ssh),@"closed":@((BOOL)!strcmp(operation,"ssh_close"))};return 0;
+    }
+    if (!strcmp(operation,"screenshot")) {
+        unsigned char *pixels=NULL;AsbScreenshotReply reply;uint64_t start=asb_mac_milliseconds();
+        uint32_t error=asb_mac_capture(target,body[@"timeoutMs"]?[body[@"timeoutMs"] unsignedIntValue]:5000,&reply,&pixels);
+        if (!error) {
+            NSData *png=capture_png(&reply,pixels);
+            if (!png) error=ASB_DATA;
+            else *result=@{@"metadata":@{@"vmId":@(vm),@"vm":@(target->name),@"osType":@(target->os_type),
+                @"width":@(reply.width),@"height":@(reply.height),@"stride":@(reply.stride),@"frameSeq":@(reply.frame_seq),
+                @"gpuSharingActive":@((BOOL)((reply.flags&ASB_SCREENSHOT_GPU_SHARED)!=0)),@"elapsedMs":@(asb_mac_milliseconds()-start)},
+                @"image":@{@"mimeType":@"image/png",@"data":[png base64EncodedStringWithOptions:0]}};
+        }
+        free(pixels);return error;
+    }
+    AsbMacInput *session=asb_mac_input_session(target);if (!session) return ASB_MEMORY;
+    AsbMacInputStatus status;uint32_t error=0;
+    if (!strcmp(operation,"request_control")) {
+        AsbMacInputStatus labels={0};
+        if (!copy_label(body,@"identity",labels.identity,sizeof(labels.identity),80) ||
+            !copy_label(body,@"vendor",labels.vendor,sizeof(labels.vendor),80) ||
+            !copy_label(body,@"model",labels.model,sizeof(labels.model),80) ||
+            !copy_label(body,@"purpose",labels.purpose,sizeof(labels.purpose),300)) error=ASB_INVALID;
+        else {
+            BOOL native=!strcasecmp(target->os_type,"macOS");
+            asb_mac_input_status(session,&status);
+            BOOL transfer=!(status.flags&(ASB_STATUS_AGENT_HAS_CONTROL|ASB_STATUS_USER_PAUSED|ASB_STATUS_AGENT_CANCELLED));
+            __block VzDisplayWindow *display=nil;
+            if (native) on_main(^{
+                AsbVmMac *vm=asb_mac_vm_find_by_id(target->id);
+                if (vm && vm->run_id==target->run_id && vm->display && !vm->display.userClosed && vm->display.window.visible) {
+                    display=vm->display;if (transfer) [display prepareForAgentInput];
+                }
+            });
+            error=asb_mac_input_claim(session,&labels);
+            if (display && transfer) on_main(^{ [display finishPreparingForAgentInput]; });
+        }
+    } else if (!strcmp(operation,"finish")) error=asb_mac_input_control(session,ASB_INPUT_AGENT_END,0);
+    else if (!strcmp(operation,"input")) {
+        asb_mac_input_status(session,&status);
+        error=status.flags&ASB_STATUS_AGENT_CANCELLED?ASB_CANCELLED:
+            !(status.flags&ASB_STATUS_AGENT_HAS_CONTROL)?ASB_DENIED:execute_input(target,session,body,status.generation);
+    } else if (!strcmp(operation,"wait_control")) {
+        uint64_t deadline=asb_mac_milliseconds()+(body[@"timeoutMs"]?[body[@"timeoutMs"] unsignedIntValue]:30000);
+        do {
+            asb_mac_input_status(session,&status);
+            if (status.flags&(ASB_STATUS_AGENT_HAS_CONTROL|ASB_STATUS_AGENT_FINISHED)) break;
+            usleep(50000);
+        } while (!g_stop_all && asb_mac_milliseconds()<deadline);
+    } else if (strcmp(operation,"input_status")) error=ASB_INVALID;
+    if (!error) {
+        asb_mac_input_status(session,&status);NSDictionary *control=input_status_object(target,&status);
+        *result=!strcmp(operation,"input")?@{@"handledActions":@([body[@"actions"] count]),
+            @"acknowledgement":!strcasecmp(target->os_type,"macOS")?@"virtual_device_dispatched":@"injector_processed",@"control":control}:control;
+    }
+    asb_mac_input_release(session);return error;
+}
+
+static void service_error(int fd,uint32_t error,int input_operation)
+{
+    AsbApiOperationError response=asb_api_operation_error(error,input_operation);
+    send_err(fd,response.status,"Operation Failed",@(response.code),@(response.message));
+}
+
+static void *service_thread(void *context)
+{
+    ServiceCall *call=context;pthread_detach(pthread_self());
+    @autoreleasepool {
+        if (!strcmp(call->operation,"screenshot")) pthread_set_qos_class_self_np(QOS_CLASS_UTILITY,0);
+        NSData *data=[NSData dataWithBytes:call->body length:strlen(call->body)];
+        NSDictionary *body=data.length?[NSJSONSerialization JSONObjectWithData:data options:0 error:nil]:@{};
+        id result=nil;uint32_t error=service_execute(call,body,&result);
+        if (error) service_error(call->client->fd,error,strcmp(call->operation,"screenshot") && strncmp(call->operation,"ssh_",4));
+        else send_json(call->client->fd,200,"OK",json_str(result ?: @{}));
+        asb_mac_channel_release(call->target.channel);client_close(call->client);free(call);--g_service_count;
+    }
+    return NULL;
+}
+
+static int defer_service(int fd,const HttpReq *request,uint64_t identity,const wchar_t *operation,uint64_t session_id)
+{
+    ServiceCall *call=calloc(1,sizeof(*call));if (!call) { send_err(fd,500,"Internal Server Error",@"memory",@"Allocation failed.");return 0; }
+    if (atomic_fetch_add(&g_service_count,1)>=64) {
+        --g_service_count;free(call);send_err(fd,503,"Service Unavailable",@"busy",@"Too many active headless requests.");return 0;
+    }
+    __block BOOL exists=NO,running=NO;__block AsbMacHeadlessTarget target={0};
+    on_main(^{
+        AsbVmMac *vm=asb_mac_vm_find_by_id(identity);exists=vm!=NULL;running=vm && vm->running && !vm->shutting_down;
+        if (vm) {
+            if (running) asb_mac_target(identity,&target);
+            target.id=identity;target.run_id=vm->run_id;
+            strlcpy(target.name,vm->name,sizeof(target.name));strlcpy(target.os_type,vm->os_type,sizeof(target.os_type));
+        }
+    });
+    if (!exists || (!running && wcscmp(operation,L"input_status"))) {
+        --g_service_count;free(call);send_err(fd,exists?409:404,exists?"Conflict":"Not Found",exists?@"not_running":@"not_found",exists?@"VM is not running.":@"no such VM");return 0;
+    }
+    call->target=target;call->target.ssh_session=session_id;call->client=g_serving_client;
+    for (size_t i=0;operation[i] && i+1<sizeof(call->operation);++i) call->operation[i]=(char)operation[i];
+    memcpy(call->body,request->body,strlen(request->body)+1);pthread_t thread;
+    if (pthread_create(&thread,NULL,service_thread,call)) {
+        --g_service_count;asb_mac_channel_release(target.channel);free(call);send_err(fd,500,"Internal Server Error",@"thread",@"Worker creation failed.");return 0;
+    }
+    return 2;
+}
+
 static int handle_request(int fd, HttpReq *r) {
-    NSString *path = @(r->path);
+    NSString *path = [@(r->path) componentsSeparatedByString:@"?"][0];
     BOOL isGET    = strcmp(r->method, "GET") == 0;
     BOOL isPOST   = strcmp(r->method, "POST") == 0;
     BOOL isPUT    = strcmp(r->method, "PUT") == 0;
@@ -607,13 +967,21 @@ static int handle_request(int fd, HttpReq *r) {
         send_json(fd, 200, "OK", json_str(@{
             @"product": @"AppSandbox", @"version": product_version(),
             @"apiVersion": @ASB_API_VERSION, @"hostOs": @"macOS",
-            @"capabilities": @{ @"snapshots": @NO, @"templates": @YES } }));
+            @"capabilities": [NSJSONSerialization JSONObjectWithData:[@(asb_api_capabilities_json(0)) dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] }));
         return 0;
     }
     if (!auth_ok(r)) {
         send_err(fd, 401, "Unauthorized", @"unauthorized",
                  @"missing or bad bearer token");
         return 0;
+    }
+    NSDictionary *requestBody=parse_body(r);
+    if (!requestBody) {
+        send_err(fd,400,"Bad Request",@"invalid_arg",@"Request body must be a valid JSON object with valid field types within the API size limits.");
+        return 0;
+    }
+    if (isGET && [path isEqualToString:@"/v1/operations"]) {
+        send_json(fd,200,"OK",@(asb_api_operations_json()));return 0;
     }
 
     /* SSE event stream -- handed to a dedicated thread. */
@@ -632,7 +1000,7 @@ static int handle_request(int fd, HttpReq *r) {
             int count = asb_mac_vm_count();
             for (int i = 0; i < count; i++) {
                 AsbVmMac *v = asb_mac_vm_get(i);
-                if (!v) continue;
+                if (!v || v->template_ready) continue;
                 if (v->running) { vmCores += v->cpu_cores; vmRamMb += v->ram_mb; }
                 vmHddGb += v->hdd_gb;
             }
@@ -641,7 +1009,7 @@ static int handle_request(int fd, HttpReq *r) {
                       @"freeGb":    @([HostInfo freeGb]),
                       @"defaultDiskDirectory": [VmDir vmsRootDirectory].path,
                       @"vmCores":   @(vmCores), @"vmRamMb": @(vmRamMb),
-                      @"vmHddGb":   @(vmHddGb) };
+                      @"vmHddGb":   @(vmHddGb),@"gpus":@[] };
         });
         send_json(fd, 200, "OK", json_str(info));
         return 0;
@@ -653,41 +1021,53 @@ static int handle_request(int fd, HttpReq *r) {
         send_json(fd, 200, "OK", json_str(@{ @"templates": templates }));
         return 0;
     }
-    if (strcmp(r->method, "DELETE") == 0 && [path hasPrefix:@"/v1/templates/"]) {
-        NSString *name = [path substringFromIndex:14];
+    if ([path hasPrefix:@"/v1/templates/"] || [path hasPrefix:@"/v1/template-ids/"]) {
+        BOOL byID=[path hasPrefix:@"/v1/template-ids/"];
+        NSString *target=[[path substringFromIndex:byID?17:14] stringByRemovingPercentEncoding];
+        if (!target) { send_err(fd,400,"Bad Request",@"invalid_arg",@"Invalid resource selector.");return 0; }
+        __block NSString *name=target;
         __block int rc = BACKEND_ERR_NOT_FOUND;
         __block AsbVmId identity = 0;
+        __block NSDictionary *info=nil;
         on_main(^{
-            AsbVmMac *vm = asb_mac_vm_find(name.UTF8String);
-            if (vm && vm->template_ready) {
+            AsbVmMac *vm=byID?asb_mac_vm_find_by_id(asb_template_id_parse(target.UTF8String)):asb_mac_vm_find(target.UTF8String);
+            if (vm && vm->is_template) {
                 identity = vm->unique_id;
-                rc = asb_mac_vm_delete(identity);
+                name=@(vm->name);
+                char id[ASB_TEMPLATE_ID_TEXT_SIZE];asb_template_id_format(identity,id);
+                info=@{@"id":@(id),@"name":name,@"osType":@(vm->os_type),@"hddGb":@(vm->hdd_gb),
+                    @"ready":@((BOOL)vm->template_ready),@"state":vm->template_ready?@"ready":@"building",
+                    @"building":@((BOOL)!vm->template_ready),@"progress":@(vm->template_ready?100:vm->install_progress)};
+                if (!strcmp(r->method,"DELETE")) rc=asb_mac_template_delete(identity);
             }
         });
+        if (!info) { send_err(fd,404,"Not Found",@"not_found",@"no such template");return 0; }
+        if (isGET) { send_json(fd,200,"OK",json_str(info));return 0; }
+        if (strcmp(r->method,"DELETE")) { send_err(fd,405,"Method Not Allowed",@"method",@"use GET or DELETE");return 0; }
         send_rc(fd, "deleteTemplate", name, identity, rc);
         return 0;
     }
 
     /* ---- /v1/vms (collection) ---- */
-    if ([path isEqualToString:@"/v1/vms"]) {
+    if ([path isEqualToString:@"/v1/vms"] || ([path isEqualToString:@"/v1/templates"] && isPOST)) {
         if (isGET) {
             __block NSMutableArray *vms = [NSMutableArray array];
             on_main(^{
                 int count = asb_mac_vm_count();
                 for (int i = 0; i < count; i++) {
                     AsbVmMac *v = asb_mac_vm_get(i);
-                    if (v && !v->template_ready) [vms addObject:asb_mac_vm_snapshot(v)];
+                    if (v && !v->is_template) [vms addObject:api_vm_snapshot(v)];
                 }
             });
             send_json(fd, 200, "OK", json_str(@{ @"vms": vms }));
             return 0;
         }
         if (isPOST) {
-            NSDictionary *b = parse_body(r);
+            NSDictionary *b = requestBody;
             NSString *name = [[b[@"name"] description] stringByTrimmingCharactersInSet:
                               [NSCharacterSet whitespaceAndNewlineCharacterSet]];
             if (!b[@"name"]) name = @"";
-            NSString *os   = b[@"osType"] ? [b[@"osType"] description] : @"macOS";
+            NSString *os   = b[@"osType"] ?: @"";
             NSString *img  = b[@"imagePath"] ? [b[@"imagePath"] description] : @"";
             if (b[@"diskDirectory"] && ![b[@"diskDirectory"] isKindOfClass:[NSString class]]) {
                 send_err(fd, 400, "Bad Request", @"invalid_arg", @"diskDirectory must be a string.");
@@ -698,15 +1078,24 @@ static int handle_request(int fd, HttpReq *r) {
             NSString *pass = b[@"adminPass"];
             int ram = [b[@"ramMb"] intValue], hdd = [b[@"hddGb"] intValue];
             int cpu = [b[@"cpuCores"] intValue], gpu = [b[@"gpuMode"] intValue];
-            int net = b[@"networkMode"] ? [b[@"networkMode"] intValue] : 1;
+            int net = b[@"networkMode"] ? [b[@"networkMode"] intValue] : ASB_API_DEFAULT_NETWORK_MODE;
             BOOL sshEnabled = [b[@"sshEnabled"] boolValue];
             BOOL sshDeploy  = [b[@"sshDeployKey"] boolValue];
             BOOL testMode   = [b[@"testMode"] boolValue];
-            BOOL isTemplate = [b[@"isTemplate"] boolValue];
+            BOOL isTemplate=[path isEqualToString:@"/v1/templates"] || [b[@"isTemplate"] boolValue];
+            wchar_t guest[32]={0};
+            for (NSUInteger i=0;i<os.length && i<31;++i) guest[i]=[os characterAtIndex:i];
+            if (asb_api_guest_support(0,guest,isTemplate)==120) { send_501(fd,@"Guest platform");return 0; }
+            if (b[@"networkMode"] && (net<0 || net>3)) {
+                send_err(fd,400,"Bad Request",@"invalid_arg",@"networkMode must be between 0 and 3.");return 0;
+            }
+            if (net!=1 || [b[@"gpuId"] length] || [b[@"netAdapter"] length]) {
+                send_501(fd,@"Selected GPU or network mode");return 0;
+            }
             NSString *templateName = [b[@"templateName"] isKindOfClass:[NSString class]] ? b[@"templateName"] : @"";
             NSString *templateId = [b[@"templateId"] isKindOfClass:[NSString class]] ? b[@"templateId"] : @"";
-            AsbVmId templateIdentity = asb_vm_id_parse(templateId.UTF8String);
-            if (templateId.length && !templateIdentity) {
+            AsbTemplateId templateIdentity=asb_template_id_parse(templateId.UTF8String);
+            if ((templateId.length && !templateIdentity) || (templateId.length && templateName.length)) {
                 send_err(fd, 400, "Bad Request", @"invalid_arg", @"Invalid template ID.");
                 return 0;
             }
@@ -719,7 +1108,7 @@ static int handle_request(int fd, HttpReq *r) {
             __block NSString *verr = nil;
             on_main(^{
                 verr = validate_create_mac(name, os, user, pass,
-                                           ram, hdd, cpu, gpu, net, diskDirectory);
+                                           ram, hdd, cpu, gpu, net, diskDirectory,isTemplate);
             });
             if (verr) {
                 send_err(fd, 400, "Bad Request", @"invalid_arg", verr);
@@ -745,7 +1134,7 @@ static int handle_request(int fd, HttpReq *r) {
                 AsbVmMac *vm = rc == BACKEND_OK ? asb_mac_vm_find(name.UTF8String) : NULL;
                 if (vm) vm_id = vm->unique_id;
             });
-            send_rc(fd, "createVm", name, vm_id, rc);
+            send_rc(fd,isTemplate?"createTemplate":"createVm",name,vm_id,rc);
             return 0;
         }
     }
@@ -756,6 +1145,8 @@ static int handle_request(int fd, HttpReq *r) {
         NSRange slash = [rest rangeOfString:@"/"];
         NSString *target = (slash.location == NSNotFound)
                              ? rest : [rest substringToIndex:slash.location];
+        target=[target stringByRemovingPercentEncoding];
+        if (!target) { send_err(fd,400,"Bad Request",@"invalid_arg",@"Invalid resource selector.");return 0; }
         NSString *sub  = (slash.location == NSNotFound)
                              ? nil  : [rest substringFromIndex:slash.location + 1];
         if (target.length == 0 || target.length > 255) {
@@ -768,11 +1159,36 @@ static int handle_request(int fd, HttpReq *r) {
         on_main(^{
             AsbVmMac *v = byID ? asb_mac_vm_find_by_id(asb_vm_id_parse(target.UTF8String))
                               : asb_mac_vm_find(target.UTF8String);
-            if (v) { vm_id = v->unique_id; name = @(v->name); }
+            if (v && !v->is_template) { vm_id = v->unique_id; name = @(v->name); }
         });
         if (!vm_id) {
             send_err(fd, 404, "Not Found", @"not_found", @"no such VM");
             return 0;
+        }
+        if (!isGET) {
+            __block BOOL starting=NO;
+            on_main(^{ AsbVmMac *v=asb_mac_vm_find_by_id(vm_id);starting=v && v->starting; });
+            if (starting) {
+                send_err(fd,409,"Conflict",@"vm_starting",@"VM start is in progress; retry once it completes");return 0;
+            }
+        }
+
+        if (sub) {
+            wchar_t route[1024];
+            if (sub.length>=sizeof(route)/sizeof(*route)) {
+                send_err(fd,400,"Bad Request",@"invalid_arg",@"Invalid route.");return 0;
+            }
+            for (NSUInteger i=0;i<sub.length;++i) route[i]=[sub characterAtIndex:i];
+            route[sub.length]=0;
+            int snapshot_index,branch_index;
+            int snapshot_route=asb_api_snapshot_route(r->method,route,&snapshot_index,&branch_index);
+            if (snapshot_route<0) {
+                send_err(fd,400,"Bad Request",@"invalid_arg",@"Invalid snapshot index or path.");return 0;
+            }
+            if (snapshot_route) { send_501(fd,@"Snapshots");return 0; }
+            uint64_t session_id;
+            const wchar_t *operation=asb_api_headless_route(r->method,route,&session_id);
+            if (operation) return defer_service(fd,r,vm_id,operation,session_id);
         }
 
         if (sub == nil) {
@@ -780,14 +1196,15 @@ static int handle_request(int fd, HttpReq *r) {
                 __block NSDictionary *st = nil;
                 on_main(^{
                     AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
-                    if (v) st = asb_mac_vm_snapshot(v);
+                    if (v) st = api_vm_snapshot(v);
                 });
                 if (!st) send_err(fd, 404, "Not Found", @"not_found", @"no such VM");
                 else     send_json(fd, 200, "OK", json_str(st));
                 return 0;
             }
             if (isPUT) {   /* edit -- VM must be stopped (and not installing) */
-                NSDictionary *b = parse_body(r);
+                NSDictionary *b = requestBody;
+                if ([b[@"gpuId"] length]) { send_501(fd,@"GPU selection");return 0; }
                 __block int conflict = 0;
                 on_main(^{
                     AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
@@ -828,8 +1245,8 @@ static int handle_request(int fd, HttpReq *r) {
                 if (b[@"networkMode"]) {
                     int iv = [b[@"networkMode"] intValue];
                     if (iv != 1) {
-                        send_err(fd, 400, "Bad Request", @"invalid_arg",
-                                 @"networkMode must be 1 (NAT) on macOS; other modes are not implemented");
+                        if (iv<0 || iv>3) send_err(fd,400,"Bad Request",@"invalid_arg",@"networkMode must be between 0 and 3.");
+                        else send_501(fd,@"Selected network mode");
                         return 0;
                     }
                 }
@@ -844,7 +1261,7 @@ static int handle_request(int fd, HttpReq *r) {
                     }
                     asb_mac_save();
                     AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
-                    if (v) st = asb_mac_vm_snapshot(v);
+                    if (v) st = api_vm_snapshot(v);
                 });
                 if (rc == BACKEND_OK && st) send_json(fd, 200, "OK", json_str(st));
                 else                        send_rc(fd, "editVm", name, vm_id, rc);
@@ -856,11 +1273,24 @@ static int handle_request(int fd, HttpReq *r) {
 
         /* sub-routes */
         if (isPOST && [sub isEqualToString:@"start"]) {
-            /* snapIndex/branchIndex bodies are a snapshot feature -> ignored
-               (capabilities.snapshots=false; the GUI has no snapshot UI on
-               macOS either). A plain start boots the current disk. */
+            NSDictionary *options=requestBody;
+            int snapshot=options[@"snapIndex"]?[options[@"snapIndex"] intValue]:-1;
+            int branch=options[@"branchIndex"]?[options[@"branchIndex"] intValue]:-1;
+            NSString *branchName=options[@"branchName"] ?: @"";
+            if (!asb_api_validate_start_options(snapshot,branch,branchName.length!=0)) {
+                send_err(fd,400,"Bad Request",@"invalid_arg",@"Invalid start request.");return 0;
+            }
+            if (snapshot!=-1 || branch!=-1 || branchName.length) {
+                send_501(fd,@"snapshot and branch start options");return 0;
+            }
             __block int rc = BACKEND_ERR_FAILED;
-            on_main(^{ rc = asb_mac_vm_start(vm_id); });
+            on_main(^{
+                rc = asb_mac_vm_start(vm_id);
+                if (rc==BACKEND_OK && options[@"openDisplay"]) {
+                    AsbVmMac *v=asb_mac_vm_find_by_id(vm_id);
+                    if (v) v->display_suppressed=![options[@"openDisplay"] boolValue];
+                }
+            });
             send_rc(fd, "start", name, vm_id, rc);
             return 0;
         }
@@ -932,8 +1362,7 @@ static int handle_request(int fd, HttpReq *r) {
                 else if (rc == BACKEND_ERR_NOT_FOUND)
                     send_err(fd, 404, "Not Found", @"not_found", @"no such VM");
                 else
-                    send_json(fd, 500, "Internal Server Error",
-                              json_str(@{ @"ok": @NO, @"error": @{ @"rc": @(rc) } }));
+                    send_err(fd,500,"Internal Server Error",@"display_failed",@"failed to open display");
                 return 0;
             }
             if (isDELETE) {   /* close the window (no-op if already closed) */
@@ -965,11 +1394,6 @@ static int handle_request(int fd, HttpReq *r) {
             return 0;
         }
 
-        if ([sub hasPrefix:@"snapshots"]) {
-            send_501(fd, @"snapshots");
-            return 0;
-        }
-
         send_err(fd, 404, "Not Found", @"not_found", @"no such route");
         return 0;
     }
@@ -978,7 +1402,7 @@ static int handle_request(int fd, HttpReq *r) {
        in-process), so exit terminates them -- refuse while any VM is running
        or mid-install unless the caller passes {"force":true}. */
     if (isPOST && [path isEqualToString:@"/v1/shutdown"]) {
-        BOOL force = [parse_body(r)[@"force"] boolValue];
+        BOOL force = [requestBody[@"force"] boolValue];
         __block NSMutableArray *active = [NSMutableArray array];
         on_main(^{
             int count = asb_mac_vm_count();
@@ -1039,10 +1463,13 @@ static void *server_thread(void *param) {
         pthread_mutex_unlock(&g_clients_mu);
         g_serving_client = client;
         HttpReq req;
-        if (read_request(fd, &req) != 0 || g_stop_all) { client_close(client); continue; }
+        if (read_request(fd, &req) != 0 || g_stop_all) {
+            if (!g_stop_all) send_err(fd,400,"Bad Request",@"invalid_arg",@"Invalid or oversized HTTP request body.");
+            client_close(client);continue;
+        }
 
         int rc;
-        @autoreleasepool { rc = handle_request(fd, &req); }
+        @autoreleasepool { rc = !strcmp(req.path,"/mcp")?mcp_dispatch(fd,&req):handle_request(fd, &req); }
         if (rc != 2) client_close(client);          /* 2 = SSE thread owns the socket */
         if (rc == 1) {                   /* POST /v1/shutdown accepted */
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -1099,12 +1526,16 @@ int asb_api_start(int with_gui) {
     gen_token();
     int port = 0;
     if (!http_start(&port)) return 0;
+    AsbMcpEvents mcp_events={NULL,mcp_event_cursor,mcp_read_events};
+    g_mcp=asb_mcp_create((unsigned)port,g_token,product_version().UTF8String,&mcp_events);
+    if (!g_mcp) { close(g_listen_fd);g_listen_fd=-1;return 0; }
     g_api_subscription = asb_events_subscribe(headless_event_cb, NULL);
-    if (!g_api_subscription) { close(g_listen_fd); g_listen_fd = -1; return 0; }
+    if (!g_api_subscription) { asb_mcp_destroy(g_mcp);g_mcp=NULL;close(g_listen_fd); g_listen_fd = -1; return 0; }
     g_server_done = 0;
     if (pthread_create(&g_server_thread, NULL, server_thread, NULL) != 0) {
         g_server_done = 1;
         asb_events_unsubscribe(g_api_subscription);
+        asb_mcp_destroy(g_mcp);g_mcp=NULL;
         close(g_listen_fd); g_listen_fd = -1;
         return 0;
     }
@@ -1130,10 +1561,13 @@ void asb_api_stop(void) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
     pthread_join(g_server_thread, NULL);
     close(g_listen_fd); g_listen_fd = -1;
-    pthread_mutex_lock(&g_clients_mu);
-    while (g_clients) pthread_cond_wait(&g_clients_cv, &g_clients_mu);
-    pthread_mutex_unlock(&g_clients_mu);
+    for (;;) {
+        pthread_mutex_lock(&g_clients_mu);BOOL pending=g_clients!=NULL;pthread_mutex_unlock(&g_clients_mu);
+        if (!pending) break;
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.01,true);
+    }
     fix_tree_ownership_now(vm_disk_ownership_paths());
+    asb_mcp_destroy(g_mcp);g_mcp=NULL;
 }
 
 /* ---- Entry ---- */

@@ -807,6 +807,7 @@ static BOOL enable_privilege(LPCWSTR priv_name)
 /* ---- Input helper process (spawned into console session as SYSTEM) ---- */
 
 static HANDLE g_input_process = NULL;
+static SRWLOCK g_input_process_lock = SRWLOCK_INIT;
 static DWORD  g_input_session = 0xFFFFFFFF;  /* session the helper was spawned into */
 static volatile BOOL g_input_monitor_running = FALSE;
 static HANDLE g_input_monitor_thread = NULL;
@@ -895,6 +896,7 @@ static DWORD WINAPI input_monitor_thread(LPVOID param)
         DWORD cur_session = WTSGetActiveConsoleSessionId();
 
         if (cur_session != 0xFFFFFFFF) {
+            AcquireSRWLockExclusive(&g_input_process_lock);
             BOOL helper_alive = g_input_process &&
                 WaitForSingleObject(g_input_process, 0) != WAIT_OBJECT_0;
 
@@ -915,6 +917,7 @@ static DWORD WINAPI input_monitor_thread(LPVOID param)
                 agent_log("Input monitor: helper died, respawning in session %lu.", cur_session);
                 spawn_input_in_session(cur_session);
             }
+            ReleaseSRWLockExclusive(&g_input_process_lock);
         }
 
         /* Sleep 3 seconds, but check stop flag every 500ms */
@@ -925,7 +928,9 @@ static DWORD WINAPI input_monitor_thread(LPVOID param)
         }
     }
 
+    AcquireSRWLockExclusive(&g_input_process_lock);
     kill_input_helper();
+    ReleaseSRWLockExclusive(&g_input_process_lock);
     agent_log("Input monitor: stopped.");
     return 0;
 }
@@ -1692,11 +1697,16 @@ static void handle_idd_connect(AsbConn *client, const char *tag)
 {
     DWORD new_console = WTSGetActiveConsoleSessionId();
 
-    /* Kill and respawn input helper in the console session */
-    kill_input_helper();
-    agent_log("idd_connect: respawning input helper in session %lu.", new_console);
-    if (new_console != 0xFFFFFFFF)
-        spawn_input_in_session(new_console);
+    AcquireSRWLockExclusive(&g_input_process_lock);
+    BOOL input_alive = g_input_process && WaitForSingleObject(g_input_process, 0) == WAIT_TIMEOUT;
+    if (!input_alive || g_input_session != new_console) {
+        kill_input_helper();
+        agent_log("idd_connect: starting input helper in session %lu.", new_console);
+        if (new_console != 0xFFFFFFFF) spawn_input_in_session(new_console);
+    } else {
+        agent_log("idd_connect: reusing input helper in session %lu.", new_console);
+    }
+    ReleaseSRWLockExclusive(&g_input_process_lock);
 
     /* Kill and respawn clipboard helper (SYSTEM, :0005) in the console session */
     kill_clipboard_helper();

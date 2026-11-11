@@ -9,6 +9,8 @@
 #include <winsock2.h>
 #include "asb_core.h"
 #include "asb_events.h"
+#include "api_contract.h"
+#include "headless_vm.h"
 #include "hcs_vm.h"
 #include "gpu_enum.h"
 #include "hcn_network.h"
@@ -180,6 +182,8 @@ typedef struct {
     wchar_t os_type[32];
     wchar_t image_path[MAX_PATH];
     wchar_t vhdx_path[MAX_PATH];
+    AsbTemplateId unique_id;
+    DWORD hdd_gb;
 } TemplateInfo;
 static TemplateInfo g_templates[ASB_MAX_TEMPLATES];
 static int g_template_count = 0;
@@ -234,6 +238,7 @@ static void core_event(int type, AsbVm vm, int value, const wchar_t *message, BO
     CoreVmEvent event = {0};
     char text[16384];
     event.vm_id = vm ? vm_inst(vm)->unique_id : 0;
+    event.is_template=vm && vm_inst(vm)->is_template;
     event.type = type; event.int_value = value; event.staging = staging;
     if (vm) WideCharToMultiByte(CP_UTF8, 0, asb_vm_name(vm), -1,
                                event.vm_name, sizeof(event.vm_name), NULL, NULL);
@@ -628,6 +633,10 @@ static BOOL save_vm_list(void)
 
     for (i = 0; i < g_template_count; i++) {
         fwprintf(f, L"[Template]\n");
+        wchar_t template_id[ASB_TEMPLATE_ID_TEXT_SIZE];
+        asb_template_id_format_w(g_templates[i].unique_id,template_id);
+        fwprintf(f,L"Id=%s\n",template_id);
+        fwprintf(f,L"HddGB=%lu\n",g_templates[i].hdd_gb);
         fwprintf(f, L"Name=%s\n", g_templates[i].name);
         fwprintf(f, L"OsType=%s\n", g_templates[i].os_type);
         fwprintf(f, L"ImagePath=%s\n", g_templates[i].image_path);
@@ -637,8 +646,8 @@ static BOOL save_vm_list(void)
     for (i = 0; i < g_vm_count; i++) {
         if (VM_AT(i).building_vhdx) continue;
         fwprintf(f, L"[VM]\n");
-        wchar_t id[ASB_VM_ID_TEXT_SIZE];
-        asb_vm_id_format_w(VM_AT(i).unique_id, id);
+        wchar_t id[ASB_TEMPLATE_ID_TEXT_SIZE];
+        asb_resource_id_format_w(VM_AT(i).unique_id,VM_AT(i).is_template,id);
         fwprintf(f, L"Id=%s\n", id);
         fwprintf(f, L"Name=%s\n", VM_AT(i).name);
         fwprintf(f, L"OsType=%s\n", VM_AT(i).os_type);
@@ -722,6 +731,8 @@ static void load_vm_list(void)
     unsigned char bom[3] = { 0 };
     BOOL unicode_config;
     BOOL gpu_changed = FALSE;
+    int identities_changed=0;
+    wchar_t record_ids[ASB_MAX_VMS][ASB_TEMPLATE_ID_TEXT_SIZE]={0};
 
     get_config_path(path, MAX_PATH);
     if (_wfopen_s(&f, path, L"rb") != 0 || !f) return;
@@ -765,7 +776,11 @@ static void load_vm_list(void)
         }
 
         if (tpl) {
-            if (wcsncmp(line, L"Name=", 5) == 0)
+            if (wcsncmp(line,L"Id=",3)==0)
+                tpl->unique_id=asb_resource_id_load_w(line+3,1,&identities_changed);
+            else if (wcsncmp(line,L"HddGB=",6)==0)
+                tpl->hdd_gb=(DWORD)_wtoi(line+6);
+            else if (wcsncmp(line, L"Name=", 5) == 0)
                 wcsncpy_s(tpl->name, 256, line + 5, _TRUNCATE);
             else if (wcsncmp(line, L"OsType=", 7) == 0)
                 wcsncpy_s(tpl->os_type, 32, line + 7, _TRUNCATE);
@@ -786,8 +801,11 @@ static void load_vm_list(void)
 
         if (!vm) continue;
 
-        if (wcsncmp(line, L"Id=", 3) == 0)
-            vm->unique_id = asb_vm_id_parse_w(line + 3);
+        if (wcsncmp(line, L"Id=", 3) == 0) {
+            record_ids[g_vm_count-1][0]=0;
+            if (wcslen(line+3)<ASB_TEMPLATE_ID_TEXT_SIZE)
+                wcscpy_s(record_ids[g_vm_count-1],ASB_TEMPLATE_ID_TEXT_SIZE,line+3);
+        }
         else if (wcsncmp(line, L"Name=", 5) == 0)
             wcscpy_s(vm->name, 256, line + 5);
         else if (wcsncmp(line, L"OsType=", 7) == 0)
@@ -843,6 +861,9 @@ static void load_vm_list(void)
 
     fclose(f);
 
+    for (int i=0;i<g_vm_count;++i)
+        VM_AT(i).unique_id=asb_resource_id_load_w(record_ids[i],VM_AT(i).is_template,&identities_changed);
+
     /* Initialize snapshot lists, reset runtime state, load per-VM state */
     {
         int i;
@@ -870,7 +891,12 @@ static void load_vm_list(void)
         return;
     }
     for (int i = 0; i < g_vm_count; ++i) VM_AT(i).unique_id = ids[i];
-    if ((gpu_changed || migrated) && !save_vm_list()) {
+    AsbVmId template_ids[ASB_MAX_TEMPLATES];
+    for (int i=0;i<g_template_count;++i) template_ids[i]=g_templates[i].unique_id;
+    int templates_migrated=asb_vm_ids_ensure(template_ids,(size_t)g_template_count);
+    if (templates_migrated<0) { g_config_load_failed=TRUE;g_vm_count=0;return; }
+    for (int i=0;i<g_template_count;++i) g_templates[i].unique_id=template_ids[i];
+    if ((gpu_changed || migrated || templates_migrated || identities_changed) && !save_vm_list()) {
         g_config_load_failed = TRUE;
         g_vm_count = 0;
     }
@@ -921,6 +947,11 @@ static void scan_templates(void)
 
         {
             TemplateInfo *ti = &g_templates[g_template_count];
+            ti->unique_id=asb_vm_id_new();
+            if (!ti->unique_id) break;
+            ULONGLONG virtual_bytes=0;
+            if (SUCCEEDED(vhdx_get_virtual_size(vhdx_path,&virtual_bytes)))
+                ti->hdd_gb=(DWORD)((virtual_bytes+((1ULL<<30)-1))>>30);
             wcscpy_s(ti->name, 256, fd.cFileName);
             wcscpy_s(ti->vhdx_path, MAX_PATH, vhdx_path);
             ti->os_type[0] = L'\0';
@@ -948,6 +979,7 @@ static void scan_templates(void)
     } while (FindNextFileW(hFind, &fd));
 
     FindClose(hFind);
+    save_vm_list();
 }
 
 /* ---- Utility: recursive directory delete ---- */
@@ -1006,6 +1038,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
                (snapshot/branch revert), so "deployed" is only valid per boot.
                The guest-side write is idempotent. */
             instance->ssh_key_deployed = FALSE;
+            asb_headless_forget(instance->unique_id);
             hcs_stop_monitor(instance);
             vm_ssh_proxy_stop(instance);
             vm_agent_stop(instance);
@@ -1019,7 +1052,6 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
             if (instance->is_template) {
                 wchar_t tpl_dir[MAX_PATH], tmp[MAX_PATH], jp[MAX_PATH];
                 wchar_t *sl;
-                int j;
                 wcscpy_s(tpl_dir, MAX_PATH, instance->vhdx_path);
                 sl = wcsrchr(tpl_dir, L'\\'); if (sl) *sl = L'\0';
                 swprintf_s(tmp, MAX_PATH, L"%s\\vm.vmgs", tpl_dir); DeleteFileW(tmp);
@@ -1037,6 +1069,8 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
                 if (g_template_count < ASB_MAX_TEMPLATES) {
                     TemplateInfo *ti = &g_templates[g_template_count++];
                     ZeroMemory(ti, sizeof(*ti));
+                    ti->unique_id=instance->unique_id;
+                    ti->hdd_gb=instance->hdd_gb;
                     wcscpy_s(ti->name, 256, instance->name);
                     wcscpy_s(ti->os_type, 32, instance->os_type);
                     wcscpy_s(ti->image_path, MAX_PATH, instance->image_path);
@@ -3003,6 +3037,7 @@ ASB_API void asb_cleanup(void)
     int i;
     if (!g_initialized) return;
 
+    asb_headless_shutdown();
     stop_template_copies();
     for (i = 0; i < g_vm_count; i++) {
         if (VM_AT(i).start_thread) {
@@ -3148,28 +3183,32 @@ ASB_API const wchar_t *asb_validate_disk_directory(const wchar_t *name,
     return resolve_disk_directory(name, disk_directory, is_template, parent, vm_dir);
 }
 
-ASB_API const wchar_t *asb_validate_template_disk_size(const wchar_t *template_name,
-    DWORD hdd_gb)
+static const wchar_t *validate_template_capacity(int index,DWORD hdd_gb)
 {
-    int i;
     ULONGLONG parent_bytes;
     HRESULT hr;
-
-    if (!template_name || !template_name[0]) return NULL;
-    for (i = 0; i < g_template_count; i++) {
-        if (_wcsicmp(g_templates[i].name, template_name) == 0) {
-            hr = vhdx_get_virtual_size(g_templates[i].vhdx_path, &parent_bytes);
-            if (FAILED(hr)) {
-                asb_log(L"Cannot read template VHDX capacity (0x%08X): %s",
-                        hr, g_templates[i].vhdx_path);
-                return L"Cannot read the selected template's virtual disk size.";
-            }
-            if ((ULONGLONG)(hdd_gb ? hdd_gb : 64) * 1024ULL * 1024ULL * 1024ULL < parent_bytes)
-                return L"HDD size cannot be smaller than the template's virtual disk size.";
-            return NULL;
+    if (index>=0 && index<g_template_count) {
+        hr = vhdx_get_virtual_size(g_templates[index].vhdx_path, &parent_bytes);
+        if (FAILED(hr)) {
+            asb_log(L"Cannot read template VHDX capacity (0x%08X): %s",
+                    hr, g_templates[index].vhdx_path);
+            return L"Cannot read the selected template's virtual disk size.";
         }
+        if (hdd_gb && (ULONGLONG)hdd_gb * 1024ULL * 1024ULL * 1024ULL < parent_bytes) {
+            static __declspec(thread) wchar_t error[128];
+            ULONGLONG required_gb=(parent_bytes+((1ULL<<30)-1))>>30;
+            swprintf_s(error,ARRAYSIZE(error),L"This template requires a disk size of at least %llu GB.",required_gb);
+            return error;
+        }
+        return NULL;
     }
     return L"The selected template was not found.";
+}
+
+ASB_API const wchar_t *asb_validate_template_disk_size(const wchar_t *template_name,DWORD hdd_gb)
+{
+    if (!template_name || !template_name[0]) return NULL;
+    return validate_template_capacity(asb_template_index_by_id(asb_template_id_by_name(template_name)),hdd_gb);
 }
 
 /* ECMAScript String.trim whitespace, matching the creation form. */
@@ -3324,17 +3363,33 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
         return E_INVALIDARG;
     }
 
+    AsbVmConfig selected=*config;
+    if (!selected.template_id && selected.template_name && selected.template_name[0]) {
+        selected.template_id=asb_template_id_by_name(selected.template_name);
+        if (!selected.template_id) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        selected.template_name=NULL;
+    }
+    if (selected.template_id) {
+        if (selected.template_name && selected.template_name[0]) return E_INVALIDARG;
+        int index=asb_template_index_by_id(selected.template_id);
+        if (index<0) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        selected.template_name=g_templates[index].name;
+        config=&selected;
+    }
+
     effective_os = config->os_type;
     if (config->template_name && config->template_name[0] != L'\0') {
         int i;
         for (i = 0; i < g_template_count; i++) {
-            if (_wcsicmp(g_templates[i].name, config->template_name) == 0) {
+            if (g_templates[i].unique_id==config->template_id) {
                 template_idx = i;
                 from_template = TRUE;
                 effective_os = g_templates[i].os_type;
                 break;
             }
         }
+        if (!from_template) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        if (config->is_template || !config->os_type || _wcsicmp(config->os_type,effective_os)) return E_INVALIDARG;
     }
     {
         const wchar_t *error = asb_validate_username(effective_os, config->username,
@@ -3380,9 +3435,10 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     cfg.is_template = is_template_create;
 
     /* Defaults */
-    if (cfg.hdd_gb == 0) cfg.hdd_gb = 64;
-    if (cfg.ram_mb == 0) cfg.ram_mb = 4096;
-    if (cfg.cpu_cores == 0) cfg.cpu_cores = 4;
+    if (cfg.hdd_gb == 0) cfg.hdd_gb = from_template?asb_template_hdd_gb(template_idx):ASB_API_DEFAULT_HDD_GB;
+    if (!cfg.hdd_gb) return E_FAIL;
+    if (cfg.ram_mb == 0) cfg.ram_mb = ASB_API_DEFAULT_RAM_MB;
+    if (cfg.cpu_cores == 0) cfg.cpu_cores = ASB_API_DEFAULT_CPU_CORES;
 
     /* Linux defaults: respect the UI's gpu_mode (GPU-PV works via
        DKMS-built dxgkrnl + asb_drm). Force test_mode=TRUE so the
@@ -3398,7 +3454,7 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     }
 
     {
-        const wchar_t *error = asb_validate_template_disk_size(config->template_name, cfg.hdd_gb);
+        const wchar_t *error = from_template ? validate_template_capacity(template_idx,cfg.hdd_gb) : NULL;
         if (error) {
             asb_log(L"Error: %s", error);
             asb_alert(error);
@@ -4020,6 +4076,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
 
     inst->running = FALSE;
     inst->shutdown_requested = FALSE;
+    asb_headless_forget(inst->unique_id);
     inst->hyperv_video_off = FALSE;
     inst->ssh_key_deployed = FALSE;   /* disk may change while stopped (revert) -- re-deploy next boot */
     hcs_stop_monitor(inst);
@@ -4045,9 +4102,9 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
 
 /* ---- VM Delete ---- */
 
-ASB_API HRESULT asb_vm_delete(AsbVm vm)
+static HRESULT delete_instance(AsbVm vm,BOOL template_resource)
 {
-    int idx, i;
+    int idx;
     wchar_t dir[MAX_PATH];
     VmInstance *inst;
     DWORD attrs;
@@ -4056,6 +4113,7 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     inst = &VM_AT(idx);
+    if (!!inst->is_template!=!!template_resource) return E_INVALIDARG;
     if (inst->building_vhdx || inst->starting) return E_ACCESSDENIED;
     if (inst->start_thread) WaitForSingleObject(inst->start_thread, INFINITE);
     if (!get_vm_disk_root(inst->vhdx_path, dir)) return E_INVALIDARG;
@@ -4081,6 +4139,7 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
         }
     } else if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
 
+    asb_headless_forget(inst->unique_id);
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
     vm_agent_stop(inst);
@@ -4114,6 +4173,11 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     return S_OK;
 }
 
+ASB_API HRESULT asb_vm_delete(AsbVm vm)
+{
+    return delete_instance(vm,FALSE);
+}
+
 /* ---- VM Queries ---- */
 
 ASB_API int asb_vm_count(void) { return g_vm_count; }
@@ -4141,12 +4205,15 @@ ASB_API AsbVm asb_vm_get(int index)
 ASB_API AsbVm asb_vm_find(const wchar_t *name)
 {
     int i;
+    AsbVm found=NULL;
     if (!name) return NULL;
     for (i = 0; i < g_vm_count; i++) {
-        if (_wcsicmp(VM_AT(i).name, name) == 0)
-            return vm_handle(&VM_AT(i));
+        if (_wcsicmp(VM_AT(i).name, name) == 0) {
+            if (found) return NULL;
+            found=vm_handle(&VM_AT(i));
+        }
     }
-    return NULL;
+    return found;
 }
 
 ASB_API const wchar_t *asb_vm_name(AsbVm vm)
@@ -4245,25 +4312,10 @@ ASB_API DWORD asb_vm_ssh_port(AsbVm vm)
 
 ASB_API HRESULT asb_vm_set_name(AsbVm vm, const wchar_t *name)
 {
-    VmInstance *inst;
     int idx = vm_index_of(vm);
-    int i;
     if (idx < 0) return E_INVALIDARG;
-    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
-    inst = &VM_AT(idx);
-    if (inst->running) return E_ACCESSDENIED;
-    if (!name || name[0] == L'\0') return E_INVALIDARG;
-
-    for (i = 0; i < g_vm_count; i++) {
-        if (i != idx && _wcsicmp(VM_AT(i).name, name) == 0) {
-            asb_log(L"Name \"%s\" is already in use.", name);
-            return E_INVALIDARG;
-        }
-    }
-    wcscpy_s(inst->name, 256, name);
-    save_vm_list();
-    notify_state(vm, inst->running, g_state_ud);
-    return S_OK;
+    if (VM_AT(idx).running || VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
+    return name && !wcscmp(VM_AT(idx).name,name)?S_FALSE:E_INVALIDARG;
 }
 
 ASB_API HRESULT asb_vm_set_ram(AsbVm vm, DWORD ram_mb)
@@ -4271,7 +4323,7 @@ ASB_API HRESULT asb_vm_set_ram(AsbVm vm, DWORD ram_mb)
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     if (VM_AT(idx).running || VM_AT(idx).building_vhdx || VM_AT(idx).starting) return E_ACCESSDENIED;
-    if (ram_mb < 4000) ram_mb = 4000;
+    if (ram_mb < 512 || ram_mb%2) return E_INVALIDARG;
     VM_AT(idx).ram_mb = ram_mb;
     save_vm_list();
     notify_state(vm, VM_AT(idx).running, g_state_ud);
@@ -4283,7 +4335,7 @@ ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores)
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     if (VM_AT(idx).running || VM_AT(idx).building_vhdx || VM_AT(idx).starting) return E_ACCESSDENIED;
-    if (cores < 1) cores = 1;
+    if (cores < 1) return E_INVALIDARG;
     VM_AT(idx).cpu_cores = cores;
     save_vm_list();
     notify_state(vm, VM_AT(idx).running, g_state_ud);
@@ -4482,6 +4534,61 @@ ASB_API void asb_snap_get_current(AsbVm vm, int *snap_idx, int *branch_idx)
 
 ASB_API int asb_template_count(void) { return g_template_count; }
 
+ASB_API AsbTemplateId asb_template_id(int index)
+{
+    return index>=0 && index<g_template_count?g_templates[index].unique_id:0;
+}
+
+ASB_API DWORD asb_template_hdd_gb(int index)
+{
+    if (index<0 || index>=g_template_count) return 0;
+    if (!g_templates[index].hdd_gb) {
+        ULONGLONG size=0;
+        if (SUCCEEDED(vhdx_get_virtual_size(g_templates[index].vhdx_path,&size))) {
+            g_templates[index].hdd_gb=(DWORD)((size+((1ULL<<30)-1))>>30);
+            save_vm_list();
+        }
+    }
+    return g_templates[index].hdd_gb;
+}
+
+ASB_API AsbTemplateId asb_template_id_by_name(const wchar_t *name)
+{
+    if (!name || !name[0]) return 0;
+    AsbTemplateId found=0;
+    for (int i=0;i<g_template_count;++i) if (!_wcsicmp(name,g_templates[i].name)) {
+        if (found) return 0;
+        found=g_templates[i].unique_id;
+    }
+    AsbVm vm=asb_vm_find(name);
+    VmInstance *instance=asb_vm_instance(vm);
+    if (instance && instance->is_template) return found?0:instance->unique_id;
+    return found;
+}
+
+ASB_API int asb_template_index_by_id(AsbTemplateId id)
+{
+    if (id) for (int i=0;i<g_template_count;++i) if (g_templates[i].unique_id==id) return i;
+    return -1;
+}
+
+static HRESULT delete_template_index(int index);
+
+ASB_API HRESULT asb_template_delete_by_id(AsbTemplateId id)
+{
+    int index=asb_template_index_by_id(id);
+    if (index>=0) return delete_template_index(index);
+    for (int i=0;id && i<g_vm_count;++i) if (VM_AT(i).unique_id==id && VM_AT(i).is_template) {
+        AsbVm vm=asb_vm_get(i);
+        if (VM_AT(i).running) {
+            HRESULT hr=asb_vm_stop(vm);
+            if (FAILED(hr)) return hr;
+        }
+        return delete_instance(vm,TRUE);
+    }
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
 ASB_API const wchar_t *asb_template_name(int index)
 {
     if (index < 0 || index >= g_template_count) return L"";
@@ -4496,17 +4603,22 @@ ASB_API const wchar_t *asb_template_os_type(int index)
 
 ASB_API HRESULT asb_template_delete(const wchar_t *name)
 {
+    if (!name || !name[0]) return E_INVALIDARG;
+    AsbTemplateId id=asb_template_id_by_name(name);
+    return id?asb_template_delete_by_id(id):HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
+static HRESULT delete_template_index(int index)
+{
     wchar_t tpl_dir[MAX_PATH];
     GUID template_id, template_parent;
     DWORD attrs;
     HRESULT hr;
-    int index, i;
+    int i;
 
     if (g_config_load_failed) return E_FAIL;
-    if (!name || name[0] == L'\0') return E_INVALIDARG;
-    for (index = 0; index < g_template_count; index++)
-        if (_wcsicmp(g_templates[index].name, name) == 0) break;
-    if (index == g_template_count) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    if (index<0 || index>=g_template_count) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    const wchar_t *name=g_templates[index].name;
     for (i = 0; i < ASB_MAX_VMS; i++) {
         TemplateCopy *copy = &g_template_copies[i];
         if (copy->thread && _wcsicmp(copy->source, g_templates[index].vhdx_path) == 0 &&

@@ -156,6 +156,35 @@ static BOOL is_function_key(UINT32 vk)
            vk == VK_SLEEP || (vk >= VK_BROWSER_BACK && vk <= VK_LAUNCH_APP2);
 }
 
+static UINT unicode_utf16(UINT32 scalar, WORD units[2])
+{
+    if (!scalar || scalar > 0x10ffff || (scalar >= 0xd800 && scalar <= 0xdfff)) return 0;
+    if (scalar <= 0xffff) { units[0] = (WORD)scalar; return 1; }
+    scalar -= 0x10000;
+    units[0] = (WORD)(0xd800 + (scalar >> 10));
+    units[1] = (WORD)(0xdc00 + (scalar & 0x3ff));
+    return 2;
+}
+
+static void inject_unicode(const InputPacket *pkt)
+{
+    WORD units[2];
+    UINT count = unicode_utf16(pkt->param1, units);
+    INPUT events[4] = {0};
+    if (!count || pkt->param2 || pkt->param3)
+        return;
+    for (UINT i = 0; i < count; ++i) {
+        events[i * 2].type = INPUT_KEYBOARD;
+        events[i * 2].ki.wScan = units[i];
+        events[i * 2].ki.dwFlags = KEYEVENTF_UNICODE;
+        events[i * 2 + 1] = events[i * 2];
+        events[i * 2 + 1].ki.dwFlags |= KEYEVENTF_KEYUP;
+    }
+    switch_to_input_desktop();
+    if (SendInput(count * 2, events, sizeof(INPUT)) != count * 2)
+        input_log("SendInput(UNICODE) failed: %lu", GetLastError());
+}
+
 static void inject_relative_mouse(const InputPacket *pkt)
 {
     INPUT inp = {0};
@@ -329,6 +358,8 @@ static void handle_conn(AsbConn *c)
         } else if (pkt.type == INPUT_KEY_PHYSICAL) {
             if (keyboard_version >= INPUT_KEYBOARD_VERSION)
                 inject_physical_key(&pkt, &keys);
+        } else if (pkt.type == INPUT_UNICODE) {
+            inject_unicode(&pkt);
         } else {
             inject_input(&pkt, mouse_version);
         }

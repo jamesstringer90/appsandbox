@@ -85,7 +85,9 @@ int asb_gpu_query_ioctl(struct drm_device *drm, void *data, struct drm_file *fil
 	args->adapter_luid = 0;
 	query = symbol_get(dxgk_shared_resource_info);
 	if (query) {
-		args->capabilities |= ASB_DRM_GPU_CAP_BUFFER_IMPORT;
+		args->capabilities |= ASB_DRM_GPU_CAP_BUFFER_IMPORT |
+				      ASB_DRM_GPU_CAP_RGB_FORMATS |
+				      ASB_DRM_GPU_CAP_MODIFIERS;
 		symbol_put(dxgk_shared_resource_info);
 	}
 	native = symbol_get(dxgk_shared_object_info);
@@ -307,11 +309,50 @@ out_dxg:
 	return ret;
 }
 
+static unsigned int asb_gpu_format_cpp(u32 format)
+{
+	switch (format) {
+	case DRM_FORMAT_XRGB8888:
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR8888:
+	case DRM_FORMAT_ABGR2101010:
+	case DRM_FORMAT_XBGR2101010:
+	case DRM_FORMAT_GR1616:
+	case DRM_FORMAT_GR1616F:
+	case DRM_FORMAT_R32F:
+		return 4;
+	case DRM_FORMAT_ABGR16161616:
+	case DRM_FORMAT_XBGR16161616:
+	case DRM_FORMAT_ABGR16161616F:
+	case DRM_FORMAT_XBGR16161616F:
+	case DRM_FORMAT_GR3232F:
+		return 8;
+	case DRM_FORMAT_ABGR32323232F:
+		return 16;
+	case DRM_FORMAT_RGB565:
+	case DRM_FORMAT_ARGB1555:
+	case DRM_FORMAT_XRGB1555:
+	case DRM_FORMAT_ARGB4444:
+	case DRM_FORMAT_XRGB4444:
+	case DRM_FORMAT_RGBA4444:
+	case DRM_FORMAT_GR88:
+	case DRM_FORMAT_R16:
+	case DRM_FORMAT_R16F:
+		return 2;
+	case DRM_FORMAT_R8:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
 int asb_gpu_import_ioctl(struct drm_device *drm, void *data,
 			struct drm_file *file)
 {
 	struct drm_asb_gpu_import *args = data;
 	struct asb_device *asb = to_asb(drm);
+	unsigned int cpp = asb_gpu_format_cpp(args->format);
 	struct asb_gpu_object *gpu;
 	struct file *resource;
 	void *identity;
@@ -321,11 +362,9 @@ int asb_gpu_import_ioctl(struct drm_device *drm, void *data,
 	if (args->flags || args->handle || args->adapter_luid ||
 	    !args->width || args->width > ASB_MAX_WIDTH ||
 	    !args->height || args->height > ASB_MAX_HEIGHT ||
-	    (args->format != DRM_FORMAT_XRGB8888 &&
-	     args->format != DRM_FORMAT_ARGB8888) ||
-	    args->pitch < args->width * 4 ||
-	    args->pitch > ALIGN(ASB_MAX_WIDTH * 4, 256) ||
-	    (args->pitch & 3))
+	    !cpp || args->pitch < args->width * cpp ||
+	    args->pitch > ALIGN(ASB_MAX_WIDTH * cpp, 256) ||
+	    args->pitch % cpp)
 		return -EINVAL;
 
 	resource = fget(args->fd);
@@ -436,14 +475,22 @@ struct drm_framebuffer *asb_fb_create(struct drm_device *drm,
 	struct drm_gem_object *obj;
 	struct asb_gpu_object *gpu;
 
+	bool has_modifier = cmd->flags & DRM_MODE_FB_MODIFIERS;
+	u64 modifier = has_modifier ? cmd->modifier[0] : DRM_FORMAT_MOD_INVALID;
+
 	fb = drm_gem_fb_create(drm, file, info, cmd);
 	if (IS_ERR(fb))
 		return fb;
 	obj = drm_gem_fb_get_obj(fb, 0);
-	if (obj->funcs != &asb_gpu_object_funcs)
-		return fb;
+	if (obj->funcs != &asb_gpu_object_funcs) {
+		if (!has_modifier || modifier == DRM_FORMAT_MOD_LINEAR)
+			return fb;
+		drm_framebuffer_put(fb);
+		return ERR_PTR(-EINVAL);
+	}
 	gpu = container_of(obj, struct asb_gpu_object, base);
-	if (!cmd->flags && !cmd->offsets[0] &&
+	if ((!has_modifier || modifier == ASB_DRM_FORMAT_MOD_D3D12) &&
+	    !(cmd->flags & ~DRM_MODE_FB_MODIFIERS) && !cmd->offsets[0] &&
 	    cmd->width == gpu->width && cmd->height == gpu->height &&
 	    cmd->pixel_format == gpu->format && cmd->pitches[0] == gpu->pitch)
 		return fb;
