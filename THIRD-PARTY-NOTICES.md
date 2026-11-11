@@ -1,24 +1,25 @@
 # Third-Party Notices
 
 AppSandbox is licensed under the MIT License (see [LICENSE](LICENSE)). That MIT
-grant covers **only AppSandbox's own source code**. The repository also bundles
-the third-party components listed below, which are **not** licensed under the
-MIT License and remain under their own licenses and copyrights. Each vendored
-source file additionally carries its own `SPDX-License-Identifier` header, which
-governs that file.
+grant covers **only AppSandbox's own source code**. Bundled and downloaded
+third-party components retain their own licenses and copyrights; AppSandbox's
+MIT License does not replace those terms. Per-file license notices govern the
+corresponding source files.
 
 ---
 
-## tools/linux/dxgkrnl/ — Microsoft WSL2 `dxgkrnl` GPU driver
+## asb-dxgkrnl — Linux guest GPU driver
 
 - **License:** GNU General Public License, version 2 (`SPDX: GPL-2.0`).
   A verbatim copy of the license text is provided at
   [`tools/linux/dxgkrnl/COPYING`](tools/linux/dxgkrnl/COPYING).
 - **Copyright:** Copyright (c) Microsoft Corporation.
-- A vendored copy of the WSL2 paravirtualized GPU kernel driver. Every file
-  carries its own `SPDX-License-Identifier: GPL-2.0` header. This component is
-  GPL-2.0 and is *not* relicensed under MIT; it is included as a separate work
-  (mere aggregation in the same repository).
+- **Source:** [jamesstringer90/asb-dxgkrnl](https://github.com/jamesstringer90/asb-dxgkrnl),
+  based on Microsoft's WSL2 paravirtualized GPU kernel driver. Linux guest
+  provisioning downloads the source version selected by
+  [`src/core/linux_deps.h`](src/core/linux_deps.h) and builds it in the guest.
+  Source files carry their own GPL-2.0 notices; this driver is not relicensed
+  under AppSandbox's MIT License.
 
 ## tools/iso-patch/engine/xz/ — XZ Embedded decoder
 
@@ -28,21 +29,21 @@ governs that file.
   `SPDX-License-Identifier: 0BSD` header. 0BSD is a public-domain-equivalent,
   MIT-compatible permissive license.
 
-## tools/linux/wsl-mesa/prebuilt/ — Mesa 3D Graphics Library (prebuilt binary)
+## vendor/mesa-d3d12/ — AppSandbox Mesa D3D12 build
 
 - **License:** MIT License (the Mesa project's overall license; some bundled
   components are under other compatible permissive licenses, e.g. the SGI Free
   Software License B). The headline MIT license text is shipped at
-  [`tools/linux/wsl-mesa/prebuilt/MESA-LICENSE.txt`](tools/linux/wsl-mesa/prebuilt/MESA-LICENSE.txt);
+  [`vendor/mesa-d3d12/MESA-LICENSE.txt`](vendor/mesa-d3d12/MESA-LICENSE.txt);
   the full per-component listing is at <https://docs.mesa3d.org/license.html>.
 - **Copyright:** Copyright (c) the Mesa contributors.
-- `tools/linux/wsl-mesa/prebuilt/ubuntu-26.04-amd64/wsl-mesa.tar.zst` is an
-  **unmodified upstream build** of Mesa 25.3.6 (gallium `llvmpipe`/`d3d12`,
-  Vulkan `swrast`/`dzn`), produced by the in-repo `build/build-mesa.sh` with no
-  source modifications. It contains Mesa's own binaries only; LLVM (used by
-  `llvmpipe`) is an external `apt` dependency installed on the guest and is
-  **not** bundled in this repository. The surrounding `tools/linux/wsl-mesa/`
-  scripts and configs are AppSandbox's own code (MIT).
+- **Source:** [jamesstringer90/asb-mesa](https://github.com/jamesstringer90/asb-mesa),
+  based on Mesa 26.2.6 with AppSandbox D3D12 display integration. The source
+  revision and archive checksum are recorded in
+  [`vendor/mesa-d3d12/source-version.json`](vendor/mesa-d3d12/source-version.json).
+  The prebuilt archive is cached under `vendor/mesa-d3d12/prebuilt/` or downloaded
+  from the release selected by [`src/core/linux_deps.h`](src/core/linux_deps.h).
+  LLVM is an external guest package dependency, not bundled in that archive.
 
 ## tools/vdd/ThirdParty/wdf/ — Microsoft Windows Driver Framework (WDF)
 
@@ -73,7 +74,7 @@ governs that file.
 - **Copyright:** the QEMU, GLib, GNU gettext, PCRE2 (University of Cambridge),
   and TianoCore/EDK2 contributors.
 - The macOS host runs Windows guests on a vendored, patched build of **QEMU
-  11.0.1** (ivshmem-plain on HVF) together with its GLib / gettext / PCRE2
+  11.1.3** (ivshmem-plain on HVF) together with its GLib / gettext / PCRE2
   runtime and the EDK2 UEFI firmware, embedded under
   `AppSandbox.app/Contents/Resources/qemu/`. QEMU runs as a separate process
   (aggregated with, not linked into, the app); the LGPL dylibs are dynamically
