@@ -997,7 +997,7 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu,
 static int display_session(int argc, char **argv)
 {
     if (argc < 3) return 1;
-    int accelerated = 0;
+    int accelerated = 0, queried = 0;
     for (int i = 0; i < 8 && !accelerated; ++i) {
         char path[64];
         snprintf(path, sizeof(path), "/dev/dri/card%d", i);
@@ -1006,10 +1006,13 @@ static int display_session(int argc, char **argv)
         drmDropMaster(fd);
         struct drm_asb_gpu_query query = {0};
         if (ioctl(fd, DRM_IOCTL_ASB_GPU_QUERY, &query) == 0 &&
-            query.version == ASB_DRM_GPU_VERSION && (query.capabilities & ASB_DRM_GPU_CAP_PRESENT))
-            accelerated = 1;
+            query.version == ASB_DRM_GPU_VERSION) {
+            queried = 1;
+            accelerated |= !!(query.capabilities & ASB_DRM_GPU_CAP_PRESENT);
+        }
         close(fd);
     }
+    if (!queried) accelerated = access("/run/appsandbox/gpu-present", F_OK) == 0;
     if (accelerated) {
         unsetenv("LIBGL_ALWAYS_SOFTWARE");
         setenv("GALLIUM_DRIVER", "d3d12", 1);
@@ -1068,6 +1071,7 @@ int main(int argc, char **argv)
         sigaction(SIGTERM, &sa, NULL);
     }
 
+    unlink("/run/appsandbox/gpu-present");
     display_wait_runtime();
     int drm_fd = capture_open();
     if (drm_fd < 0) return 1;

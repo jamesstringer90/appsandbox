@@ -21,7 +21,8 @@ WSL_MESA=/opt/wsl-mesa
 WSL_MESA_LIB="$WSL_MESA/lib/x86_64-linux-gnu"
 WSL_LIB=/usr/lib/wsl/lib
 
-if [ -e /dev/dxg ] && [ -d "$WSL_MESA_LIB" ]; then
+if [ -e /dev/dxg ] && [ -d "$WSL_MESA_LIB" ] &&
+   /usr/local/bin/appsandbox-display --session /bin/sh -c 'test "$GALLIUM_DRIVER" = d3d12' 2>/dev/null; then
     # LD_LIBRARY_PATH covers two needs:
     #   - $WSL_MESA_LIB picks Mesa's d3d12 gallium + dzn Vulkan over stock.
     #   - $WSL_LIB lets apps that dlopen the WSL NVIDIA userspace libs by

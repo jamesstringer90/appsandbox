@@ -53,4 +53,4 @@ if [ -e /dev/dxg ] && [ -d "$WSL_MESA_LIB" ]; then
     fi
 fi
 
-exec "$@"
+exec /usr/local/bin/appsandbox-display --session "$@"

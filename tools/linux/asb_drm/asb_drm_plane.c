@@ -27,6 +27,7 @@
 #include <drm/drm_print.h>
 
 #include "asb_drm.h"
+#include "asb_drm_uapi.h"
 
 /* --------------------------------------------------------------------------
  * Format tables. Listed in preference order; first format the compositor
@@ -49,10 +50,25 @@ static const u32 asb_cursor_formats[] = {
 	                         * plane suitability check rejects us. */
 };
 
-static const u64 asb_format_modifiers[] = {
+static const u64 asb_primary_modifiers[] = {
+	ASB_DRM_FORMAT_MOD_D3D12,
 	DRM_FORMAT_MOD_LINEAR,
 	DRM_FORMAT_MOD_INVALID
 };
+
+static const u64 asb_cursor_modifiers[] = {
+	DRM_FORMAT_MOD_LINEAR,
+	DRM_FORMAT_MOD_INVALID
+};
+
+static bool asb_primary_format_mod_supported(struct drm_plane *plane,
+                                             u32 format, u64 modifier)
+{
+	if (modifier == DRM_FORMAT_MOD_LINEAR)
+		return true;
+	return modifier == ASB_DRM_FORMAT_MOD_D3D12 &&
+	       (format == DRM_FORMAT_XRGB8888 || format == DRM_FORMAT_ARGB8888);
+}
 
 /* --------------------------------------------------------------------------
  * Primary plane
@@ -101,6 +117,7 @@ static const struct drm_plane_funcs asb_primary_funcs = {
 	.reset                  = drm_atomic_helper_plane_reset,
 	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
 	.atomic_destroy_state   = drm_atomic_helper_plane_destroy_state,
+	.format_mod_supported   = asb_primary_format_mod_supported,
 };
 
 /* --------------------------------------------------------------------------
@@ -187,7 +204,7 @@ int asb_planes_init(struct asb_device *asb)
 	                               &asb_primary_funcs,
 	                               asb_primary_formats,
 	                               ARRAY_SIZE(asb_primary_formats),
-	                               asb_format_modifiers,
+	                               asb_primary_modifiers,
 	                               DRM_PLANE_TYPE_PRIMARY,
 	                               "primary");
 	if (ret)
@@ -200,7 +217,7 @@ int asb_planes_init(struct asb_device *asb)
 	                               &asb_cursor_funcs,
 	                               asb_cursor_formats,
 	                               ARRAY_SIZE(asb_cursor_formats),
-	                               asb_format_modifiers,
+	                               asb_cursor_modifiers,
 	                               DRM_PLANE_TYPE_CURSOR,
 	                               "cursor");
 	if (ret)

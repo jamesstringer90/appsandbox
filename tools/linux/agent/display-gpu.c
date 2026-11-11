@@ -177,7 +177,10 @@ void display_gpu_destroy(struct display_gpu *gpu)
 {
     if (!gpu) return;
     struct drm_asb_gpu_present present = {.event_fd = -1};
-    if (gpu->registered) gpu_ioctl(gpu->drm_fd, DRM_IOCTL_ASB_GPU_PRESENT, &present);
+    if (gpu->registered) {
+        unlink("/run/appsandbox/gpu-present");
+        gpu_ioctl(gpu->drm_fd, DRM_IOCTL_ASB_GPU_PRESENT, &present);
+    }
     if (gpu->complete) display_gpu_disconnect(gpu);
     if (gpu->capture_slot.commands) ID3D12GraphicsCommandList_Release(gpu->capture_slot.commands);
     if (gpu->capture_slot.allocator) ID3D12CommandAllocator_Release(gpu->capture_slot.allocator);
@@ -260,6 +263,9 @@ struct display_gpu *display_gpu_create(int drm_fd)
     if (gpu_ioctl(gpu->drm_fd, DRM_IOCTL_ASB_GPU_PRESENT, &present) < 0) goto fail;
     gpu->registered = true;
     gpu->adapter_luid = present.adapter_luid;
+    int ready = open("/run/appsandbox/gpu-present", O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (ready >= 0) close(ready);
+    else fprintf(stderr, "[display] GPU session readiness: %s\n", strerror(errno));
     IUnknown_Release(adapters);
     IUnknown_Release(factory);
     return gpu;
