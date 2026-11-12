@@ -1174,6 +1174,16 @@ static int do_to_vhdx(const wchar_t *iso_path_arg, int image_index, int size_gb,
 
         ret = run_command(cmd, TRUE);
         if (ret != 0) {
+            /* Secure Boot plus the 2023 UEFI CA in db makes bcdboot pick the EX boot
+               binaries, which images older than that CA do not contain. /offline forces
+               offline servicing so the image files already on disk are used. */
+            log_msg(L"bcdboot failed with exit code %d, retrying with /offline", ret);
+            swprintf_s(cmd, 1024,
+                        L"%s\\bcdboot.exe \"%s\" /s \"%s\" /f UEFI /offline",
+                        sys_dir, windows_dir, efi_clean);
+            ret = run_command(cmd, TRUE);
+        }
+        if (ret != 0) {
             log_err(L"Failed to install boot files (bcdboot exit code %d)", ret);
             goto cleanup;
         }
