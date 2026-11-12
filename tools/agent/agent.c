@@ -1635,7 +1635,7 @@ static void ensure_display_monitor(void)
     slash = wcsrchr(exe_path, L'\\');
     if (slash) *(slash + 1) = L'\0';
     wcscat_s(exe_path, MAX_PATH, L"appsandbox-displays.exe");
-    swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%s\" --watch-hyperv", exe_path);
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%s\"", exe_path);
 
     if (GetFileAttributesW(exe_path) == INVALID_FILE_ATTRIBUTES) {
         agent_log("Hyper-V display: %ls not found.", exe_path);
