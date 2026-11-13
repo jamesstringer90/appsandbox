@@ -48,6 +48,7 @@ typedef void (^IsoPatchCompletion)(NSError * _Nullable error);
                         outDisk:(NSURL *)outDiskURL
                signedPayloadZip:(NSString *)signedPayloadZip
                       netkvmZip:(nullable NSString *)netkvmZip
+                     vioscsiZip:(nullable NSString *)vioscsiZip
                      sshMsiPath:(nullable NSString *)sshMsiPath
                          vmName:(NSString *)vmName
                       adminUser:(NSString *)adminUser
@@ -76,6 +77,8 @@ typedef void (^IsoPatchCompletion)(NSError * _Nullable error);
  * cached PATH. build-windows extracts it into the guest's drivers. Returns nil on failure (the VM then
  * builds without a guest NIC). Blocking; call off-main. */
 + (nullable NSString *)ensureNetkvmZipCached;
+
++ (nullable NSString *)ensureVioscsiZipCached;
 
 @end
 

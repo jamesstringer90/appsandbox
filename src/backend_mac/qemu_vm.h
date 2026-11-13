@@ -32,6 +32,11 @@ typedef NS_ENUM(int, QemuVmState) {
 typedef void (^QemuVmStateChange)(QemuVmState state);
 typedef void (^QemuVmLog)(NSString *line);
 
+typedef NS_ENUM(int, QemuStorageController) {
+    QemuStorageNvme = 0,
+    QemuStorageVirtioScsi = 1,
+};
+
 @interface QemuVm : NSObject
 
 /* Paths/params for one VM. ramMb/cpuCores/diskGb mirror the CoreVmConfig. The backing file lives in
@@ -41,6 +46,7 @@ typedef void (^QemuVmLog)(NSString *line);
                        ramMb:(int)ramMb
                     cpuCores:(int)cpuCores
                   macAddress:(NSString *)macAddress
+           storageController:(QemuStorageController)storageController
                     testMode:(BOOL)testMode;
 
 @property (nonatomic, copy, readonly)   NSString *name;

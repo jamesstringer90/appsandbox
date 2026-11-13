@@ -1550,7 +1550,7 @@ int ntfs_writer_close(ntfs_writer_t *w){
      * at least 16 KiB in). Both live below mft_zone_end, in front of the free MFT
      * zone. $MFTMirr was fixed at the volume midpoint in open(). */
     uint64_t boot_clusters = (8192 + w->cluster_size-1)/w->cluster_size;  /* $Boot = [0,2) */
-    uint64_t mftbmp_bytes = (mft_count+7)/8;
+    uint64_t mftbmp_bytes = align_up(((uint64_t)mft_count+7)/8, 8);
     int      mftbmp_resident = (mftbmp_bytes <= 0x40);
     uint64_t mftbmp_lcn = 0, mftbmp_clusters = 0;
     if (!mftbmp_resident){

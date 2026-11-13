@@ -25,6 +25,16 @@ static uint32_t ru8(uint32_t x){ return (x+7)&~7u; }
 #define NIL 0xFFFFFFFFu
 #define BODY(h,off) ((h)->b + 0x1000 + (off) + 4)   /* record body of cell at stored off */
 
+static int hive_name_compare(const char *a, const char *b){
+    for (;; a++, b++) {
+        unsigned ca=(unsigned char)*a, cb=(unsigned char)*b;
+        if (ca>='a' && ca<='z') ca-='a'-'A';
+        if (cb>='a' && cb<='z') cb-='a'-'A';
+        if (ca!=cb) return ca<cb?-1:1;
+        if (!ca) return 0;
+    }
+}
+
 /* ---- read-side navigation ---- */
 static void nk_name(hive_t *h, uint32_t nk, char *out, int cap){
     uint8_t *b = BODY(h,nk); uint16_t fl=rd16(b+0x02), nl=rd16(b+0x48); uint8_t *nm=b+0x4C; int j=0;
@@ -45,7 +55,7 @@ static int children(hive_t *h, uint32_t nk, uint32_t *out, int cap){
 }
 static uint32_t find_subkey(hive_t *h, uint32_t nk, const char *name){
     uint32_t kids[4096]; int n=children(h,nk,kids,4096);
-    for (int i=0;i<n;i++){ char nm[128]; nk_name(h,kids[i],nm,sizeof nm); if (!strcasecmp(nm,name)) return kids[i]; }
+    for (int i=0;i<n;i++){ char nm[128]; nk_name(h,kids[i],nm,sizeof nm); if (!hive_name_compare(nm,name)) return kids[i]; }
     return NIL;
 }
 static uint32_t find_value(hive_t *h, uint32_t nk, const char *name){
@@ -54,7 +64,7 @@ static uint32_t find_value(hive_t *h, uint32_t nk, const char *name){
     for (uint32_t i=0;i<nval;i++){ uint32_t vk=rd32(ve+4*i); uint8_t *vb=BODY(h,vk);
         uint16_t nl=rd16(vb+0x02), vf=rd16(vb+0x10); char nm[64]; int j=0;
         if (vf&1){ for (int k=0;k<nl&&j<63;k++) nm[j++]=vb[0x14+k]; } else { for (int k=0;k+1<nl&&j<63;k+=2) nm[j++]=vb[0x14+k]; }
-        nm[j]=0; if (!strcasecmp(nm,name)) return vk; }
+        nm[j]=0; if (!hive_name_compare(nm,name)) return vk; }
     return NIL;
 }
 static const uint8_t *vk_data(hive_t *h, uint32_t vk, uint32_t *len){
@@ -63,15 +73,16 @@ static const uint8_t *vk_data(hive_t *h, uint32_t vk, uint32_t *len){
 }
 
 /* ---- write-side: append hbin + carve cells ---- */
-static void hbin_append(hive_t *h){
+static void hbin_append(hive_t *h, uint32_t need){
     uint32_t hbins = rd32(h->b+0x28);
-    size_t nl = h->len + 0x1000;
+    uint32_t size = (need + 0x20 + 0xFFF) & ~0xFFFu;
+    size_t nl = h->len + size;
     if (nl > h->cap){ h->cap = nl*2; h->b = realloc(h->b, h->cap); }
-    uint8_t *hb = h->b + h->len; memset(hb,0,0x1000);
-    memcpy(hb,"hbin",4); wr32(hb+4, hbins); wr32(hb+8, 0x1000);
-    wr32(h->b+0x28, hbins + 0x1000);
+    uint8_t *hb = h->b + h->len; memset(hb,0,size);
+    memcpy(hb,"hbin",4); wr32(hb+4, hbins); wr32(hb+8, size);
+    wr32(h->b+0x28, hbins + size);
     h->abump = (uint32_t)(h->len + 0x20);
-    h->aend  = (uint32_t)(h->len + 0x1000);
+    h->aend  = (uint32_t)(h->len + size);
     h->len = nl;
 }
 /* returns stored offset of a new allocated cell holding `payload` bytes (zeroed) */
@@ -79,7 +90,7 @@ static uint32_t cell_alloc(hive_t *h, uint32_t payload){
     uint32_t need = ru8(4+payload);
     if (h->aend==0 || h->abump+need > h->aend){
         if (h->aend && h->abump < h->aend) wr32(h->b+h->abump, h->aend - h->abump); /* free tail */
-        hbin_append(h);
+        hbin_append(h, need);
     }
     uint32_t fo = h->abump;
     wr32(h->b+fo, (uint32_t)(-(int32_t)need));
@@ -93,7 +104,7 @@ static void sublist_add(hive_t *h, uint32_t parent, uint32_t child, const char *
     uint32_t kids[4096]; int n = collect(h, rd32(BODY(h,parent)+0x1C), kids, 4095);
     kids[n++] = child;
     for (int i=1;i<n;i++){ uint32_t k=kids[i]; char ki[128]; nk_name(h,k,ki,sizeof ki); int j=i-1;
-        for (; j>=0; j--){ char kj[128]; nk_name(h,kids[j],kj,sizeof kj); if (strcasecmp(kj,ki)>0) kids[j+1]=kids[j]; else break; }
+        for (; j>=0; j--){ char kj[128]; nk_name(h,kids[j],kj,sizeof kj); if (hive_name_compare(kj,ki)>0) kids[j+1]=kids[j]; else break; }
         kids[j+1]=k; }
     uint32_t lf = cell_alloc(h, 4 + 8*n);
     uint8_t *lb = BODY(h,lf); memcpy(lb,"lf",2); wr16(lb+2,(uint16_t)n);
@@ -198,24 +209,35 @@ static uint32_t create_object(hive_t *h, uint32_t objects, const char *guid, uin
  * lacks it, so sysprep's Sysprep_Online_Specialize_Bcd rejects ours as "not system
  * store" (0xC0000098) -> "could not configure hardware". Pointers recomputed after
  * every cell_alloc (realloc may move the buffer). */
-static void set_dword_value(hive_t *h, uint32_t nk, const char *name, uint32_t val){
+static void set_value(hive_t *h, uint32_t nk, const char *name, uint32_t type,
+                      const uint8_t *data, uint32_t len){
     uint32_t vk = find_value(h, nk, name);
-    if (vk != NIL){                                  /* update existing */
-        uint8_t *vb=BODY(h,vk); wr32(vb+0x04, 4u|0x80000000u); wr32(vb+0x08, val); wr32(vb+0x0C, 4);
-        return;
+    uint32_t dc = 0;
+    if (len > 4){ dc = cell_alloc(h, len); memcpy(BODY(h,dc), data, len); }
+    if (vk == NIL){
+        size_t nl = strlen(name);
+        vk = cell_alloc(h, (uint32_t)(0x14 + nl));
+        uint32_t count = rd32(BODY(h,nk)+0x24);
+        uint32_t oldlist = rd32(BODY(h,nk)+0x28);
+        uint32_t list = cell_alloc(h, 4*(count+1));
+        if (count) memcpy(BODY(h,list), BODY(h,oldlist), 4*count);
+        wr32(BODY(h,list)+4*count, vk);
+        wr32(BODY(h,nk)+0x24, count+1); wr32(BODY(h,nk)+0x28, list);
+        uint8_t *v = BODY(h,vk);
+        memcpy(v,"vk",2); wr16(v+2,(uint16_t)nl); wr16(v+0x10,1);
+        memcpy(v+0x14,name,nl);
     }
-    int nl=(int)strlen(name);
-    uint32_t nvk = cell_alloc(h, 0x14+nl);           /* new vk cell */
-    uint32_t nval    = rd32(BODY(h,nk)+0x24);
-    uint32_t oldlist = rd32(BODY(h,nk)+0x28);
-    uint32_t newlist = cell_alloc(h, 4*(nval+1));    /* grown value list */
-    { uint8_t *vb=BODY(h,nvk); memcpy(vb,"vk",2); wr16(vb+0x02,(uint16_t)nl);
-      wr32(vb+0x04, 4u|0x80000000u);                 /* size 4, inline-data flag */
-      wr32(vb+0x08, val); wr32(vb+0x0C, 4 /*REG_DWORD*/); wr16(vb+0x10, 1); memcpy(vb+0x14, name, nl); }
-    { uint8_t *nlb=BODY(h,newlist);
-      if (oldlist!=NIL){ uint8_t *ob=BODY(h,oldlist); for (uint32_t i=0;i<nval;i++) wr32(nlb+4*i, rd32(ob+4*i)); }
-      wr32(nlb+4*nval, nvk); }
-    { uint8_t *nb=BODY(h,nk); wr32(nb+0x24, nval+1); wr32(nb+0x28, newlist); }
+    uint8_t *v = BODY(h,vk);
+    wr32(v+4, len | (len <= 4 ? 0x80000000u : 0));
+    wr32(v+8, dc); wr32(v+0x0C, type);
+    if (len <= 4 && len) memcpy(v+8,data,len);
+    uint32_t name_len = (uint32_t)strlen(name)*2;
+    if (rd32(BODY(h,nk)+0x3C) < name_len) wr32(BODY(h,nk)+0x3C,name_len);
+    if (rd32(BODY(h,nk)+0x40) < len) wr32(BODY(h,nk)+0x40,len);
+}
+
+static void set_dword_value(hive_t *h, uint32_t nk, const char *name, uint32_t val){
+    uint8_t data[4]; wr32(data,val); set_value(h,nk,name,4,data,4);
 }
 
 /* ---- BCD-specific helpers ---- */
@@ -385,5 +407,137 @@ int bcd_build(const uint8_t *tpl, size_t tpl_len, const bcd_guids_t *g, uint8_t 
     if (s==0xFFFFFFFF) s=0xFFFFFFFE; if (s==0) s=1; wr32(h->b+0x1FC, s);
 
     *out = h->b; *out_len = h->len;
+    return 0;
+}
+
+static uint32_t ensure_key(hive_t *h, uint32_t parent, const char *name){
+    uint32_t key = find_subkey(h,parent,name);
+    if (key != NIL) return key;
+    if (rd32(BODY(h,parent)+0x14) >= 4095) return NIL;
+    size_t len = strlen(name);
+    uint32_t sk = rd32(BODY(h,parent)+0x2C);
+    key = cell_alloc(h,(uint32_t)(0x4C+len));
+    uint8_t *b = BODY(h,key);
+    memcpy(b,"nk",2); wr16(b+2,0x20);
+    memcpy(b+4,BODY(h,parent)+4,8);
+    wr32(b+0x10,parent); wr32(b+0x1C,NIL); wr32(b+0x20,NIL);
+    wr32(b+0x28,NIL); wr32(b+0x2C,sk); wr32(b+0x30,NIL);
+    wr16(b+0x48,(uint16_t)len); memcpy(b+0x4C,name,len);
+    if (sk != NIL) wr32(BODY(h,sk)+0x0C,rd32(BODY(h,sk)+0x0C)+1);
+    sublist_add(h,parent,key,name);
+    uint32_t longest = rd32(BODY(h,parent)+0x34);
+    if (longest < len*2) wr32(BODY(h,parent)+0x34,(uint32_t)len*2);
+    return key;
+}
+
+static uint32_t ensure_path(hive_t *h, uint32_t root, const char *path){
+    char copy[512];
+    if (strlen(path) >= sizeof copy) return NIL;
+    strcpy(copy,path);
+    char *save = NULL;
+    for (char *part = strtok_r(copy,"\\",&save); part; part = strtok_r(NULL,"\\",&save)) {
+        root = ensure_key(h,root,part);
+        if (root == NIL) break;
+    }
+    return root;
+}
+
+static void set_string(hive_t *h, uint32_t key, const char *name, uint32_t type, const char *value){
+    uint8_t data[512];
+    uint32_t len = str_utf16(value,data,type == 7);
+    set_value(h,key,name,type,data,len);
+}
+
+int windows_boot_vioscsi(const uint8_t *system, size_t system_len,
+                         uint8_t **out, size_t *out_len){
+    if (!system || !out || !out_len || system_len < 0x2000 ||
+        system_len > 64*1024*1024 || memcmp(system,"regf",4) ||
+        rd32(system+4) != rd32(system+8) || rd32(system+0x14) != 1 ||
+        rd32(system+0x28) > system_len-0x1000) return -1;
+    system_len = 0x1000 + (size_t)rd32(system+0x28);
+    if (system_len < 0x2000) return -1;
+    for (size_t off = 0x1000; off < system_len;) {
+        const uint8_t *bin = system+off;
+        if (system_len-off < 0x20 || memcmp(bin,"hbin",4) ||
+            rd32(bin+4) != off-0x1000) return -1;
+        uint32_t size = rd32(bin+8);
+        if (size < 0x1000 || (size & 0xFFF) || size > system_len-off) return -1;
+        for (uint32_t pos = 0x20; pos < size;) {
+            int32_t cell = (int32_t)rd32(bin+pos);
+            if (cell == INT32_MIN) return -1;
+            uint32_t len = cell < 0 ? (uint32_t)-cell : (uint32_t)cell;
+            if (len < 8 || (len & 7) || len > size-pos) return -1;
+            pos += len;
+        }
+        off += size;
+    }
+    uint32_t root = rd32(system+0x24);
+    if (root > system_len-0x1000-0x50 || memcmp(system+0x1004+root,"nk",2)) return -1;
+    hive_t h = { .cap = system_len+8*1024*1024, .len = system_len };
+    h.b = malloc(h.cap);
+    if (!h.b) return -1;
+    memcpy(h.b,system,system_len);
+    uint32_t database = find_subkey(&h,root,"DriverDatabase");
+    if (database == NIL) { free(h.b); return -1; }
+
+    uint32_t controls[4096];
+    int count = children(&h,root,controls,4096), prepared = 0;
+    for (int i = 0; i < count; i++) {
+        char name[128]; nk_name(&h,controls[i],name,sizeof name);
+        if (strlen(name) != 13 || strncmp(name,"ControlSet",10) ||
+            name[10] < '0' || name[10] > '9' || name[11] < '0' || name[11] > '9' ||
+            name[12] < '0' || name[12] > '9') continue;
+        if (++prepared > 32) { free(h.b); return -1; }
+        uint32_t key = ensure_path(&h,controls[i],"Services\\vioscsi");
+        if (key == NIL) { free(h.b); return -1; }
+        set_dword_value(&h,key,"Type",1); set_dword_value(&h,key,"Start",0);
+        set_dword_value(&h,key,"ErrorControl",1);
+        set_string(&h,key,"Group",1,"SCSI miniport");
+        set_string(&h,key,"ImagePath",2,"system32\\drivers\\vioscsi.sys");
+        uint32_t params = ensure_path(&h,key,"Parameters\\PnpInterface");
+        if (params == NIL) { free(h.b); return -1; }
+        set_dword_value(&h,params,"5",1);
+        params = ensure_key(&h,key,"Parameters");
+        set_dword_value(&h,params,"BusType",10);
+        set_dword_value(&h,params,"DmaRemappingCompatible",0);
+    }
+    if (!prepared) { free(h.b); return -1; }
+
+    const char *package = ASB_VIOSCSI_DRIVER_PACKAGE;
+    uint32_t key = ensure_path(&h,database,"DriverInfFiles\\vioscsi.inf");
+    if (key == NIL) { free(h.b); return -1; }
+    set_string(&h,key,"",7,package); set_string(&h,key,"Active",1,package);
+    set_string(&h,key,"Configurations",7,"scsi_inst");
+    char package_path[256]; snprintf(package_path,sizeof package_path,"DriverPackages\\%s",package);
+    key = ensure_path(&h,database,package_path);
+    if (key == NIL) { free(h.b); return -1; }
+    const uint8_t version[48] = {0x00,0xFF,0x0C,0,0,0,0,0,
+        0x7B,0xE9,0x36,0x4D,0x25,0xE3,0xCE,0x11,0xBF,0xC1,0x08,0,0x2B,0xE1,0x03,0x18};
+    set_value(&h,key,"Version",3,version,sizeof version);
+    uint32_t config = ensure_path(&h,key,"Configurations\\scsi_inst");
+    if (config == NIL) { free(h.b); return -1; }
+    set_dword_value(&h,config,"ConfigFlags",0);
+    set_string(&h,config,"Service",1,"vioscsi");
+    const char *ids[] = {"VEN_1AF4&DEV_1004", "VEN_1AF4&DEV_1004&REV_00",
+                         "VEN_1AF4&DEV_1048", "VEN_1AF4&DEV_1048&REV_01"};
+    for (size_t i = 0; i < sizeof ids/sizeof ids[0]; i++) {
+        char path[256]; snprintf(path,sizeof path,"DeviceIds\\PCI\\%s",ids[i]);
+        uint32_t device = ensure_path(&h,database,path);
+        if (device == NIL) { free(h.b); return -1; }
+        const uint8_t rank[] = {1,0xFF,0,0};
+        set_value(&h,device,"vioscsi.inf",3,rank,sizeof rank);
+        snprintf(path,sizeof path,"Descriptors\\PCI\\%s",ids[i]);
+        device = ensure_path(&h,key,path);
+        if (device == NIL) { free(h.b); return -1; }
+        set_string(&h,device,"Configuration",1,"scsi_inst");
+    }
+    if (h.aend && h.abump < h.aend) wr32(h.b+h.abump,h.aend-h.abump);
+    wr32(h.b+8,rd32(h.b+4));
+    uint32_t checksum = 0;
+    for (int i = 0; i < 127; i++) checksum ^= rd32(h.b+4*i);
+    if (checksum == 0xFFFFFFFF) checksum = 0xFFFFFFFE;
+    if (!checksum) checksum = 1;
+    wr32(h.b+0x1FC,checksum);
+    *out = h.b; *out_len = h.len;
     return 0;
 }

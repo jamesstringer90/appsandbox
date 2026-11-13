@@ -32,4 +32,9 @@ typedef struct {
 int bcd_build(const uint8_t *tpl, size_t tpl_len, const bcd_guids_t *g,
               uint8_t **out, size_t *out_len);
 
+int windows_boot_vioscsi(const uint8_t *system, size_t system_len,
+                         uint8_t **out, size_t *out_len);
+
+#define ASB_VIOSCSI_DRIVER_PACKAGE "vioscsi.inf_arm64_945c15ddf303c9f3"
+
 #endif /* ASB_BCD_PATCH_H */

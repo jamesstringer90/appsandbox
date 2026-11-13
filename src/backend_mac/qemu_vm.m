@@ -23,6 +23,7 @@
 @property (nonatomic, assign) int ramMb;
 @property (nonatomic, assign) int cpuCores;
 @property (nonatomic, copy) NSString *macAddress;
+@property (nonatomic, assign) QemuStorageController storageController;
 @property (nonatomic, assign) BOOL testMode;
 @property (nonatomic, assign, readwrite) QemuVmState state;
 @property (nonatomic, strong, readwrite) AsbIvshmemTransport *transport;
@@ -38,6 +39,7 @@
                        ramMb:(int)ramMb
                     cpuCores:(int)cpuCores
                   macAddress:(NSString *)macAddress
+           storageController:(QemuStorageController)storageController
                     testMode:(BOOL)testMode {
     if ((self = [super init])) {
         _name = [name copy];
@@ -45,6 +47,7 @@
         _ramMb = ramMb > 0 ? ramMb : 4096;
         _cpuCores = cpuCores > 0 ? cpuCores : 4;
         _macAddress = [macAddress copy];
+        _storageController = storageController;
         _testMode = testMode;
         _state = QemuVmStateStopped;
     }
@@ -155,6 +158,9 @@
 
     NSString *qemu = [self qemuBinary];
     if (!qemu) { done([self err:@"vendored qemu-system-aarch64 not found"]); return; }
+    if (self.storageController != QemuStorageNvme && self.storageController != QemuStorageVirtioScsi) {
+        done([self err:@"Unsupported Windows storage controller"]); return;
+    }
     /* Firmware ships gzipped (edk2-*.fd.gz, ~1.6 MB) and is decompressed with the base-system
      * /usr/bin/gunzip (zero developer-tool deps): the read-only code firmware once into a shared
      * cache, the writable vars template per-VM (below). */
@@ -218,7 +224,9 @@
          * SetDisplayConfig topology code). Dropping it leaves the VDD as the sole adapter, mirroring
          * the Hyper-V case where the desktop lands on the VDD with no topology setup. */
         @"-device", @"qemu-xhci,id=usb", @"-device", @"usb-kbd", @"-device", @"usb-tablet",
-        @"-device", @"nvme,drive=hdd,serial=asb-nvme,bootindex=0",
+        @"-device", self.storageController == QemuStorageVirtioScsi
+            ? @"virtio-scsi-pci,id=scsi0,iothread=diskio"
+            : @"nvme,drive=hdd,serial=asb-nvme,bootindex=0",
         @"-drive", [NSString stringWithFormat:@"if=none,id=hdd,format=raw,file=%@",
                     [diskPath stringByReplacingOccurrencesOfString:@"," withString:@",,"]],
         @"-netdev", @"stream,id=net0,server=off,addr.type=fd,addr.str=0",
@@ -245,6 +253,12 @@
     }
     self.networkPort = port;
     NSMutableArray<NSString *> *launchArgs = [args mutableCopy];
+    if (self.storageController == QemuStorageVirtioScsi) {
+        [launchArgs addObjectsFromArray:@[
+            @"-object", @"iothread,id=diskio",
+            @"-device", @"scsi-hd,bus=scsi0.0,drive=hdd,serial=asb-scsi,bootindex=0",
+        ]];
+    }
     NSString *resources = [self.vmDir URLByAppendingPathComponent:@"resources.iso"].path;
     if ([[NSFileManager defaultManager] fileExistsAtPath:resources]) {
         [launchArgs addObjectsFromArray:@[@"-device", @"usb-storage,drive=setup",

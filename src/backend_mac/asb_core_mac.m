@@ -263,6 +263,8 @@ static BOOL save_vm_list(void) {
         fprintf(f, "RamMB=%d\n", g_vms[i].ram_mb);
         fprintf(f, "HddGB=%d\n", g_vms[i].hdd_gb);
         fprintf(f, "CpuCores=%d\n", g_vms[i].cpu_cores);
+        if (vm_is_windows_idx(i))
+            fprintf(f, "WindowsStorageController=%d\n", g_vms[i].windows_storage_controller);
         fprintf(f, "GpuMode=%d\n", g_vms[i].gpu_mode);
         fprintf(f, "NetworkMode=%d\n", g_vms[i].network_mode);
         if (g_vms[i].mac_address[0])
@@ -365,6 +367,13 @@ static void load_vm_list(void) {
             vm->hdd_gb = atoi(line + 6);
         else if (strncmp(line, "CpuCores=", 9) == 0)
             vm->cpu_cores = atoi(line + 9);
+        else if (strncmp(line, "WindowsStorageController=", 25) == 0) {
+            char *end = NULL;
+            long controller = strtol(line + 25, &end, 10);
+            vm->windows_storage_controller = end != line + 25 && !*end &&
+                (controller == QemuStorageNvme || controller == QemuStorageVirtioScsi)
+                ? (int)controller : -1;
+        }
         else if (strncmp(line, "GpuMode=", 8) == 0) {
             vm->gpu_mode = atoi(line + 8);
             if (vm->gpu_mode == 2) vm->gpu_mode = 1;
@@ -1077,6 +1086,7 @@ static void start_windows_build_flow(int idx, NSURL *isoURL) {
        disk build run on a background queue. */
     BOOL sshEnabled     = g_vms[idx].ssh_enabled;
     BOOL testMode       = g_vms[idx].test_mode;
+    BOOL virtioScsi     = g_vms[idx].windows_storage_controller == QemuStorageVirtioScsi;
     NSString *adminUser = [NSString stringWithUTF8String:g_vms[idx].admin_user];
     NSString *adminPass = [NSString stringWithUTF8String:g_vms[idx].admin_pass];
 
@@ -1091,6 +1101,7 @@ static void start_windows_build_flow(int idx, NSURL *isoURL) {
            too. All are cached under the support dir like the IPSW. */
         NSString *signedZip = [IsoPatchMac ensureSignedWinPayloadZipCached];
         NSString *netkvmZip = [IsoPatchMac ensureNetkvmZipCached];
+        NSString *vioscsiZip = virtioScsi ? [IsoPatchMac ensureVioscsiZipCached] : nil;
         NSString *sshMsi    = sshEnabled ? [IsoPatchMac ensureOpenSSHMsiCached] : nil;
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1106,6 +1117,11 @@ static void start_windows_build_flow(int idx, NSURL *isoURL) {
             }
             if (!netkvmZip)
                 post_log("[%s] NetKVM download failed; VM will build without a guest network driver.", g_vms[i].name);
+            if (virtioScsi && !vioscsiZip) {
+                finish_install(i, [NSError errorWithDomain:@"AsbCore" code:1
+                    userInfo:@{NSLocalizedDescriptionKey:@"The ARM64 VirtIO SCSI driver package download failed"}]);
+                return;
+            }
             if (sshEnabled && !sshMsi)
                 post_log("[%s] OpenSSH MSI download failed; VM will build without SSH server.", g_vms[i].name);
 
@@ -1117,6 +1133,7 @@ static void start_windows_build_flow(int idx, NSURL *isoURL) {
                                         outDisk:outputURL
                                signedPayloadZip:signedZip
                                       netkvmZip:netkvmZip
+                                     vioscsiZip:vioscsiZip
                                      sshMsiPath:sshMsi
                                          vmName:nsName
                                       adminUser:adminUser
@@ -1495,6 +1512,8 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     vm->ram_mb = ram_mb;
     vm->hdd_gb = hdd_gb;
     vm->cpu_cores = cpu_cores > 0 ? cpu_cores : ASB_API_DEFAULT_CPU_CORES;
+    vm->windows_storage_controller = source ? source->windows_storage_controller
+        : isWindows ? QemuStorageVirtioScsi : QemuStorageNvme;
     vm->gpu_mode = gpu_mode;
     vm->network_mode = network_mode;
     vm_mac_address(vm);
@@ -1636,6 +1655,7 @@ int asb_mac_vm_start(AsbVmId vm_id) {
                                              ramMb:g_vms[idx].ram_mb
                                           cpuCores:g_vms[idx].cpu_cores
                                         macAddress:macAddress.string
+                                 storageController:g_vms[idx].windows_storage_controller
                                           testMode:g_vms[idx].test_mode];
         g_qemu_refs[idx] = qvm;
         g_vms[idx].starting = YES;

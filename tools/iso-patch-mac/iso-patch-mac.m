@@ -1,5 +1,7 @@
 
 #import <Foundation/Foundation.h>
+#include <CommonCrypto/CommonDigest.h>
+#include "engine/bcd_patch.h"
 #import <Virtualization/Virtualization.h>
 
 #include <sys/stat.h>
@@ -1187,7 +1189,7 @@ static void bw_progress(int pct, const char *msg) {
 }
 
 static int cmd_build_windows(int argc, char **argv) {
-    NSString *iso = nil, *out = nil, *sshMsi = nil, *signedZip = nil, *netkvmZip = nil;
+    NSString *iso = nil, *out = nil, *sshMsi = nil, *signedZip = nil, *netkvmZip = nil, *vioscsiZip = nil;
     NSString *vmName = @"WIN11-VM", *user = @"user", *pass = @"test123";
     NSString *provDir = nil;   /* host-generated unattend.xml/setup.cmd/SetupComplete.cmd (password encoded host-side) */
     NSString *lang = @"";   /* empty => auto-detect from the install.wim XML (else en-US) */
@@ -1200,6 +1202,7 @@ static int cmd_build_windows(int argc, char **argv) {
         else if (strcmp(argv[i], "--out") == 0 && i+1 < argc) out = @(argv[++i]);
         else if (strcmp(argv[i], "--signed-payload-zip") == 0 && i+1 < argc) signedZip = @(argv[++i]);
         else if (strcmp(argv[i], "--netkvm-zip") == 0 && i+1 < argc) netkvmZip = @(argv[++i]);
+        else if (strcmp(argv[i], "--vioscsi-zip") == 0 && i+1 < argc) vioscsiZip = @(argv[++i]);
         else if (strcmp(argv[i], "--ssh-msi") == 0 && i+1 < argc) sshMsi = @(argv[++i]);
         else if (strcmp(argv[i], "--vm-name") == 0 && i+1 < argc) vmName = @(argv[++i]);
         else if (strcmp(argv[i], "--user") == 0 && i+1 < argc) user = @(argv[++i]);
@@ -1260,6 +1263,31 @@ static int cmd_build_windows(int argc, char **argv) {
         }
     } else {
         emit_log(@"no netkvm zip provided; VM will build without a network driver");
+    }
+
+    NSString *vioscsiDir = nil;
+    if (vioscsiZip) {
+        vioscsiDir = [tmp stringByAppendingPathComponent:@"vioscsi"];
+        int result = run_tool(@"/usr/bin/unzip", @[@"-o", @"-q", vioscsiZip, @"-d", vioscsiDir], NULL, NULL);
+        NSDictionary<NSString *, NSString *> *hashes = @{
+            @"vioscsi.inf": @"945c15ddf303c9f354160a4e89aeaca0ffde63f67a5c2420d4448706617136e8",
+            @"vioscsi.sys": @"dd9e4626d904f58494ca9569f674f12cdfb080fc7a8269111e8bb34b7913d970",
+            @"vioscsi.cat": @"8051fd81961af6160b440d2543d30e17c5d9d63507b220e5e735ba5b67a12a61",
+        };
+        for (NSString *file in hashes) {
+            NSData *data = [NSData dataWithContentsOfFile:[vioscsiDir stringByAppendingPathComponent:file]];
+            if (!data.length || data.length > UINT32_MAX) { result = -1; continue; }
+            unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+            CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+            NSMutableString *hex = [NSMutableString stringWithCapacity:64];
+            for (size_t i = 0; i < sizeof digest; i++) [hex appendFormat:@"%02x", digest[i]];
+            if (![hex isEqualToString:hashes[file]]) result = -1;
+        }
+        if (result != 0) {
+            [fm removeItemAtPath:tmp error:nil];
+            emit_error(@"The ARM64 VirtIO SCSI driver package failed validation");
+            return 3;
+        }
     }
 
     /* Mount the ISO + locate install.wim FIRST so the OS language can be read from the
@@ -1334,7 +1362,7 @@ static int cmd_build_windows(int argc, char **argv) {
                 if (isTemplate) asb_provision_unattend_template(fu, vmName.UTF8String, "arm64", testMode, 1);
                 else asb_provision_unattend(fu, vmName.UTF8String, user.UTF8String, pass.UTF8String,
                                        "arm64", testMode, /*is_arm64=*/1, lang.UTF8String, NULL);
-                asb_provision_setup_cmd(fs, 1, resourcesOnly);
+                asb_provision_setup_cmd(fs, 1, resourcesOnly, vioscsiDir != nil);
                 asb_provision_setupcomplete(fc, sshMsiName.length ? sshMsiName.UTF8String : NULL, resourcesOnly);
                 scriptsOK = YES;
             }
@@ -1355,6 +1383,23 @@ static int cmd_build_windows(int argc, char **argv) {
     if (!mf) { bw_unmount_iso(&g_iso_mount); [fm removeItemAtPath:tmp error:nil]; emit_error(@"cannot open manifest"); return 3; }
     int n = 0;
     n += bw_manifest_add(mf, unattend,      "\\Windows\\Panther\\unattend.xml");
+    if (vioscsiDir && !resourcesOnly) {
+        n += bw_manifest_add(mf, [vioscsiDir stringByAppendingPathComponent:@"vioscsi.sys"],
+                             "\\Windows\\System32\\drivers\\vioscsi.sys");
+        for (NSString *file in @[@"vioscsi.inf", @"vioscsi.sys", @"vioscsi.cat"]) {
+            n += bw_manifest_add(mf, [vioscsiDir stringByAppendingPathComponent:file],
+                [NSString stringWithFormat:@"\\Windows\\System32\\DriverStore\\FileRepository\\%s\\%@",
+                 ASB_VIOSCSI_DRIVER_PACKAGE, file].UTF8String);
+        }
+    }
+    if (vioscsiDir) {
+        for (NSString *file in @[@"vioscsi.inf", @"vioscsi.sys", @"vioscsi.cat"]) {
+            n += bw_manifest_add(mf, [vioscsiDir stringByAppendingPathComponent:file],
+                [@"\\Windows\\AppSandbox\\drivers\\" stringByAppendingString:file].UTF8String);
+        }
+        n += bw_manifest_add(mf, [vioscsiDir stringByAppendingPathComponent:@"virtio-win_license.txt"],
+                             "\\Windows\\AppSandbox\\drivers\\vioscsi_license.txt");
+    }
     if (!isTemplate) {
     n += bw_manifest_add(mf, setupCmd,      "\\Windows\\AppSandbox\\setup.cmd");
     n += bw_manifest_add(mf, setupComplete, "\\Windows\\Setup\\Scripts\\SetupComplete.cmd");
@@ -1439,6 +1484,7 @@ static int cmd_build_windows(int argc, char **argv) {
                             (uint32_t)imageIdx,
                             (uint64_t)(diskGb > 0 ? diskGb : 64),
                             manifest.fileSystemRepresentation,
+                            vioscsiDir != nil,
                             bw_progress);
     check_cancelled();
 
