@@ -581,10 +581,10 @@ static unsigned long stage_manifest(const char *manifest_path, unsigned long *er
 
 int win_disk_build(const char *wimp, const char *imgp, uint32_t idx, uint64_t gib,
                    const char *manifest_path,
-                   int virtio_scsi,
+                   const char *vioscsi_dir,
                    void (*progress)(int,const char*)){
     setvbuf(stdout,NULL,_IONBF,0);
-    if(!wimp || !imgp) return 2;
+    if(!wimp || !imgp || (vioscsi_dir && !manifest_path)) return 2;
     if(idx==0) idx=1;
     if(gib==0) gib=34;
     #define PROG(p,m) do{ if(progress) progress((p),(m)); }while(0)
@@ -594,12 +594,30 @@ int win_disk_build(const char *wimp, const char *imgp, uint32_t idx, uint64_t gi
     IMG=wim_image_open(W,idx);
     if(!IMG){ printf("wim image open fail\n"); return 2; }
     g_boot_system=NULL; g_boot_system_len=0; g_boot_system_written=0;
-    if(virtio_scsi){
+    if(vioscsi_dir){
+        uint32_t driver_index=0;
+        char published_inf[32], path[64];
+        for(;;){
+            snprintf(published_inf,sizeof published_inf,"oem%u.inf",driver_index);
+            snprintf(path,sizeof path,"\\Windows\\INF\\%s",published_inf);
+            wim_dentry_t entry;
+            if(!wim_resolve(path,&entry)) break;
+            if(driver_index==UINT32_MAX) return 2;
+            driver_index++;
+        }
         uint64_t len=0;
         uint8_t *system=wim_read_path("\\Windows\\System32\\config\\SYSTEM",&len);
-        int result=system ? windows_boot_vioscsi(system,(size_t)len,&g_boot_system,&g_boot_system_len) : -1;
+        int result=system ? windows_boot_vioscsi(system,(size_t)len,published_inf,
+                                               &g_boot_system,&g_boot_system_len) : -1;
         free(system);
         if(result){ printf("Cannot prepare the Windows SYSTEM hive for VirtIO SCSI boot\n"); return 2; }
+        FILE *mf=fopen(manifest_path,"a");
+        if(!mf){ free(g_boot_system); g_boot_system=NULL; return 2; }
+        int written=fprintf(mf,"%s/vioscsi.inf\t\\Windows\\INF\\%s\n"
+            "%s/vioscsi.cat\t\\Windows\\System32\\CatRoot\\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\\oem%u.cat\n",
+            vioscsi_dir,published_inf,vioscsi_dir,driver_index);
+        int closed=fclose(mf);
+        if(written<0 || closed){ free(g_boot_system); g_boot_system=NULL; return 2; }
     }
 
     uint64_t bytes=gib<<30;
@@ -660,7 +678,7 @@ int win_disk_build(const char *wimp, const char *imgp, uint32_t idx, uint64_t gi
     apply(root,r.subdir_offset,0,"");
     unsigned long perr = pool_finish();        /* drain + join workers before any close */
     free(g_boot_system); g_boot_system=NULL;
-    if(virtio_scsi && g_boot_system_written!=1) g_err++;
+    if(vioscsi_dir && g_boot_system_written!=1) g_err++;
     if(mon_ok){ __atomic_store_n(&g_mon_stop, 1, __ATOMIC_RELAXED); pthread_join(mon,NULL); }
     double T_apply1 = now_s();
     printf("PHASE apply+extract (parallel) = %.1fs\n", T_apply1 - T_apply0);
@@ -751,6 +769,6 @@ int main(int argc,char**argv){
     uint32_t idx = argc>3?(uint32_t)atoi(argv[3]):1;
     uint64_t gib = argc>4?(uint64_t)atoll(argv[4]):34;
     const char *manifest = argc>5?argv[5]:NULL;
-    return win_disk_build(argv[1],argv[2],idx,gib,manifest,0,NULL);
+    return win_disk_build(argv[1],argv[2],idx,gib,manifest,NULL,NULL);
 }
 #endif

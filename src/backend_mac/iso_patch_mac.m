@@ -364,10 +364,10 @@ static BOOL write_unattend_xml(NSString *path, NSString *vmName, NSString *user,
 }
 
 /* Generate setup.cmd + SetupComplete.cmd in-process (no secrets; same shared source as Windows). */
-static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName, BOOL fromMedia, BOOL virtioScsi) {
+static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName, BOOL fromMedia) {
     BOOL ok = YES;
     FILE *fs = fopen([dir stringByAppendingPathComponent:@"setup.cmd"].fileSystemRepresentation, "wb");
-    if (fs) { if (asb_provision_setup_cmd(fs, 1, fromMedia, virtioScsi) != 0) ok = NO; fclose(fs); } else ok = NO;
+    if (fs) { if (asb_provision_setup_cmd(fs, 1, fromMedia) != 0) ok = NO; fclose(fs); } else ok = NO;
     FILE *fc = fopen([dir stringByAppendingPathComponent:@"SetupComplete.cmd"].fileSystemRepresentation, "wb");
     if (fc) { if (asb_provision_setupcomplete(fc, sshMsiName.length ? sshMsiName.UTF8String : NULL, fromMedia) != 0) ok = NO; fclose(fc); } else ok = NO;
     return ok;
@@ -409,7 +409,7 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName, BOOL fromMed
     NSString *inputLocale = windows_input_locale();
     if (!write_unattend_xml([provDir stringByAppendingPathComponent:@"unattend.xml"],
                             vmName, adminUser, adminPass, initialLang, inputLocale, testMode, templateMode) ||
-        !write_prov_scripts(provDir, sshMsiName, templateMode == 2, vioscsiZip.length > 0)) {
+        !write_prov_scripts(provDir, sshMsiName, templateMode == 2)) {
         [fm removeItemAtPath:provDir error:nil];
         completion([NSError errorWithDomain:@"IsoPatchMac" code:7
                      userInfo:@{NSLocalizedDescriptionKey:

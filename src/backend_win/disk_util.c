@@ -1319,7 +1319,7 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
     swprintf_s(file_path, MAX_PATH, L"%s\\setup.cmd", staging);
     FILE *cmd;
     if (_wfopen_s(&cmd, file_path, L"wb") == 0 && cmd) {
-        asb_provision_setup_cmd(cmd, nat_network, 1, 0);
+        asb_provision_setup_cmd(cmd, nat_network, 1);
         fclose(cmd);
     }
     swprintf_s(file_path, MAX_PATH, L"%s\\SetupComplete.cmd", staging);
@@ -1478,7 +1478,7 @@ BOOL generate_vhdx_setup_cmd(const wchar_t *output_path, BOOL nat_network)
     int rc;
     if (_wfopen_s(&cmd, output_path, L"wb") != 0 || !cmd)
         return FALSE;
-    rc = asb_provision_setup_cmd(cmd, nat_network, 0, 0);
+    rc = asb_provision_setup_cmd(cmd, nat_network, 0);
     fclose(cmd);
     return rc == 0;
 }

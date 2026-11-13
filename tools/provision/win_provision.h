@@ -27,7 +27,7 @@ int asb_provision_unattend_instance(FILE *f, const char *vm_name, const char *us
                                     const char *pass, const char *arch, int test_mode,
                                     int is_arm64, const char *lang, const char *input_locale);
 
-int asb_provision_setup_cmd(FILE *f, int nat_network, int from_media, int virtio_scsi);
+int asb_provision_setup_cmd(FILE *f, int nat_network, int from_media);
 
 int asb_provision_login_setup(FILE *f);
 

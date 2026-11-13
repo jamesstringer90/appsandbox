@@ -352,7 +352,7 @@ int asb_provision_nat_setup(FILE *f) {
     return ferror(f) ? -1 : 0;
 }
 
-int asb_provision_setup_cmd(FILE *f, int nat_network, int from_media, int virtio_scsi) {
+int asb_provision_setup_cmd(FILE *f, int nat_network, int from_media) {
     if (!f) return -1;
     fputs(
         "@echo off\r\n"
@@ -360,14 +360,6 @@ int asb_provision_setup_cmd(FILE *f, int nat_network, int from_media, int virtio
         f);
     if (from_media) fputs("mkdir \"%SystemRoot%\\AppSandbox\" 2>nul\r\n", f);
     fputs("echo === setup.cmd started === >> \"%LOG%\"\r\n", f);
-    if (virtio_scsi) {
-        fputs(
-            "echo [STORAGE] Installing the VirtIO SCSI driver package... >> \"%LOG%\"\r\n"
-            "pnputil.exe /add-driver \"%SystemRoot%\\AppSandbox\\drivers\\vioscsi.inf\" /install >> \"%LOG%\" 2>&1\r\n"
-            "set STORAGE_RESULT=%errorlevel%\r\n"
-            "if not \"%STORAGE_RESULT%\"==\"0\" if not \"%STORAGE_RESULT%\"==\"3010\" exit /b %STORAGE_RESULT%\r\n",
-            f);
-    }
     if (asb_provision_login_setup(f) != 0) return -1;
     if (from_media) {
         fputs(

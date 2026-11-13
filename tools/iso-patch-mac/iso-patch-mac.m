@@ -1362,7 +1362,7 @@ static int cmd_build_windows(int argc, char **argv) {
                 if (isTemplate) asb_provision_unattend_template(fu, vmName.UTF8String, "arm64", testMode, 1);
                 else asb_provision_unattend(fu, vmName.UTF8String, user.UTF8String, pass.UTF8String,
                                        "arm64", testMode, /*is_arm64=*/1, lang.UTF8String, NULL);
-                asb_provision_setup_cmd(fs, 1, resourcesOnly, vioscsiDir != nil);
+                asb_provision_setup_cmd(fs, 1, resourcesOnly);
                 asb_provision_setupcomplete(fc, sshMsiName.length ? sshMsiName.UTF8String : NULL, resourcesOnly);
                 scriptsOK = YES;
             }
@@ -1384,19 +1384,14 @@ static int cmd_build_windows(int argc, char **argv) {
     int n = 0;
     n += bw_manifest_add(mf, unattend,      "\\Windows\\Panther\\unattend.xml");
     if (vioscsiDir && !resourcesOnly) {
-        n += bw_manifest_add(mf, [vioscsiDir stringByAppendingPathComponent:@"vioscsi.sys"],
-                             "\\Windows\\System32\\drivers\\vioscsi.sys");
         for (NSString *file in @[@"vioscsi.inf", @"vioscsi.sys", @"vioscsi.cat"]) {
             n += bw_manifest_add(mf, [vioscsiDir stringByAppendingPathComponent:file],
                 [NSString stringWithFormat:@"\\Windows\\System32\\DriverStore\\FileRepository\\%s\\%@",
                  ASB_VIOSCSI_DRIVER_PACKAGE, file].UTF8String);
         }
+        n += 2;
     }
     if (vioscsiDir) {
-        for (NSString *file in @[@"vioscsi.inf", @"vioscsi.sys", @"vioscsi.cat"]) {
-            n += bw_manifest_add(mf, [vioscsiDir stringByAppendingPathComponent:file],
-                [@"\\Windows\\AppSandbox\\drivers\\" stringByAppendingString:file].UTF8String);
-        }
         n += bw_manifest_add(mf, [vioscsiDir stringByAppendingPathComponent:@"virtio-win_license.txt"],
                              "\\Windows\\AppSandbox\\drivers\\vioscsi_license.txt");
     }
@@ -1484,7 +1479,7 @@ static int cmd_build_windows(int argc, char **argv) {
                             (uint32_t)imageIdx,
                             (uint64_t)(diskGb > 0 ? diskGb : 64),
                             manifest.fileSystemRepresentation,
-                            vioscsiDir != nil,
+                            vioscsiDir.fileSystemRepresentation,
                             bw_progress);
     check_cancelled();
 

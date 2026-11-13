@@ -13,6 +13,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include <time.h>
 
 typedef struct { uint8_t *b; size_t len, cap; uint32_t abump, aend; } hive_t;
 
@@ -449,8 +450,9 @@ static void set_string(hive_t *h, uint32_t key, const char *name, uint32_t type,
 }
 
 int windows_boot_vioscsi(const uint8_t *system, size_t system_len,
+                         const char *published_inf,
                          uint8_t **out, size_t *out_len){
-    if (!system || !out || !out_len || system_len < 0x2000 ||
+    if (!system || !published_inf || !published_inf[0] || !out || !out_len || system_len < 0x2000 ||
         system_len > 64*1024*1024 || memcmp(system,"regf",4) ||
         rd32(system+4) != rd32(system+8) || rd32(system+0x14) != 1 ||
         rd32(system+0x28) > system_len-0x1000) return -1;
@@ -479,6 +481,10 @@ int windows_boot_vioscsi(const uint8_t *system, size_t system_len,
     memcpy(h.b,system,system_len);
     uint32_t database = find_subkey(&h,root,"DriverDatabase");
     if (database == NIL) { free(h.b); return -1; }
+    uint32_t inf_files = find_subkey(&h,database,"DriverInfFiles");
+    if (inf_files == NIL || find_subkey(&h,inf_files,published_inf) != NIL) {
+        free(h.b); return -1;
+    }
 
     uint32_t controls[4096];
     int count = children(&h,root,controls,4096), prepared = 0;
@@ -493,18 +499,46 @@ int windows_boot_vioscsi(const uint8_t *system, size_t system_len,
         set_dword_value(&h,key,"Type",1); set_dword_value(&h,key,"Start",0);
         set_dword_value(&h,key,"ErrorControl",1);
         set_string(&h,key,"Group",1,"SCSI miniport");
-        set_string(&h,key,"ImagePath",2,"system32\\drivers\\vioscsi.sys");
+        char display_name[256];
+        snprintf(display_name,sizeof display_name,"@%s,%%VirtioScsi.SVCDESC%%;Red Hat VirtIO SCSI pass-through Service",published_inf);
+        set_string(&h,key,"DisplayName",1,display_name);
+        set_string(&h,key,"Owners",7,published_inf);
+        set_string(&h,key,"ImagePath",2,"System32\\DriverStore\\FileRepository\\" ASB_VIOSCSI_DRIVER_PACKAGE "\\vioscsi.sys");
+        uint32_t order = ensure_path(&h,controls[i],"Control\\GroupOrderList");
+        if (order == NIL) { free(h.b); return -1; }
+        uint32_t group_value = find_value(&h,order,"SCSI miniport");
+        if (group_value == NIL) { free(h.b); return -1; }
+        uint32_t length = 0;
+        const uint8_t *groups = vk_data(&h,group_value,&length);
+        if (length < 4 || (length&3) || rd32(groups) != length/4-1) { free(h.b); return -1; }
+        uint32_t tag = 1;
+        for (uint32_t n = 4; n < length;) {
+            if (rd32(groups+n) == tag) {
+                if (tag == UINT32_MAX) { free(h.b); return -1; }
+                tag++; n = 4;
+            } else n += 4;
+        }
+        uint8_t *updated = malloc(length+4);
+        if (!updated) { free(h.b); return -1; }
+        memcpy(updated,groups,length); wr32(updated,length/4); wr32(updated+length,tag);
+        set_value(&h,order,"SCSI miniport",3,updated,length+4);
+        free(updated);
+        set_dword_value(&h,key,"Tag",tag);
         uint32_t params = ensure_path(&h,key,"Parameters\\PnpInterface");
         if (params == NIL) { free(h.b); return -1; }
         set_dword_value(&h,params,"5",1);
         params = ensure_key(&h,key,"Parameters");
         set_dword_value(&h,params,"BusType",10);
         set_dword_value(&h,params,"DmaRemappingCompatible",0);
+        params = ensure_path(&h,controls[i],"Services\\EventLog\\System\\vioscsi");
+        if (params == NIL) { free(h.b); return -1; }
+        set_string(&h,params,"EventMessageFile",2,"%SystemRoot%\\System32\\IoLogMsg.dll");
+        set_dword_value(&h,params,"TypesSupported",7);
     }
     if (!prepared) { free(h.b); return -1; }
 
     const char *package = ASB_VIOSCSI_DRIVER_PACKAGE;
-    uint32_t key = ensure_path(&h,database,"DriverInfFiles\\vioscsi.inf");
+    uint32_t key = ensure_key(&h,inf_files,published_inf);
     if (key == NIL) { free(h.b); return -1; }
     set_string(&h,key,"",7,package); set_string(&h,key,"Active",1,package);
     set_string(&h,key,"Configurations",7,"scsi_inst");
@@ -512,24 +546,67 @@ int windows_boot_vioscsi(const uint8_t *system, size_t system_len,
     key = ensure_path(&h,database,package_path);
     if (key == NIL) { free(h.b); return -1; }
     const uint8_t version[48] = {0x00,0xFF,0x0C,0,0,0,0,0,
-        0x7B,0xE9,0x36,0x4D,0x25,0xE3,0xCE,0x11,0xBF,0xC1,0x08,0,0x2B,0xE1,0x03,0x18};
+        0x7B,0xE9,0x36,0x4D,0x25,0xE3,0xCE,0x11,0xBF,0xC1,0x08,0,0x2B,0xE1,0x03,0x18,
+        0x00,0x80,0xF2,0x09,0x6D,0x19,0xDD,0x01,0xF8,0x75,0x68,0x00,0x67,0x00,0x64,0x00};
     set_value(&h,key,"Version",3,version,sizeof version);
+    set_string(&h,key,"",1,published_inf);
+    set_string(&h,key,"Provider",1,"Red Hat, Inc.");
+    set_string(&h,key,"InfName",1,"vioscsi.inf");
+    set_string(&h,key,"Catalog",1,"vioscsi.cat");
+    set_string(&h,key,"SignerName",1,"Microsoft Windows Hardware Compatibility Publisher");
+    set_dword_value(&h,key,"CatalogAttributes",0x80000003);
+    set_dword_value(&h,key,"SignerScore",0x0D000005);
+    set_dword_value(&h,key,"StatusFlags",0x30);
+    set_dword_value(&h,key,"LockLevel",2);
+    set_dword_value(&h,key,"OsVersionFloor",0x0A003FAB);
+    uint8_t qword[8];
+    uint64_t imported = ((uint64_t)time(NULL)+11644473600ULL)*10000000ULL;
+    wr32(qword,(uint32_t)imported); wr32(qword+4,(uint32_t)(imported>>32));
+    set_value(&h,key,"ImportDate",3,qword,sizeof qword);
+    wr32(qword,102989); wr32(qword+4,0);
+    set_value(&h,key,"FileSize",11,qword,sizeof qword);
+    memset(qword,0xFF,sizeof qword);
+    set_value(&h,key,"ManifestHash",11,qword,sizeof qword);
+    if (ensure_key(&h,key,"Properties") == NIL) { free(h.b); return -1; }
     uint32_t config = ensure_path(&h,key,"Configurations\\scsi_inst");
     if (config == NIL) { free(h.b); return -1; }
     set_dword_value(&h,config,"ConfigFlags",0);
+    set_dword_value(&h,config,"ConfigScope",3967);
     set_string(&h,config,"Service",1,"vioscsi");
-    const char *ids[] = {"VEN_1AF4&DEV_1004", "VEN_1AF4&DEV_1004&REV_00",
-                         "VEN_1AF4&DEV_1048", "VEN_1AF4&DEV_1048&REV_01"};
+    uint32_t params = ensure_path(&h,config,"Services\\vioscsi\\Parameters");
+    if (params == NIL) { free(h.b); return -1; }
+    set_dword_value(&h,params,"BusType",10);
+    set_dword_value(&h,params,"DmaRemappingCompatible",0);
+    params = ensure_key(&h,params,"PnpInterface");
+    if (params == NIL) { free(h.b); return -1; }
+    set_dword_value(&h,params,"5",1);
+    params = ensure_path(&h,config,"Device\\Interrupt Management\\Affinity Policy");
+    if (params == NIL) { free(h.b); return -1; }
+    set_dword_value(&h,params,"DevicePolicy",5);
+    set_dword_value(&h,params,"DevicePriority",3);
+    set_dword_value(&h,params,"GroupPolicy",1);
+    params = ensure_path(&h,config,"Device\\Interrupt Management\\MessageSignaledInterruptProperties");
+    if (params == NIL) { free(h.b); return -1; }
+    set_dword_value(&h,params,"MSISupported",1);
+    set_dword_value(&h,params,"MessageNumberLimit",258);
+    params = ensure_key(&h,key,"Strings");
+    if (params == NIL) { free(h.b); return -1; }
+    set_string(&h,params,"vendor",1,"Red Hat, Inc.");
+    set_string(&h,params,"virtioscsi.devicedesc",1,"Red Hat VirtIO SCSI pass-through controller");
+    const char *ids[] = {"VEN_1AF4&DEV_1004&SUBSYS_00081AF4&REV_00", "VEN_1AF4&DEV_1004",
+                         "VEN_1AF4&DEV_1048&SUBSYS_11001AF4&REV_01", "VEN_1AF4&DEV_1048"};
     for (size_t i = 0; i < sizeof ids/sizeof ids[0]; i++) {
         char path[256]; snprintf(path,sizeof path,"DeviceIds\\PCI\\%s",ids[i]);
         uint32_t device = ensure_path(&h,database,path);
         if (device == NIL) { free(h.b); return -1; }
-        const uint8_t rank[] = {1,0xFF,0,0};
-        set_value(&h,device,"vioscsi.inf",3,rank,sizeof rank);
+        const uint8_t rank[] = {(i&1)?2:1,0xFF,0,0};
+        set_value(&h,device,published_inf,3,rank,sizeof rank);
         snprintf(path,sizeof path,"Descriptors\\PCI\\%s",ids[i]);
         device = ensure_path(&h,key,path);
         if (device == NIL) { free(h.b); return -1; }
         set_string(&h,device,"Configuration",1,"scsi_inst");
+        set_string(&h,device,"Manufacturer",1,"%vendor%");
+        set_string(&h,device,"Description",1,"%virtioscsi.devicedesc%");
     }
     if (h.aend && h.abump < h.aend) wr32(h.b+h.abump,h.aend-h.abump);
     wr32(h.b+8,rd32(h.b+4));
