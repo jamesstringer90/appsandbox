@@ -227,9 +227,11 @@ static BOOL idd_console_user(uid_t *uid, gid_t *gid)
 static void cur_data_free(void *info, const void *data, size_t size) { (void)info; (void)size; free((void *)data); }
 
 static BOOL idd_cursor_geometry_valid(uint32_t width, uint32_t height, uint32_t pitch,
+                                      uint32_t xhot, uint32_t yhot,
                                       uint32_t cursorType, uint32_t imageSize)
 {
     if (width == 0 || height == 0 || width > VDD_MAX_CURSOR_DIM || height > VDD_MAX_CURSOR_DIM ||
+        xhot >= width || yhot >= height ||
         (cursorType != 1 && cursorType != 2) || imageSize == 0 || imageSize > VDD_MAX_CURSOR_SIZE)
         return NO;
     uint64_t rowBytes = (uint64_t)width * 4u;
@@ -244,7 +246,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
         return [[NSCursor alloc] initWithImage:blank hotSpot:NSZeroPoint];
     }
     uint32_t w = cur->width, h = cur->height, pitch = cur->pitch, type = cur->cursor_type;
-    if (!idd_cursor_geometry_valid(w, h, pitch, type, cur->image_size)) return nil;
+    if (!idd_cursor_geometry_valid(w, h, pitch, cur->xhot, cur->yhot, type, cur->image_size)) return nil;
     const uint8_t *src = (const uint8_t *)cur + sizeof(AsbCursor);
     size_t rowBytes = (size_t)w * 4u;
     size_t outsz = rowBytes * h;
@@ -1445,7 +1447,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
                 if (![self readDisplay:fd bytes:(uint8_t *)&ch + 4 length:sizeof(ch) - 4 session:session idle:NO]) break;
                 uint8_t *shape = NULL;
                 if (ch.shape_updated) {
-                    if (!idd_cursor_geometry_valid(ch.width, ch.height, ch.pitch,
+                    if (!idd_cursor_geometry_valid(ch.width, ch.height, ch.pitch, ch.xhot, ch.yhot,
                                                    ch.cursor_type, ch.shape_data_size)) break;
                     shape = malloc(ch.shape_data_size);
                     if (!shape) break;
