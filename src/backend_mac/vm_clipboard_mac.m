@@ -1219,10 +1219,11 @@ static int wr_full(int fd, const void *buf, size_t n) {
             rh.data_size = ntohl(rh.data_size);
             if (rh.magic != CLIP_MAGIC) return -1;
             if (rh.data_size > CLIP_MAX_PAYLOAD) return -1;
+            if (rh.format_len > CLIP_MAX_PAYLOAD) return -1;
 
             NSString *respFmt = nil;
             if (rh.format_len) {
-                char *fb = malloc(rh.format_len + 1);
+                char *fb = malloc((size_t)rh.format_len + 1);
                 if (!fb) return -1;
                 if (rd_full(_sock, fb, rh.format_len) <= 0) { free(fb); return -1; }
                 fb[rh.format_len] = 0;
@@ -1251,6 +1252,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
                         fh.data_size = ntohl(fh.data_size);
                         if (fh.magic != CLIP_MAGIC || fh.msg_type != CLIP_MSG_FILE_DATA)
                             return -1;
+                        if (fh.format_len != 0) return -1;
                         NSURL *topLevel = nil;
                         if (![self streamFileData:fh destDir:dest outTopLevel:&topLevel])
                             return -1;
@@ -1287,10 +1289,11 @@ static int wr_full(int fd, const void *buf, size_t n) {
     h.data_size = ntohl(h.data_size);
     if (h.magic != CLIP_MAGIC) return -1;
     if (h.data_size > CLIP_MAX_PAYLOAD) return -1;
+    if (h.format_len > CLIP_MAX_PAYLOAD) return -1;
 
     NSString *format = nil;
     if (h.format_len) {
-        char *fb = malloc(h.format_len + 1);
+        char *fb = malloc((size_t)h.format_len + 1);
         if (!fb) return -1;
         if (rd_full(_sock, fb, h.format_len) <= 0) { free(fb); return -1; }
         fb[h.format_len] = 0;
