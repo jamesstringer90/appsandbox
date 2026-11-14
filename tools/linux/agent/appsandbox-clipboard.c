@@ -79,6 +79,7 @@
 #define CLIP_MAX_FORMATS          64u
 #define CLIP_MAX_PAYLOAD          (64u * 1024u * 1024u)
 #define CLIP_FILE_CHUNK           (1u * 1024u * 1024u)
+#define CLIP_FILE_CACHE_LIMIT     (16u * 1024u * 1024u)
 
 #define VSOCK_PORT_WRITER         5u
 #define VSOCK_PORT_READER         6u
@@ -1139,11 +1140,7 @@ static void deliver_hdrop_to_host(const uint8_t *body, size_t body_len)
  * body (text/uri-list or x-special/gnome-copied-files) and complete
  * the X SelectionRequest by writing the property + sending
  * SelectionNotify.
- *
- * tmp_dir is created in $XDG_RUNTIME_DIR (tmpfs, auto-cleaned at
- * logout) with a timestamp+pid suffix so consecutive pastes don't
- * fight over the same files. Old tmp dirs are not actively cleaned
- * mid-session — they go away when /run/user/$UID is recycled. */
+ */
 struct hdrop_collect {
     bool   active;
     char   tmp_dir[512];
@@ -1181,24 +1178,22 @@ static bool path_safe(const char *p)
     return true;
 }
 
-static void hdrop_collect_start(void)
+static bool hdrop_collect_start(void)
 {
-    const char *rt = getenv("XDG_RUNTIME_DIR");
-    if (!rt || !*rt) rt = "/tmp";
-    snprintf(g_hdrop.tmp_dir, sizeof(g_hdrop.tmp_dir),
-             "%s/appsandbox-clip-%ld-%d",
-             rt, (long)time(NULL), (int)getpid());
-    if (mkdir(g_hdrop.tmp_dir, 0700) < 0 && errno != EEXIST) {
+    int length = snprintf(g_hdrop.tmp_dir, sizeof(g_hdrop.tmp_dir),
+                          "/var/tmp/appsandbox-clip-XXXXXX");
+    if (length < 0 || (size_t)length >= sizeof(g_hdrop.tmp_dir) || !mkdtemp(g_hdrop.tmp_dir)) {
         clip_log("hdrop: mkdir(%s) failed: %s",
                  g_hdrop.tmp_dir, strerror(errno));
         g_hdrop.tmp_dir[0] = '\0';
-        return;
+        return false;
     }
     g_hdrop.active = true;
     g_hdrop.uris = NULL;
     g_hdrop.n_uris = 0;
     g_hdrop.cap_uris = 0;
     clip_log("hdrop: collecting into %s", g_hdrop.tmp_dir);
+    return true;
 }
 
 static void hdrop_add_uri(const char *uri)
@@ -1589,7 +1584,12 @@ static void handle_selection_request(xcb_selection_request_event_t *ev)
 
     /* CF_HDROP needs streaming file collection — start a fresh tmpdir
      * BEFORE we send the request so we don't miss the first FILE_DATA. */
-    if (cf == CF_HDROP) hdrop_collect_start();
+    if (cf == CF_HDROP && !hdrop_collect_start()) {
+        send_selection_notify(ev->requestor, ev->selection, ev->target,
+                              XCB_ATOM_NONE, ev->time);
+        finish_pending_x();
+        return;
+    }
 
     if (send_clip_msg(g_writer_fd, CLIP_MSG_FORMAT_DATA_REQ, cf, NULL, 0) < 0) {
         clip_log("send FORMAT_DATA_REQ failed");
@@ -2064,6 +2064,11 @@ static int handle_writer_message(int fd, const struct ClipHeader *h)
 
             if (fi.is_directory) {
                 int mk = mkdir_p(full);   /* 0 on success/EEXIST, -1 on failure */
+                if (mk < 0) {
+                    clip_log("hdrop: mkdir(%s): %s", full, strerror(errno));
+                    free(u8);
+                    return -1;
+                }
                 /* Directories carry no body bytes (file_size==0). A *top-level*
                    directory (no '/' in its relative path) is itself a dropped
                    item, so list its URI — the file manager then copies the whole
@@ -2089,25 +2094,65 @@ static int handle_writer_message(int fd, const struct ClipHeader *h)
                 }
 
                 FILE *fp = fopen(full, "wb");
-                if (!fp) clip_log("hdrop: fopen(%s): %s", full, strerror(errno));
+                if (!fp) {
+                    clip_log("hdrop: fopen(%s): %s", full, strerror(errno));
+                    free(u8);
+                    return -1;
+                }
 
                 uint64_t remaining = fi.file_size;
+                uint64_t discarded = 0;
                 uint8_t buf[64 * 1024];
                 while (remaining > 0) {
                     size_t c = remaining > sizeof(buf) ? sizeof(buf)
                                                        : (size_t)remaining;
                     if (recv_exact(fd, buf, c) < 0) {
-                        if (fp) fclose(fp);
+                        fclose(fp);
+                        unlink(full);
                         free(u8);
                         return -1;
                     }
-                    if (fp) {
-                        size_t w = fwrite(buf, 1, c, fp);
-                        if (w != c) clip_log("hdrop: fwrite short");
+                    if (fwrite(buf, 1, c, fp) != c) {
+                        clip_log("hdrop: fwrite(%s): %s", full, strerror(errno));
+                        fclose(fp);
+                        unlink(full);
+                        free(u8);
+                        return -1;
                     }
                     remaining -= c;
+                    uint64_t completed = fi.file_size - remaining;
+                    if (fi.file_size > CLIP_FILE_CACHE_LIMIT &&
+                        (completed - discarded >= CLIP_FILE_CACHE_LIMIT || remaining == 0)) {
+                        int flushed = fflush(fp);
+                        if (flushed == 0) {
+                            do { flushed = fdatasync(fileno(fp)); } while (flushed < 0 && errno == EINTR);
+                        }
+                        if (flushed != 0) {
+                            clip_log("hdrop: flush(%s): %s", full, strerror(errno));
+                            fclose(fp);
+                            unlink(full);
+                            free(u8);
+                            return -1;
+                        }
+                        int advised = posix_fadvise(fileno(fp), (off_t)discarded,
+                                                   (off_t)(completed - discarded), POSIX_FADV_DONTNEED);
+                        if (advised != 0) {
+                            clip_log("hdrop: discard cache(%s): %s", full, strerror(advised));
+                            fclose(fp);
+                            unlink(full);
+                            free(u8);
+                            return -1;
+                        }
+                        discarded = completed;
+                    }
                 }
-                if (fp) { fclose(fp); wrote_locally = true; }
+                if (fclose(fp) != 0) {
+                    clip_log("hdrop: fclose(%s): %s", full, strerror(errno));
+                    unlink(full);
+                    free(u8);
+                    return -1;
+                }
+                wrote_locally = true;
 
                 /* Only list TOP-LEVEL files. A file nested inside a dropped
                    folder is reached via that folder's URI (added above); listing

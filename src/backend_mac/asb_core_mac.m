@@ -568,6 +568,7 @@ static void start_clipboard_for(int idx) {
     NSString *nsName = [NSString stringWithUTF8String:g_vms[idx].name];
     VmClipboardMac *clip = [[VmClipboardMac alloc] initWithName:nsName
                                                     socketDevice:vsock];
+    [clip setSharingEnabled:asb_mac_vm_clipboard_sharing_enabled(g_vms[idx].unique_id)];
     clip.onLog = ^(NSString *line) {
         post_diag("[%s] clipboard: %s", nsName.UTF8String, line.UTF8String);
     };
@@ -1742,9 +1743,39 @@ void asb_mac_vm_set_clipboard_sync(AsbVmId vm_id, BOOL enabled) {
     if (!vm_id) return;
     int idx = vm_index_of(vm_id);
     if (idx < 0) return;
+    id display = g_display_refs[idx];
+    if ([display isKindOfClass:IddDisplayWindow.class]) {
+        [display setClipboardSyncEnabled:enabled];
+        return;
+    }
     VmClipboardMac *clip = g_clipboard_refs[idx];
     if (!clip) return;
     [clip setSyncEnabled:enabled];
+}
+
+BOOL asb_mac_vm_clipboard_sharing_enabled(AsbVmId vm_id) {
+    int idx = vm_index_of(vm_id);
+    if (idx < 0) return NO;
+    id display = g_display_refs[idx];
+    if ([display isKindOfClass:IddDisplayWindow.class]) return [display clipboardSharingEnabled];
+    VmClipboardMac *clip = g_clipboard_refs[idx];
+    if (clip) return [clip sharingEnabled];
+    NSDictionary *settings = [VmDir displaySettingsForVm:@(g_vms[idx].name)];
+    id value = settings[@"shareClipboard"];
+    return [value isKindOfClass:NSNumber.class] ? [value boolValue] : YES;
+}
+
+BOOL asb_mac_vm_set_clipboard_sharing_enabled(AsbVmId vm_id, BOOL enabled) {
+    int idx = vm_index_of(vm_id);
+    if (idx < 0) return NO;
+    id display = g_display_refs[idx];
+    if ([display isKindOfClass:IddDisplayWindow.class]) [display setClipboardSharingEnabled:enabled];
+    [(VmClipboardMac *)g_clipboard_refs[idx] setSharingEnabled:enabled];
+    NSError *error = nil;
+    BOOL saved = [VmDir saveDisplaySettings:@{@"shareClipboard": @(enabled ? 1 : 0)}
+                                    forVm:@(g_vms[idx].name) error:&error];
+    if (!saved) post_alert(vm_id, "Could not save viewer settings: %s", error.localizedDescription.UTF8String);
+    return saved;
 }
 
 void asb_mac_vm_set_audio_muted(AsbVmId vm_id, BOOL muted) {

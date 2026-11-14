@@ -238,6 +238,16 @@ int asb_mac_native_input_connect(const AsbMacHeadlessTarget *target)
 }
 - (NSEvent *)routeViewerInput:(NSEvent *)event {
     if (event.window!=self.window) return event;
+    NSPoint location = event.locationInWindow;
+    if (event.type == NSEventTypeRightMouseDown && !self.window.attachedSheet &&
+        location.y >= NSMaxY(self.window.contentLayoutRect) && location.y < self.window.frame.size.height) {
+        NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+        NSMenuItem *item = [menu addItemWithTitle:@"Share clipboard" action:@selector(toggleClipboardSharing:) keyEquivalent:@""];
+        item.target = self;
+        item.state = asb_mac_vm_clipboard_sharing_enabled(self.vmId) ? NSControlStateValueOn : NSControlStateValueOff;
+        [menu popUpMenuPositioningItem:nil atLocation:[self.window convertPointToScreen:location] inView:nil];
+        return nil;
+    }
     BOOL allowed=[self updateInputControl];
     BOOL key=event.type==NSEventTypeKeyDown || event.type==NSEventTypeKeyUp || event.type==NSEventTypeFlagsChanged;
     if (!key && [_overlay handleViewerMouseEvent:event]) return nil;
@@ -259,6 +269,10 @@ int asb_mac_native_input_connect(const AsbMacHeadlessTarget *target)
     if (_inputMonitor) [NSEvent removeMonitor:_inputMonitor];_inputMonitor=nil;
     [_inputTimer invalidate];_inputTimer=nil;
     [_overlay invalidate];_overlay=nil;
+}
+- (void)toggleClipboardSharing:(id)sender {
+    (void)sender;
+    asb_mac_vm_set_clipboard_sharing_enabled(self.vmId, !asb_mac_vm_clipboard_sharing_enabled(self.vmId));
 }
 - (void)dealloc { [self stopInputMonitor]; }
 

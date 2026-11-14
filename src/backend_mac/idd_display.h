@@ -37,5 +37,8 @@
 - (instancetype)initWithName:(NSString *)name
                    transport:(AsbIvshmemTransport *)transport vmId:(uint64_t)vmId;
 - (void)showDisplay;
+- (void)setClipboardSyncEnabled:(BOOL)enabled;
+- (void)setClipboardSharingEnabled:(BOOL)enabled;
+- (BOOL)clipboardSharingEnabled;
 
 @end

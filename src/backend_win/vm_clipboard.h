@@ -53,6 +53,7 @@ ASB_API void vm_clipboard_destroy(VmClipboard clip);
  * On enable: sends SYNC_ENABLE(1) to guest, pushes current host clipboard.
  * On disable: sends SYNC_ENABLE(0) to guest, stops forwarding. */
 ASB_API void vm_clipboard_set_sync_enabled(VmClipboard clip, BOOL enabled);
+ASB_API void vm_clipboard_set_sharing_enabled(VmClipboard clip, BOOL enabled);
 
 /* Call from WM_CLIPBOARDUPDATE in the display window's wndproc.
  * Forwards host clipboard to guest if sync is enabled. */

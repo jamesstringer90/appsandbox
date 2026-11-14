@@ -39,6 +39,7 @@
 #include "vm_display_idd.h"
 #include "asb_core.h"
 #include "../core/protocol.h"
+#include "../core/api_json.h"
 #include "../../tools/transport/asb_automation.h"
 #include "vm_clipboard.h"
 #include "vm_agent.h"
@@ -128,6 +129,7 @@ typedef struct AudioFrameHeader {
 #define WM_IDD_CURSOR_CHANGED   (WM_USER + 103)
 #define WM_IDD_DISPLAY_SIZE     (WM_USER + 104)
 #define WM_IDD_TAKE_CONTROL     (WM_USER + 105)
+#define WM_IDD_CLIPBOARD_READY  (WM_USER + 106)
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -327,6 +329,7 @@ struct VmDisplayIdd {
 
     /* Clipboard (extracted to vm_clipboard.c) */
     VmClipboard      clipboard;
+    BOOL             share_clipboard;
 
     /* Audio playback channel (:0004 — guest→host render) */
     volatile SOCKET  audio_socket;
@@ -365,6 +368,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
 #define IDM_MATCH_WINDOW   0x1030
+#define IDM_SHARE_CLIPBOARD 0x1040
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -690,40 +694,53 @@ static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, si
     swprintf_s(out, out_chars, L"%s\\display_settings.json", dir);
 }
 
-static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys)
+static BOOL idd_display_settings_save(VmDisplayIdd *d)
 {
     wchar_t path[MAX_PATH];
+    wchar_t temporary[MAX_PATH];
     FILE *f;
-    if (!vhdx_path || vhdx_path[0] == L'\0') return;
-    idd_display_settings_path(vhdx_path, path, MAX_PATH);
-    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
-    fprintf(f, "{\"transmitKeyboardHotkeys\":%d}\n", transmit_hotkeys ? 1 : 0);
-    fclose(f);
+    BOOL ok;
+    if (!d->vhdx_path[0]) return FALSE;
+    idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
+    if (swprintf_s(temporary, MAX_PATH, L"%s.tmp", path) < 0) return FALSE;
+    if (_wfopen_s(&f, temporary, L"w") != 0 || !f) return FALSE;
+    ok = fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"shareClipboard\":%d}\n",
+                 d->transmit_hotkeys ? 1 : 0, d->share_clipboard ? 1 : 0) > 0;
+    if (fclose(f) != 0) ok = FALSE;
+    if (ok && MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return TRUE;
+    DeleteFileW(temporary);
+    return FALSE;
 }
 
-/* Read the persisted setting; if the file is absent, create it with the
-   default (off) and return FALSE. Returns the transmit-hotkeys value. */
-static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path)
+static void idd_display_settings_load_or_create(VmDisplayIdd *d)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
-    char buf[256];
-    BOOL transmit = FALSE;
+    wchar_t buf[512];
+    size_t length;
+    int value;
 
-    if (!vhdx_path || vhdx_path[0] == L'\0') return FALSE;
-    idd_display_settings_path(vhdx_path, path, MAX_PATH);
+    d->transmit_hotkeys = FALSE;
+    d->share_clipboard = TRUE;
+    if (!d->vhdx_path[0]) return;
+    idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
 
-    if (_wfopen_s(&f, path, L"r") != 0 || !f) {
-        /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
-        idd_display_settings_save(vhdx_path, FALSE);
-        return FALSE;
+    if (_wfopen_s(&f, path, L"rt, ccs=UTF-8") != 0 || !f) {
+        idd_display_settings_save(d);
+        return;
     }
-    if (fgets(buf, sizeof(buf), f)) {
-        if (strstr(buf, "\"transmitKeyboardHotkeys\":1"))
-            transmit = TRUE;
+    length = fread(buf, sizeof(wchar_t), ARRAYSIZE(buf) - 1, f);
+    buf[length] = L'\0';
+    if (!ferror(f) && feof(f)) {
+        if (api_json_get_bool(buf, L"transmitKeyboardHotkeys", &value) ||
+            api_json_get_int(buf, L"transmitKeyboardHotkeys", &value))
+            d->transmit_hotkeys = value != 0;
+        if (api_json_get_bool(buf, L"shareClipboard", &value) ||
+            api_json_get_int(buf, L"shareClipboard", &value))
+            d->share_clipboard = value != 0;
     }
     fclose(f);
-    return transmit;
 }
 
 /* ==================================================================
@@ -2719,8 +2736,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         if (!d->clipboard) {
             d->clipboard = vm_clipboard_create(&d->runtime_id, d->os_type,
                                                d->hwnd, clip_log_callback, d);
-            if (d->clipboard)
+            if (d->clipboard) {
                 idd_log(d, L"Clipboard module created.");
+                PostMessageW(d->hwnd, WM_IDD_CLIPBOARD_READY, 0, 0);
+            }
         }
 
         /* Ensure audio recv thread is running (:0004, guest→host).
@@ -3173,10 +3192,13 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
+            AppendMenuW(sysmenu, MF_STRING, IDM_SHARE_CLIPBOARD, L"Share clipboard");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_MATCH_WINDOW, L"Match window size");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(sysmenu, IDM_SHARE_CLIPBOARD,
+                          MF_BYCOMMAND | (d->share_clipboard ? MF_CHECKED : MF_UNCHECKED));
         }
     }
 
@@ -3350,6 +3372,17 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     case WM_SYSCOMMAND:
+        if (d && (wp & 0xFFF0) == IDM_SHARE_CLIPBOARD) {
+            HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
+            d->share_clipboard = !d->share_clipboard;
+            CheckMenuItem(sysmenu, IDM_SHARE_CLIPBOARD,
+                          MF_BYCOMMAND | (d->share_clipboard ? MF_CHECKED : MF_UNCHECKED));
+            SendMessageW(hwnd, WM_IDD_CLIPBOARD_READY, 0, 0);
+            if (!idd_display_settings_save(d))
+                idd_log(d, L"Could not save viewer settings.");
+            idd_log(d, d->share_clipboard ? L"Clipboard sharing: ON." : L"Clipboard sharing: OFF.");
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_MATCH_WINDOW) {
             BOOL enabled;
             enabled = d->shared_ready && d->shared_resize && !d->shared_disabled &&
@@ -3388,7 +3421,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 idd_flush_held_keys(d);
             }
             idd_update_kbd_hook(d);
-            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys);
+            if (!idd_display_settings_save(d))
+                idd_log(d, L"Could not save viewer settings.");
             idd_log(d, d->transmit_hotkeys
                         ? L"Transmit Keyboard Hotkeys: ON."
                         : L"Transmit Keyboard Hotkeys: OFF.");
@@ -3680,14 +3714,13 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
 
+    case WM_IDD_CLIPBOARD_READY:
     case WM_SETFOCUS:
-        if (d && d->clipboard)
-            vm_clipboard_set_sync_enabled(d->clipboard, TRUE);
-        break;
-
     case WM_KILLFOCUS:
-        if (d && d->clipboard)
-            vm_clipboard_set_sync_enabled(d->clipboard, FALSE);
+        if (d && d->clipboard) {
+            vm_clipboard_set_sharing_enabled(d->clipboard, d->share_clipboard);
+            vm_clipboard_set_sync_enabled(d->clipboard, d->share_clipboard && d->input_focused && !IsIconic(hwnd));
+        }
         break;
 
     /* Top-level activation gates keyboard forwarding. Tracking activation
@@ -3698,6 +3731,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ACTIVATE:
         if (d) {
             d->input_focused = (LOWORD(wp) != WA_INACTIVE);
+            if (d->clipboard)
+                vm_clipboard_set_sync_enabled(d->clipboard, d->share_clipboard && d->input_focused && !IsIconic(hwnd));
             if (!d->input_focused) {
                 agent_overlay_cancel_input(d->agent_overlay);
                 idd_flush_held_keys(d);
@@ -3913,10 +3948,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->agent_control = d->agent_x = d->agent_y = -1;
     d->agent_finished = TRUE;
 
-    /* Load the per-VM display setting, creating display_settings.json with
-       the default (off) if this VM doesn't have one yet. The hook itself is
-       installed later, on the window thread, once the window exists. */
-    d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path);
+    idd_display_settings_load_or_create(d);
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;

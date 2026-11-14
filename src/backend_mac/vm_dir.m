@@ -18,6 +18,21 @@ static struct passwd *invoking_user(void) {
 + (uid_t)ownerUID { struct passwd *p = invoking_user(); return p ? p->pw_uid : getuid(); }
 + (gid_t)ownerGID { struct passwd *p = invoking_user(); return p ? p->pw_gid : getgid(); }
 
++ (NSDictionary *)displaySettingsForVm:(NSString *)name {
+    NSURL *url = [[self directoryForVm:name] URLByAppendingPathComponent:@"display_settings.json"];
+    NSData *data = [NSData dataWithContentsOfURL:url];
+    id settings = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    return [settings isKindOfClass:NSDictionary.class] ? settings : @{};
+}
+
++ (BOOL)saveDisplaySettings:(NSDictionary *)settings forVm:(NSString *)name error:(NSError **)error {
+    NSMutableDictionary *merged = [[self displaySettingsForVm:name] mutableCopy];
+    [merged addEntriesFromDictionary:settings];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:merged options:0 error:error];
+    NSURL *url = [[self directoryForVm:name] URLByAppendingPathComponent:@"display_settings.json"];
+    return data && [data writeToURL:url options:NSDataWritingAtomic error:error];
+}
+
 + (NSURL *)vmsRootDirectory {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSURL *appSupport = nil;

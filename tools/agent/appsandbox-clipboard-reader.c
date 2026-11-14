@@ -80,8 +80,7 @@ typedef struct {
 
 /* ---- Globals ---- */
 
-static AsbConn * volatile g_client_sock = NULL;
-static CRITICAL_SECTION g_send_cs;
+static volatile LONG g_pending_formats;
 static HWND g_msg_hwnd = NULL;
 static char g_log_path[MAX_PATH];
 
@@ -93,11 +92,14 @@ static HANDLE g_sync_event = NULL;
 
 static BOOL clip_sync_is_enabled(void)
 {
+    if (!g_sync_event) {
+        HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, CLIP_SYNC_EVENT_NAME);
+        if (event && InterlockedCompareExchangePointer((PVOID volatile *)&g_sync_event, event, NULL))
+            CloseHandle(event);
+    }
     if (!g_sync_event) return TRUE;
     return WaitForSingleObject(g_sync_event, 0) == WAIT_OBJECT_0;
 }
-
-#define WM_CLIP_DATA_REQ (WM_USER + 201)
 
 /* ---- Logging ---- */
 
@@ -138,14 +140,6 @@ static BOOL recv_exact(AsbConn *s, void *buf, int len)
     return TRUE;
 }
 
-/* Send on the connection (caller must hold g_send_cs) */
-static BOOL send_all_locked(const void *buf, int len)
-{
-    AsbConn *s = g_client_sock;
-    if (!s) return FALSE;
-    return asb_send(s, buf, len) == len;
-}
-
 /* ---- Skip non-transferable formats ---- */
 
 static BOOL should_skip_format(UINT fmt)
@@ -169,7 +163,7 @@ static BOOL should_skip_format(UINT fmt)
 
 /* ---- Send file entry over socket ---- */
 
-static BOOL clip_send_file_entry(const wchar_t *full_path, const wchar_t *rel_path)
+static BOOL clip_send_file_entry(AsbConn *s, const wchar_t *full_path, const wchar_t *rel_path)
 {
     ClipHeader hdr;
     ClipFileInfo fi;
@@ -192,9 +186,9 @@ static BOOL clip_send_file_entry(const wchar_t *full_path, const wchar_t *rel_pa
         hdr.format = 0;
         hdr.data_size = (UINT32)sizeof(fi) + path_bytes;
 
-        if (!send_all_locked(&hdr, sizeof(hdr))) return FALSE;
-        if (!send_all_locked(&fi, sizeof(fi))) return FALSE;
-        if (path_bytes > 0 && !send_all_locked(rel_path, (int)path_bytes)) return FALSE;
+        if (!send_all(s, &hdr, sizeof(hdr))) return FALSE;
+        if (!send_all(s, &fi, sizeof(fi))) return FALSE;
+        if (path_bytes > 0 && !send_all(s, rel_path, (int)path_bytes)) return FALSE;
 
         swprintf_s(search, MAX_PATH, L"%s\\*", full_path);
         h = FindFirstFileW(search, &fd);
@@ -204,7 +198,7 @@ static BOOL clip_send_file_entry(const wchar_t *full_path, const wchar_t *rel_pa
                 if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
                 swprintf_s(child_full, MAX_PATH, L"%s\\%s", full_path, fd.cFileName);
                 swprintf_s(child_rel, MAX_PATH, L"%s\\%s", rel_path, fd.cFileName);
-                if (!clip_send_file_entry(child_full, child_rel)) {
+                if (!clip_send_file_entry(s, child_full, child_rel)) {
                     FindClose(h);
                     return FALSE;
                 }
@@ -221,7 +215,11 @@ static BOOL clip_send_file_entry(const wchar_t *full_path, const wchar_t *rel_pa
         if (hFile == INVALID_HANDLE_VALUE) return TRUE;
         chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
         if (!chunk) { CloseHandle(hFile); return FALSE; }
-        GetFileSizeEx(hFile, &size);
+        if (!GetFileSizeEx(hFile, &size)) {
+            HeapFree(GetProcessHeap(), 0, chunk);
+            CloseHandle(hFile);
+            return FALSE;
+        }
         fi.file_size = (UINT64)size.QuadPart;
         fi.is_directory = 0;
         hdr.magic = CLIP_MAGIC;
@@ -229,9 +227,9 @@ static BOOL clip_send_file_entry(const wchar_t *full_path, const wchar_t *rel_pa
         hdr.format = 0;
         hdr.data_size = (UINT32)sizeof(fi) + path_bytes;
 
-        if (!send_all_locked(&hdr, sizeof(hdr)) ||
-            !send_all_locked(&fi, sizeof(fi)) ||
-            (path_bytes > 0 && !send_all_locked(rel_path, (int)path_bytes))) {
+        if (!send_all(s, &hdr, sizeof(hdr)) ||
+            !send_all(s, &fi, sizeof(fi)) ||
+            (path_bytes > 0 && !send_all(s, rel_path, (int)path_bytes))) {
             HeapFree(GetProcessHeap(), 0, chunk);
             CloseHandle(hFile);
             return FALSE;
@@ -245,7 +243,7 @@ static BOOL clip_send_file_entry(const wchar_t *full_path, const wchar_t *rel_pa
                 CloseHandle(hFile);
                 return FALSE;
             }
-            if (!send_all_locked(chunk, (int)bytes_read)) {
+            if (!send_all(s, chunk, (int)bytes_read)) {
                 HeapFree(GetProcessHeap(), 0, chunk);
                 CloseHandle(hFile);
                 return FALSE;
@@ -260,7 +258,7 @@ static BOOL clip_send_file_entry(const wchar_t *full_path, const wchar_t *rel_pa
 
 /* ---- Send format list to host (clipboard changed locally) ---- */
 
-static void clip_send_format_list(void)
+static BOOL clip_send_format_list(AsbConn *s)
 {
     ClipHeader hdr;
     UINT fmt;
@@ -268,11 +266,10 @@ static void clip_send_format_list(void)
     int offset = 4;
     UINT32 count = 0;
 
-    if (g_client_sock == NULL) return;
-
     if (!OpenClipboard(g_msg_hwnd)) {
         reader_log("clip_send_format_list: OpenClipboard failed (%lu).", GetLastError());
-        return;
+        InterlockedExchange(&g_pending_formats, 1);
+        return TRUE;
     }
 
     {
@@ -304,7 +301,7 @@ static void clip_send_format_list(void)
 
     if (count == 0) {
         reader_log("No formats to send.");
-        return;
+        return TRUE;
     }
 
     *(UINT32 *)buf = count;
@@ -314,95 +311,64 @@ static void clip_send_format_list(void)
     hdr.format = 0;
     hdr.data_size = (UINT32)offset;
 
-    EnterCriticalSection(&g_send_cs);
-    send_all_locked(&hdr, sizeof(hdr));
-    send_all_locked(buf, offset);
-    LeaveCriticalSection(&g_send_cs);
+    if (!send_all(s, &hdr, sizeof(hdr)) || !send_all(s, buf, offset)) return FALSE;
 
     reader_log("Sent format list (%u formats).", count);
+    return TRUE;
 }
 
 /* ---- Handle FORMAT_DATA_REQ from host ---- */
 
-static void clip_handle_data_request(UINT fmt)
+static BOOL clip_handle_data_request(AsbConn *s, UINT fmt)
 {
-    ClipHeader hdr;
+    ClipHeader hdr = { CLIP_MAGIC, CLIP_MSG_FORMAT_DATA_RESP, fmt, 0 };
+    BYTE *data = NULL;
+    wchar_t (*paths)[MAX_PATH] = NULL;
+    UINT path_count = 0;
+    BOOL sent = TRUE;
 
-    if (fmt == CF_HDROP) {
-        if (OpenClipboard(g_msg_hwnd)) {
-            HANDLE hData = GetClipboardData(CF_HDROP);
-            if (hData) {
-                HDROP hDrop = (HDROP)hData;
-                UINT file_count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
-                UINT fi;
-                reader_log("Data request CF_HDROP — %u files.", file_count);
-                EnterCriticalSection(&g_send_cs);
-                for (fi = 0; fi < file_count; fi++) {
-                    wchar_t path[MAX_PATH];
-                    wchar_t *name;
-                    DragQueryFileW(hDrop, fi, path, MAX_PATH);
-                    name = wcsrchr(path, L'\\');
-                    name = name ? name + 1 : path;
-                    clip_send_file_entry(path, name);
-                }
-                hdr.magic = CLIP_MAGIC;
-                hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-                hdr.format = CF_HDROP;
-                hdr.data_size = 0;
-                send_all_locked(&hdr, sizeof(hdr));
-                LeaveCriticalSection(&g_send_cs);
-            } else {
-                reader_log("GetClipboardData(CF_HDROP) returned NULL.");
-                goto send_empty;
-            }
-            CloseClipboard();
-        } else {
-            reader_log("OpenClipboard failed for CF_HDROP (%lu).", GetLastError());
-            goto send_empty;
-        }
-        return;
-
-    send_empty:
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = 0;
-        EnterCriticalSection(&g_send_cs);
-        send_all_locked(&hdr, sizeof(hdr));
-        LeaveCriticalSection(&g_send_cs);
-        return;
-    }
-
-    /* Regular format */
     if (OpenClipboard(g_msg_hwnd)) {
         HANDLE hData = GetClipboardData(fmt);
-        void *ptr = hData ? GlobalLock(hData) : NULL;
-        SIZE_T size = ptr ? GlobalSize(hData) : 0;
-
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = (ptr && size <= CLIP_MAX_PAYLOAD) ? (UINT32)size : 0;
-
-        EnterCriticalSection(&g_send_cs);
-        send_all_locked(&hdr, sizeof(hdr));
-        if (hdr.data_size > 0)
-            send_all_locked(ptr, (int)hdr.data_size);
-        LeaveCriticalSection(&g_send_cs);
-
-        if (ptr) GlobalUnlock(hData);
+        if (fmt == CF_HDROP && hData) {
+            UINT count = DragQueryFileW((HDROP)hData, 0xFFFFFFFF, NULL, 0);
+            if (count && count <= CLIP_MAX_PAYLOAD / sizeof(*paths))
+                paths = (wchar_t (*)[MAX_PATH])HeapAlloc(GetProcessHeap(), 0, (SIZE_T)count * sizeof(*paths));
+            if (paths) {
+                for (path_count = 0; path_count < count; path_count++) {
+                    UINT length = DragQueryFileW((HDROP)hData, path_count, NULL, 0);
+                    if (!length || length >= MAX_PATH ||
+                        DragQueryFileW((HDROP)hData, path_count, paths[path_count], MAX_PATH) != length) {
+                        path_count = 0;
+                        break;
+                    }
+                }
+            }
+        } else if (hData) {
+            void *ptr = GlobalLock(hData);
+            SIZE_T size = ptr ? GlobalSize(hData) : 0;
+            if (size && size <= CLIP_MAX_PAYLOAD)
+                data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, size);
+            if (data) {
+                memcpy(data, ptr, size);
+                hdr.data_size = (UINT32)size;
+            }
+            if (ptr) GlobalUnlock(hData);
+        }
         CloseClipboard();
-        reader_log("Responded format %u (%u bytes).", fmt, hdr.data_size);
     } else {
         reader_log("OpenClipboard failed for format %u (%lu).", fmt, GetLastError());
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = 0;
-        EnterCriticalSection(&g_send_cs);
-        send_all_locked(&hdr, sizeof(hdr));
-        LeaveCriticalSection(&g_send_cs);
     }
+
+    for (UINT i = 0; i < path_count && sent; i++) {
+        const wchar_t *name = wcsrchr(paths[i], L'\\');
+        sent = clip_send_file_entry(s, paths[i], name ? name + 1 : paths[i]);
+    }
+    if (sent) sent = send_all(s, &hdr, sizeof(hdr));
+    if (sent && data) sent = send_all(s, data, (int)hdr.data_size);
+    if (paths) HeapFree(GetProcessHeap(), 0, paths);
+    if (data) HeapFree(GetProcessHeap(), 0, data);
+    reader_log("Responded format %u (%u bytes, %u paths, sent=%d).", fmt, hdr.data_size, path_count, sent);
+    return sent;
 }
 
 /* ---- Recv thread: handles FORMAT_DATA_REQ from host ---- */
@@ -415,6 +381,12 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
     reader_log("Recv thread started.");
 
     while (1) {
+        int ready;
+        if (InterlockedExchange(&g_pending_formats, 0) && clip_sync_is_enabled() &&
+            !clip_send_format_list(s)) break;
+        ready = asb_poll(s, 100);
+        if (ready < 0) break;
+        if (!ready) continue;
         if (!recv_exact(s, &hdr, sizeof(hdr)))
             break;
 
@@ -426,8 +398,7 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
         switch (hdr.msg_type) {
         case CLIP_MSG_FORMAT_DATA_REQ:
             reader_log("Data request for format %u.", hdr.format);
-            /* Post to msg window thread so clipboard is accessed there */
-            PostMessageW(g_msg_hwnd, WM_CLIP_DATA_REQ, (WPARAM)hdr.format, 0);
+            if (!clip_handle_data_request(s, hdr.format)) goto done;
             break;
 
         default:
@@ -460,12 +431,7 @@ static LRESULT CALLBACK clip_msg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
             reader_log("WM_CLIPBOARDUPDATE ignored (sync disabled).");
             break;
         }
-        reader_log("WM_CLIPBOARDUPDATE — sending format list to host.");
-        clip_send_format_list();
-        return 0;
-
-    case WM_CLIP_DATA_REQ:
-        clip_handle_data_request((UINT)wp);
+        InterlockedExchange(&g_pending_formats, 1);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -520,13 +486,12 @@ static void handle_client(AsbConn *s)
     }
     reader_log("Sent ready signal to host.");
 
-    g_client_sock = s;
+    asb_set_timeout(s, 5000, 10000);
 
     /* Start recv thread */
     recv_th = CreateThread(NULL, 0, recv_thread_proc, (LPVOID)s, 0, NULL);
     if (!recv_th) {
         reader_log("Failed to create recv thread (%lu).", GetLastError());
-        g_client_sock = NULL;
         return;
     }
 
@@ -534,7 +499,6 @@ static void handle_client(AsbConn *s)
     WaitForSingleObject(recv_th, INFINITE);
     CloseHandle(recv_th);
 
-    g_client_sock = NULL;
     reader_log("Host disconnected.");
 }
 
@@ -554,8 +518,6 @@ int main(void)
                GetCurrentProcessId(),
                WTSGetActiveConsoleSessionId());
 
-    InitializeCriticalSection(&g_send_cs);
-
     g_sync_event = OpenEventW(SYNCHRONIZE, FALSE, CLIP_SYNC_EVENT_NAME);
     if (!g_sync_event)
         reader_log("Warning: could not open sync event (writer not running yet?).");
@@ -564,7 +526,6 @@ int main(void)
     msg_th = CreateThread(NULL, 0, msg_window_thread, NULL, 0, NULL);
     if (!msg_th) {
         reader_log("Failed to create message window thread (%lu).", GetLastError());
-        DeleteCriticalSection(&g_send_cs);
         return 1;
     }
 
@@ -573,14 +534,12 @@ int main(void)
 
     if (asb_transport_init() != 0) {
         reader_log("asb_transport_init failed.");
-        DeleteCriticalSection(&g_send_cs);
         return 1;
     }
 
     l = asb_listen(ASB_CH_CLIPBOARD_READER);
     if (!l) {
         reader_log("asb_listen(ASB_CH_CLIPBOARD_READER) failed.");
-        DeleteCriticalSection(&g_send_cs);
         return 1;
     }
     reader_log("Listening on clipboard-reader channel (transport=%s).",

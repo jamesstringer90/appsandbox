@@ -24,6 +24,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include "../transport/asb_transport.h"   /* AF_HYPERV on PC, ivshmem on Mac */
+#include "../../src/backend_win/clipboard_file.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "user32.lib")
@@ -100,6 +101,8 @@ typedef struct {
 static ClipFmtEntry g_clip_fmts[CLIP_MAX_FORMATS];
 static int          g_clip_fmt_count = 0;
 static int          g_clip_fetch_idx = 0;
+static CRITICAL_SECTION g_pending_cs;
+static BOOL g_clip_ready;
 
 /* Echo suppression */
 static volatile LONG g_suppress = 0;
@@ -250,7 +253,8 @@ static HGLOBAL clip_build_hdrop_from_temp(void)
     WIN32_FIND_DATAW fd;
     wchar_t pattern[MAX_PATH];
     HANDLE h;
-    wchar_t paths[CLIP_MAX_FORMATS][MAX_PATH];
+    wchar_t (*paths)[MAX_PATH];
+    SIZE_T capacity = CLIP_MAX_FORMATS;
     int count = 0;
     SIZE_T total_size;
     HGLOBAL hMem;
@@ -258,17 +262,30 @@ static HGLOBAL clip_build_hdrop_from_temp(void)
     wchar_t *ptr;
     int i;
 
+    paths = (wchar_t (*)[MAX_PATH])HeapAlloc(GetProcessHeap(), 0, capacity * sizeof(*paths));
+    if (!paths) return NULL;
     swprintf_s(pattern, MAX_PATH, L"%s\\*", g_clip_temp_dir);
     h = FindFirstFileW(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return NULL;
+    if (h == INVALID_HANDLE_VALUE) { HeapFree(GetProcessHeap(), 0, paths); return NULL; }
     do {
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        if ((SIZE_T)count == capacity) {
+            wchar_t (*grown)[MAX_PATH] = NULL;
+            if (capacity <= CLIP_MAX_PAYLOAD / (2 * sizeof(*paths)))
+                grown = (wchar_t (*)[MAX_PATH])HeapReAlloc(GetProcessHeap(), 0, paths, capacity * 2 * sizeof(*paths));
+            if (!grown) {
+                FindClose(h);
+                HeapFree(GetProcessHeap(), 0, paths);
+                return NULL;
+            }
+            paths = grown;
+            capacity *= 2;
+        }
         swprintf_s(paths[count], MAX_PATH, L"%s\\%s", g_clip_temp_dir, fd.cFileName);
         count++;
-        if (count >= CLIP_MAX_FORMATS) break;
     } while (FindNextFileW(h, &fd));
     FindClose(h);
-    if (count == 0) return NULL;
+    if (count == 0) { HeapFree(GetProcessHeap(), 0, paths); return NULL; }
 
     total_size = sizeof(DROPFILES);
     for (i = 0; i < count; i++)
@@ -276,17 +293,18 @@ static HGLOBAL clip_build_hdrop_from_temp(void)
     total_size += sizeof(wchar_t);
 
     hMem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_size);
-    if (!hMem) return NULL;
+    if (!hMem) { HeapFree(GetProcessHeap(), 0, paths); return NULL; }
     df = (DROPFILES *)GlobalLock(hMem);
-    if (!df) { GlobalFree(hMem); return NULL; }
+    if (!df) { HeapFree(GetProcessHeap(), 0, paths); GlobalFree(hMem); return NULL; }
     df->pFiles = sizeof(DROPFILES);
     df->fWide = TRUE;
     ptr = (wchar_t *)((BYTE *)df + sizeof(DROPFILES));
     for (i = 0; i < count; i++) {
-        wcscpy_s(ptr, MAX_PATH, paths[i]);
+        wcscpy_s(ptr, wcslen(paths[i]) + 1, paths[i]);
         ptr += wcslen(paths[i]) + 1;
     }
     *ptr = L'\0';
+    HeapFree(GetProcessHeap(), 0, paths);
     GlobalUnlock(hMem);
     return hMem;
 }
@@ -310,6 +328,9 @@ static void clip_request_next_format(void)
     ClipHeader hdr;
 
     if (g_clip_fetch_idx >= g_clip_fmt_count) {
+        EnterCriticalSection(&g_pending_cs);
+        g_clip_ready = TRUE;
+        LeaveCriticalSection(&g_pending_cs);
         /* All formats fetched — tell msg window to apply */
         clip_log("All %d formats fetched, applying.", g_clip_fmt_count);
         if (g_msg_hwnd)
@@ -338,7 +359,12 @@ static void clip_apply_format_list(void)
 {
     int i;
 
-    if (g_clip_fmt_count == 0) return;
+    EnterCriticalSection(&g_pending_cs);
+    if (!g_clip_ready || g_clip_fmt_count == 0) {
+        LeaveCriticalSection(&g_pending_cs);
+        return;
+    }
+    g_clip_ready = FALSE;
 
     InterlockedExchange(&g_suppress, 1);
 
@@ -346,6 +372,7 @@ static void clip_apply_format_list(void)
         clip_log("clip_apply_format_list: OpenClipboard failed (%lu).", GetLastError());
         InterlockedExchange(&g_suppress, 0);
         clip_free_pending();
+        LeaveCriticalSection(&g_pending_cs);
         return;
     }
 
@@ -374,6 +401,7 @@ static void clip_apply_format_list(void)
     CloseClipboard();
     clip_log("Applied %d formats to clipboard.", g_clip_fmt_count);
     clip_free_pending();
+    LeaveCriticalSection(&g_pending_cs);
 }
 
 /* ---- Message window for clipboard monitoring ---- */
@@ -475,32 +503,31 @@ static BOOL clip_recv_file_data(AsbConn *s, const ClipHeader *hdr)
         clip_ensure_parent_dir(full_path);
         CreateDirectoryW(full_path, NULL);
     } else {
-        HANDLE hFile;
-        BYTE *chunk;
+        ClipFileWriter file;
         clip_ensure_parent_dir(full_path);
-        chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
-        if (!chunk) return FALSE;
-        hFile = CreateFileW(full_path, GENERIC_WRITE, 0, NULL,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile != INVALID_HANDLE_VALUE) {
+        if (clip_file_writer_open(&file, full_path, fi.file_size)) {
             UINT64 remaining = fi.file_size;
             while (remaining > 0) {
-                DWORD to_read = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : (DWORD)remaining;
-                DWORD written;
-                if (!recv_exact(s, chunk, (int)to_read)) { HeapFree(GetProcessHeap(), 0, chunk); CloseHandle(hFile); return FALSE; }
-                WriteFile(hFile, chunk, to_read, &written, NULL);
+                DWORD to_read = remaining > CLIP_FILE_BUFFER_SIZE ? CLIP_FILE_BUFFER_SIZE : (DWORD)remaining;
+                if (!recv_exact(s, file.buffer, (int)to_read)) {
+                    clip_file_writer_abort(&file);
+                    return FALSE;
+                }
+                if (!clip_file_writer_write(&file, to_read)) {
+                    clip_log("File write failed (%lu).", GetLastError());
+                    clip_file_writer_abort(&file);
+                    return FALSE;
+                }
                 remaining -= to_read;
             }
-            CloseHandle(hFile);
-        } else {
-            UINT64 remaining = fi.file_size;
-            while (remaining > 0) {
-                int c = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : (int)remaining;
-                if (!recv_exact(s, chunk, c)) { HeapFree(GetProcessHeap(), 0, chunk); return FALSE; }
-                remaining -= c;
+            if (!clip_file_writer_finish(&file)) {
+                clip_log("File completion failed (%lu).", GetLastError());
+                return FALSE;
             }
+        } else {
+            clip_log("File creation failed (%lu).", GetLastError());
+            return FALSE;
         }
-        HeapFree(GetProcessHeap(), 0, chunk);
     }
     return TRUE;
 }
@@ -563,6 +590,8 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
             if (count > CLIP_MAX_FORMATS) count = CLIP_MAX_FORMATS;
             off = 4;
 
+            EnterCriticalSection(&g_pending_cs);
+            g_clip_ready = FALSE;
             clip_free_pending();
             g_clip_fmt_count = 0;
             for (i = 0; i < count && off + 8 <= (int)hdr.data_size; i++) {
@@ -592,6 +621,7 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
                 g_clip_fmt_count++;
             }
             g_clip_fetch_idx = 0;
+            LeaveCriticalSection(&g_pending_cs);
 
             clip_log("Received format list (%u formats), fetching data...", g_clip_fmt_count);
 
@@ -614,8 +644,10 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
                 } else if (hdr.data_size > 0 && hdr.data_size <= CLIP_MAX_PAYLOAD) {
                     BYTE *data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr.data_size);
                     if (data && recv_exact(s, data, (int)hdr.data_size)) {
+                        EnterCriticalSection(&g_pending_cs);
                         g_clip_fmts[idx].data = data;
                         g_clip_fmts[idx].data_size = hdr.data_size;
+                        LeaveCriticalSection(&g_pending_cs);
                     } else {
                         if (data) HeapFree(GetProcessHeap(), 0, data);
                     }
@@ -680,8 +712,11 @@ static void handle_client(AsbConn *s)
     CloseHandle(recv_th);
 
     g_client_sock = NULL;
+    EnterCriticalSection(&g_pending_cs);
+    g_clip_ready = FALSE;
     clip_free_pending();
     g_clip_fmt_count = 0;
+    LeaveCriticalSection(&g_pending_cs);
     clip_remove_dir_recursive(g_clip_temp_dir);
     clip_log("Client disconnected.");
 }
@@ -698,6 +733,7 @@ int main(void)
              WTSGetActiveConsoleSessionId());
 
     InitializeCriticalSection(&g_send_cs);
+    InitializeCriticalSection(&g_pending_cs);
     g_clip_fetch_idx = 0;
     clip_init_temp_dir();
 

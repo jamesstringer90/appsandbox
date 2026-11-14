@@ -20,6 +20,8 @@ NS_ASSUME_NONNULL_BEGIN
 + (gid_t)ownerGID;
 + (NSURL *)vmsRootDirectory;
 + (NSURL *)directoryForVm:(NSString *)name;
++ (NSDictionary *)displaySettingsForVm:(NSString *)name;
++ (BOOL)saveDisplaySettings:(NSDictionary *)settings forVm:(NSString *)name error:(NSError **)error;
 + (NSURL *)diskDirectoryForVm:(NSString *)name;
 /* Empty selects the default VM directory. Custom parents must already exist. */
 + (NSString *)normalizedDiskDirectory:(NSString *)directory;

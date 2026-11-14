@@ -118,7 +118,13 @@ static NSData *clip_readlink(NSString *path) {
     pthread_mutex_t _pendingLock;
     NSMutableDictionary<NSNumber *, VmClipPending *> *_pending;
     _Atomic uint32_t _nextSeq;
-    uint64_t _lazyGeneration;   /* bumped each time we overwrite the host pasteboard */
+    _Atomic uint64_t _lazyGeneration;
+    _Atomic BOOL _sharingEnabled;
+    _Atomic uint64_t _sharingGeneration;
+    _Atomic BOOL _syncDirty;
+    NSData *_queuedFormats;
+    uint32_t _queuedFormatsType;
+    uint64_t _queuedFormatsGeneration;
 }
 @property (nonatomic, strong) VZVirtioSocketDevice *socketDevice;
 @property (nonatomic, copy)   NSString *vmName;
@@ -142,7 +148,10 @@ static NSData *clip_readlink(NSString *path) {
         pthread_mutex_init(&_pendingLock, NULL);
         _pending = [NSMutableDictionary dictionary];
         atomic_init(&_nextSeq, 1);
-        _lazyGeneration = 1;
+        atomic_init(&_lazyGeneration, 1);
+        atomic_init(&_sharingEnabled, YES);
+        atomic_init(&_sharingGeneration, 1);
+        atomic_init(&_syncDirty, YES);
 
         NSURL *caches = [NSFileManager.defaultManager
             URLForDirectory:NSCachesDirectory inDomain:NSUserDomainMask
@@ -255,7 +264,21 @@ static NSData *clip_readlink(NSString *path) {
  * user-defined setter with a synthesized getter. Plain BOOL load is
  * atomic on Apple platforms. */
 - (BOOL)syncEnabled {
-    return _syncEnabled;
+    return _syncEnabled && atomic_load(&_sharingEnabled);
+}
+
+- (BOOL)sharingEnabled { return atomic_load(&_sharingEnabled); }
+
+- (void)setSharingEnabled:(BOOL)enabled {
+    if (atomic_exchange(&_sharingEnabled, enabled) == enabled) return;
+    atomic_fetch_add(&_sharingGeneration, 1);
+    atomic_fetch_add(&_lazyGeneration, 1);
+    atomic_store(&_syncDirty, YES);
+    pthread_mutex_lock(&_pendingLock);
+    _queuedFormats = nil;
+    pthread_mutex_unlock(&_pendingLock);
+    [self pendingFailAll];
+    if (enabled) dispatch_async(dispatch_get_main_queue(), ^{ self->_lastChangeSeen = -1; });
 }
 
 - (void)setSyncEnabled:(BOOL)enabled {
@@ -269,12 +292,7 @@ static NSData *clip_readlink(NSString *path) {
             self->_lastChangeSeen = -1;
         });
     }
-    /* Tell the guest so it mirrors the gate for guest→host syncing. */
-    if (_sock >= 0) {
-        uint8_t flag = enabled ? 1 : 0;
-        [self sendMessage:CLIP_MSG_SYNC_ENABLE format:nil
-                     data:[NSData dataWithBytes:&flag length:1]];
-    }
+    atomic_store(&_syncDirty, YES);
     [self logFmt:@"clipboard sync %@", enabled ? @"enabled" : @"disabled"];
 }
 
@@ -316,7 +334,8 @@ static NSData *clip_readlink(NSString *path) {
 
 #pragma mark - Host-side lazy pasteboard (guest → host)
 
-- (void)writeLazyHostPasteboardItems:(NSArray<NSDictionary *> *)items {
+- (void)writeLazyHostPasteboardItems:(NSArray<NSDictionary *> *)items generation:(uint64_t)generation {
+    if (!self.running || !self.syncEnabled || generation != atomic_load(&_sharingGeneration)) return;
     /* Called on main queue. Bump generation to orphan prior providers. */
     _lazyGeneration++;
     uint64_t gen = _lazyGeneration;
@@ -375,7 +394,8 @@ static NSData *clip_readlink(NSString *path) {
 - (nullable NSData *)fetchItemData:(uint32_t)itemIndex
                               type:(NSString *)type
                            timeout:(NSTimeInterval)timeout {
-    if (_sock < 0) return nil;
+    if (_sock < 0 || !self.sharingEnabled) return nil;
+    uint64_t generation = atomic_load(&_sharingGeneration);
 
     VmClipPending *p = [VmClipPending new];
     p.seqId = [self allocSeq];
@@ -391,7 +411,7 @@ static NSData *clip_readlink(NSString *path) {
     while (!p.completed) {
         if (![p.cond waitUntilDate:deadline]) break;
     }
-    BOOL ok = p.completed && !p.failed;
+    BOOL ok = p.completed && !p.failed && self.sharingEnabled && generation == atomic_load(&_sharingGeneration);
     NSData *result = ok ? [p.body copy] : nil;
     [p.cond unlock];
     [self pendingRemove:p.seqId];
@@ -410,7 +430,8 @@ static NSData *clip_readlink(NSString *path) {
 /* Fetch one item's file subtree, return top-level URL. */
 - (nullable NSURL *)fetchItemFileURL:(uint32_t)itemIndex
                              timeout:(NSTimeInterval)timeout {
-    if (_sock < 0) return nil;
+    if (_sock < 0 || !self.sharingEnabled) return nil;
+    uint64_t generation = atomic_load(&_sharingGeneration);
 
     VmClipPending *p = [VmClipPending new];
     p.seqId = [self allocSeq];
@@ -429,7 +450,7 @@ static NSData *clip_readlink(NSString *path) {
     while (!p.completed) {
         if (![p.cond waitUntilDate:deadline]) break;
     }
-    BOOL ok = p.completed && !p.failed;
+    BOOL ok = p.completed && !p.failed && self.sharingEnabled && generation == atomic_load(&_sharingGeneration);
     NSArray<NSURL *> *urls = ok ? [p.fileTreeUrls copy] : nil;
     [p.cond unlock];
 
@@ -514,6 +535,31 @@ static int wr_full(int fd, const void *buf, size_t n) {
 
 #pragma mark - Pasteboard polling (outbound)
 
+- (int)queueFormatList:(uint32_t)type data:(NSData *)body {
+    if (!self.syncEnabled) return 1;
+    pthread_mutex_lock(&_pendingLock);
+    _queuedFormats = [body copy];
+    _queuedFormatsType = type;
+    _queuedFormatsGeneration = atomic_load(&_sharingGeneration);
+    pthread_mutex_unlock(&_pendingLock);
+    return 1;
+}
+
+- (BOOL)flushClipboardUpdates {
+    if (atomic_exchange(&_syncDirty, NO)) {
+        uint8_t flag = self.syncEnabled ? 1 : 0;
+        if ([self sendMessage:CLIP_MSG_SYNC_ENABLE format:nil data:[NSData dataWithBytes:&flag length:1]] <= 0) return NO;
+    }
+    pthread_mutex_lock(&_pendingLock);
+    NSData *data = _queuedFormats;
+    uint32_t type = _queuedFormatsType;
+    uint64_t generation = _queuedFormatsGeneration;
+    _queuedFormats = nil;
+    pthread_mutex_unlock(&_pendingLock);
+    if (!data || !self.syncEnabled || generation != atomic_load(&_sharingGeneration)) return YES;
+    return [self sendMessage:type format:nil data:data] > 0;
+}
+
 - (NSArray<NSString *> *)wantedFormats:(NSPasteboard *)pb {
     NSArray *want = @[ NSPasteboardTypeFileURL, NSPasteboardTypePNG,
                        NSPasteboardTypeTIFF, NSPasteboardTypeRTF,
@@ -561,7 +607,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
         [buf appendBytes:&len length:4];
         [buf appendData:u];
     }
-    [self sendMessage:CLIP_MSG_FORMAT_LIST format:nil data:buf];
+    [self queueFormatList:CLIP_MSG_FORMAT_LIST data:buf];
     [self logFmt:@"host → guest FORMAT_LIST [%@]",
         [utis componentsJoinedByString:@", "]];
 #endif
@@ -577,7 +623,8 @@ static int wr_full(int fd, const void *buf, size_t n) {
  *   pasteboard-poll FORMAT_LIST can't interleave mid-stream. */
 - (int)sendFileEntry:(NSString *)relPath isDir:(BOOL)isDir
             fileSize:(uint64_t)fileSize openFd:(int)openFd {
-    if (_sock < 0) return -1;
+    if (_sock < 0 || !self.sharingEnabled) return -1;
+    uint64_t generation = atomic_load(&_sharingGeneration);
     NSData *pathUTF8 = [relPath dataUsingEncoding:NSUTF8StringEncoding];
     uint32_t path_len  = (uint32_t)pathUTF8.length;
     uint32_t data_size = (uint32_t)sizeof(ClipFileInfo) + path_len;
@@ -605,6 +652,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
         if (!chunk) rc = -1;
         uint64_t remaining = fileSize;
         while (rc > 0 && remaining > 0) {
+            if (!self.sharingEnabled || generation != atomic_load(&_sharingGeneration)) { rc = -1; break; }
             size_t want = remaining > CLIP_FILE_CHUNK
                 ? CLIP_FILE_CHUNK : (size_t)remaining;
             ssize_t got = read(openFd, chunk, want);
@@ -621,7 +669,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
 /* V1 symlink entry: type=SYMLINK, file_size = target length, target string
  * after the header. Preserves the link instead of following it. */
 - (int)sendSymlinkEntry:(NSString *)relPath target:(NSData *)target {
-    if (_sock < 0) return -1;
+    if (_sock < 0 || !self.sharingEnabled) return -1;
     NSData *pathUTF8 = [relPath dataUsingEncoding:NSUTF8StringEncoding];
     uint32_t path_len  = (uint32_t)pathUTF8.length;
     uint32_t tlen      = (uint32_t)target.length;
@@ -648,6 +696,8 @@ static int wr_full(int fd, const void *buf, size_t n) {
 }
 
 - (int)sendFileTree:(NSURL *)top {
+    if (!self.sharingEnabled) return -1;
+    uint64_t generation = atomic_load(&_sharingGeneration);
     NSString *base = top.lastPathComponent;
     NSNumber *isLink = nil;
     [top getResourceValue:&isLink forKey:NSURLIsSymbolicLinkKey error:nil];
@@ -674,6 +724,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
         includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey]
                            options:0 errorHandler:nil];
     for (NSURL *child in en) {
+        if (!self.sharingEnabled || generation != atomic_load(&_sharingGeneration)) return -1;
         NSString *rel = [base stringByAppendingPathComponent:
                          [child.path substringFromIndex:top.path.length + 1]];
         NSNumber *cl = nil;
@@ -704,7 +755,10 @@ static int wr_full(int fd, const void *buf, size_t n) {
 
 #pragma mark - Data request handler (outbound response)
 
-- (void)handleDataRequest:(NSString *)format {
+- (int)handleDataRequest:(NSString *)format {
+    if (!self.sharingEnabled)
+        return [self sendMessage:CLIP_MSG_FORMAT_DATA_RESP format:format data:[NSData data]];
+    uint64_t generation = atomic_load(&_sharingGeneration);
     NSPasteboard *pb = NSPasteboard.generalPasteboard;
     [self logFmt:@"guest → host DATA_REQ %@", format];
     if ([format isEqualToString:NSPasteboardTypeFileURL]) {
@@ -729,13 +783,17 @@ static int wr_full(int fd, const void *buf, size_t n) {
         }
         uint32_t be = htonl(total);
         NSData *count = [NSData dataWithBytes:&be length:4];
-        [self sendMessage:CLIP_MSG_FORMAT_DATA_RESP format:format data:count];
-        for (NSURL *u in valid) [self sendFileTree:u];
-        return;
+        if (!self.sharingEnabled || generation != atomic_load(&_sharingGeneration)) return -1;
+        if ([self sendMessage:CLIP_MSG_FORMAT_DATA_RESP format:format data:count] <= 0) return -1;
+        for (NSURL *u in valid) {
+            if (!self.sharingEnabled || generation != atomic_load(&_sharingGeneration) || [self sendFileTree:u] <= 0) return -1;
+        }
+        return 1;
     }
 
     NSData *d = [pb dataForType:format];
-    [self sendMessage:CLIP_MSG_FORMAT_DATA_RESP format:format data:(d ?: [NSData data])];
+    if (!self.sharingEnabled || generation != atomic_load(&_sharingGeneration)) return -1;
+    return [self sendMessage:CLIP_MSG_FORMAT_DATA_RESP format:format data:(d ?: [NSData data])];
 }
 
 #pragma mark - V2 FORMAT_LIST
@@ -858,7 +916,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
     [body appendData:itemsBody];
 
     [self logFmt:@"host → guest FORMAT_LIST_V2 (%u items)", itemCount];
-    return [self sendMessage:CLIP_MSG_FORMAT_LIST_V2 format:nil data:body];
+    return [self queueFormatList:CLIP_MSG_FORMAT_LIST_V2 data:body];
 }
 
 #pragma mark - V2 outbound streaming
@@ -868,6 +926,8 @@ static int wr_full(int fd, const void *buf, size_t n) {
  * body, a series of FORMAT_DATA_CHUNK messages, and FORMAT_DATA_END. All
  * messages carry the same seq. Checks cancel flag between chunks. */
 - (int)sendDataRespV2:(uint32_t)seq format:(NSString *)fmt bytes:(NSData *)bytes {
+    uint64_t generation = atomic_load(&_sharingGeneration);
+    if (bytes.length && !self.sharingEnabled) return -1;
     if ((uint32_t)bytes.length <= CLIP_LARGE_THRESHOLD) {
         return [self sendMessageV2:CLIP_MSG_FORMAT_DATA_RESP_V2
                                seq:seq format:fmt data:bytes];
@@ -880,6 +940,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
     const uint8_t *p = bytes.bytes;
     NSUInteger remaining = bytes.length;
     while (remaining > 0) {
+        if (!self.sharingEnabled || generation != atomic_load(&_sharingGeneration)) return -1;
         NSUInteger chunk = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : remaining;
         NSData *slice = [NSData dataWithBytesNoCopy:(void *)p length:chunk freeWhenDone:NO];
         rc = [self sendMessageV2:CLIP_MSG_FORMAT_DATA_CHUNK
@@ -895,7 +956,8 @@ static int wr_full(int fd, const void *buf, size_t n) {
  * bytes after the header are NOT counted in data_size. Checks cancel. */
 - (int)sendFileEntryV2:(uint32_t)seq relPath:(NSString *)relPath
                  isDir:(BOOL)isDir fileSize:(uint64_t)fileSize openFd:(int)openFd {
-    if (_sock < 0) return -1;
+    if (_sock < 0 || !self.sharingEnabled) return -1;
+    uint64_t generation = atomic_load(&_sharingGeneration);
     NSData *pathUTF8 = [relPath dataUsingEncoding:NSUTF8StringEncoding];
     uint32_t path_len  = (uint32_t)pathUTF8.length;
     /* data_size = seq(4) + sizeof(ClipFileInfo) + path_len */
@@ -926,6 +988,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
         if (!chunk) rc = -1;
         uint64_t remaining = fileSize;
         while (rc > 0 && remaining > 0) {
+            if (!self.sharingEnabled || generation != atomic_load(&_sharingGeneration)) { rc = -1; break; }
             size_t want = remaining > CLIP_FILE_CHUNK
                 ? CLIP_FILE_CHUNK : (size_t)remaining;
             ssize_t got = read(openFd, chunk, want);
@@ -943,7 +1006,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
  * streamed after the header (same framing as file bytes). Preserves the link
  * instead of following it. */
 - (int)sendSymlinkEntryV2:(uint32_t)seq relPath:(NSString *)relPath target:(NSData *)target {
-    if (_sock < 0) return -1;
+    if (_sock < 0 || !self.sharingEnabled) return -1;
     NSData *pathUTF8 = [relPath dataUsingEncoding:NSUTF8StringEncoding];
     uint32_t path_len  = (uint32_t)pathUTF8.length;
     uint32_t tlen      = (uint32_t)target.length;
@@ -974,6 +1037,8 @@ static int wr_full(int fd, const void *buf, size_t n) {
 /* V2 per-file-tree sender: mirrors -sendFileTree: but using FILE_DATA_V2
  * and carrying seq. Walks one top-level URL and emits entries. */
 - (int)sendFileTreeV2:(NSURL *)top seq:(uint32_t)seq {
+    if (!self.sharingEnabled) return -1;
+    uint64_t generation = atomic_load(&_sharingGeneration);
     NSString *base = top.lastPathComponent;
     NSNumber *isLink = nil;
     [top getResourceValue:&isLink forKey:NSURLIsSymbolicLinkKey error:nil];
@@ -1000,6 +1065,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
         includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey]
                            options:0 errorHandler:nil];
     for (NSURL *child in en) {
+        if (!self.sharingEnabled || generation != atomic_load(&_sharingGeneration)) return -1;
         NSString *rel = [base stringByAppendingPathComponent:
                          [child.path substringFromIndex:top.path.length + 1]];
         NSNumber *cl = nil;
@@ -1028,26 +1094,20 @@ static int wr_full(int fd, const void *buf, size_t n) {
     return 1;
 }
 
-- (void)handleDataRequestV2:(NSString *)format
+- (int)handleDataRequestV2:(NSString *)format
                          seq:(uint32_t)seq
                         item:(uint32_t)itemIndex {
+    if (!self.sharingEnabled) return [self sendDataRespV2:seq format:format bytes:[NSData data]];
+    uint64_t generation = atomic_load(&_sharingGeneration);
     NSPasteboard *pb = NSPasteboard.generalPasteboard;
     NSArray<NSPasteboardItem *> *items = pb.pasteboardItems;
     [self logFmt:@"host → guest DATA_REQ_V2 seq=%u item=%u %@",
         seq, itemIndex, format];
 
-    /* Intentionally NOT gated on syncEnabled. The gate only suppresses
-     * proactive announcements (FORMAT_LIST_V2 from the host's poll). This
-     * handler runs because something is actively pasting on the guest,
-     * which is a user-initiated action — serve from the host pasteboard
-     * regardless of focus. Without this, VM-to-VM paste-through-host
-     * would break after a focus switch. */
-
     if (itemIndex >= items.count) {
         [self logFmt:@"DATA_REQ_V2 item %u out of range (count %lu)",
             itemIndex, (unsigned long)items.count];
-        [self sendDataRespV2:seq format:format bytes:[NSData data]];
-        return;
+        return [self sendDataRespV2:seq format:format bytes:[NSData data]];
     }
     NSPasteboardItem *item = items[itemIndex];
 
@@ -1056,10 +1116,9 @@ static int wr_full(int fd, const void *buf, size_t n) {
         NSURL *url = urlStr ? [NSURL URLWithString:urlStr] : nil;
         if (!url.isFileURL) {
             uint32_t zero = htonl(0);
-            [self sendMessageV2:CLIP_MSG_FORMAT_DATA_RESP_V2
+            return [self sendMessageV2:CLIP_MSG_FORMAT_DATA_RESP_V2
                             seq:seq format:format
                            data:[NSData dataWithBytes:&zero length:4]];
-            return;
         }
         uint32_t count = 1;
         NSNumber *isDir = nil;
@@ -1072,15 +1131,16 @@ static int wr_full(int fd, const void *buf, size_t n) {
             for (NSURL *__unused c in en) count++;
         }
         uint32_t be = htonl(count);
-        [self sendMessageV2:CLIP_MSG_FORMAT_DATA_RESP_V2
+        if (!self.sharingEnabled || generation != atomic_load(&_sharingGeneration)) return -1;
+        if ([self sendMessageV2:CLIP_MSG_FORMAT_DATA_RESP_V2
                         seq:seq format:format
-                       data:[NSData dataWithBytes:&be length:4]];
-        [self sendFileTreeV2:url seq:seq];
-        return;
+                       data:[NSData dataWithBytes:&be length:4]] <= 0) return -1;
+        return [self sendFileTreeV2:url seq:seq];
     }
 
     NSData *d = [item dataForType:format];
-    [self sendDataRespV2:seq format:format bytes:(d ?: [NSData data])];
+    if (!self.sharingEnabled || generation != atomic_load(&_sharingGeneration)) return -1;
+    return [self sendDataRespV2:seq format:format bytes:(d ?: [NSData data])];
 }
 
 #pragma mark - Inbound
@@ -1173,8 +1233,9 @@ static int wr_full(int fd, const void *buf, size_t n) {
 }
 
 - (void)writePasteboard:(NSDictionary<NSString *, NSData *> *)formats
-               fileUrls:(NSArray<NSURL *> *)urls {
+               fileUrls:(NSArray<NSURL *> *)urls generation:(uint64_t)generation {
     dispatch_sync(dispatch_get_main_queue(), ^{
+        if (!self.running || !self.sharingEnabled || generation != atomic_load(&self->_sharingGeneration)) return;
         NSPasteboard *pb = NSPasteboard.generalPasteboard;
         [pb clearContents];
         if (urls.count) [pb writeObjects:urls];
@@ -1188,8 +1249,10 @@ static int wr_full(int fd, const void *buf, size_t n) {
 }
 
 - (int)handleInboundFormatList:(ClipHeader)h {
+    uint64_t generation = atomic_load(&_sharingGeneration);
     NSMutableData *buf = [NSMutableData dataWithLength:h.data_size];
     if (rd_full(_sock, buf.mutableBytes, h.data_size) <= 0) return -1;
+    if (!self.syncEnabled || generation != atomic_load(&_sharingGeneration)) return 1;
     const uint8_t *p = buf.bytes;
     const uint8_t *end = p + h.data_size;
     if (end - p < 4) return -1;
@@ -1272,7 +1335,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
             }
         }
     }
-    [self writePasteboard:formats fileUrls:fileUrls];
+    [self writePasteboard:formats fileUrls:fileUrls generation:generation];
     [self logFmt:@"applied host pasteboard (%d formats, %d file URLs)",
         (int)formats.count, (int)fileUrls.count];
     return 1;
@@ -1306,8 +1369,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
             NSMutableData *trash = [NSMutableData dataWithLength:h.data_size];
             rd_full(_sock, trash.mutableBytes, h.data_size);
         }
-        if (format) [self handleDataRequest:format];
-        return 1;
+        return format ? [self handleDataRequest:format] : 1;
     }
 
     /* V2 request: body = seq (4) + item_index (4). */
@@ -1329,14 +1391,14 @@ static int wr_full(int fd, const void *buf, size_t n) {
         }
         uint32_t seq = ntohl(seqBE);
         uint32_t idx = ntohl(idxBE);
-        if (format) [self handleDataRequestV2:format seq:seq item:idx];
-        return 1;
+        return format ? [self handleDataRequestV2:format seq:seq item:idx] : 1;
     }
 
     /* V2 from guest: FORMAT_LIST_V2 announces the guest pasteboard as a
      * per-item structure. Decode and write N lazy host NSPasteboardItems
      * mirroring the shape. */
     if (h.msg_type == CLIP_MSG_FORMAT_LIST_V2) {
+        uint64_t generation = atomic_load(&_sharingGeneration);
         if (h.data_size < 4) {
             if (h.data_size) {
                 NSMutableData *trash = [NSMutableData dataWithLength:h.data_size];
@@ -1346,6 +1408,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
         }
         NSMutableData *buf = [NSMutableData dataWithLength:h.data_size];
         if (rd_full(_sock, buf.mutableBytes, h.data_size) <= 0) return -1;
+        if (!self.syncEnabled || generation != atomic_load(&_sharingGeneration)) return 1;
         const uint8_t *p = buf.bytes;
         const uint8_t *end = p + h.data_size;
 
@@ -1391,7 +1454,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
         if (items.count > 0) {
             NSArray *itemsCopy = [items copy];
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self writeLazyHostPasteboardItems:itemsCopy];
+                [self writeLazyHostPasteboardItems:itemsCopy generation:generation];
             });
         }
         return 1;
@@ -1603,17 +1666,19 @@ static int wr_full(int fd, const void *buf, size_t n) {
             continue;
         }
         _sock = fd;
-        _lastChangeSeen = NSPasteboard.generalPasteboard.changeCount;
+        atomic_store(&_syncDirty, YES);
+        dispatch_async(dispatch_get_main_queue(), ^{ self->_lastChangeSeen = -1; });
         [self logFmt:@"connected to guest clipboard (vsock :%d)",
             VM_CLIPBOARD_VSOCK_PORT];
-        /* Tell the guest our current focus state on every connect so a
-         * freshly-booted or reconnecting helper starts in the right mode. */
-        {
-            uint8_t flag = self.syncEnabled ? 1 : 0;
-            [self sendMessage:CLIP_MSG_SYNC_ENABLE format:nil
-                         data:[NSData dataWithBytes:&flag length:1]];
-        }
         while (self.running) {
+            if (![self flushClipboardUpdates]) break;
+            fd_set reads;
+            FD_ZERO(&reads); FD_SET(fd, &reads);
+            struct timeval timeout = { 0, 100000 };
+            int ready = select(fd + 1, &reads, NULL, NULL, &timeout);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0) break;
+            if (!ready) continue;
             if ([self handleInbound] <= 0) break;
         }
         _sock = -1;
@@ -1644,7 +1709,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
 - (void)pasteboard:(NSPasteboard *)pb item:(NSPasteboardItem *)item
 provideDataForType:(NSString *)type {
     VmClipboardMac *clip = self.clipboard;
-    if (!clip || self.generation != [clip currentLazyGeneration]) return;
+    if (!clip || !clip.sharingEnabled || self.generation != [clip currentLazyGeneration]) return;
 
     [_cacheLock lock];
     NSData *cached = _cache[type];
@@ -1671,7 +1736,7 @@ provideDataForType:(NSString *)type {
         result = [clip fetchItemData:self.itemIndex type:type timeout:timeout];
     }
 
-    if (!result) return;
+    if (!result || !clip.sharingEnabled || self.generation != [clip currentLazyGeneration]) return;
     [_cacheLock lock];
     _cache[type] = result;
     [_cacheLock unlock];
