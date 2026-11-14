@@ -23,6 +23,7 @@
 #include "asb_automation.h"
 
 #define ASB_RING_HDR   ((uint32_t)sizeof(AsbRing))
+#define ASB_SHM_BAR_SIZE (128ull * 1024 * 1024)
 
 /* ---- Region offsets/sizes/ring-caps (from BAR base). The directory occupies the first
  * 4 KiB page; regions start at 0x10000. Sizes leave headroom over each region's slot stride. */
@@ -89,7 +90,71 @@ typedef char asb_fits_p9     [((uint64_t)ASB_P9_N_SLOTS  * ASB_P9_SLOT_STRIDE  <
 
 typedef char asb_fits_screenshot[(ASB_SCREENSHOT_SLOT_STRIDE <= ASB_SCREENSHOT_REGION_SIZE) ? 1 : -1];
 
-#define ASB_SHM_N_REGIONS       9
+#define ASB_SHM_LEGACY_N_REGIONS 8u
+#define ASB_SHM_N_REGIONS        9u
+
+typedef struct AsbShmRegionLayout {
+    AsbShmRegionDesc region;
+    uint32_t g2h_cap;
+    uint32_t h2g_cap;
+} AsbShmRegionLayout;
+
+static const AsbShmRegionLayout asb_shm_regions[ASB_SHM_N_REGIONS] = {
+    { { ASB_CH_DISPLAY,          ASB_REGION_STREAM, ASB_FRAME_REGION_OFF,      ASB_FRAME_REGION_SIZE,      1,               ASB_DISPLAY_SLOT_STRIDE    }, ASB_DISPLAY_RING_CAP,    ASB_DISPLAY_H2G_CAP },
+    { { ASB_CH_INPUT,            ASB_REGION_STREAM, ASB_INPUT_REGION_OFF,      ASB_INPUT_REGION_SIZE,      1,               ASB_INPUT_SLOT_STRIDE      }, ASB_INPUT_RING_CAP,      ASB_INPUT_RING_CAP },
+    { { ASB_CH_AUDIO,            ASB_REGION_STREAM, ASB_AUDIO_REGION_OFF,      ASB_AUDIO_REGION_SIZE,      1,               ASB_AUDIO_SLOT_STRIDE      }, ASB_AUDIO_RING_CAP,      ASB_AUDIO_RING_CAP },
+    { { ASB_CH_CLIPBOARD,        ASB_REGION_STREAM, ASB_CLIPW_REGION_OFF,      ASB_CLIPW_REGION_SIZE,      1,               ASB_CLIP_SLOT_STRIDE       }, ASB_CLIP_RING_CAP,       ASB_CLIP_RING_CAP },
+    { { ASB_CH_CLIPBOARD_READER, ASB_REGION_STREAM, ASB_CLIPR_REGION_OFF,      ASB_CLIPR_REGION_SIZE,      1,               ASB_CLIP_SLOT_STRIDE       }, ASB_CLIP_RING_CAP,       ASB_CLIP_RING_CAP },
+    { { ASB_CH_AGENT,            ASB_REGION_STREAM, ASB_AGENT_REGION_OFF,      ASB_AGENT_REGION_SIZE,      1,               ASB_AGENT_SLOT_STRIDE      }, ASB_AGENT_RING_CAP,      ASB_AGENT_RING_CAP },
+    { { ASB_CH_SSH,              ASB_REGION_STREAM, ASB_SSH_REGION_OFF,        ASB_SSH_REGION_SIZE,        ASB_SSH_N_SLOTS, ASB_SSH_SLOT_STRIDE        }, ASB_SSH_RING_CAP,        ASB_SSH_RING_CAP },
+    { { ASB_CH_9P,               ASB_REGION_STREAM, ASB_P9_REGION_OFF,         ASB_P9_REGION_SIZE,         ASB_P9_N_SLOTS,  ASB_P9_SLOT_STRIDE         }, ASB_P9_RING_CAP,         ASB_P9_RING_CAP },
+    { { ASB_CH_SCREENSHOT,       ASB_REGION_STREAM, ASB_SCREENSHOT_REGION_OFF, ASB_SCREENSHOT_REGION_SIZE, 1,               ASB_SCREENSHOT_SLOT_STRIDE }, ASB_SCREENSHOT_RING_CAP, ASB_SCREENSHOT_RING_CAP },
+};
+
+static inline int asb_shm_region_matches(const AsbShmRegionDesc *actual,
+                                         const AsbShmRegionDesc *expected)
+{
+    return actual->channel_id == expected->channel_id &&
+           actual->flags == expected->flags &&
+           actual->offset == expected->offset &&
+           actual->size == expected->size &&
+           actual->n_slots == expected->n_slots &&
+           actual->slot_stride == expected->slot_stride;
+}
+
+static inline uint32_t asb_shm_validate_directory(const AsbShmDirectory *dir,
+                                                  uint64_t mapping_size)
+{
+    if (!dir || mapping_size != ASB_SHM_BAR_SIZE ||
+        dir->magic != ASB_SHM_DIR_MAGIC || dir->version != ASB_SHM_VERSION ||
+        dir->bar_size != ASB_SHM_BAR_SIZE ||
+        (dir->n_regions != ASB_SHM_LEGACY_N_REGIONS && dir->n_regions != ASB_SHM_N_REGIONS))
+        return 0;
+
+    for (uint32_t i = 0; i < dir->n_regions; i++) {
+        const AsbShmRegionLayout *layout = &asb_shm_regions[i];
+        const AsbShmRegionDesc *region = &layout->region;
+        uint64_t required = (uint64_t)ASB_SLOT_HDR + ASB_RING_HDR + layout->g2h_cap +
+                            ASB_RING_HDR + layout->h2g_cap;
+        if (!asb_shm_region_matches(&dir->regions[i], region) ||
+            region->offset > mapping_size || region->size > mapping_size - region->offset ||
+            region->slot_stride < required || region->slot_stride == 0 ||
+            region->n_slots == 0 || region->n_slots > region->size / region->slot_stride ||
+            layout->g2h_cap == 0 || (layout->g2h_cap & (layout->g2h_cap - 1)) != 0 ||
+            layout->h2g_cap == 0 || (layout->h2g_cap & (layout->h2g_cap - 1)) != 0)
+            return 0;
+    }
+    return dir->n_regions;
+}
+
+static inline const AsbShmRegionLayout *asb_shm_region_for_channel(uint32_t channel,
+                                                                   uint32_t n_regions)
+{
+    if (n_regions != ASB_SHM_LEGACY_N_REGIONS && n_regions != ASB_SHM_N_REGIONS) return NULL;
+    for (uint32_t i = 0; i < n_regions; i++)
+        if (asb_shm_regions[i].region.channel_id == channel) return &asb_shm_regions[i];
+    return NULL;
+}
 
 /* Initialize one region's slots in place: zero each slot, set both rings' caps, mark FREE.
  * For an asymmetric region pass distinct g2h/h2g caps (display); otherwise they're equal. */
@@ -107,15 +172,10 @@ static inline void asb_shm_init_slots(uint8_t *bar, uint64_t off, uint32_t n_slo
     }
 }
 
-static inline void asb_shm_set_region(AsbShmDirectory *dir, int idx, uint32_t channel,
-                                       uint64_t off, uint64_t size, uint32_t n_slots, uint32_t stride)
+static inline void asb_shm_set_region(AsbShmDirectory *dir, uint32_t idx,
+                                      const AsbShmRegionLayout *layout)
 {
-    dir->regions[idx].channel_id  = channel;
-    dir->regions[idx].flags       = ASB_REGION_STREAM;
-    dir->regions[idx].offset      = off;
-    dir->regions[idx].size        = size;
-    dir->regions[idx].n_slots     = n_slots;
-    dir->regions[idx].slot_stride = stride;
+    dir->regions[idx] = layout->region;
 }
 
 /* Publish the directory + initialize every slot (state FREE, ring caps set). Sets the magic LAST,
@@ -129,25 +189,12 @@ static inline void asb_shm_publish(uint8_t *bar, uint64_t bar_size)
     dir->bar_size  = (uint32_t)bar_size;
     dir->n_regions = ASB_SHM_N_REGIONS;
 
-    asb_shm_set_region(dir, 0, ASB_CH_DISPLAY,          ASB_FRAME_REGION_OFF, ASB_FRAME_REGION_SIZE, 1, ASB_DISPLAY_SLOT_STRIDE);
-    asb_shm_set_region(dir, 1, ASB_CH_INPUT,            ASB_INPUT_REGION_OFF, ASB_INPUT_REGION_SIZE, 1, ASB_INPUT_SLOT_STRIDE);
-    asb_shm_set_region(dir, 2, ASB_CH_AUDIO,            ASB_AUDIO_REGION_OFF, ASB_AUDIO_REGION_SIZE, 1, ASB_AUDIO_SLOT_STRIDE);
-    asb_shm_set_region(dir, 3, ASB_CH_CLIPBOARD,        ASB_CLIPW_REGION_OFF, ASB_CLIPW_REGION_SIZE, 1, ASB_CLIP_SLOT_STRIDE);
-    asb_shm_set_region(dir, 4, ASB_CH_CLIPBOARD_READER, ASB_CLIPR_REGION_OFF, ASB_CLIPR_REGION_SIZE, 1, ASB_CLIP_SLOT_STRIDE);
-    asb_shm_set_region(dir, 5, ASB_CH_AGENT,            ASB_AGENT_REGION_OFF, ASB_AGENT_REGION_SIZE, 1, ASB_AGENT_SLOT_STRIDE);
-    asb_shm_set_region(dir, 6, ASB_CH_SSH,              ASB_SSH_REGION_OFF,   ASB_SSH_REGION_SIZE,   ASB_SSH_N_SLOTS, ASB_SSH_SLOT_STRIDE);
-    asb_shm_set_region(dir, 7, ASB_CH_9P,               ASB_P9_REGION_OFF,    ASB_P9_REGION_SIZE,    ASB_P9_N_SLOTS,  ASB_P9_SLOT_STRIDE);
-    asb_shm_set_region(dir, 8, ASB_CH_SCREENSHOT, ASB_SCREENSHOT_REGION_OFF, ASB_SCREENSHOT_REGION_SIZE, 1, ASB_SCREENSHOT_SLOT_STRIDE);
-
-    asb_shm_init_slots(bar, ASB_FRAME_REGION_OFF, 1, ASB_DISPLAY_SLOT_STRIDE, ASB_DISPLAY_RING_CAP, ASB_DISPLAY_H2G_CAP);
-    asb_shm_init_slots(bar, ASB_INPUT_REGION_OFF, 1, ASB_INPUT_SLOT_STRIDE, ASB_INPUT_RING_CAP, ASB_INPUT_RING_CAP);
-    asb_shm_init_slots(bar, ASB_AUDIO_REGION_OFF, 1, ASB_AUDIO_SLOT_STRIDE, ASB_AUDIO_RING_CAP, ASB_AUDIO_RING_CAP);
-    asb_shm_init_slots(bar, ASB_CLIPW_REGION_OFF, 1, ASB_CLIP_SLOT_STRIDE, ASB_CLIP_RING_CAP, ASB_CLIP_RING_CAP);
-    asb_shm_init_slots(bar, ASB_CLIPR_REGION_OFF, 1, ASB_CLIP_SLOT_STRIDE, ASB_CLIP_RING_CAP, ASB_CLIP_RING_CAP);
-    asb_shm_init_slots(bar, ASB_AGENT_REGION_OFF, 1, ASB_AGENT_SLOT_STRIDE, ASB_AGENT_RING_CAP, ASB_AGENT_RING_CAP);
-    asb_shm_init_slots(bar, ASB_SSH_REGION_OFF, ASB_SSH_N_SLOTS, ASB_SSH_SLOT_STRIDE, ASB_SSH_RING_CAP, ASB_SSH_RING_CAP);
-    asb_shm_init_slots(bar, ASB_P9_REGION_OFF, ASB_P9_N_SLOTS, ASB_P9_SLOT_STRIDE, ASB_P9_RING_CAP, ASB_P9_RING_CAP);
-    asb_shm_init_slots(bar, ASB_SCREENSHOT_REGION_OFF, 1, ASB_SCREENSHOT_SLOT_STRIDE, ASB_SCREENSHOT_RING_CAP, ASB_SCREENSHOT_RING_CAP);
+    for (uint32_t i = 0; i < ASB_SHM_N_REGIONS; i++) {
+        const AsbShmRegionLayout *layout = &asb_shm_regions[i];
+        asb_shm_set_region(dir, i, layout);
+        asb_shm_init_slots(bar, layout->region.offset, layout->region.n_slots,
+                           layout->region.slot_stride, layout->g2h_cap, layout->h2g_cap);
+    }
 
     __sync_synchronize();
     dir->magic = ASB_SHM_DIR_MAGIC;

@@ -53,6 +53,8 @@
 #define VDD_FRAME_MAGIC    0x52465341u        /* 'ASFR' */
 #define VDD_CURSOR_MAGIC   0x52435341u        /* 'ASCR' */
 #define VDD_MAX_DIRTY      64u
+#define VDD_MAX_CURSOR_DIM 256u
+#define VDD_MAX_CURSOR_SIZE (4u * 1024u * 1024u)
 #pragma pack(push, 1)
 typedef struct { uint32_t magic, width, height, stride; uint64_t frame_seq; uint32_t dirty_rect_count; } WireFrameHeader;
 typedef struct { int32_t left, top, right, bottom; } WireRect;   /* Windows RECT */
@@ -224,6 +226,16 @@ static BOOL idd_console_user(uid_t *uid, gid_t *gid)
    cursor maps to a fully transparent cursor so the pointer disappears over the view. ---- */
 static void cur_data_free(void *info, const void *data, size_t size) { (void)info; (void)size; free((void *)data); }
 
+static BOOL idd_cursor_geometry_valid(uint32_t width, uint32_t height, uint32_t pitch,
+                                      uint32_t cursorType, uint32_t imageSize)
+{
+    if (width == 0 || height == 0 || width > VDD_MAX_CURSOR_DIM || height > VDD_MAX_CURSOR_DIM ||
+        (cursorType != 1 && cursorType != 2) || imageSize == 0 || imageSize > VDD_MAX_CURSOR_SIZE)
+        return NO;
+    uint64_t rowBytes = (uint64_t)width * 4u;
+    return (uint64_t)pitch >= rowBytes && (uint64_t)pitch * height <= imageSize;
+}
+
 static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 {
     if (scale <= 0) scale = 1.0;
@@ -232,17 +244,17 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
         return [[NSCursor alloc] initWithImage:blank hotSpot:NSZeroPoint];
     }
     uint32_t w = cur->width, h = cur->height, pitch = cur->pitch, type = cur->cursor_type;
-    if (!w || !h || !cur->image_size || (type != 1 && type != 2) ||
-        pitch < w * 4 || (uint64_t)pitch * h > cur->image_size) return nil;
+    if (!idd_cursor_geometry_valid(w, h, pitch, type, cur->image_size)) return nil;
     const uint8_t *src = (const uint8_t *)cur + sizeof(AsbCursor);
-    size_t outsz = (size_t)w * h * 4;
+    size_t rowBytes = (size_t)w * 4u;
+    size_t outsz = rowBytes * h;
     uint8_t *cpy = malloc(outsz);
     if (!cpy) return nil;
     for (uint32_t row = 0; row < h; row++) {
         const uint8_t *s = src + (size_t)row * pitch;
-        uint8_t *d = cpy + (size_t)row * w * 4;
+        uint8_t *d = cpy + (size_t)row * rowBytes;
         if (type == 2) {
-            memcpy(d, s, (size_t)w * 4);                          /* ALPHA: premultiplied BGRA */
+            memcpy(d, s, rowBytes);                               /* ALPHA: premultiplied BGRA */
         } else {
             for (uint32_t c = 0; c < w; c++) {                    /* MASKED_COLOR: AND mask in alpha */
                 uint8_t B = s[c*4+0], G = s[c*4+1], R = s[c*4+2], A = s[c*4+3];
@@ -258,7 +270,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     }
     CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
     CGDataProviderRef cdp = CGDataProviderCreateWithData(NULL, cpy, outsz, cur_data_free);
-    CGImageRef cg = CGImageCreate(w, h, 8, 32, w * 4, cs2,
+    CGImageRef cg = CGImageCreate(w, h, 8, 32, rowBytes, cs2,
         kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little, cdp, NULL, false, kCGRenderingIntentDefault);
     CGDataProviderRelease(cdp);
     CGColorSpaceRelease(cs2);
@@ -1432,12 +1444,13 @@ static __weak IddDisplayWindow *g_mouseOwner;
                 ch.magic = magic;
                 if (![self readDisplay:fd bytes:(uint8_t *)&ch + 4 length:sizeof(ch) - 4 session:session idle:NO]) break;
                 uint8_t *shape = NULL;
-                if (ch.shape_updated && ch.shape_data_size > 0) {
-                    if (ch.shape_data_size > 4u*1024*1024) break;   /* sanity */
+                if (ch.shape_updated) {
+                    if (!idd_cursor_geometry_valid(ch.width, ch.height, ch.pitch,
+                                                   ch.cursor_type, ch.shape_data_size)) break;
                     shape = malloc(ch.shape_data_size);
                     if (!shape) break;
                     if (![self readDisplay:fd bytes:shape length:(int)ch.shape_data_size session:session idle:NO]) { free(shape); break; }
-                }
+                } else if (ch.shape_data_size != 0) break;
                 /* Build an AsbCursor blob (header + image) so the render timer reuses buildGuestCursor
                    unchanged. shape_updated=0 => keep last image, update visibility only. */
                 pthread_mutex_lock(&_curLock);
@@ -1457,7 +1470,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
                     }
                 } else {
                     if (!_curBlob) {
-                        _curBlob = calloc(1, sizeof(AsbCursor));
+                        AsbCursor *emptyCursor = calloc(1, sizeof(*emptyCursor));
+                        _curBlob = (uint8_t *)emptyCursor;
                         _curBlobSeq++;
                     }
                     AsbCursor *c = (AsbCursor *)_curBlob;
