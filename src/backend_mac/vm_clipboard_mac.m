@@ -128,7 +128,7 @@ static NSData *clip_readlink(NSString *path) {
 }
 @property (nonatomic, strong) VZVirtioSocketDevice *socketDevice;
 @property (nonatomic, copy)   NSString *vmName;
-@property (nonatomic, assign) BOOL running;
+@property (atomic, assign) BOOL running;
 @property (atomic,    assign) BOOL syncEnabled;
 @property (nonatomic, strong) NSString *cacheBase;
 - (void)logFmt:(NSString *)fmt, ...;
@@ -252,12 +252,17 @@ static NSData *clip_readlink(NSString *path) {
 - (void)stop {
     if (!self.running) return;
     self.running = NO;
+    atomic_fetch_add(&_sharingGeneration, 1);
+    atomic_fetch_add(&_lazyGeneration, 1);
 
     if (_pbTimer) { dispatch_source_cancel(_pbTimer); _pbTimer = nil; }
 
+    pthread_mutex_lock(&_pendingLock);
     int s = _sock;
     _sock = -1;
-    if (s >= 0) { shutdown(s, SHUT_RDWR); close(s); }
+    if (s >= 0) shutdown(s, SHUT_RDWR);
+    pthread_mutex_unlock(&_pendingLock);
+    [self pendingFailAll];
 }
 
 /* Paired getter needed because the atomic synthesis won't mix a
@@ -421,9 +426,9 @@ static NSData *clip_readlink(NSString *path) {
 - (NSString *)allocHostTreeCacheDir {
     NSString *sub = [self.cacheBase stringByAppendingPathComponent:
                      NSUUID.UUID.UUIDString];
-    [NSFileManager.defaultManager createDirectoryAtPath:sub
+    if (![NSFileManager.defaultManager createDirectoryAtPath:sub
                             withIntermediateDirectories:YES
-                                             attributes:nil error:nil];
+                                             attributes:nil error:nil]) return nil;
     return sub;
 }
 
@@ -436,6 +441,7 @@ static NSData *clip_readlink(NSString *path) {
     VmClipPending *p = [VmClipPending new];
     p.seqId = [self allocSeq];
     p.fileTreeDir = [self allocHostTreeCacheDir];
+    if (!p.fileTreeDir) return nil;
     p.fileCountExpected = INT32_MAX;
     [self pendingRegister:p];
 
@@ -656,6 +662,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
             size_t want = remaining > CLIP_FILE_CHUNK
                 ? CLIP_FILE_CHUNK : (size_t)remaining;
             ssize_t got = read(openFd, chunk, want);
+            if (got < 0 && errno == EINTR) continue;
             if (got <= 0) { rc = -1; break; }
             if (wr_full(_sock, chunk, (size_t)got) <= 0) { rc = -1; break; }
             remaining -= (uint64_t)got;
@@ -709,11 +716,10 @@ static int wr_full(int fd, const void *buf, size_t n) {
     [top getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
     if (!isDir.boolValue) {
         int ffd = open(top.path.fileSystemRepresentation, O_RDONLY);
-        uint64_t sz = 0;
-        if (ffd >= 0) {
-            struct stat st;
-            if (fstat(ffd, &st) == 0) sz = (uint64_t)st.st_size;
-        }
+        if (ffd < 0) return -1;
+        struct stat st;
+        if (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) { close(ffd); return -1; }
+        uint64_t sz = (uint64_t)st.st_size;
         int rc = [self sendFileEntry:base isDir:NO fileSize:sz openFd:ffd];
         if (ffd >= 0) close(ffd);
         return rc;
@@ -740,11 +746,10 @@ static int wr_full(int fd, const void *buf, size_t n) {
             if ([self sendFileEntry:rel isDir:YES fileSize:0 openFd:-1] <= 0) return -1;
         } else {
             int ffd = open(child.path.fileSystemRepresentation, O_RDONLY);
-            uint64_t sz = 0;
-            if (ffd >= 0) {
-                struct stat st;
-                if (fstat(ffd, &st) == 0) sz = (uint64_t)st.st_size;
-            }
+            if (ffd < 0) return -1;
+            struct stat st;
+            if (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) { close(ffd); return -1; }
+            uint64_t sz = (uint64_t)st.st_size;
             int rc = [self sendFileEntry:rel isDir:NO fileSize:sz openFd:ffd];
             if (ffd >= 0) close(ffd);
             if (rc <= 0) return -1;
@@ -921,22 +926,14 @@ static int wr_full(int fd, const void *buf, size_t n) {
 
 #pragma mark - V2 outbound streaming
 
-/* Chunked V2 DATA_RESP sender. For payloads ≤ CLIP_LARGE_THRESHOLD sends
- * one FORMAT_DATA_RESP_V2. For larger, sends FORMAT_DATA_RESP_V2 with no
- * body, a series of FORMAT_DATA_CHUNK messages, and FORMAT_DATA_END. All
- * messages carry the same seq. Checks cancel flag between chunks. */
 - (int)sendDataRespV2:(uint32_t)seq format:(NSString *)fmt bytes:(NSData *)bytes {
     uint64_t generation = atomic_load(&_sharingGeneration);
     if (bytes.length && !self.sharingEnabled) return -1;
-    if ((uint32_t)bytes.length <= CLIP_LARGE_THRESHOLD) {
+    if (bytes.length <= CLIP_LARGE_THRESHOLD) {
         return [self sendMessageV2:CLIP_MSG_FORMAT_DATA_RESP_V2
                                seq:seq format:fmt data:bytes];
     }
-    /* Large: kick off with empty RESP_V2 then stream chunks. */
-    int rc = [self sendMessageV2:CLIP_MSG_FORMAT_DATA_RESP_V2
-                             seq:seq format:fmt data:nil];
-    if (rc <= 0) return rc;
-
+    int rc = 1;
     const uint8_t *p = bytes.bytes;
     NSUInteger remaining = bytes.length;
     while (remaining > 0) {
@@ -992,6 +989,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
             size_t want = remaining > CLIP_FILE_CHUNK
                 ? CLIP_FILE_CHUNK : (size_t)remaining;
             ssize_t got = read(openFd, chunk, want);
+            if (got < 0 && errno == EINTR) continue;
             if (got <= 0) { rc = -1; break; }
             if (wr_full(_sock, chunk, (size_t)got) <= 0) { rc = -1; break; }
             remaining -= (uint64_t)got;
@@ -1050,11 +1048,10 @@ static int wr_full(int fd, const void *buf, size_t n) {
     [top getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
     if (!isDir.boolValue) {
         int ffd = open(top.path.fileSystemRepresentation, O_RDONLY);
-        uint64_t sz = 0;
-        if (ffd >= 0) {
-            struct stat st;
-            if (fstat(ffd, &st) == 0) sz = (uint64_t)st.st_size;
-        }
+        if (ffd < 0) return -1;
+        struct stat st;
+        if (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) { close(ffd); return -1; }
+        uint64_t sz = (uint64_t)st.st_size;
         int rc = [self sendFileEntryV2:seq relPath:base isDir:NO fileSize:sz openFd:ffd];
         if (ffd >= 0) close(ffd);
         return rc;
@@ -1081,11 +1078,10 @@ static int wr_full(int fd, const void *buf, size_t n) {
             if ([self sendFileEntryV2:seq relPath:rel isDir:YES fileSize:0 openFd:-1] <= 0) return -1;
         } else {
             int ffd = open(child.path.fileSystemRepresentation, O_RDONLY);
-            uint64_t sz = 0;
-            if (ffd >= 0) {
-                struct stat st;
-                if (fstat(ffd, &st) == 0) sz = (uint64_t)st.st_size;
-            }
+            if (ffd < 0) return -1;
+            struct stat st;
+            if (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) { close(ffd); return -1; }
+            uint64_t sz = (uint64_t)st.st_size;
             int rc = [self sendFileEntryV2:seq relPath:rel isDir:NO fileSize:sz openFd:ffd];
             if (ffd >= 0) close(ffd);
             if (rc <= 0) return -1;
@@ -1100,7 +1096,9 @@ static int wr_full(int fd, const void *buf, size_t n) {
     if (!self.sharingEnabled) return [self sendDataRespV2:seq format:format bytes:[NSData data]];
     uint64_t generation = atomic_load(&_sharingGeneration);
     NSPasteboard *pb = NSPasteboard.generalPasteboard;
-    NSArray<NSPasteboardItem *> *items = pb.pasteboardItems;
+    NSMutableArray<NSPasteboardItem *> *items = [NSMutableArray array];
+    for (NSPasteboardItem *item in pb.pasteboardItems)
+        if ([self transportTypesForItem:item].count) [items addObject:item];
     [self logFmt:@"host → guest DATA_REQ_V2 seq=%u item=%u %@",
         seq, itemIndex, format];
 
@@ -1148,9 +1146,9 @@ static int wr_full(int fd, const void *buf, size_t n) {
 - (NSString *)allocCacheDir {
     NSString *sub = [self.cacheBase stringByAppendingPathComponent:
                      NSUUID.UUID.UUIDString];
-    [NSFileManager.defaultManager createDirectoryAtPath:sub
+    if (![NSFileManager.defaultManager createDirectoryAtPath:sub
                             withIntermediateDirectories:YES
-                                             attributes:nil error:nil];
+                                             attributes:nil error:nil]) return nil;
     return sub;
 }
 
@@ -1175,10 +1173,10 @@ static int wr_full(int fd, const void *buf, size_t n) {
     if (!pb) return NO;
     if (path_len && rd_full(_sock, pb, path_len) <= 0) { free(pb); return NO; }
     pb[path_len] = 0;
-    NSString *rel = [NSString stringWithUTF8String:pb];
+    NSString *rel = [[NSString alloc] initWithBytes:pb length:path_len encoding:NSUTF8StringEncoding];
     free(pb);
 
-    if ([rel containsString:@".."]) {
+    if (!destDir) {
         uint8_t drain[4096];
         uint64_t rem = file_size;
         while (rem > 0) {
@@ -1189,26 +1187,34 @@ static int wr_full(int fd, const void *buf, size_t n) {
         return YES;
     }
 
+    if (!rel.length || rel.isAbsolutePath ||
+        [rel.pathComponents containsObject:@".."] || [rel.pathComponents containsObject:@"."] ||
+        [rel rangeOfString:@"\0"].location != NSNotFound) return NO;
+    if (!self.sharingEnabled) return NO;
+    uint64_t generation = atomic_load(&_sharingGeneration);
+
     NSString *target = [destDir stringByAppendingPathComponent:rel];
     if (is_dir) {
-        [NSFileManager.defaultManager createDirectoryAtPath:target
+        if (![NSFileManager.defaultManager createDirectoryAtPath:target
                                 withIntermediateDirectories:YES
-                                                 attributes:nil error:nil];
+                                                 attributes:nil error:nil]) return NO;
         if (outTopLevel && rel.pathComponents.count == 1)
             *outTopLevel = [NSURL fileURLWithPath:target];
         return YES;
     }
 
-    [NSFileManager.defaultManager createDirectoryAtPath:[target stringByDeletingLastPathComponent]
+    if (![NSFileManager.defaultManager createDirectoryAtPath:[target stringByDeletingLastPathComponent]
                             withIntermediateDirectories:YES
-                                             attributes:nil error:nil];
+                                             attributes:nil error:nil]) return NO;
     int ffd = open(target.fileSystemRepresentation,
                    O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (ffd < 0) return NO;
     uint8_t *chunk = malloc(CLIP_FILE_CHUNK);
     if (!chunk) { if (ffd >= 0) close(ffd); return NO; }
     uint64_t remaining = file_size;
     BOOL ok = YES;
     while (remaining > 0) {
+        if (!self.sharingEnabled || generation != atomic_load(&_sharingGeneration)) { ok = NO; break; }
         size_t want = remaining > CLIP_FILE_CHUNK
             ? CLIP_FILE_CHUNK : (size_t)remaining;
         if (rd_full(_sock, chunk, want) <= 0) { ok = NO; break; }
@@ -1217,6 +1223,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
             size_t left = want;
             while (left) {
                 ssize_t w = write(ffd, p, left);
+                if (w < 0 && errno == EINTR) continue;
                 if (w <= 0) { ok = NO; break; }
                 p += w; left -= (size_t)w;
             }
@@ -1225,8 +1232,8 @@ static int wr_full(int fd, const void *buf, size_t n) {
         remaining -= want;
     }
     free(chunk);
-    if (ffd >= 0) close(ffd);
-    if (!ok) return NO;
+    if (close(ffd) < 0) ok = NO;
+    if (!ok) { unlink(target.fileSystemRepresentation); return NO; }
     if (outTopLevel && rel.pathComponents.count == 1)
         *outTopLevel = [NSURL fileURLWithPath:target];
     return YES;
@@ -1282,10 +1289,11 @@ static int wr_full(int fd, const void *buf, size_t n) {
             rh.data_size = ntohl(rh.data_size);
             if (rh.magic != CLIP_MAGIC) return -1;
             if (rh.data_size > CLIP_MAX_PAYLOAD) return -1;
+            if (rh.format_len > CLIP_MAX_PAYLOAD) return -1;
 
             NSString *respFmt = nil;
             if (rh.format_len) {
-                char *fb = malloc(rh.format_len + 1);
+                char *fb = malloc((size_t)rh.format_len + 1);
                 if (!fb) return -1;
                 if (rd_full(_sock, fb, rh.format_len) <= 0) { free(fb); return -1; }
                 fb[rh.format_len] = 0;
@@ -1305,6 +1313,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
                     }
                     uint32_t n; memcpy(&n, cb, 4); n = ntohl(n);
                     NSString *dest = [self allocCacheDir];
+                    if (!dest) return -1;
                     for (uint32_t i = 0; i < n; i++) {
                         ClipHeader fh;
                         if (rd_full(_sock, &fh, sizeof(fh)) <= 0) return -1;
@@ -1314,9 +1323,12 @@ static int wr_full(int fd, const void *buf, size_t n) {
                         fh.data_size = ntohl(fh.data_size);
                         if (fh.magic != CLIP_MAGIC || fh.msg_type != CLIP_MSG_FILE_DATA)
                             return -1;
+                        if (fh.format_len != 0 || fh.data_size > CLIP_MAX_PAYLOAD) return -1;
                         NSURL *topLevel = nil;
-                        if (![self streamFileData:fh destDir:dest outTopLevel:&topLevel])
+                        if (![self streamFileData:fh destDir:dest outTopLevel:&topLevel]) {
+                            [NSFileManager.defaultManager removeItemAtPath:dest error:nil];
                             return -1;
+                        }
                         if (topLevel) [fileUrls addObject:topLevel];
                     }
                     break;
@@ -1350,10 +1362,11 @@ static int wr_full(int fd, const void *buf, size_t n) {
     h.data_size = ntohl(h.data_size);
     if (h.magic != CLIP_MAGIC) return -1;
     if (h.data_size > CLIP_MAX_PAYLOAD) return -1;
+    if (h.format_len > CLIP_MAX_PAYLOAD) return -1;
 
     NSString *format = nil;
     if (h.format_len) {
-        char *fb = malloc(h.format_len + 1);
+        char *fb = malloc((size_t)h.format_len + 1);
         if (!fb) return -1;
         if (rd_full(_sock, fb, h.format_len) <= 0) { free(fb); return -1; }
         fb[h.format_len] = 0;
@@ -1478,6 +1491,10 @@ static int wr_full(int fd, const void *buf, size_t n) {
         uint32_t remaining = h.data_size - 4;
         VmClipPending *p = [self pendingLookup:seq];
         if (!p) {
+            if (h.msg_type == CLIP_MSG_FILE_DATA_V2) {
+                h.data_size = remaining;
+                return [self streamFileData:h destDir:nil outTopLevel:NULL] ? 1 : -1;
+            }
             if (remaining) {
                 NSMutableData *trash = [NSMutableData dataWithLength:remaining];
                 rd_full(_sock, trash.mutableBytes, remaining);
@@ -1501,6 +1518,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
                 uint32_t cnt = 0;
                 if (rd_full(_sock, &cnt, 4) <= 0) return -1;
                 cnt = ntohl(cnt);
+                if (cnt > INT32_MAX) return -1;
                 if (remaining > 4) {
                     NSMutableData *trash = [NSMutableData dataWithLength:remaining - 4];
                     rd_full(_sock, trash.mutableBytes, remaining - 4);
@@ -1566,39 +1584,36 @@ static int wr_full(int fd, const void *buf, size_t n) {
                 free(pathBuf); return -1;
             }
             pathBuf[path_len] = 0;
-            NSString *relPath = [NSString stringWithUTF8String:pathBuf];
+            NSString *relPath = [[NSString alloc] initWithBytes:pathBuf length:path_len encoding:NSUTF8StringEncoding];
             free(pathBuf);
 
-            if ([relPath containsString:@".."]) {
-                uint64_t rem = file_size;
-                uint8_t trash[4096];
-                while (rem > 0) {
-                    size_t w = rem > sizeof(trash) ? sizeof(trash) : (size_t)rem;
-                    if (rd_full(_sock, trash, w) <= 0) return -1;
-                    rem -= w;
-                }
-                return 1;
-            }
+            if (!relPath.length || relPath.isAbsolutePath ||
+                [relPath.pathComponents containsObject:@".."] || [relPath.pathComponents containsObject:@"."] ||
+                [relPath rangeOfString:@"\0"].location != NSNotFound) return -1;
 
             if (p.fileTreeDir) {
+                if (!self.sharingEnabled) return -1;
+                uint64_t generation = atomic_load(&_sharingGeneration);
                 NSString *target = [p.fileTreeDir
                     stringByAppendingPathComponent:relPath];
                 if (is_dir) {
-                    [NSFileManager.defaultManager createDirectoryAtPath:target
+                    if (![NSFileManager.defaultManager createDirectoryAtPath:target
                                             withIntermediateDirectories:YES
-                                                             attributes:nil error:nil];
+                                                             attributes:nil error:nil]) return -1;
                 } else {
-                    [NSFileManager.defaultManager createDirectoryAtPath:
+                    if (![NSFileManager.defaultManager createDirectoryAtPath:
                         [target stringByDeletingLastPathComponent]
                                             withIntermediateDirectories:YES
-                                                             attributes:nil error:nil];
+                                                             attributes:nil error:nil]) return -1;
                     int ffd = open(target.fileSystemRepresentation,
                                    O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    if (ffd < 0) return -1;
                     uint8_t *chunk = malloc(CLIP_FILE_CHUNK);
                     if (!chunk) { if (ffd >= 0) close(ffd); return -1; }
                     uint64_t rem = file_size;
                     BOOL ok = YES;
                     while (rem > 0) {
+                        if (!self.sharingEnabled || generation != atomic_load(&_sharingGeneration)) { ok = NO; break; }
                         size_t want = rem > CLIP_FILE_CHUNK
                             ? CLIP_FILE_CHUNK : (size_t)rem;
                         if (rd_full(_sock, chunk, want) <= 0) { ok = NO; break; }
@@ -1606,6 +1621,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
                             const uint8_t *pp = chunk; size_t left = want;
                             while (left) {
                                 ssize_t w = write(ffd, pp, left);
+                                if (w < 0 && errno == EINTR) continue;
                                 if (w <= 0) { ok = NO; break; }
                                 pp += w; left -= (size_t)w;
                             }
@@ -1614,8 +1630,9 @@ static int wr_full(int fd, const void *buf, size_t n) {
                         rem -= want;
                     }
                     free(chunk);
-                    if (ffd >= 0) close(ffd);
+                    if (close(ffd) < 0) ok = NO;
                     if (!ok) {
+                        unlink(target.fileSystemRepresentation);
                         [p.cond lock];
                         p.failed = YES; p.completed = YES;
                         [p.cond broadcast];
@@ -1665,7 +1682,9 @@ static int wr_full(int fd, const void *buf, size_t n) {
             for (int i = 0; i < 30 && self.running; i++) usleep(100 * 1000);
             continue;
         }
+        pthread_mutex_lock(&_pendingLock);
         _sock = fd;
+        pthread_mutex_unlock(&_pendingLock);
         atomic_store(&_syncDirty, YES);
         dispatch_async(dispatch_get_main_queue(), ^{ self->_lastChangeSeen = -1; });
         [self logFmt:@"connected to guest clipboard (vsock :%d)",
@@ -1681,8 +1700,12 @@ static int wr_full(int fd, const void *buf, size_t n) {
             if (!ready) continue;
             if ([self handleInbound] <= 0) break;
         }
+        pthread_mutex_lock(&_pendingLock);
         _sock = -1;
         close(fd);
+        pthread_mutex_unlock(&_pendingLock);
+        atomic_fetch_add(&_sharingGeneration, 1);
+        atomic_fetch_add(&_lazyGeneration, 1);
         [self pendingFailAll];
         if (self.running)
             [self logFmt:@"guest clipboard disconnected — will reconnect"];
