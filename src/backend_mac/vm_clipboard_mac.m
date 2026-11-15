@@ -577,14 +577,14 @@ static int wr_full(int fd, const void *buf, size_t n) {
 
 - (void)pollPasteboard {
     NSPasteboard *pb = NSPasteboard.generalPasteboard;
-    asb_clipboard_temp_changed((uint64_t)pb.changeCount);
+    NSInteger now = pb.changeCount;
+    asb_clipboard_temp_changed((uint64_t)now);
     if (_sock < 0) return;
     /* Only sync while a VM window is focused on the host. When unfocused
      * we don't push FORMAT_LIST_V2 to the guest at all, so system daemons
      * in the guest (Universal Clipboard, Spotlight, clipboard managers)
      * have no lazy items to probe and no fetches can be triggered. */
     if (!self.syncEnabled) return;
-    NSInteger now = pb.changeCount;
     if (now == _lastChangeSeen) return;
     _lastChangeSeen = now;
 

@@ -930,40 +930,55 @@ void asb_clipboard_temp_publish(AsbClipboardTemp *temp, const void *owner, uint6
     temp->token = token;
     release_handles(temp, 0);
     compact_temp(temp);
+    int needs_collection = 0;
     TEMP_LOCK();
     if (clipboard_token == token) {
         temp->next = published;
         published = temp;
-    } else retire_locked(temp, (uint64_t)time(NULL) + ASB_CLIP_TEMP_RETENTION);
+    } else {
+        retire_locked(temp, (uint64_t)time(NULL) + ASB_CLIP_TEMP_RETENTION);
+        needs_collection = 1;
+    }
     TEMP_UNLOCK();
-    wake_collector();
+    if (needs_collection) wake_collector();
 }
 
 void asb_clipboard_temp_changed(uint64_t token)
 {
+    int needs_collection = 0;
     TEMP_LOCK();
+    if (clipboard_token == token) { TEMP_UNLOCK(); return; }
     clipboard_token = token;
     AsbClipboardTemp **cursor = &published;
     while (*cursor) {
         AsbClipboardTemp *temp = *cursor;
-        if (temp->token != token) { *cursor = temp->next; retire_locked(temp, (uint64_t)time(NULL) + ASB_CLIP_TEMP_RETENTION); }
+        if (temp->token != token) {
+            *cursor = temp->next;
+            retire_locked(temp, (uint64_t)time(NULL) + ASB_CLIP_TEMP_RETENTION);
+            needs_collection = 1;
+        }
         else cursor = &temp->next;
     }
     TEMP_UNLOCK();
-    wake_collector();
+    if (needs_collection) wake_collector();
 }
 
 void asb_clipboard_temp_retire_owner(const void *owner)
 {
+    int needs_collection = 0;
     TEMP_LOCK();
     AsbClipboardTemp **cursor = &published;
     while (*cursor) {
         AsbClipboardTemp *temp = *cursor;
-        if (temp->owner == owner) { *cursor = temp->next; retire_locked(temp, (uint64_t)time(NULL) + ASB_CLIP_TEMP_RETENTION); }
+        if (temp->owner == owner) {
+            *cursor = temp->next;
+            retire_locked(temp, (uint64_t)time(NULL) + ASB_CLIP_TEMP_RETENTION);
+            needs_collection = 1;
+        }
         else cursor = &temp->next;
     }
     TEMP_UNLOCK();
-    wake_collector();
+    if (needs_collection) wake_collector();
 }
 
 void asb_clipboard_temp_shutdown(void)

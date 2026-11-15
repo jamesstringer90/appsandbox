@@ -120,6 +120,7 @@ struct VmClipboardData {
     int              reader_fetch_idx;
     BOOL             reader_ready;
     LONG             reader_generation;
+    HGLOBAL          reader_hdrop;
 
     /* Temp directory for file transfers */
     wchar_t          temp_dir[MAX_PATH];
@@ -788,6 +789,8 @@ static void clip_reader_free_pending(VmClipboard clip)
             clip->reader_fmts[i].data = NULL;
         }
     }
+    if (clip->reader_hdrop) GlobalFree(clip->reader_hdrop);
+    clip->reader_hdrop = NULL;
     asb_clipboard_temp_discard(clip->temp);
     clip->temp = NULL;
     clip->temp_dir[0] = 0;
@@ -799,12 +802,13 @@ static void clip_reader_request_next(VmClipboard clip, SOCKET s)
 
     if (!clip->sharing_enabled || clip->reader_generation != clip->sharing_generation) return;
     if (clip->reader_fetch_idx >= clip->reader_fmt_count) {
-        if (clip->temp && !asb_clipboard_temp_prepare(clip->temp)) {
+        if (clip->temp && (!asb_clipboard_temp_prepare(clip->temp) ||
+            !(clip->reader_hdrop = clip_build_hdrop_from_temp(clip->temp_dir)))) {
             EnterCriticalSection(&clip->reader_cs);
             clip_reader_free_pending(clip);
             clip->reader_fmt_count = 0;
             LeaveCriticalSection(&clip->reader_cs);
-            clip_log(clip, L"CLIP-R: Could not prepare clipboard file permissions.");
+            clip_log(clip, L"CLIP-R: Could not prepare clipboard files.");
             return;
         }
         EnterCriticalSection(&clip->reader_cs);
@@ -1187,10 +1191,9 @@ ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)
 
     for (i = 0; i < clip->reader_fmt_count; i++) {
         if (clip->reader_fmts[i].is_hdrop) {
-            HGLOBAL hDrop = clip_build_hdrop_from_temp(clip->temp_dir);
-            if (hDrop) {
-                if (SetClipboardData(clip->reader_fmts[i].local_id, hDrop)) files_published = TRUE;
-                else GlobalFree(hDrop);
+            if (clip->reader_hdrop && SetClipboardData(clip->reader_fmts[i].local_id, clip->reader_hdrop)) {
+                clip->reader_hdrop = NULL;
+                files_published = TRUE;
             }
         } else if (clip->reader_fmts[i].data && clip->reader_fmts[i].data_size > 0) {
             HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, clip->reader_fmts[i].data_size);
