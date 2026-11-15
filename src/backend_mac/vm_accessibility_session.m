@@ -170,17 +170,10 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
     if (!_started || connection != _connection) return;
     if ([state isKindOfClass:VmAccessibilitySnapshot.class]) {
         VmAccessibilitySnapshot *snapshot = state;
-        if (connection.supportsRefresh && snapshot.refreshGeneration < _requestedRefresh) return;
-        if (snapshot.truncated) {
-            _snapshot = nil;
-            _pending = NO;
-            _status = @"The guest could not provide a complete accessibility tree.";
-        } else {
-            if ([_snapshot.session isEqual:snapshot.session] && snapshot.revision <= _snapshot.revision) return;
-            _snapshot = snapshot;
-            _pending = NO;
-            _status = @"";
-        }
+        if ([_snapshot.session isEqual:snapshot.session] && snapshot.revision <= _snapshot.revision) return;
+        _snapshot = snapshot;
+        _pending = snapshot.truncated || (connection.supportsRefresh && snapshot.refreshGeneration < _requestedRefresh);
+        _status = _pending ? @"Guest accessibility is updating." : @"";
         [self publishSnapshot:YES];
         return;
     }
@@ -193,6 +186,12 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
             _status = @"Guest accessibility is updating.";
             [self publishSnapshot:NO];
         }
+        return;
+    }
+    if ([status isEqual:@"captureFailed"] && _snapshot) {
+        _pending = YES;
+        _status = @"Guest accessibility is updating.";
+        [self publishSnapshot:NO];
         return;
     }
     _snapshot = nil;
@@ -236,7 +235,8 @@ static NSEvent *VmAccessibilityEventForWindow(CGEventRef input, NSWindow *window
     BOOL geometry = _displayAvailable && !self.view.window.miniaturized &&
         (!_snapshot || VmAccessibilityDisplayPixelsCompatible(_displayPixels, _snapshot.pixels));
     NSMutableDictionary *message = [@{@"type": @"tree", @"epoch": @(_epoch),
-        @"mirroring": @(_snapshot && !_pending && geometry), @"pending": @(_pending && _connection != nil),
+        @"mirroring": @(_snapshot && geometry), @"pending": @(_pending && _connection != nil),
+        @"snapshotAvailable": @(_snapshot != nil),
         @"navigationQueries": @(_connection.supportsNavigationQueries),
         @"frame": @[@(frame.origin.x), @(frame.origin.y), @(frame.size.width), @(frame.size.height)],
         @"keyWindow": @(self.view.window.keyWindow), @"name": _name, @"status": _status ?: @""} mutableCopy];

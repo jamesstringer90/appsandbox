@@ -177,16 +177,18 @@ static NSDictionary *AXRecord(NSDictionary *record, NSDictionary *records) {
     if ([p[@"IsWindowPatternAvailable"] boolValue]) attributes[@"AXModal"] = @([p[@"WindowIsModal"] boolValue]);
     NSInteger control = [p[@"ControlType"] integerValue];
     NSString *text = p[@"Text.DocumentText"];
+    if (secure && AsbAXIsMaskedValue(text) && ![attributes[@"AXValue"] length]) attributes[@"AXValue"] = text;
     if (!secure && text && (control == 50004 || control == 50030)) {
         attributes[@"AXValue"] = text;
         attributes[@"AXNumberOfCharacters"] = @(text.length);
         [parameters addObjectsFromArray:@[@"AXStringForRange", @"AXBoundsForRange", @"AXAttributedStringForRange", @"AXRangeForPosition"]];
+        if (enabled && [p[@"Text.SupportedTextSelection"] integerValue] > 0)
+            [writable addObject:@"AXSelectedTextRange"];
         NSArray *selected = p[@"Text.Selection"];
         if (selected.count == 1) {
             NSArray *bounds = selected[0];
             attributes[@"AXSelectedTextRange"] = AXValue(@"range", bounds);
             attributes[@"AXSelectedText"] = [text substringWithRange:NSMakeRange([bounds[0] unsignedIntegerValue], [bounds[1] unsignedIntegerValue])];
-            if (enabled) [writable addObject:@"AXSelectedTextRange"];
         }
     }
     NSDictionary *relations = @{@"SelectionSelection": @"AXSelectedChildren", @"TableColumnHeaders": @"AXColumnHeaderUIElements",
@@ -210,6 +212,7 @@ static NSDictionary *AXRecord(NSDictionary *record, NSDictionary *records) {
     NSMutableOrderedSet *names = [NSMutableOrderedSet orderedSetWithArray:@[@"AXRole", @"AXRoleDescription", @"AXParent", @"AXWindow", @"AXTopLevelUIElement",
         @"AXChildren", @"AXPosition", @"AXSize", @"AXEnabled", @"AXFocused", @"AXDescription"]];
     if (secure) [names addObject:@"AXSubrole"];
+    if ([writable containsObject:@"AXSelectedTextRange"]) [names addObject:@"AXSelectedTextRange"];
     [names addObjectsFromArray:[attributes.allKeys sortedArrayUsingSelector:@selector(compare:)]];
     node[@"attributes"] = attributes; node[@"attributeNames"] = names.array;
     node[@"writableAttributes"] = writable.array; node[@"actions"] = actions.array; node[@"parameterizedNames"] = parameters;
@@ -439,7 +442,10 @@ static NSDictionary *AXResponse(NSDictionary *response, NSString *action) {
     NSDictionary *response = call(operation, nodeID, argument, nil);
     if (![response[@"ok"] boolValue]) return response;
     id result = response[@"value"];
-    if (cell) return UiaReference(result) ? AXSuccess(AXValue(@"element", UiaReference(result))) : AXFailure(kAXErrorCannotComplete);
+    if (cell) {
+        if (result == NSNull.null) return AXFailure(kAXErrorNoValue);
+        return UiaReference(result) ? AXSuccess(AXValue(@"element", UiaReference(result))) : AXFailure(kAXErrorCannotComplete);
+    }
     if (point) return AsbAXFiniteArray(result, 2, YES) ? AXSuccess(AXValue(@"range", result)) : AXFailure(kAXErrorCannotComplete);
     if ([attribute isEqual:@"AXStringForRange"]) return VmAccessibilityIsString(result, ASB_AX_MAX_STRING) ? AXSuccess(result) : AXFailure(kAXErrorCannotComplete);
     if ([attribute isEqual:@"AXBoundsForRange"]) {

@@ -150,15 +150,12 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
     NSDictionary *previousElements = _elements;
     NSDictionary *previousAuxiliaryElements = nil;
     VmAccessibilitySnapshot *snapshot = message[@"snapshot"] ? VmAccessibilityParseSnapshot(message[@"snapshot"]) :
-        ([message[@"mirroring"] boolValue] || [message[@"pending"] boolValue] ? previous[@"snapshot"] : nil);
+        ([message[@"snapshotAvailable"] boolValue] || [message[@"mirroring"] boolValue] ||
+            [message[@"pending"] boolValue] ? previous[@"snapshot"] : nil);
     BOOL mirroring = [message[@"mirroring"] boolValue] && snapshot != nil;
-    NSDictionary *elements = @{};
-    if (!mirroring && [message[@"pending"] boolValue]) {
-        snapshot = previous[@"snapshot"];
-        elements = previous[@"elements"] ?: @{};
-    }
+    NSDictionary *elements = snapshot ? _elements ?: @{} : @{};
     [_condition lock];
-    if (mirroring && message[@"snapshot"]) {
+    if (snapshot && message[@"snapshot"]) {
         NSMutableDictionary *updatedElements = [NSMutableDictionary dictionary];
         [_auxiliaryRecords removeAllObjects];
         if (![snapshot.session isEqual:[previous[@"snapshot"] session]]) {
@@ -178,12 +175,13 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
         }
         elements = updatedElements;
         _elements = elements;
-    } else if (mirroring) elements = previous[@"elements"] ?: @{};
+    }
     NSString *name = [snapshot.app[@"name"] length] ? snapshot.app[@"name"] : snapshot.app[@"bundleId"];
     NSMutableDictionary *state = [@{ @"mirroring": @(mirroring), @"pending": message[@"pending"] ?: @NO,
         @"navigationQueries": message[@"navigationQueries"] ?: @NO,
         @"epoch": message[@"epoch"] ?: @0, @"frame": [NSValue valueWithRect:frame],
-        @"keyWindow": message[@"keyWindow"] ?: @NO, @"elements": elements,
+        @"keyWindow": message[@"keyWindow"] ?: @NO,
+        @"elements": mirroring || [message[@"pending"] boolValue] ? elements : @{},
         @"label": name ? [NSString stringWithFormat:@"%@ in %@", name, message[@"name"]] : message[@"name"],
         @"status": message[@"status"] ?: @"Guest accessibility is unavailable." } mutableCopy];
     if (snapshot) state[@"snapshot"] = snapshot;
@@ -196,7 +194,7 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
         ![oldSnapshot.roots isEqual:snapshot.roots] || oldSnapshot.nodes.count != snapshot.nodes.count;
     for (VmAccessibilityElement *element in previousAuxiliaryElements.allValues)
         if (elements[element.nodeID] != element) [element retire];
-    if (mirroring && message[@"snapshot"]) {
+    if (snapshot && message[@"snapshot"]) {
         for (NSString *identifier in previousElements) {
             if (previousElements[identifier] != elements[identifier]) {
                 [previousElements[identifier] retire];
@@ -216,7 +214,7 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
                 NSAccessibilityPostNotification(elements[identifier], NSAccessibilitySelectedTextChangedNotification);
         }
     }
-    if (changed && ![state[@"pending"] boolValue])
+    if (changed && (mirroring || ![state[@"pending"] boolValue]))
         NSAccessibilityPostNotification(_root, NSAccessibilityLayoutChangedNotification);
     if (mirroring && [message[@"keyWindow"] boolValue] && snapshot.focused &&
         (newSession || ![oldSnapshot.focused isEqual:snapshot.focused]))
@@ -225,7 +223,7 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
 - (NSDictionary *)stateWaiting:(BOOL)wait {
     [_condition lock];
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.2];
-    while (wait && !NSThread.isMainThread && [_state[@"pending"] boolValue])
+    while (wait && !NSThread.isMainThread && ![_state[@"mirroring"] boolValue] && [_state[@"pending"] boolValue])
         if (![_condition waitUntilDate:deadline]) break;
     NSDictionary *state = _state;
     [_condition unlock];
@@ -246,7 +244,7 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
     if (!element) return nil;
     NSDictionary *state = [self stateWaiting:NO];
     if (element == _root) return @{ @"label": state[@"label"], @"enabled": @YES,
-        @"attributes": @{@"AXElementBusy": state[@"pending"] ?: @NO} };
+        @"attributes": @{@"AXElementBusy": [state[@"pending"] boolValue] ? @YES : @NO} };
     if (element == _status) return @{ @"label": state[@"status"],
         @"role": [state[@"pending"] boolValue] ? NSAccessibilityBusyIndicatorRole : NSAccessibilityStaticTextRole,
         @"enabled": @NO };
@@ -271,11 +269,13 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
     NSDictionary *state = [self stateWaiting:element == _root];
     if (element == _root && ![state[@"mirroring"] boolValue]) return @[_status];
     VmAccessibilitySnapshot *snapshot = state[@"snapshot"];
-    NSArray *ids = element == _root ? snapshot.roots : [self recordForElement:element][@"children"];
+    BOOL captured = element == _root || state[@"elements"][element.nodeID] == element;
+    NSArray *ids = element == _root ? snapshot.roots :
+        captured ? snapshot.nodes[element.nodeID][@"children"] : [self recordForElement:element][@"children"];
     NSMutableArray *children = [NSMutableArray array];
     for (NSString *nodeID in ids) {
-        id child = [self elementForIdentifier:nodeID session:snapshot.session];
-        if (child) [children addObject:child];
+        VmAccessibilityElement *child = captured ? state[@"elements"][nodeID] : [self elementForIdentifier:nodeID session:snapshot.session];
+        if (child && !child.retired) [children addObject:child];
     }
     return children;
 }
@@ -293,16 +293,7 @@ static id VmAccessibilityRecordValue(NSDictionary *record) {
     NSRect frame = [state[@"frame"] rectValue];
     if (element == _root || element == _status) return frame;
     VmAccessibilitySnapshot *snapshot = state[@"snapshot"];
-    NSArray *raw;
-    if ([state[@"pending"] boolValue]) {
-        if (NSThread.isMainThread) return NSZeroRect;
-        NSDictionary *response = [self request:@{@"action": @"getFrame"} element:element];
-        if (![response[@"ok"] boolValue] || !AsbAXFiniteArray(response[@"value"], 4, NO)) return NSZeroRect;
-        NSDictionary *current = [self stateWaiting:NO];
-        if (![current[@"epoch"] isEqual:state[@"epoch"]] || ![self isCurrentElement:element]) return NSZeroRect;
-        raw = response[@"value"];
-        frame = [current[@"frame"] rectValue];
-    } else raw = [self recordForElement:element][@"frame"];
+    NSArray *raw = [self recordForElement:element][@"frame"];
     if (!raw || snapshot.pixels.width <= 0 || snapshot.pixels.height <= 0) return NSZeroRect;
     NSRect guest = NSMakeRect([raw[0] doubleValue], [raw[1] doubleValue], [raw[2] doubleValue], [raw[3] doubleValue]);
     if (NSIsEmptyRect(guest)) return NSZeroRect;

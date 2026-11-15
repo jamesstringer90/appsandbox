@@ -211,8 +211,7 @@ static int capture_continue(void *context) {
     size_t count;
     observe_changes(s);
     c->connected = c->connected && expire_pending(s);
-    if (is_stopping() || !c->connected || !s->subscribed || s->work_generation != c->generation ||
-        GetTickCount64() - c->started >= ASB_AX_CAPTURE_TIMEOUT_MS) return 0;
+    if (is_stopping() || !c->connected || !s->subscribed || s->work_generation != c->generation) return 0;
     if (GetTickCount64() >= c->tick) {
         c->connected = status_message(s, L"updating", 0);
         c->tick = GetTickCount64() + 500;
@@ -228,9 +227,19 @@ static int capture_continue(void *context) {
             s->deferred_message = message; return 0;
         }
         c->connected = handle(s, message); ax_json_release(message);
-        if (!s->subscribed || s->work_generation != c->generation ||
-            GetTickCount64() - c->started >= ASB_AX_CAPTURE_TIMEOUT_MS) return 0;
+        if (!s->subscribed || s->work_generation != c->generation) return 0;
     }
+    return c->connected;
+}
+static int publish_capture(void *context, AccessibilityJson *snapshot) {
+    CaptureContext *c = context;
+    AccessibilitySession *s = c->session;
+    ax_json_set(snapshot, L"type", ax_json_string(L"snapshot"));
+    ax_json_set(snapshot, L"version", ax_json_number(ASB_AX_VERSION));
+    ax_json_set(snapshot, L"session", ax_json_string(s->session));
+    ax_json_set(snapshot, L"revision", ax_json_number((double)++s->revision));
+    ax_json_set(snapshot, L"refreshGeneration", ax_json_number((double)s->refresh_generation));
+    c->connected = write_message(s->connection, snapshot);
     return c->connected;
 }
 static void run_session(AccessibilityUia *uia, AsbConn *connection) {
@@ -274,19 +283,14 @@ static void run_session(AccessibilityUia *uia, AsbConn *connection) {
                 context.session = &s; context.started = GetTickCount64(); context.tick = context.started + 500; context.connected = 1;
                 context.generation = s.work_generation;
                 s.capture_requested = 0; s.background_capture_requested = 0; s.capturing = 1;
-                capture_result = accessibility_uia_capture(uia, context.started + ASB_AX_CAPTURE_TIMEOUT_MS, capture_continue, &context, &snapshot);
+                capture_result = accessibility_uia_capture(uia, context.started + ASB_AX_CAPTURE_TIMEOUT_MS, capture_continue, publish_capture, &context, &snapshot);
                 s.capturing = 0;
                 if (!context.connected) { ax_json_release(snapshot); break; }
                 if (s.work_generation != context.generation || !s.subscribed ||
                     capture_result == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
                     ax_json_release(snapshot);
                 } else if (SUCCEEDED(capture_result)) {
-                    ax_json_set(snapshot, L"type", ax_json_string(L"snapshot"));
-                    ax_json_set(snapshot, L"version", ax_json_number(ASB_AX_VERSION));
-                    ax_json_set(snapshot, L"session", ax_json_string(s.session));
-                    ax_json_set(snapshot, L"revision", ax_json_number((double)++s.revision));
-                    ax_json_set(snapshot, L"refreshGeneration", ax_json_number((double)s.refresh_generation));
-                    ready = write_message(connection, snapshot); ax_json_release(snapshot); if (!ready) break;
+                    ready = publish_capture(&context, snapshot); ax_json_release(snapshot); if (!ready) break;
                     s.capture_failures = 0;
                 } else if (!accessibility_uia_active(uia) || GetForegroundWindow() != foreground) {
                     s.capture_requested = s.subscribed; s.background_capture_requested = 0;
@@ -300,7 +304,7 @@ static void run_session(AccessibilityUia *uia, AsbConn *connection) {
                     }
                 }
                 finished = GetTickCount64(); background_delay = 3 * (finished - context.started);
-                s.background_capture_after = finished + (background_delay < 1000 ? 1000 : background_delay);
+                s.background_capture_after = finished + (background_delay < 1000 ? 1000 : background_delay > 2000 ? 2000 : background_delay);
                 if (s.capture_requested && s.background_capture_requested && s.capture_after < s.background_capture_after)
                     s.capture_after = s.background_capture_after;
                 heartbeat = GetTickCount64() + 1000;

@@ -56,12 +56,17 @@ static id GuestAccessibilityValueWithoutError(id value) {
     return value;
 }
 
-static BOOL GuestAccessibilityIsUnexpectedError(id value) {
+static AXError GuestAccessibilityAttributeError(id value) {
     if (!value || CFGetTypeID((__bridge CFTypeRef)value) != AXValueGetTypeID() ||
-        AXValueGetType((__bridge AXValueRef)value) != kAXValueAXErrorType) return NO;
+        AXValueGetType((__bridge AXValueRef)value) != kAXValueAXErrorType) return kAXErrorSuccess;
     AXError error = kAXErrorSuccess;
-    return AXValueGetValue((__bridge AXValueRef)value, kAXValueAXErrorType, &error) &&
-        error != kAXErrorSuccess && error != kAXErrorNoValue && error != kAXErrorAttributeUnsupported;
+    AXValueGetValue((__bridge AXValueRef)value, kAXValueAXErrorType, &error);
+    return error;
+}
+
+static BOOL GuestAccessibilityIsUnexpectedError(id value) {
+    AXError error = GuestAccessibilityAttributeError(value);
+    return error != kAXErrorSuccess && error != kAXErrorNoValue && error != kAXErrorAttributeUnsupported;
 }
 
 static BOOL GuestAccessibilityIsMissingAttribute(id value) {
@@ -87,20 +92,6 @@ static NSArray *GuestAccessibilityReadAttributes(AXUIElementRef element, NSArray
         return nil;
     }
     return CFBridgingRelease(values);
-}
-
-static NSArray *GuestAccessibilityReadSupportedAttributes(AXUIElementRef element, NSArray *attributes,
-                                                         NSArray *supported, AXError *outError) {
-    NSMutableArray *requested = NSMutableArray.array;
-    for (NSString *name in attributes)
-        if ([supported containsObject:name]) [requested addObject:name];
-    NSArray *values = GuestAccessibilityReadAttributes(element, requested, outError);
-    if (!values || values.count != requested.count) return nil;
-    NSMutableArray *expanded = [NSMutableArray arrayWithCapacity:attributes.count];
-    NSUInteger index = 0;
-    for (NSString *name in attributes)
-        [expanded addObject:[supported containsObject:name] ? values[index++] : NSNull.null];
-    return expanded;
 }
 
 static NSArray *GuestAccessibilityElementArray(id value) {
@@ -188,8 +179,6 @@ static NSDictionary *GuestAccessibilityCaptureContext(void) {
 @property(nonatomic) BOOL secureSticky;
 @property(nonatomic, copy) NSArray *attributeNames;
 @property(nonatomic, copy) NSArray *parameterizedNames;
-@property(nonatomic, copy) NSArray *writableAttributes;
-@property(nonatomic, copy) NSDictionary *settable;
 @property(nonatomic, copy) NSDictionary *actionDescriptions;
 @property(nonatomic) AXError capabilityError;
 @property(nonatomic) AXError actionNamesError;
@@ -221,6 +210,9 @@ static NSDictionary *GuestAccessibilityCaptureContext(void) {
 @property(nonatomic) double nextSnapshot;
 @property(nonatomic) uint64_t revision;
 @property(nonatomic) uint64_t publishedRevision;
+@property(nonatomic) uint64_t snapshotSequence;
+@property(nonatomic, copy) NSDictionary<NSString *, NSDictionary *> *publishedNodes;
+@property(nonatomic) pid_t publishedPID;
 @property(nonatomic) uint64_t refreshGeneration;
 @property(nonatomic) uint64_t nextIdentifier;
 @property(nonatomic) uint64_t workGeneration;
@@ -259,6 +251,7 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
     id _inputMonitor;
     id _applicationMonitor;
     AXObserverRef _accessibilityObserver;
+    id _displayMonitor;
     pid_t _observedPID;
     uint64_t _systemInput;
     uint64_t _observedSystemInput;
@@ -285,6 +278,7 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
 - (void)dealloc {
     if (_inputMonitor) [NSEvent removeMonitor:_inputMonitor];
     if (_applicationMonitor) [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:_applicationMonitor];
+    if (_displayMonitor) [NSNotificationCenter.defaultCenter removeObserver:_displayMonitor];
     if (_accessibilityObserver) {
         CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(_accessibilityObserver), kCFRunLoopCommonModes);
         CFRelease(_accessibilityObserver);
@@ -308,6 +302,9 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
         handler:^(NSEvent *event) { (void)event; [weakSelf noteSystemInput]; }];
     if (!_applicationMonitor) _applicationMonitor = [NSWorkspace.sharedWorkspace.notificationCenter
         addObserverForName:NSWorkspaceDidActivateApplicationNotification object:nil queue:nil
+        usingBlock:^(NSNotification *notification) { (void)notification; [weakSelf noteSystemInput]; }];
+    if (!_displayMonitor) _displayMonitor = [NSNotificationCenter.defaultCenter
+        addObserverForName:NSApplicationDidChangeScreenParametersNotification object:NSApp queue:nil
         usingBlock:^(NSNotification *notification) { (void)notification; [weakSelf noteSystemInput]; }];
 }
 
@@ -575,25 +572,6 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
     if (parameterError == kAXErrorSuccess || parameterError == kAXErrorNotImplemented || parameterError == kAXErrorAttributeUnsupported)
         record.parameterizedNames = CFBridgingRelease(parameters) ?: @[];
     else if (parameters) CFRelease(parameters);
-    if (record.attributeNames) {
-        NSMutableArray *writable = NSMutableArray.array;
-        NSMutableDictionary *known = NSMutableDictionary.dictionary;
-        for (NSString *attribute in record.attributeNames) {
-            if (GuestAccessibilityMonotonicTime() >= deadline) { record.capabilityError = kAXErrorCannotComplete; return; }
-            Boolean settable = false;
-            AXError error = AXUIElementIsAttributeSettable(record.element, (__bridge CFStringRef)attribute, &settable);
-            if (error == kAXErrorCannotComplete || error == kAXErrorInvalidUIElement) {
-                record.capabilityError = error;
-                return;
-            }
-            if (error == kAXErrorSuccess || error == kAXErrorAttributeUnsupported || error == kAXErrorNotImplemented) {
-                known[attribute] = @(error == kAXErrorSuccess && settable);
-                if ([known[attribute] boolValue]) [writable addObject:attribute];
-            }
-        }
-        record.settable = known;
-        record.writableAttributes = writable;
-    }
     NSMutableDictionary *descriptions = NSMutableDictionary.dictionary;
     for (NSString *action in record.actions) {
         CFStringRef description = NULL;
@@ -639,9 +617,8 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
     NSMutableDictionary *errors = NSMutableDictionary.dictionary;
     for (NSUInteger i = 0; i < values.count; i++) {
         NSString *name = capturedNames[i];
-        if (GuestAccessibilityIsUnexpectedError(values[i])) {
-            AXError error = kAXErrorFailure;
-            AXValueGetValue((__bridge AXValueRef)values[i], kAXValueAXErrorType, &error);
+        AXError error = GuestAccessibilityAttributeError(values[i]);
+        if (error != kAXErrorSuccess) {
             if (error == kAXErrorInvalidUIElement) return nil;
             errors[name] = @(error);
         }
@@ -654,7 +631,7 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
     }
     NSMutableDictionary *node = [@{@"id": record.identifier, @"actions": record.actions ?: @[],
         @"attributeNames": record.attributeNames, @"parameterizedNames": record.secure ? @[] : (record.parameterizedNames ?: @[]),
-        @"writableAttributes": record.writableAttributes ?: @[], @"settable": record.settable ?: @{}, @"actionDescriptions": record.actionDescriptions ?: @{},
+        @"actionDescriptions": record.actionDescriptions ?: @{},
         @"attributes": attributes, @"enabled": attributes[@"AXEnabled"] ?: @YES,
         @"focused": attributes[@"AXFocused"] ?: @NO, @"secure": @(record.secure),
         @"role": attributes[@"AXRole"] ?: @"AXUnknown", @"frame": @[@0, @0, @0, @0]} mutableCopy];
@@ -729,6 +706,11 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
             depths[record.identifier] = @0;
         }
     }
+    if (queue.count > 1 && GuestAccessibilityElementArray(rootValues[0]).count) {
+        GuestAccessibilityRecord *menu = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        [queue addObject:menu];
+    }
     NSArray *attributes = @[(__bridge NSString *)kAXRoleAttribute, (__bridge NSString *)kAXSubroleAttribute,
         (__bridge NSString *)kAXTitleAttribute, (__bridge NSString *)kAXDescriptionAttribute,
         (__bridge NSString *)kAXValueAttribute, (__bridge NSString *)kAXEnabledAttribute,
@@ -738,9 +720,14 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
     NSMutableArray<NSMutableDictionary *> *nodes = NSMutableArray.array;
     NSString *focused = nil;
     NSUInteger estimatedBytes = 2048;
+    double publishAfter = GuestAccessibilityMonotonicTime() + 0.25;
     for (NSUInteger cursor = 0; cursor < queue.count; cursor++) {
         if (g_stop) return nil;
-        if ([self collectionInterrupted]) return nil;
+        if ([self collectionInterrupted]) {
+            if (self.connectionFailed || !self.subscribed || self.workGeneration != self.collectingGeneration) return nil;
+            truncated = YES;
+            break;
+        }
         if (estimatedBytes >= ASB_AX_MAX_MESSAGE * 3 / 4) {
             truncated = YES;
             break;
@@ -750,7 +737,7 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
             AXUIElementSetMessagingTimeout(record.element, 1.0f);
             [self updateCapabilities:record deadline:self.captureDeadline > 0 ? self.captureDeadline : GuestAccessibilityMonotonicTime() + ASB_AX_CAPTURE_TIMEOUT_MS / 1000.0];
             if (record.capabilityError == kAXErrorInvalidUIElement) continue;
-            if (record.capabilityError != kAXErrorSuccess) return nil;
+            if (record.capabilityError != kAXErrorSuccess) { truncated = YES; break; }
             NSMutableArray *remaining = [AsbAXCaptureAttributeNames(record.attributeNames) mutableCopy];
             [remaining removeObjectsInArray:attributes];
             double attributeReadStartedAt = GuestAccessibilityMonotonicTime();
@@ -759,27 +746,27 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
             if (extraError == kAXErrorInvalidUIElement) continue;
             if (extraError == kAXErrorSuccess && extraValues.count != remaining.count) return nil;
             AXError bulkError = kAXErrorSuccess;
-            NSArray *values = GuestAccessibilityReadSupportedAttributes(record.element, attributes, record.attributeNames, &bulkError);
+            NSArray *values = GuestAccessibilityReadAttributes(record.element, attributes, &bulkError);
             if (bulkError == kAXErrorInvalidUIElement && ![roots containsObject:record.identifier]) continue;
             if (values.count != attributes.count) {
                 return nil;
             }
-            BOOL invalid = NO;
+            BOOL invalid = NO, attributeReadFailed = extraError != kAXErrorSuccess;
             NSMutableDictionary *attributeErrors = NSMutableDictionary.dictionary;
             for (NSUInteger index = 0; index < values.count; index++) {
                 id value = values[index];
-                if (!GuestAccessibilityIsUnexpectedError(value)) continue;
-                AXError error = kAXErrorSuccess;
-                AXValueGetValue((__bridge AXValueRef)value, kAXValueAXErrorType, &error);
+                AXError error = GuestAccessibilityAttributeError(value);
+                if (error == kAXErrorSuccess) continue;
+                if (GuestAccessibilityIsUnexpectedError(value)) attributeReadFailed = YES;
                 if (error == kAXErrorInvalidUIElement) {
                     if ([roots containsObject:record.identifier]) return nil;
                     invalid = YES;
                 } else attributeErrors[attributes[index]] = @(error);
             }
             for (NSUInteger index = 0; index < extraValues.count; index++) {
-                if (!GuestAccessibilityIsUnexpectedError(extraValues[index])) continue;
-                AXError error = kAXErrorSuccess;
-                AXValueGetValue((__bridge AXValueRef)extraValues[index], kAXValueAXErrorType, &error);
+                AXError error = GuestAccessibilityAttributeError(extraValues[index]);
+                if (error == kAXErrorSuccess) continue;
+                if (GuestAccessibilityIsUnexpectedError(extraValues[index])) attributeReadFailed = YES;
                 if (error == kAXErrorInvalidUIElement) invalid = YES;
                 else attributeErrors[remaining[index]] = @(error);
             }
@@ -797,7 +784,7 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
                     ![rawRole hasPrefix:@"AX"];
             }
             record.seenRevision = self.revision;
-            record.attributeReadStartedAt = attributeErrors.count ? 0 : attributeReadStartedAt;
+            record.attributeReadStartedAt = attributeReadFailed ? 0 : attributeReadStartedAt;
             NSMutableDictionary *node = [@{@"id": record.identifier, @"role": role,
                 @"enabled": @YES, @"focused": @NO, @"secure": @(record.secure),
                 @"frame": @[@0, @0, @0, @0]} mutableCopy];
@@ -900,27 +887,70 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
                 label = GuestAccessibilityString(attributedDescription[@"value"]);
             if (title) node[@"title"] = title;
             if (label) node[@"label"] = label;
-            if (!record.actions || !record.attributeNames || !record.parameterizedNames || !record.writableAttributes) truncated = YES;
+            if (!record.actions || !record.attributeNames || !record.parameterizedNames) truncated = YES;
             estimatedBytes += 1536 + title.length * 3 + label.length * 3 + children.count * 32;
             if ([node[@"value"] isKindOfClass:NSString.class]) estimatedBytes += [node[@"value"] length] * 3;
             [nodes addObject:node];
         }
+        double now = GuestAccessibilityMonotonicTime();
+        if (now >= publishAfter) {
+            NSDictionary *progress = [self snapshotWithNodes:nodes roots:roots focused:focused context:context truncated:YES];
+            if (progress && ![self publish:progress]) { self.connectionFailed = YES; return nil; }
+            self.captureDeadline = GuestAccessibilityMonotonicTime() + ASB_AX_CAPTURE_TIMEOUT_MS / 1000.0;
+            publishAfter = GuestAccessibilityMonotonicTime() + 0.5;
+        }
+    }
+    return [self snapshotWithNodes:nodes roots:roots focused:focused context:context truncated:truncated];
+}
+
+- (BOOL)publish:(NSDictionary *)snapshot {
+    if (![self send:snapshot]) return NO;
+    NSMutableDictionary *nodes = NSMutableDictionary.dictionary;
+    for (NSDictionary *node in snapshot[@"nodes"]) nodes[node[@"id"]] = node;
+    self.publishedNodes = nodes;
+    self.publishedPID = [snapshot[@"app"][@"pid"] intValue];
+    NSMutableSet *retained = [self.capturingRecords mutableCopy] ?: NSMutableSet.set;
+    [retained addObjectsFromArray:nodes.allKeys];
+    self.publishedRecords = retained;
+    self.publishedRevision = self.revision;
+    return YES;
+}
+
+- (NSDictionary *)snapshotWithNodes:(NSArray *)source roots:(NSArray *)sourceRoots focused:(NSString *)focused
+                            context:(NSDictionary *)context truncated:(BOOL)truncated {
+    NSMutableDictionary *available = truncated && self.publishedPID == [context[@"app"][@"pid"] intValue] ?
+        [self.publishedNodes mutableCopy] : NSMutableDictionary.dictionary;
+    if (!available) available = NSMutableDictionary.dictionary;
+    for (NSDictionary *node in source) available[node[@"id"]] = node;
+    NSMutableArray *nodes = NSMutableArray.array, *roots = NSMutableArray.array, *queue = NSMutableArray.array;
+    NSMutableSet *seen = NSMutableSet.set;
+    NSMutableDictionary *parents = NSMutableDictionary.dictionary, *depths = NSMutableDictionary.dictionary;
+    for (NSString *root in sourceRoots) if (available[root] && ![seen containsObject:root]) {
+        [roots addObject:root]; [queue addObject:root]; [seen addObject:root];
+    }
+    for (NSUInteger index = 0; index < queue.count; index++) {
+        NSString *identifier = queue[index];
+        NSMutableDictionary *node = [available[identifier] mutableCopy];
+        NSMutableArray *children = NSMutableArray.array;
+        for (NSString *child in node[@"children"]) if (available[child] && ![seen containsObject:child] && queue.count < ASB_AX_MAX_NODES && [depths[identifier] unsignedIntegerValue] < 127) {
+            [seen addObject:child]; [queue addObject:child]; [children addObject:child]; parents[child] = identifier;
+            depths[child] = @([depths[identifier] unsignedIntegerValue] + 1);
+        }
+        node[@"children"] = children;
+        [node removeObjectForKey:@"parent"];
+        if (parents[identifier]) node[@"parent"] = parents[identifier];
+        [nodes addObject:node];
     }
     for (NSMutableDictionary *node in nodes) {
         GuestAccessibilityRecord *record = self.records[node[@"id"]];
         node[@"actions"] = record.actions ?: @[];
         node[@"attributeNames"] = record.attributeNames ?: @[];
         node[@"parameterizedNames"] = record.secure ? @[] : (record.parameterizedNames ?: @[]);
-        node[@"writableAttributes"] = record.writableAttributes ?: @[];
-        node[@"settable"] = record.settable ?: @{};
         node[@"actionDescriptions"] = record.actionDescriptions ?: @{};
         if (record.actionNamesError != kAXErrorSuccess) node[@"actionNamesError"] = @(record.actionNamesError);
-        node[@"writableValue"] = @([record.writableAttributes containsObject:@"AXValue"]);
-        node[@"writableFocused"] = @([record.writableAttributes containsObject:@"AXFocused"]);
-        node[@"writableSelectedTextRange"] = @(!record.secure && [record.writableAttributes containsObject:@"AXSelectedTextRange"]);
     }
     NSMutableDictionary *snapshot = [@{@"type": @"snapshot", @"version": @(ASB_AX_VERSION),
-        @"session": self.session, @"revision": @(self.revision), @"app": context[@"app"],
+        @"session": self.session, @"revision": @(++self.snapshotSequence), @"app": context[@"app"],
         @"display": context[@"display"], @"roots": roots, @"nodes": nodes, @"truncated": @(truncated),
         @"refreshGeneration": @(self.refreshGeneration)} mutableCopy];
     for (;;) {
@@ -936,6 +966,14 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
                     (void)bindings;
                     return [emitted containsObject:identifier];
                 }]];
+            NSMutableDictionary *attributes = [node[@"attributes"] mutableCopy];
+            if ([attributes[@"AXChildren"] isKindOfClass:NSArray.class])
+                attributes[@"AXChildren"] = [attributes[@"AXChildren"] filteredArrayUsingPredicate:
+                    [NSPredicate predicateWithBlock:^BOOL(id reference, NSDictionary *bindings) {
+                        (void)bindings;
+                        return [reference isKindOfClass:NSDictionary.class] && [emitted containsObject:reference[@"value"]];
+                    }]];
+            node[@"attributes"] = attributes;
         }
         if (focused && [emitted containsObject:focused]) snapshot[@"focused"] = focused;
         else [snapshot removeObjectForKey:@"focused"];
@@ -1196,6 +1234,9 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
             self.captureDeadline = 0;
             self.revision = 0;
             self.publishedRevision = 0;
+            self.snapshotSequence = 0;
+            self.publishedNodes = nil;
+            self.publishedPID = 0;
             self.refreshGeneration = 0;
             self.workGeneration = 0;
             self.nextSnapshot = INFINITY;
@@ -1251,16 +1292,11 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
                                 NSDictionary *after = [self context];
                                 [self processSystemInput];
                                 if (self.collectingGeneration == self.workGeneration) {
-                                    BOOL complete = snapshot && ![snapshot[@"truncated"] boolValue] &&
-                                        GuestAccessibilityMonotonicTime() <= self.captureDeadline && [after[@"active"] boolValue] &&
+                                    BOOL complete = snapshot && [after[@"active"] boolValue] &&
                                         [after[@"app"][@"pid"] isEqual:context[@"app"][@"pid"]];
-                                    connected = complete ? [self send:snapshot] : [self sendStatus:@"captureFailed"];
+                                    connected = complete ? [self publish:snapshot] : [self sendStatus:@"captureFailed"];
                                     if (complete) {
                                         self.captureFailures = 0;
-                                        if (connected) {
-                                            self.publishedRecords = self.capturingRecords;
-                                            self.publishedRevision = self.revision;
-                                        }
                                     }
                                     else if (connected && ++self.captureFailures <= 2 && ![snapshot[@"truncated"] boolValue] &&
                                              [after[@"active"] boolValue] && [after[@"trusted"] boolValue] &&
@@ -1276,7 +1312,7 @@ static void GuestAccessibilityObserveChange(AXObserverRef observer, AXUIElementR
                         self.capturingRecords = nil;
                         [self expireRecords];
                         double finished = GuestAccessibilityMonotonicTime();
-                        self.backgroundCaptureAfter = finished + MAX(1.0, 3 * (finished - captureStarted));
+                        self.backgroundCaptureAfter = finished + MIN(2.0, MAX(1.0, 3 * (finished - captureStarted)));
                         if (self.captureRequested && self.backgroundCaptureRequested)
                             self.nextSnapshot = MAX(self.nextSnapshot, self.backgroundCaptureAfter);
                         self.nextHeartbeat = GuestAccessibilityMonotonicTime() + 1.0;

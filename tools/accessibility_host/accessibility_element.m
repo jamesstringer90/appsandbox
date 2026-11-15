@@ -7,6 +7,11 @@
 #pragma clang diagnostic ignored "-Wdeprecated-implementations"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
+static id VmAccessibilityError(AXError error) {
+    @throw [NSException exceptionWithName:NSAccessibilityException reason:@"Accessibility request failed"
+        userInfo:@{NSAccessibilityErrorCodeExceptionInfo: @(error)}];
+}
+
 @implementation VmAccessibilityElement
 - (NSDictionary *)record { return [self.owner recordForElement:self]; }
 - (void)retire {
@@ -27,7 +32,7 @@
     return role ?: NSAccessibilityStaticTextRole;
 }
 - (id)accessibilityValue {
-    if (self.record[@"attributeErrors"][@"AXValue"]) return nil;
+    if (self.record[@"attributeErrors"][@"AXValue"]) return VmAccessibilityError([self.record[@"attributeErrors"][@"AXValue"] intValue]);
     id encoded = self.record[@"attributes"][@"AXValue"];
     if ([self.record[@"secure"] boolValue]) {
         id value = encoded ?: self.record[@"value"];
@@ -41,7 +46,7 @@
 - (id)accessibilityTopLevelUIElement { return self.owner.window; }
 - (NSArray *)accessibilityChildren {
     NSDictionary *record = self.record;
-    if (record[@"attributeErrors"][@"AXChildren"]) return nil;
+    if (record[@"attributeErrors"][@"AXChildren"]) return VmAccessibilityError([record[@"attributeErrors"][@"AXChildren"] intValue]);
     if (!self.isAccessibilityElement) return @[];
     id encoded = record[@"attributes"][@"AXChildren"];
     if (encoded) {
@@ -85,19 +90,23 @@
     if (!self.record[@"attributeNames"] || self.container || self.status)
         [names addObjectsFromArray:@[@"AXRole", @"AXRoleDescription", @"AXParent", @"AXWindow", @"AXTopLevelUIElement",
             @"AXChildren", @"AXPosition", @"AXSize", @"AXEnabled", @"AXFocused"]];
+    if (self.container) [names addObject:@"AXFocusedUIElement"];
     NSDictionary *keys = @{@"title": @"AXTitle", @"label": @"AXDescription", @"value": @"AXValue", @"subrole": @"AXSubrole", @"selectedTextRange": @"AXSelectedTextRange"};
     for (NSString *key in keys) if (self.record[key]) [names addObject:keys[key]];
     [names addObjectsFromArray:[self.record[@"attributes"] allKeys] ?: @[]];
     if ([self.record[@"secure"] boolValue]) {
         for (NSString *name in [names.array copy])
             if ([name containsString:@"Text"] || [name containsString:@"Character"] ||
-                ([name isEqual:@"AXValue"] && !self.accessibilityValue)) [names removeObject:name];
+                ([name isEqual:@"AXValue"] && (self.record[@"attributeErrors"][@"AXValue"] || !self.accessibilityValue))) [names removeObject:name];
     }
     return names.array;
 }
 - (id)accessibilityAttributeValue:(NSString *)attribute {
     if (!self.isAccessibilityElement) return nil;
-    if (self.record[@"attributeErrors"][attribute]) return nil;
+    if (self.record[@"attributeErrors"][attribute]) return VmAccessibilityError([self.record[@"attributeErrors"][attribute] intValue]);
+    if (!self.container && !self.status && self.record[@"attributeNames"] &&
+        ![self.record[@"attributeNames"] containsObject:attribute] && ![attribute isEqual:@"AXFrame"])
+        return VmAccessibilityError(kAXErrorAttributeUnsupported);
     if ([attribute isEqual:@"AXRole"]) return self.accessibilityRole;
     if ([attribute isEqual:@"AXParent"]) return self.accessibilityParent;
     if ([attribute isEqual:@"AXWindow"] || [attribute isEqual:@"AXTopLevelUIElement"]) return self.owner.window;
@@ -105,8 +114,9 @@
     if ([attribute isEqual:@"AXPosition"]) return [NSValue valueWithPoint:self.accessibilityFrame.origin];
     if ([attribute isEqual:@"AXSize"]) return [NSValue valueWithSize:self.accessibilityFrame.size];
     if ([attribute isEqual:@"AXFrame"]) return [NSValue valueWithRect:self.accessibilityFrame];
-    if ([attribute isEqual:@"AXFocused"]) return @([self.owner focusedGuestElement] == self);
-    if ([attribute isEqual:@"AXEnabled"]) return @(!self.status && [self.record[@"enabled"] boolValue]);
+    if (self.container && [attribute isEqual:@"AXFocusedUIElement"]) return self.accessibilityFocusedUIElement;
+    if ([attribute isEqual:@"AXFocused"]) return [self.owner focusedGuestElement] == self ? @YES : @NO;
+    if ([attribute isEqual:@"AXEnabled"]) return !self.status && [self.record[@"enabled"] boolValue] ? @YES : @NO;
     if ([attribute isEqual:@"AXTitle"]) return self.record[@"title"];
     if ([attribute isEqual:@"AXDescription"]) return self.record[@"label"];
     if ([attribute isEqual:@"AXValue"]) return self.accessibilityValue;
@@ -123,7 +133,8 @@
     }
     if (AsbAXAttributeRequiresLiveQuery(attribute) && [self.record[@"attributeNames"] containsObject:attribute]) {
         NSDictionary *response = [self.owner request:@{@"action": @"getAttribute", @"attribute": attribute} element:self];
-        id result = [response[@"ok"] boolValue] ? [self decode:response[@"value"] geometry:YES] : nil;
+        if (![response[@"ok"] boolValue]) return VmAccessibilityError(response[@"error"] ? [response[@"error"] intValue] : kAXErrorCannotComplete);
+        id result = [self decode:response[@"value"] geometry:YES];
         return result == NSNull.null ? nil : result;
     }
     return nil;
@@ -133,6 +144,11 @@
     if (self.record[@"settable"][attribute]) return [self.record[@"settable"][attribute] boolValue];
     NSArray *writable = self.record[@"writableAttributes"];
     if (writable) return [writable containsObject:attribute];
+    if ([self.record[@"attributeNames"] containsObject:attribute]) {
+        NSDictionary *response = [self.owner request:@{@"action": @"isAttributeSettable", @"attribute": attribute} element:self];
+        if (![response[@"ok"] boolValue]) VmAccessibilityError(response[@"error"] ? [response[@"error"] intValue] : kAXErrorCannotComplete);
+        return [response[@"value"] boolValue];
+    }
     if ([attribute isEqual:@"AXValue"]) return [self.record[@"writableValue"] boolValue];
     if ([attribute isEqual:@"AXFocused"]) return [self.record[@"writableFocused"] boolValue];
     if ([attribute isEqual:@"AXSelectedTextRange"]) return [self.record[@"writableSelectedTextRange"] boolValue];
@@ -150,31 +166,35 @@
         NSRect guest = [[self.owner transformGeometry:[NSValue valueWithRect:frame] toGuest:YES] rectValue];
         wire = AsbAXEncodeValue([NSValue valueWithPoint:guest.origin], nil, 0);
     } else wire = [self encode:value geometry:YES];
-    NSDictionary *response = wire ? [self.owner request:@{@"action": @"setAttribute", @"attribute": attribute, @"value": wire} element:self] : nil;
-    if (![response[@"ok"] boolValue]) NSAccessibilityRaiseBadArgumentException(self, attribute, value);
+    if (!wire) VmAccessibilityError(kAXErrorIllegalArgument);
+    NSDictionary *response = [self.owner request:@{@"action": @"setAttribute", @"attribute": attribute, @"value": wire} element:self];
+    if (![response[@"ok"] boolValue]) VmAccessibilityError(response[@"error"] ? [response[@"error"] intValue] : kAXErrorCannotComplete);
 }
 - (NSArray *)accessibilityActionNames {
-    if (self.record[@"actionNamesError"]) return nil;
+    if (self.record[@"actionNamesError"]) return VmAccessibilityError([self.record[@"actionNamesError"] intValue]);
     return self.isAccessibilityElement ? (self.record[@"actions"] ?: @[]) : @[];
 }
 - (NSString *)accessibilityActionDescription:(NSString *)action {
     return self.record[@"actionDescriptions"][action] ?: NSAccessibilityActionDescription(action);
 }
 - (void)accessibilityPerformAction:(NSString *)action {
-    if (![[self accessibilityActionNames] containsObject:action] ||
-        ![[self.owner request:@{@"action": action} element:self][@"ok"] boolValue])
-        NSAccessibilityRaiseBadArgumentException(self, action, nil);
+    if (!self.isAccessibilityElement) VmAccessibilityError(kAXErrorInvalidUIElement);
+    if (![[self accessibilityActionNames] containsObject:action]) VmAccessibilityError(kAXErrorActionUnsupported);
+    NSDictionary *response = [self.owner request:@{@"action": action} element:self];
+    if (![response[@"ok"] boolValue]) VmAccessibilityError(response[@"error"] ? [response[@"error"] intValue] : kAXErrorCannotComplete);
 }
 - (NSArray *)accessibilityParameterizedAttributeNames {
     return self.isAccessibilityElement && ![self.record[@"secure"] boolValue] ? (self.record[@"parameterizedNames"] ?: @[]) : @[];
 }
 - (id)accessibilityAttributeValue:(NSString *)attribute forParameter:(id)parameter {
-    if (![[self accessibilityParameterizedAttributeNames] containsObject:attribute]) return nil;
+    if (![[self accessibilityParameterizedAttributeNames] containsObject:attribute]) return VmAccessibilityError(kAXErrorParameterizedAttributeUnsupported);
     BOOL inputGeometry = ![attribute isEqual:@"AXScreenPointForLayoutPoint"] && ![attribute isEqual:@"AXScreenSizeForLayoutSize"];
     BOOL outputGeometry = ![attribute isEqual:@"AXLayoutPointForScreenPoint"] && ![attribute isEqual:@"AXLayoutSizeForScreenSize"];
     id wire = [self encode:parameter geometry:inputGeometry];
-    NSDictionary *response = wire ? [self.owner request:@{@"action": @"getParameterizedAttribute", @"attribute": attribute, @"value": wire} element:self] : nil;
-    id result = [response[@"ok"] boolValue] ? [self decode:response[@"value"] geometry:outputGeometry] : nil;
+    if (!wire) return VmAccessibilityError(kAXErrorIllegalArgument);
+    NSDictionary *response = [self.owner request:@{@"action": @"getParameterizedAttribute", @"attribute": attribute, @"value": wire} element:self];
+    if (![response[@"ok"] boolValue]) return VmAccessibilityError(response[@"error"] ? [response[@"error"] intValue] : kAXErrorCannotComplete);
+    id result = [self decode:response[@"value"] geometry:outputGeometry];
     return result == NSNull.null ? nil : result;
 }
 - (NSUInteger)accessibilityArrayAttributeCount:(NSString *)attribute {

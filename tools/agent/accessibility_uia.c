@@ -28,8 +28,9 @@ typedef struct UiaRecord {
     IUIAutomationElement *element;
     BSTR identity, text, captured_text;
     wchar_t id[32];
-    uint64_t number, identity_hash, capture, reference;
+    uint64_t number, identity_hash, capture, reference, publication;
     DWORD pid;
+    size_t pending_children;
     int secure, complete_text, captured_complete_text;
     Json *metadata, *captured_metadata;
     struct UiaRecord *next, *identity_next, *id_next;
@@ -38,6 +39,7 @@ typedef struct UiaRecord {
 typedef struct UiaWork {
     size_t text_units;
     uint64_t deadline;
+    HWND window;
     HRESULT error;
     int truncated, capturing;
     AccessibilityContinue continuation;
@@ -52,7 +54,7 @@ struct AccessibilityUia {
     AccessibilityUiaEvents *events;
     UiaRecord *records, **identities, **ids;
     size_t record_count;
-    uint64_t next_id, capture;
+    uint64_t next_id, capture, publication;
     HWND foreground, event_foreground;
     DWORD session_id;
     UiaWork *work;
@@ -418,7 +420,7 @@ HRESULT accessibility_uia_create(AccessibilityUia **result) {
     TRY(IUIAutomationCacheRequest_put_AutomationElementMode(uia->identity_cache, AutomationElementMode_None));
     TRY(IUIAutomationCacheRequest_AddProperty(uia->identity_cache, UIA_RuntimeIdPropertyId));
     TRY(IUIAutomationCacheRequest_AddProperty(uia->identity_cache, UIA_ProcessIdPropertyId));
-    TRY(IUIAutomationCacheRequest_Clone(uia->identity_cache, &uia->children_cache));
+    TRY(IUIAutomationCacheRequest_Clone(uia->cache, &uia->children_cache));
     TRY(IUIAutomationCacheRequest_put_TreeScope(uia->children_cache, TreeScope_Children));
     TRY(IUIAutomationCacheRequest_put_AutomationElementMode(uia->children_cache, AutomationElementMode_Full));
     TRY(IUIAutomationCacheRequest_put_TreeFilter(uia->children_cache, condition));
@@ -461,9 +463,13 @@ static void add_text(AccessibilityUia *uia, UiaRecord *record, Json *properties)
     Json *value, *ranges = NULL;
     record->captured_complete_text = 0;
     SysFreeString(record->captured_text); record->captured_text = NULL;
-    if (!check_work(uia) || record->secure || !cached_int(record->element, UIA_IsTextPatternAvailablePropertyId, 0)) return;
+    if (!check_work(uia) || !cached_int(record->element, UIA_IsTextPatternAvailablePropertyId, 0)) return;
     if (FAILED(PATTERN(record->element, IUIAutomationTextPattern, UIA_TextPatternId, &pattern)) || !pattern ||
         FAILED(IUIAutomationTextPattern_get_DocumentRange(pattern, &document)) || !document || !read_text(document, &text)) goto done;
+    if (record->secure) {
+        if (is_masked_value(text)) ax_json_set(properties, L"Text.DocumentText", snapshot_string(uia, text ? text : L"", SysStringLen(text)));
+        goto done;
+    }
     value = snapshot_string(uia, text ? text : L"", SysStringLen(text));
     length = ax_json_length(value);
     record->captured_text = SysAllocStringLen(ax_json_text(value), (UINT)length);
@@ -566,8 +572,13 @@ static Json *metadata(AccessibilityUia *uia, UiaRecord *record, int include_deta
     ax_json_set(values, L"IsPassword", ax_json_boolean(record->secure));
     if (SUCCEEDED(IUIAutomationElement_get_CachedBoundingRectangle(record->element, &bounds)))
         ax_json_set(values, L"BoundingRectangle", frame_value(bounds));
-    if (include_details) { add_text(uia, record, values); add_relations(uia, record, values); }
     ax_json_set(node, L"properties", values);
+    if (!ax_json_valid(node) && SUCCEEDED(uia->work->error)) uia->work->error = E_OUTOFMEMORY;
+    if (SUCCEEDED(uia->work->error) && (ax_json_type(named(values, L"ControlType")) != AX_JSON_NUMBER ||
+         ax_json_type(named(values, L"BoundingRectangle")) != AX_JSON_ARRAY))
+        uia->work->error = UIA_E_ELEMENTNOTAVAILABLE;
+    if (!check_work(uia)) { ax_json_release(node); return NULL; }
+    if (include_details) { add_text(uia, record, values); add_relations(uia, record, values); }
     return node;
 }
 
@@ -791,9 +802,19 @@ typedef struct CaptureWindows {
     size_t count;
     int overflow;
 } CaptureWindows;
+static HWND root_owner_window(HWND window) {
+    unsigned depth;
+    window = GetAncestor(window, GA_ROOT);
+    for (depth = 0; window && depth < 128; ++depth) {
+        HWND owner = GetWindow(window, GW_OWNER);
+        if (!owner) return window;
+        window = owner;
+    }
+    return NULL;
+}
 static BOOL CALLBACK collect_owned_window(HWND window, LPARAM parameter) {
     CaptureWindows *context = (CaptureWindows *)parameter;
-    if (window != context->windows[0] && IsWindowVisible(window) && !IsIconic(window) && GetAncestor(window, GA_ROOTOWNER) == context->owner) {
+    if (window != context->windows[0] && IsWindowVisible(window) && !IsIconic(window) && root_owner_window(window) == context->owner) {
         if (context->count == ARRAYSIZE(context->windows)) { context->overflow = 1; return FALSE; }
         context->windows[context->count++] = window;
     }
@@ -803,7 +824,8 @@ static void prune_records(AccessibilityUia *uia) {
     UiaRecord **link = &uia->records;
     while (*link) {
         UiaRecord *record = *link, **bucket;
-        if (record->capture == uia->capture || record->reference == uia->capture) { link = &record->next; continue; }
+        if (record->capture == uia->capture || record->reference == uia->capture ||
+            (uia->publication && record->publication == uia->publication)) { link = &record->next; continue; }
         bucket = &uia->identities[record->identity_hash % RECORD_BUCKETS];
         while (*bucket != record) bucket = &(*bucket)->identity_next;
         *bucket = record->identity_next;
@@ -813,21 +835,134 @@ static void prune_records(AccessibilityUia *uia) {
         *link = record->next; --uia->record_count; free_record(record);
     }
 }
-HRESULT accessibility_uia_capture(AccessibilityUia *uia, uint64_t deadline, AccessibilityContinue continuation, void *context, Json **result) {
+static Json *progress_snapshot(AccessibilityUia *uia, const Json *snapshot) {
+    typedef struct ProgressNode { UiaRecord *record; const wchar_t *parent; unsigned depth; } ProgressNode;
+    ProgressNode *queue = calloc(ASB_AX_MAX_NODES, sizeof(*queue));
+    Json *result = ax_json_object(), *nodes = ax_json_array(), *roots = ax_json_array();
+    size_t count = 0, i, j;
+    unsigned pass;
+    uint64_t publication = ++uia->publication;
+    if (!queue || !result || !nodes || !roots) { free(queue); ax_json_release(result); ax_json_release(nodes); ax_json_release(roots); return NULL; }
+    for (i = 0; i < ax_json_count(snapshot); ++i) {
+        const wchar_t *key = ax_json_key(snapshot, i);
+        if (!text_equal(key, L"nodes") && !text_equal(key, L"roots"))
+            ax_json_set(result, key, ax_json_retain(ax_json_get(snapshot, key)));
+    }
+    for (i = 0; i < ax_json_count(named(snapshot, L"roots")) && count < ASB_AX_MAX_NODES; ++i) {
+        UiaRecord *record = find_record(uia, ax_json_text(ax_json_at(named(snapshot, L"roots"), i)));
+        if (!record || record->publication == publication || (!record->captured_metadata && !record->metadata)) continue;
+        record->publication = publication;
+        queue[count++].record = record;
+        ax_json_append(roots, ax_json_string(record->id));
+    }
+    for (i = 0; i < count; ++i) {
+        UiaRecord *record = queue[i].record;
+        const Json *source = record->capture == uia->capture && record->captured_metadata ? record->captured_metadata : record->metadata;
+        Json *node = ax_json_object(), *children = ax_json_array();
+        ax_json_set(node, L"id", ax_json_string(record->id));
+        ax_json_set(node, L"properties", ax_json_retain(named(source, L"properties")));
+        if (queue[i].parent) ax_json_set(node, L"parent", ax_json_string(queue[i].parent));
+        for (pass = 0; pass < 2 && queue[i].depth < 127; ++pass) {
+            const Json *source_children = pass == 0 ? named(source, L"children") :
+                record->capture == uia->capture && record->pending_children ? named(record->metadata, L"children") : NULL;
+            for (j = 0; j < ax_json_count(source_children) && count < ASB_AX_MAX_NODES; ++j) {
+                UiaRecord *child = find_record(uia, ax_json_text(ax_json_at(source_children, j)));
+                if (!child || child->publication == publication || (!child->captured_metadata && !child->metadata)) continue;
+                child->publication = publication;
+                queue[count++] = (ProgressNode){child, record->id, queue[i].depth + 1};
+                ax_json_append(children, ax_json_string(child->id));
+            }
+        }
+        ax_json_set(node, L"children", children);
+        ax_json_append(nodes, node);
+    }
+    free(queue);
+    {
+        UiaRecord *focused = find_record(uia, named_text(result, L"focused"));
+        if (!focused || focused->publication != publication) ax_json_remove(result, L"focused");
+    }
+    ax_json_set(result, L"nodes", nodes); ax_json_set(result, L"roots", roots);
+    if (!ax_json_valid(result)) { ax_json_release(result); return NULL; }
+    return result;
+}
+static void refresh_focus(AccessibilityUia *uia, Json *snapshot, int final) {
+    IUIAutomationElement *focus = NULL;
+    BSTR identity = NULL;
+    uint64_t hash = 0;
+    UiaRecord *record;
+    Json *fresh, *target;
+    ax_json_remove(snapshot, L"focused");
+    if (!check_work(uia) || FAILED(IUIAutomation_GetFocusedElementBuildCache(uia->automation, uia->cache, &focus)) || !focus) goto done;
+    identity = identity_string(uia, focus, &hash);
+    record = final ? find_element(uia, focus, identity, hash) : identity ? find_identity(uia, identity, hash) : NULL;
+    if (!record || (!record->captured_metadata && !record->metadata)) goto done;
+    RELEASE(record->element); record->element = focus; focus = NULL;
+    fresh = metadata(uia, record, 1);
+    if (!fresh) {
+        if (uia->work->error == UIA_E_ELEMENTNOTAVAILABLE) uia->work->error = S_OK;
+        goto done;
+    }
+    target = record->captured_metadata ? record->captured_metadata : record->metadata;
+    ax_json_set(target, L"properties", ax_json_retain(named(fresh, L"properties")));
+    ax_json_release(fresh);
+    if (record->capture == uia->capture && record->captured_metadata)
+        ax_json_set(snapshot, L"focused", ax_json_string(record->id));
+done:
+    SysFreeString(identity); RELEASE(focus);
+}
+static int publish_progress(AccessibilityUia *uia, AccessibilityPublish publish, void *context, Json *snapshot, uint64_t *after) {
+    if (GetTickCount64() < *after) return 1;
+    if (!continue_capture(uia)) return 0;
+    if (!accessibility_uia_active(uia) || GetForegroundWindow() != uia->work->window) {
+        uia->work->error = HRESULT_FROM_WIN32(ERROR_CANCELLED); return 0;
+    }
+    if (publish) {
+        refresh_focus(uia, snapshot, 0);
+        if (!check_work(uia)) return 0;
+        Json *progress = progress_snapshot(uia, snapshot);
+        int sent;
+        size_t i;
+        if (!progress) { uia->work->error = E_OUTOFMEMORY; return 0; }
+        sent = publish(context, progress);
+        if (sent) for (i = 0; i < ax_json_count(named(progress, L"nodes")); ++i) {
+            Json *node = ax_json_at(named(progress, L"nodes"), i);
+            UiaRecord *record = find_record(uia, named_text(node, L"id"));
+            const Json *text = named(named(node, L"properties"), L"Text.DocumentText");
+            ax_json_release(record->metadata); record->metadata = ax_json_retain(node);
+            if (record->captured_text && ax_json_type(text) == AX_JSON_STRING &&
+                ax_json_length(text) == SysStringLen(record->captured_text) &&
+                !wmemcmp(ax_json_text(text), record->captured_text, ax_json_length(text))) {
+                BSTR published = SysAllocStringLen(record->captured_text, SysStringLen(record->captured_text));
+                if (!published) { uia->work->error = E_OUTOFMEMORY; break; }
+                SysFreeString(record->text); record->text = published;
+                record->complete_text = record->captured_complete_text;
+            }
+        }
+        ax_json_release(progress);
+        if (!check_work(uia)) return 0;
+        if (!sent) { uia->work->error = HRESULT_FROM_WIN32(ERROR_CANCELLED); return 0; }
+        uia->foreground = uia->work->window;
+    }
+    *after = GetTickCount64() + 500;
+    uia->work->deadline = GetTickCount64() + ASB_AX_CAPTURE_TIMEOUT_MS;
+    return 1;
+}
+HRESULT accessibility_uia_capture(AccessibilityUia *uia, uint64_t deadline, AccessibilityContinue continuation, AccessibilityPublish publish, void *context, Json **result) {
     typedef struct Pending { IUIAutomationElement *element; UiaRecord *parent; unsigned depth; } Pending;
     Pending *queue = NULL;
     UiaRecord **captured = NULL, *record;
-    size_t head = 0, queued = 0, count = 0, i;
+    size_t head = 0, queued = 0, count = 0, next_window = 0, i;
     unsigned pass;
     HWND window;
     DWORD pid = 0;
     MONITORINFO monitor = {sizeof(monitor)};
     CaptureWindows windows = {0};
-    IUIAutomationElement *root = NULL, *expanded = NULL, *focus = NULL;
+    IUIAutomationElement *root = NULL, *expanded = NULL;
     IUIAutomationElementArray *children = NULL;
     Json *output = NULL, *roots = NULL, *snapshot = NULL;
     UiaWork work = {0}, *previous = uia->work;
     HRESULT status;
+    uint64_t publish_after = GetTickCount64() + 250;
     int success = 0;
     if (!result) return E_POINTER;
     *result = NULL;
@@ -840,9 +975,13 @@ HRESULT accessibility_uia_capture(AccessibilityUia *uia, uint64_t deadline, Acce
     if (!accessibility_uia_active(uia) || !(window = GetForegroundWindow())) {
         uia->work->error = HRESULT_FROM_WIN32(ERROR_CANCELLED); goto done;
     }
+    uia->work->window = window;
     GetWindowThreadProcessId(window, &pid);
     if (!pid || !GetMonitorInfoW(MonitorFromPoint((POINT){0, 0}, MONITOR_DEFAULTTOPRIMARY), &monitor)) goto done;
-    windows.owner = GetAncestor(window, GA_ROOTOWNER); windows.windows[0] = window; windows.count = 1;
+    windows.owner = root_owner_window(window);
+    if (!windows.owner) goto done;
+    windows.windows[0] = IsWindowVisible(windows.owner) && !IsIconic(windows.owner) ? windows.owner : window;
+    windows.count = 1;
     EnumWindows(collect_owned_window, (LPARAM)&windows);
     uia->work->truncated = windows.overflow; uia->work->text_units = 0; ++uia->capture;
     for (record = uia->records; record; record = record->next) {
@@ -851,70 +990,6 @@ HRESULT accessibility_uia_capture(AccessibilityUia *uia, uint64_t deadline, Acce
     }
     queue = calloc(ASB_AX_MAX_NODES, sizeof(*queue)); captured = calloc(ASB_AX_MAX_NODES, sizeof(*captured));
     if (!queue || !captured || !output || !roots) { uia->work->error = E_OUTOFMEMORY; goto done; }
-    for (i = 0; i < windows.count; ++i) {
-        if (!continue_capture(uia)) goto done;
-        uia->work->error = IUIAutomation_ElementFromHandleBuildCache(uia->automation, windows.windows[i], uia->cache, &root);
-        if (i && uia->work->error == UIA_E_ELEMENTNOTAVAILABLE) { RELEASE(root); uia->work->error = S_OK; continue; }
-        if (FAILED(uia->work->error) || !root) goto done;
-        if (windows.windows[i] == window && window != uia->event_foreground) {
-            uia->event_foreground = NULL;
-            if (FAILED(uia->work->error = accessibility_uia_events_observe(uia->events, root))) goto done;
-            uia->event_foreground = window;
-        }
-        queue[queued++].element = root; root = NULL;
-    }
-    while (queued && count < ASB_AX_MAX_NODES) {
-        Pending item;
-        int child_count = 0, index;
-        if (!continue_capture(uia)) goto done;
-        item = queue[head]; queue[head].element = NULL; head = (head + 1) % ASB_AX_MAX_NODES; --queued;
-        record = remember(uia, item.element, item.parent == NULL); RELEASE(item.element);
-        if (!record) goto done;
-        if (record->capture == uia->capture) continue;
-        record->capture = uia->capture;
-        record->captured_metadata = metadata(uia, record, 0);
-        if (!record->captured_metadata || !check_work(uia)) goto done;
-        if (item.parent) {
-            ax_json_set(record->captured_metadata, L"parent", ax_json_string(item.parent->id));
-            ax_json_append(named(item.parent->captured_metadata, L"children"), ax_json_string(record->id));
-        } else ax_json_append(roots, ax_json_string(record->id));
-        captured[count++] = record;
-        ax_json_append(output, ax_json_retain(record->captured_metadata));
-        if (item.depth >= 127) { uia->work->truncated = 1; continue; }
-        if (FAILED(uia->work->error = IUIAutomationElement_BuildUpdatedCache(record->element, uia->children_cache, &expanded)) || !expanded) goto done;
-        if (FAILED(uia->work->error = IUIAutomationElement_GetCachedChildren(expanded, &children))) goto done;
-        if (children) {
-            if (FAILED(uia->work->error = IUIAutomationElementArray_get_Length(children, &child_count))) goto done;
-            for (index = 0; index < child_count; ++index) {
-                IUIAutomationElement *child = NULL;
-                size_t tail;
-                if (count + queued >= ASB_AX_MAX_NODES) { uia->work->truncated = 1; break; }
-                if (!check_work(uia)) goto done;
-                uia->work->error = IUIAutomationElementArray_GetElement(children, index, &child);
-                if (uia->work->error == UIA_E_ELEMENTNOTAVAILABLE) { RELEASE(child); uia->work->error = S_OK; continue; }
-                if (FAILED(uia->work->error) || !child) { RELEASE(child); goto done; }
-                tail = (head + queued) % ASB_AX_MAX_NODES;
-                queue[tail].element = child; queue[tail].parent = record; queue[tail].depth = item.depth + 1; ++queued;
-            }
-        }
-        RELEASE(children); RELEASE(expanded);
-    }
-    if (queued) uia->work->truncated = 1;
-    for (i = 0; i < count; ++i) {
-        if (!continue_capture(uia)) goto done;
-        add_relations(uia, captured[i], named(captured[i]->captured_metadata, L"properties"));
-    }
-    for (pass = 0; pass < 2; ++pass) for (i = 0; i < count; ++i) {
-        int focused;
-        if (!continue_capture(uia)) goto done;
-        record = captured[i]; focused = cached_int(record->element, UIA_HasKeyboardFocusPropertyId, 0) != 0;
-        if ((pass == 0) != focused || record->secure) continue;
-        add_text(uia, record, named(record->captured_metadata, L"properties"));
-    }
-    if (!count) goto done;
-    if (!accessibility_uia_active(uia) || GetForegroundWindow() != window) {
-        uia->work->error = HRESULT_FROM_WIN32(ERROR_CANCELLED); goto done;
-    }
     {
         wchar_t path[1024] = {0};
         const wchar_t *base;
@@ -931,33 +1006,109 @@ HRESULT accessibility_uia_capture(AccessibilityUia *uia, uint64_t deadline, Acce
         ax_json_set(display, L"pixelWidth", ax_json_retain(named(display, L"width")));
         ax_json_set(display, L"pixelHeight", ax_json_retain(named(display, L"height")));
         snapshot = ax_json_object(); ax_json_set(snapshot, L"app", app); ax_json_set(snapshot, L"display", display);
-        ax_json_set(snapshot, L"nodes", output); output = NULL;
-        ax_json_set(snapshot, L"roots", roots); roots = NULL;
-        ax_json_set(snapshot, L"truncated", ax_json_boolean(uia->work->truncated));
+        ax_json_set(snapshot, L"nodes", ax_json_retain(output));
+        ax_json_set(snapshot, L"roots", ax_json_retain(roots));
+        ax_json_set(snapshot, L"truncated", ax_json_boolean(1));
     }
-    if (SUCCEEDED(IUIAutomation_GetFocusedElementBuildCache(uia->automation, uia->cache, &focus)) && focus) {
-        uint64_t hash = 0;
-        BSTR identity = identity_string(uia, focus, &hash);
-        record = check_work(uia) ? find_element(uia, focus, identity, hash) : NULL;
-        if (record && record->capture == uia->capture) ax_json_set(snapshot, L"focused", ax_json_string(record->id));
-        SysFreeString(identity);
+    while ((queued || next_window < windows.count) && count < ASB_AX_MAX_NODES) {
+        Pending item;
+        int child_count = 0, index;
+        if (!continue_capture(uia)) goto done;
+        if (!queued) {
+            HWND next = windows.windows[next_window++];
+            uia->work->error = IUIAutomation_ElementFromHandleBuildCache(uia->automation, next, uia->cache, &root);
+            if (next != window && uia->work->error == UIA_E_ELEMENTNOTAVAILABLE) { RELEASE(root); uia->work->error = S_OK; continue; }
+            if (FAILED(uia->work->error) || !root) goto done;
+            if (next == window && window != uia->event_foreground) {
+                uia->event_foreground = NULL;
+                if (FAILED(uia->work->error = accessibility_uia_events_observe(uia->events, root))) goto done;
+                uia->event_foreground = window;
+            }
+            queue[head] = (Pending){root, NULL, 0}; root = NULL; queued = 1;
+        }
+        item = queue[head]; queue[head].element = NULL; head = (head + 1) % ASB_AX_MAX_NODES; --queued;
+        if (item.parent && item.parent->pending_children) --item.parent->pending_children;
+        record = remember(uia, item.element, 1); RELEASE(item.element);
+        if (!record && item.parent && uia->work->error == UIA_E_ELEMENTNOTAVAILABLE) { uia->work->error = S_OK; continue; }
+        if (!record) goto done;
+        if (record->capture == uia->capture) continue;
+        record->capture = uia->capture;
+        record->pending_children = 0;
+        record->captured_metadata = metadata(uia, record, 0);
+        if (!record->captured_metadata && item.parent && uia->work->error == UIA_E_ELEMENTNOTAVAILABLE) {
+            uia->work->error = S_OK; continue;
+        }
+        if (!record->captured_metadata || !check_work(uia)) goto done;
+        if (item.parent) {
+            ax_json_set(record->captured_metadata, L"parent", ax_json_string(item.parent->id));
+            ax_json_append(named(item.parent->captured_metadata, L"children"), ax_json_string(record->id));
+        } else ax_json_append(roots, ax_json_string(record->id));
+        captured[count++] = record;
+        ax_json_append(output, ax_json_retain(record->captured_metadata));
+        if (item.depth >= 127) { uia->work->truncated = 1; continue; }
+        uia->work->error = IUIAutomationElement_BuildUpdatedCache(record->element, uia->children_cache, &expanded);
+        if (SUCCEEDED(uia->work->error) && expanded)
+            uia->work->error = IUIAutomationElement_GetCachedChildren(expanded, &children);
+        if (uia->work->error == UIA_E_ELEMENTNOTAVAILABLE && item.parent) {
+            RELEASE(children); RELEASE(expanded); uia->work->error = S_OK; continue;
+        }
+        if (FAILED(uia->work->error) || !expanded) goto done;
+        if (children) {
+            if (FAILED(uia->work->error = IUIAutomationElementArray_get_Length(children, &child_count))) goto done;
+            if ((size_t)child_count > ASB_AX_MAX_NODES - count - queued) {
+                child_count = (int)(ASB_AX_MAX_NODES - count - queued); uia->work->truncated = 1;
+            }
+            for (index = child_count; index > 0; --index) {
+                IUIAutomationElement *child = NULL;
+                if (!check_work(uia)) goto done;
+                uia->work->error = IUIAutomationElementArray_GetElement(children, index - 1, &child);
+                if (uia->work->error == UIA_E_ELEMENTNOTAVAILABLE) { RELEASE(child); uia->work->error = S_OK; continue; }
+                if (FAILED(uia->work->error) || !child) { RELEASE(child); goto done; }
+                head = (head + ASB_AX_MAX_NODES - 1) % ASB_AX_MAX_NODES;
+                queue[head] = (Pending){child, record, item.depth + 1}; ++queued; ++record->pending_children;
+            }
+        }
+        RELEASE(children); RELEASE(expanded);
+        if (!publish_progress(uia, publish, context, snapshot, &publish_after)) goto done;
     }
+    if (queued || next_window < windows.count) uia->work->truncated = 1;
+    for (i = 0; i < count; ++i) {
+        if (!continue_capture(uia)) goto done;
+        add_relations(uia, captured[i], named(captured[i]->captured_metadata, L"properties"));
+        if (!publish_progress(uia, publish, context, snapshot, &publish_after)) goto done;
+    }
+    for (pass = 0; pass < 2; ++pass) for (i = 0; i < count; ++i) {
+        int focused;
+        if (!continue_capture(uia)) goto done;
+        record = captured[i]; focused = cached_int(record->element, UIA_HasKeyboardFocusPropertyId, 0) != 0;
+        if ((pass == 0) != focused) continue;
+        add_text(uia, record, named(record->captured_metadata, L"properties"));
+        if (!publish_progress(uia, publish, context, snapshot, &publish_after)) goto done;
+    }
+    if (!count) goto done;
+    if (!accessibility_uia_active(uia) || GetForegroundWindow() != window) {
+        uia->work->error = HRESULT_FROM_WIN32(ERROR_CANCELLED); goto done;
+    }
+    refresh_focus(uia, snapshot, 1);
     if (!continue_capture(uia)) goto done;
     if (!ax_json_valid(snapshot)) { uia->work->error = E_OUTOFMEMORY; goto done; }
     if (!accessibility_uia_active(uia) || GetForegroundWindow() != window) {
         uia->work->error = HRESULT_FROM_WIN32(ERROR_CANCELLED); goto done;
     }
-    if (uia->work->truncated) { uia->work->error = HRESULT_FROM_WIN32(ERROR_MORE_DATA); goto done; }
+    ax_json_set(snapshot, L"truncated", ax_json_boolean(uia->work->truncated));
+    ++uia->publication;
     for (i = 0; i < count; ++i) {
         record = captured[i];
+        record->publication = uia->publication;
         ax_json_release(record->metadata); record->metadata = record->captured_metadata; record->captured_metadata = NULL;
         SysFreeString(record->text); record->text = record->captured_text; record->captured_text = NULL;
         record->complete_text = record->captured_complete_text;
     }
-    uia->foreground = window; prune_records(uia); success = 1;
+    uia->foreground = window; success = 1;
 done:
     if (queue) { for (i = 0; i < ASB_AX_MAX_NODES; ++i) RELEASE(queue[i].element); free(queue); }
-    free(captured); RELEASE(focus); RELEASE(children); RELEASE(expanded); RELEASE(root);
+    free(captured); RELEASE(children); RELEASE(expanded); RELEASE(root);
+    prune_records(uia);
     ax_json_release(output); ax_json_release(roots);
     status = FAILED(work.error) ? work.error : E_FAIL;
     uia->work = previous;
@@ -1022,6 +1173,7 @@ Json *accessibility_uia_request(AccessibilityUia *uia, const Json *message, uint
     UiaWork work = {0}, *previous = uia->work;
     uia->work = &work; work.deadline = deadline;
     if (!accessibility_uia_active(uia) || !uia->foreground || GetForegroundWindow() != uia->foreground || !record) goto done;
+    if (record->publication != uia->publication && record->reference != uia->capture) goto done;
     if (wcslen(action) != ax_json_length(named(message, L"action")) || wcslen(attribute) != ax_json_length(named(message, L"attribute")) ||
         wcslen(named_text(message, L"nodeId")) != ax_json_length(named(message, L"nodeId"))) { hr = E_INVALIDARG; goto done; }
     if (!prepare(uia, deadline)) { hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT); goto done; }
