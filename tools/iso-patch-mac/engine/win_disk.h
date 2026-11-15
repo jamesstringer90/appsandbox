@@ -32,6 +32,7 @@ int win_disk_build(const char *wim_path,
                    uint32_t    image_idx,
                    uint64_t    disk_gib,
                    const char *manifest_path,
+                   const char *vioscsi_dir,
                    void (*progress)(int pct, const char *msg));
 
 #ifdef __cplusplus

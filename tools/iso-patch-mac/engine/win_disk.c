@@ -27,6 +27,10 @@ static double now_s(void){ struct timeval tv; gettimeofday(&tv,0); return (doubl
 
 static wim_t *W; static wim_image_t *IMG; static ntfs_writer_t *NW;
 static unsigned long g_dirs,g_files,g_empty,g_reparse,g_err,g_links; static unsigned long long g_bytes;
+static uint8_t *g_boot_system;
+static size_t g_boot_system_len;
+static int g_boot_system_written;
+static int name_eq(const uint8_t *nm, int nb, const char *a);
 
 /* Apply-progress: bytes durably written so far (worker pool + inline small files),
  * read by a monitor thread vs g_total_bytes (the image's uncompressed total). The
@@ -344,6 +348,15 @@ static void apply(uint64_t parent_ref, uint64_t children_off, int depth, const c
             if(empty){ ntfs_add_file(NW,parent_ref,nm,nc,snp,snc,d.attributes,sid,d.creation_time,d.last_access_time,d.last_write_time,NULL,0); g_empty++; }
             else { const wim_resource_t*res=wim_lookup_by_hash(W,d.hash);
                 if(!res){ g_err++; off=d.self_offset+d.length; continue; }
+                if(g_boot_system && !strcmp(ppath,"windows\\system32\\config") &&
+                   name_eq(d.file_name,d.file_name_nbytes,"SYSTEM")){
+                    uint64_t ref=ntfs_add_file(NW,parent_ref,nm,nc,snp,snc,d.attributes,sid,
+                        d.creation_time,d.last_access_time,d.last_write_time,g_boot_system,g_boot_system_len);
+                    if(ref){ g_files++; g_bytes+=g_boot_system_len; g_boot_system_written++;
+                        __atomic_fetch_add(&g_written,res->orig_size,__ATOMIC_RELAXED); }
+                    else g_err++;
+                    off=d.self_offset+d.length; continue;
+                }
                 /* Hard link: if this file's WIM group already has an inode on the
                  * volume, add another NAME to it (share content) instead of writing
                  * a duplicate copy -- the NTFS hard-link model. Only fall back
@@ -568,9 +581,10 @@ static unsigned long stage_manifest(const char *manifest_path, unsigned long *er
 
 int win_disk_build(const char *wimp, const char *imgp, uint32_t idx, uint64_t gib,
                    const char *manifest_path,
+                   const char *vioscsi_dir,
                    void (*progress)(int,const char*)){
     setvbuf(stdout,NULL,_IONBF,0);
-    if(!wimp || !imgp) return 2;
+    if(!wimp || !imgp || (vioscsi_dir && !manifest_path)) return 2;
     if(idx==0) idx=1;
     if(gib==0) gib=34;
     #define PROG(p,m) do{ if(progress) progress((p),(m)); }while(0)
@@ -579,6 +593,32 @@ int win_disk_build(const char *wimp, const char *imgp, uint32_t idx, uint64_t gi
     if(!W){ printf("wim open fail\n"); return 2; }
     IMG=wim_image_open(W,idx);
     if(!IMG){ printf("wim image open fail\n"); return 2; }
+    g_boot_system=NULL; g_boot_system_len=0; g_boot_system_written=0;
+    if(vioscsi_dir){
+        uint32_t driver_index=0;
+        char published_inf[32], path[64];
+        for(;;){
+            snprintf(published_inf,sizeof published_inf,"oem%u.inf",driver_index);
+            snprintf(path,sizeof path,"\\Windows\\INF\\%s",published_inf);
+            wim_dentry_t entry;
+            if(!wim_resolve(path,&entry)) break;
+            if(driver_index==UINT32_MAX) return 2;
+            driver_index++;
+        }
+        uint64_t len=0;
+        uint8_t *system=wim_read_path("\\Windows\\System32\\config\\SYSTEM",&len);
+        int result=system ? windows_boot_vioscsi(system,(size_t)len,published_inf,
+                                               &g_boot_system,&g_boot_system_len) : -1;
+        free(system);
+        if(result){ printf("Cannot prepare the Windows SYSTEM hive for VirtIO SCSI boot\n"); return 2; }
+        FILE *mf=fopen(manifest_path,"a");
+        if(!mf){ free(g_boot_system); g_boot_system=NULL; return 2; }
+        int written=fprintf(mf,"%s/vioscsi.inf\t\\Windows\\INF\\%s\n"
+            "%s/vioscsi.cat\t\\Windows\\System32\\CatRoot\\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\\oem%u.cat\n",
+            vioscsi_dir,published_inf,vioscsi_dir,driver_index);
+        int closed=fclose(mf);
+        if(written<0 || closed){ free(g_boot_system); g_boot_system=NULL; return 2; }
+    }
 
     uint64_t bytes=gib<<30;
     blockio_t*io=blockio_create(imgp,bytes); if(!io){printf("image create fail\n");return 2;}
@@ -637,6 +677,8 @@ int win_disk_build(const char *wimp, const char *imgp, uint32_t idx, uint64_t gi
     double T_apply0 = now_s();
     apply(root,r.subdir_offset,0,"");
     unsigned long perr = pool_finish();        /* drain + join workers before any close */
+    free(g_boot_system); g_boot_system=NULL;
+    if(vioscsi_dir && g_boot_system_written!=1) g_err++;
     if(mon_ok){ __atomic_store_n(&g_mon_stop, 1, __ATOMIC_RELAXED); pthread_join(mon,NULL); }
     double T_apply1 = now_s();
     printf("PHASE apply+extract (parallel) = %.1fs\n", T_apply1 - T_apply0);
@@ -727,6 +769,6 @@ int main(int argc,char**argv){
     uint32_t idx = argc>3?(uint32_t)atoi(argv[3]):1;
     uint64_t gib = argc>4?(uint64_t)atoll(argv[4]):34;
     const char *manifest = argc>5?argv[5]:NULL;
-    return win_disk_build(argv[1],argv[2],idx,gib,manifest,NULL);
+    return win_disk_build(argv[1],argv[2],idx,gib,manifest,NULL,NULL);
 }
 #endif

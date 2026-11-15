@@ -27,6 +27,7 @@ typedef struct {
     int     ram_mb;
     int     hdd_gb;
     int     cpu_cores;
+    int     windows_storage_controller;
     int     gpu_mode;
     int     network_mode;
     char    mac_address[18];

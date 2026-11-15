@@ -85,7 +85,7 @@ corresponding source files.
   (both also shipped in the app bundle); `vendor/qemu-ivshmem/fetch-sources.sh`
   retrieves the corresponding source tarballs.
 
-## vendor/virtio-win/ — NetKVM (Red Hat VirtIO Ethernet Adapter)
+## vendor/virtio-win/ — NetKVM and VirtIO SCSI guest drivers
 
 - **License:** BSD 3-Clause (`SPDX: BSD-3-Clause`). License text:
   [`vendor/virtio-win/virtio-win_license.txt`](vendor/virtio-win/virtio-win_license.txt).
@@ -93,6 +93,12 @@ corresponding source files.
 - `vendor/virtio-win/netkvm-arm64.zip` is the unmodified, WHQL-signed ARM64
   NetKVM virtio-net guest driver, JIT-staged into a Mac-hosted Windows guest for
   NAT networking. Redistributed unmodified; the license text is staged alongside
+  the driver in the guest.
+- `vendor/virtio-win/vioscsi-arm64-0.1.302.zip` contains the unmodified,
+  Microsoft-signed ARM64 VirtIO SCSI guest driver from Fedora's
+  `virtio-win-0.1.302-1` release. It is JIT-staged into Mac-hosted Windows guests
+  configured for VirtIO SCSI storage. The archive includes the upstream license
+  text and a `source.json` provenance record; the license text is staged alongside
   the driver in the guest.
 
 ---

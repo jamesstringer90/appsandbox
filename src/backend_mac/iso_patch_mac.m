@@ -377,6 +377,7 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName, BOOL fromMed
                         outDisk:(NSURL *)outDiskURL
                signedPayloadZip:(NSString *)signedPayloadZip
                       netkvmZip:(nullable NSString *)netkvmZip
+                     vioscsiZip:(nullable NSString *)vioscsiZip
                      sshMsiPath:(nullable NSString *)sshMsiPath
                          vmName:(NSString *)vmName
                       adminUser:(NSString *)adminUser
@@ -432,6 +433,7 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName, BOOL fromMed
      * language and reports it via LANG: so we re-generate unattend.xml in-process below. */
     if (hasOverride)       { [args addObject:@"--lang"];       [args addObject:lang]; }
     if (netkvmZip.length)  { [args addObject:@"--netkvm-zip"]; [args addObject:netkvmZip]; }
+    if (vioscsiZip.length) { [args addObject:@"--vioscsi-zip"]; [args addObject:vioscsiZip]; }
     if (sshMsiPath.length) { [args addObject:@"--ssh-msi"];    [args addObject:sshMsiPath]; }
 
     /* Wrap progress: intercept the LANG sentinel to re-generate unattend.xml in-process with the
@@ -529,9 +531,8 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName, BOOL fromMed
 /* See iso_patch_mac.h. Cache the vendored NetKVM zip. Mirrors ensureSignedWinPayloadZipCached: a single
  * atomic write to a fixed-named file under the AppSandbox support dir (sibling of VMs/), shared by the
  * root daemon + GUI. Pulled from the public repo (raw.githubusercontent.com); the file never changes. */
-+ (nullable NSString *)ensureNetkvmZipCached {
-    NSString *name   = @"netkvm-arm64.zip";
-    NSString *urlStr = @"https://raw.githubusercontent.com/jamesstringer90/appsandbox/main/vendor/virtio-win/netkvm-arm64.zip";
+static NSString *ensure_virtio_zip_cached(NSString *name, NSString *ref) {
+    NSString *urlStr = [NSString stringWithFormat:@"https://raw.githubusercontent.com/jamesstringer90/appsandbox/%@/vendor/virtio-win/%@", ref, name];
     NSString *cacheDir = [[VmDir vmsRootDirectory] URLByDeletingLastPathComponent].path;
     [[NSFileManager defaultManager] createDirectoryAtPath:cacheDir
                               withIntermediateDirectories:YES attributes:nil error:nil];
@@ -552,6 +553,14 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName, BOOL fromMed
         [t cancel];
     if (data.length && [data writeToFile:dst atomically:YES]) return dst;
     return nil;
+}
+
++ (nullable NSString *)ensureNetkvmZipCached {
+    return ensure_virtio_zip_cached(@"netkvm-arm64.zip", @"main");
+}
+
++ (nullable NSString *)ensureVioscsiZipCached {
+    return ensure_virtio_zip_cached(@"vioscsi-arm64-0.1.302.zip", @"main");
 }
 
 #pragma mark - stage (privileged)
