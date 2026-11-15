@@ -23,6 +23,7 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import "clipboard_xpc.h"
+#include "../transport/asb_clipboard_temp.h"
 
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -127,6 +128,7 @@ static NSString *g_cache_base;   /* ~/Library/Caches/com.appsandbox.clipboard */
  * countdown of expected file messages, and the materialised top-level
  * URLs for the pasteboard to return. */
 @property (nonatomic, copy)   NSString *fileTreeDir;
+@property (nonatomic, assign) AsbClipboardTemp *fileTemp;
 @property (nonatomic, assign) int32_t   fileCountExpected;
 @property (nonatomic, strong) NSMutableArray<NSURL *> *fileTreeUrls;
 @property (nonatomic, assign) BOOL      completed;
@@ -135,6 +137,9 @@ static NSString *g_cache_base;   /* ~/Library/Caches/com.appsandbox.clipboard */
 @end
 
 @implementation AsbClipPending
+- (void)dealloc {
+    asb_clipboard_temp_discard(_fileTemp);
+}
 - (instancetype)init {
     if ((self = [super init])) {
         _cond = [NSCondition new];
@@ -261,7 +266,6 @@ static int send_message(int fd, uint32_t msg_type,
 static int send_data_req_v2(int fd, uint32_t seq, uint32_t itemIndex,
                             NSString *uti);
 static int write_full(int fd, const void *buf, size_t n);
-static NSString *alloc_tree_cache_dir(void);
 
 /* Bumped each time we overwrite the guest pasteboard with a fresh set of
  * lazy items. Providers stamp their generation at creation and bail if it
@@ -285,6 +289,7 @@ static NSString * const kLazySentinelUTI = @"com.appsandbox.clipboard.lazy";
  * each fetch is scoped to just that one item's payload. */
 @interface AsbClipItemProvider : NSObject <NSPasteboardItemDataProvider>
 @property (nonatomic, assign) uint64_t generation;
+@property (nonatomic, assign) uint64_t pasteboardToken;
 @property (nonatomic, assign) uint32_t itemIndex;
 @property (nonatomic, strong) NSDictionary<NSString *, NSNumber *> *sizeHints;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSData *> *cache;
@@ -326,16 +331,14 @@ static NSString * const kLazySentinelUTI = @"com.appsandbox.clipboard.lazy";
     return result;
 }
 
-/* File-URL fetch: send DATA_REQ_V2, accumulate into a cache dir, return
- * the first top-level URL in the resulting subtree. Each item is one
- * top-level file or directory, so exactly one URL comes back. */
-- (nullable NSURL *)fetchFileURLWithTimeout:(NSTimeInterval)timeout {
+- (nullable AsbClipPending *)fetchFilesWithTimeout:(NSTimeInterval)timeout {
     int fd = g_client_sock;
     if (fd < 0) return nil;
     AsbClipPending *p = [AsbClipPending new];
     p.seqId = alloc_seq();
-    p.fileTreeDir = alloc_tree_cache_dir();
-    if (!p.fileTreeDir) return nil;
+    p.fileTemp = asb_clipboard_temp_create(g_cache_base.fileSystemRepresentation);
+    if (!p.fileTemp) return nil;
+    p.fileTreeDir = @(asb_clipboard_temp_path(p.fileTemp));
     p.fileCountExpected = INT32_MAX;
     pending_register(p);
     if (send_data_req_v2(fd, p.seqId, self.itemIndex,
@@ -349,13 +352,9 @@ static NSString * const kLazySentinelUTI = @"com.appsandbox.clipboard.lazy";
         if (![p.cond waitUntilDate:deadline]) break;
     }
     BOOL ok = p.completed && !p.failed;
-    NSArray<NSURL *> *urls = ok ? [p.fileTreeUrls copy] : nil;
     [p.cond unlock];
-    if (!ok && p.fileTreeDir) {
-        [NSFileManager.defaultManager removeItemAtPath:p.fileTreeDir error:nil];
-    }
     pending_remove(p.seqId);
-    return urls.firstObject;
+    return ok ? p : nil;
 }
 
 - (void)pasteboard:(NSPasteboard *)pb item:(NSPasteboardItem *)item
@@ -380,6 +379,7 @@ provideDataForType:(NSString *)type {
 
     uint64_t hint = self.sizeHints[type].unsignedLongLongValue;
     NSData *result = nil;
+    AsbClipPending *files = nil;
 
     if ([type isEqualToString:NSPasteboardTypeFileURL]) {
         NSTimeInterval ftimeout = hint > 1024ULL * 1024 * 1024 ? 600.0
@@ -387,7 +387,8 @@ provideDataForType:(NSString *)type {
                                 : 60.0;
         clip_log(@"provider: fetching file-url item=%u (hint=%llu, timeout=%.0fs)",
                  self.itemIndex, (unsigned long long)hint, ftimeout);
-        NSURL *url = [self fetchFileURLWithTimeout:ftimeout];
+        files = [self fetchFilesWithTimeout:ftimeout];
+        NSURL *url = files.fileTreeUrls.firstObject;
         if (!url) return;
         result = [url.absoluteString dataUsingEncoding:NSUTF8StringEncoding];
     } else {
@@ -398,26 +399,20 @@ provideDataForType:(NSString *)type {
                  type, self.itemIndex, (unsigned long long)hint, timeout);
         result = [self fetchTypedData:type timeout:timeout];
     }
-    if (!result) {
+    if (!result || self.generation != atomic_load(&g_lazy_generation) || self.pasteboardToken != (uint64_t)pb.changeCount) {
         clip_log(@"provider: fetch failed for item %u %@", self.itemIndex, type);
         return;
     }
+    if (![item setData:result forType:type]) return;
     [self.cacheLock lock];
     self.cache[type] = result;
     [self.cacheLock unlock];
-    [item setData:result forType:type];
+    if (files) {
+        asb_clipboard_temp_publish(files.fileTemp, &g_pending, self.pasteboardToken);
+        files.fileTemp = NULL;
+    }
 }
 @end
-
-/* Allocate a fresh cache-dir subfolder. */
-static NSString *alloc_tree_cache_dir(void) {
-    NSString *sub = [g_cache_base stringByAppendingPathComponent:
-                     NSUUID.UUID.UUIDString];
-    if (![NSFileManager.defaultManager createDirectoryAtPath:sub
-                            withIntermediateDirectories:YES
-                                             attributes:nil error:nil]) return nil;
-    return sub;
-}
 
 /* Build N NSPasteboardItems mirroring the host's per-item structure and
  * atomically replace the guest pasteboard. Each item's provider owns its
@@ -429,6 +424,7 @@ static void write_lazy_pasteboard(NSArray<NSDictionary *> *items) {
     uint64_t gen = atomic_load(&g_lazy_generation);
 
     NSMutableArray *writables = [NSMutableArray array];
+    NSMutableArray<AsbClipItemProvider *> *providers = [NSMutableArray array];
     for (NSUInteger i = 0; i < items.count; i++) {
         NSDictionary *entry = items[i];
         NSArray<NSString *> *types = entry[@"types"];
@@ -439,6 +435,7 @@ static void write_lazy_pasteboard(NSArray<NSDictionary *> *items) {
         provider.generation = gen;
         provider.itemIndex  = (uint32_t)i;
         provider.sizeHints  = hints;
+        [providers addObject:provider];
 
         NSPasteboardItem *pi = [NSPasteboardItem new];
         NSArray<NSString *> *typesWithSentinel =
@@ -448,8 +445,11 @@ static void write_lazy_pasteboard(NSArray<NSDictionary *> *items) {
     }
 
     NSPasteboard *pb = NSPasteboard.generalPasteboard;
+    asb_clipboard_temp_retire_owner(&g_pending);
     [pb clearContents];
     [pb writeObjects:writables];
+    asb_clipboard_temp_changed((uint64_t)pb.changeCount);
+    for (AsbClipItemProvider *provider in providers) provider.pasteboardToken = (uint64_t)pb.changeCount;
     atomic_store(&g_suppress_change, pb.changeCount);
     clip_log(@"lazy pasteboard written (gen=%llu, %u items, cc=%ld)",
              (unsigned long long)gen,
@@ -956,16 +956,6 @@ static int handle_data_request(int fd, NSString *format) {
 
 /* ---- Inbound: apply remote pasteboard ---- */
 
-static NSURL *alloc_cache_dir(void) {
-    NSString *sub = [g_cache_base stringByAppendingPathComponent:
-                     NSUUID.UUID.UUIDString];
-    NSError *err = nil;
-    if (![NSFileManager.defaultManager createDirectoryAtPath:sub
-                             withIntermediateDirectories:YES
-                                              attributes:nil error:&err]) return nil;
-    return [NSURL fileURLWithPath:sub];
-}
-
 /* Stream one FILE_DATA message body:
  *   - header carries data_size = sizeof(ClipFileInfo) + path_len
  *   - file_size raw bytes follow the header (not included in data_size)
@@ -974,7 +964,7 @@ static NSURL *alloc_cache_dir(void) {
  * whole file never lives in memory. On success, if outTopLevel is not NULL
  * and this was a top-level entry (pathComponents.count == 1), receives the
  * materialized NSURL. */
-static BOOL stream_file_data(int fd, ClipHeader h, NSURL *destDir,
+static BOOL stream_file_data(int fd, ClipHeader h, AsbClipboardTemp *temp,
                              NSURL **outTopLevel) {
     if (h.data_size < sizeof(ClipFileInfo)) return NO;
     ClipFileInfo info;
@@ -995,7 +985,7 @@ static BOOL stream_file_data(int fd, ClipHeader h, NSURL *destDir,
     NSString *rel = [[NSString alloc] initWithBytes:path_buf length:path_len encoding:NSUTF8StringEncoding];
     free(path_buf);
 
-    if (!destDir) {
+    if (!temp) {
         /* Drain the incoming bytes so the stream stays in sync, drop result. */
         uint8_t drain[4096];
         uint64_t rem = file_size;
@@ -1011,7 +1001,7 @@ static BOOL stream_file_data(int fd, ClipHeader h, NSURL *destDir,
         [rel.pathComponents containsObject:@".."] || [rel.pathComponents containsObject:@"."] ||
         [rel rangeOfString:@"\0"].location != NSNotFound) return NO;
 
-    NSURL *target = [destDir URLByAppendingPathComponent:rel];
+    NSURL *target = [NSURL fileURLWithPath:[@(asb_clipboard_temp_path(temp)) stringByAppendingPathComponent:rel]];
     if (is_dir == CLIP_ENTRY_SYMLINK) {
         /* Body (file_size bytes) is the link target string. */
         if (file_size == 0 || file_size > CLIP_SYMLINK_MAX) {
@@ -1027,27 +1017,19 @@ static BOOL stream_file_data(int fd, ClipHeader h, NSURL *destDir,
         if (!lnk) return NO;
         if (read_full(fd, lnk, (size_t)file_size) <= 0) { free(lnk); return NO; }
         lnk[file_size] = 0;
-        if (![NSFileManager.defaultManager createDirectoryAtURL:[target URLByDeletingLastPathComponent]
-                               withIntermediateDirectories:YES attributes:nil error:nil]) { free(lnk); return NO; }
-        int rc = symlink(lnk, target.path.fileSystemRepresentation);
+        int rc = !memchr(lnk, 0, (size_t)file_size) && asb_clipboard_temp_symlink(temp, rel.fileSystemRepresentation, lnk) ? 0 : -1;
         free(lnk);
         if (rc < 0) return NO;
         if (outTopLevel && rel.pathComponents.count == 1) *outTopLevel = target;
         return YES;
     }
     if (is_dir) {
-        if (![NSFileManager.defaultManager createDirectoryAtURL:target
-                               withIntermediateDirectories:YES
-                                                attributes:nil error:nil]) return NO;
+        if (!asb_clipboard_temp_directory(temp, rel.fileSystemRepresentation)) return NO;
         if (outTopLevel && rel.pathComponents.count == 1) *outTopLevel = target;
         return YES;
     }
 
-    if (![NSFileManager.defaultManager createDirectoryAtURL:[target URLByDeletingLastPathComponent]
-                           withIntermediateDirectories:YES
-                                            attributes:nil error:nil]) return NO;
-    int ffd = open(target.path.fileSystemRepresentation,
-                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int ffd = asb_clipboard_temp_file(temp, rel.fileSystemRepresentation);
     if (ffd < 0) return NO;
     uint8_t *chunk = malloc(CLIP_FILE_CHUNK);
     if (!chunk) { if (ffd >= 0) close(ffd); return NO; }
@@ -1082,23 +1064,34 @@ static void apply_format_data(NSMutableDictionary *acc, NSString *format, NSData
     acc[format] = data ?: [NSData data];
 }
 
-static void write_to_pasteboard(NSDictionary *formatData, NSArray<NSURL *> *fileUrls) {
-    NSPasteboard *pb = NSPasteboard.generalPasteboard;
-    [pb clearContents];
+static void write_to_pasteboard(int fd, NSDictionary *formatData, NSArray<NSURL *> *fileUrls, NSArray<AsbClipPending *> *files) {
+    uint64_t generation = atomic_load(&g_lazy_generation);
+    BOOL sync = atomic_load(&g_sync_enabled);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_stop || g_client_sock != fd || generation != atomic_load(&g_lazy_generation) || sync != atomic_load(&g_sync_enabled)) return;
+        NSPasteboard *pb = NSPasteboard.generalPasteboard;
+        asb_clipboard_temp_retire_owner(&g_pending);
+        [pb clearContents];
 
-    if (fileUrls.count) {
-        [pb writeObjects:fileUrls];
-    }
-    for (NSString *fmt in formatData) {
-        if ([fmt isEqualToString:NSPasteboardTypeFileURL]) continue;
-        NSData *d = formatData[fmt];
-        if (d.length == 0) continue;
-        [pb setData:d forType:fmt];
-    }
-    /* Record changeCount so poller swallows the echo. */
-    atomic_store(&g_suppress_change, pb.changeCount);
-    clip_log(@"applied pasteboard (changeCount=%ld, %d formats, %d files)",
-             (long)pb.changeCount, (int)formatData.count, (int)fileUrls.count);
+        BOOL filesWritten = NO;
+        if (fileUrls.count) {
+            filesWritten = [pb writeObjects:fileUrls];
+        }
+        for (NSString *fmt in formatData) {
+            if ([fmt isEqualToString:NSPasteboardTypeFileURL]) continue;
+            NSData *d = formatData[fmt];
+            if (d.length == 0) continue;
+            [pb setData:d forType:fmt];
+        }
+        atomic_store(&g_suppress_change, pb.changeCount);
+        asb_clipboard_temp_changed((uint64_t)pb.changeCount);
+        if (filesWritten) for (AsbClipPending *p in files) {
+            asb_clipboard_temp_publish(p.fileTemp, &g_pending, (uint64_t)pb.changeCount);
+            p.fileTemp = NULL;
+        }
+        clip_log(@"applied pasteboard (changeCount=%ld, %d formats, %d files)",
+                 (long)pb.changeCount, (int)formatData.count, (int)fileUrls.count);
+    });
 }
 
 /* ---- Connection main loop ---- */
@@ -1129,6 +1122,7 @@ static int connect_sequence_inbound_format_list(int fd, ClipHeader h) {
     /* For each format, issue DATA_REQ then wait for DATA_RESP to accumulate. */
     NSMutableDictionary<NSString *, NSData *> *dataByFmt = [NSMutableDictionary dictionary];
     NSMutableArray<NSURL *> *fileUrls = [NSMutableArray array];
+    NSMutableArray<AsbClipPending *> *files = [NSMutableArray new];
 
     for (NSString *fmt in utis) {
         if (send_message(fd, CLIP_MSG_FORMAT_DATA_REQ, fmt, nil) <= 0) return -1;
@@ -1168,8 +1162,10 @@ static int connect_sequence_inbound_format_list(int fd, ClipHeader h) {
                         }
                     }
                     uint32_t n; memcpy(&n, countBuf, 4); n = ntohl(n);
-                    NSURL *dest = alloc_cache_dir();
-                    if (!dest) return -1;
+                    AsbClipPending *file = [AsbClipPending new];
+                    file.fileTemp = asb_clipboard_temp_create(g_cache_base.fileSystemRepresentation);
+                    if (!file.fileTemp) return -1;
+                    [files addObject:file];
                     for (uint32_t i = 0; i < n; i++) {
                         ClipHeader fh;
                         if (read_full(fd, &fh, sizeof(fh)) <= 0) return -1;
@@ -1181,10 +1177,7 @@ static int connect_sequence_inbound_format_list(int fd, ClipHeader h) {
                             return -1;
                         if (fh.format_len != 0 || fh.data_size > CLIP_MAX_PAYLOAD) return -1;
                         NSURL *topLevel = nil;
-                        if (!stream_file_data(fd, fh, dest, &topLevel)) {
-                            [NSFileManager.defaultManager removeItemAtURL:dest error:nil];
-                            return -1;
-                        }
+                        if (!stream_file_data(fd, fh, file.fileTemp, &topLevel)) return -1;
                         if (topLevel) [fileUrls addObject:topLevel];
                     }
                     break;
@@ -1207,7 +1200,7 @@ static int connect_sequence_inbound_format_list(int fd, ClipHeader h) {
         }
     }
 
-    write_to_pasteboard(dataByFmt, fileUrls);
+    write_to_pasteboard(fd, dataByFmt, fileUrls, files);
     return 1;
 }
 
@@ -1442,12 +1435,30 @@ static int handle_inbound(int fd) {
             return 1;
         }
         if (h.msg_type == CLIP_MSG_FILE_DATA_V2) {
+            [p.cond lock];
+            BOOL receiving = !p.completed;
+            [p.cond unlock];
+            if (!receiving) return -1;
+            if (p.fileTreeDir) {
+                NSURL *topLevel = nil;
+                if (!stream_file_data(fd, h, p.fileTemp, &topLevel)) return -1;
+                [p.cond lock];
+                if (topLevel) {
+                    if (!p.fileTreeUrls) p.fileTreeUrls = [NSMutableArray array];
+                    [p.fileTreeUrls addObject:topLevel];
+                }
+                if (--p.fileCountExpected <= 0) {
+                    p.completed = YES;
+                    [p.cond broadcast];
+                }
+                [p.cond unlock];
+                return 1;
+            }
             if (h.data_size < sizeof(ClipFileInfo)) return -1;
             ClipFileInfo info;
             if (read_full(fd, &info, sizeof(info)) <= 0) return -1;
             uint32_t path_len  = ntohl(info.path_len);
             uint64_t file_size = CFSwapInt64BigToHost(info.file_size);
-            uint32_t is_dir    = ntohl(info.is_directory);
             if ((uint64_t)sizeof(info) + path_len != h.data_size) return -1;
 
             char *pathBuf = malloc((size_t)path_len + 1);
@@ -1463,96 +1474,6 @@ static int handle_inbound(int fd) {
             if (!relPath.length || relPath.isAbsolutePath ||
                 [relPath.pathComponents containsObject:@".."] || [relPath.pathComponents containsObject:@"."] ||
                 [relPath rangeOfString:@"\0"].location != NSNotFound) return -1;
-
-            /* Two paths: multi-file tree (p.fileTreeDir set) or single
-             * file into p.fileFd / p.body. */
-            if (p.fileTreeDir) {
-                NSString *target = [p.fileTreeDir
-                    stringByAppendingPathComponent:relPath];
-                if (is_dir == CLIP_ENTRY_SYMLINK) {
-                    /* Body (file_size bytes) is the link target string. */
-                    if (file_size == 0 || file_size > CLIP_SYMLINK_MAX) {
-                        uint64_t rem = file_size; uint8_t td[4096];
-                        while (rem > 0) {
-                            size_t w = rem > sizeof(td) ? sizeof(td) : (size_t)rem;
-                            if (read_full(fd, td, w) <= 0) return -1;
-                            rem -= w;
-                        }
-                    } else {
-                        char *lnk = malloc((size_t)file_size + 1);
-                        if (!lnk) return -1;
-                        if (read_full(fd, lnk, (size_t)file_size) <= 0) { free(lnk); return -1; }
-                        lnk[file_size] = 0;
-                        if (![NSFileManager.defaultManager createDirectoryAtPath:
-                            [target stringByDeletingLastPathComponent]
-                                            withIntermediateDirectories:YES
-                                                             attributes:nil error:nil]) { free(lnk); return -1; }
-                        int rc = symlink(lnk, target.fileSystemRepresentation);
-                        free(lnk);
-                        if (rc < 0) return -1;
-                    }
-                } else if (is_dir) {
-                    if (![NSFileManager.defaultManager createDirectoryAtPath:target
-                                        withIntermediateDirectories:YES
-                                                         attributes:nil error:nil]) return -1;
-                } else {
-                    if (![NSFileManager.defaultManager createDirectoryAtPath:
-                        [target stringByDeletingLastPathComponent]
-                                        withIntermediateDirectories:YES
-                                                         attributes:nil error:nil]) return -1;
-                    int ffd = open(target.fileSystemRepresentation,
-                                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                    if (ffd < 0) return -1;
-                    uint8_t *chunk = malloc(CLIP_FILE_CHUNK);
-                    if (!chunk) { if (ffd >= 0) close(ffd); return -1; }
-                    uint64_t remaining = file_size;
-                    BOOL ok = YES;
-                    while (remaining > 0) {
-                        size_t want = remaining > CLIP_FILE_CHUNK
-                            ? CLIP_FILE_CHUNK : (size_t)remaining;
-                        if (read_full(fd, chunk, want) <= 0) { ok = NO; break; }
-                        if (ffd >= 0) {
-                            const uint8_t *pp = chunk; size_t left = want;
-                            while (left) {
-                                ssize_t w = write(ffd, pp, left);
-                                if (w < 0 && errno == EINTR) continue;
-                                if (w <= 0) { ok = NO; break; }
-                                pp += w; left -= (size_t)w;
-                            }
-                            if (!ok) break;
-                        }
-                        remaining -= want;
-                    }
-                    free(chunk);
-                    if (close(ffd) < 0) ok = NO;
-                    if (!ok) {
-                        unlink(target.fileSystemRepresentation);
-                        [p.cond lock];
-                        p.failed = YES;
-                        p.completed = YES;
-                        [p.cond broadcast];
-                        [p.cond unlock];
-                        return -1;
-                    }
-                }
-                /* Track top-level entries as pasteboard URLs. */
-                if (relPath.pathComponents.count == 1) {
-                    [p.cond lock];
-                    if (!p.fileTreeUrls) p.fileTreeUrls = [NSMutableArray array];
-                    [p.fileTreeUrls addObject:[NSURL fileURLWithPath:target]];
-                    [p.cond unlock];
-                }
-                /* Countdown & complete. */
-                [p.cond lock];
-                p.fileCountExpected--;
-                BOOL done = (p.fileCountExpected <= 0);
-                if (done) {
-                    p.completed = YES;
-                    [p.cond broadcast];
-                }
-                [p.cond unlock];
-                return 1;
-            }
 
             /* Single-file fallback path (no tree dir). */
             [p.cond lock];
@@ -1606,13 +1527,20 @@ static void *pb_poll_thread(void *arg) {
     (void)arg;
     NSPasteboard *pb = NSPasteboard.generalPasteboard;
     g_last_seen_change = pb.changeCount;
+    NSInteger observed = -1;
     while (!g_stop) {
         usleep(250 * 1000);
+        NSInteger now = pb.changeCount;
+        if (now != observed) {
+            observed = now;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                asb_clipboard_temp_changed((uint64_t)NSPasteboard.generalPasteboard.changeCount);
+            });
+        }
         if (g_client_sock < 0) continue;
         /* Only sync guest→host while host has told us the VM window is
          * focused. Mirror of the host-side gate. */
         if (!atomic_load(&g_sync_enabled)) continue;
-        NSInteger now = pb.changeCount;
         if (now == g_last_seen_change) continue;
         g_last_seen_change = now;
 
@@ -1671,6 +1599,7 @@ static NSXPCConnection *g_xpc_conn;
     }
     clip_log(@"XPC: received host fd (dup=%d)", owned);
     dispatch_async(g_session_queue, ^{
+        atomic_fetch_add(&g_lazy_generation, 1);
         g_client_sock = owned;
         g_last_seen_change = -1;
         while (!g_stop) {
@@ -1678,6 +1607,10 @@ static NSXPCConnection *g_xpc_conn;
         }
         clip_log(@"XPC: host session ended");
         pending_fail_all(@"host session ended");
+        atomic_fetch_add(&g_lazy_generation, 1);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            asb_clipboard_temp_retire_owner(&g_pending);
+        });
         close(owned);
         g_client_sock = -1;
     });
@@ -1742,6 +1675,7 @@ int main(int argc, char *argv[]) {
         [NSFileManager.defaultManager createDirectoryAtPath:g_cache_base
                                 withIntermediateDirectories:YES
                                                  attributes:nil error:nil];
+        asb_clipboard_temp_collect(g_cache_base.fileSystemRepresentation);
 
         struct sigaction sa = {0};
         sa.sa_handler = on_signal;

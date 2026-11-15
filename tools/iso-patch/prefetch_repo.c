@@ -417,6 +417,17 @@ int do_prefetch_repo(const wchar_t *tag, const wchar_t *mesa_tag,
                 if (u_cp_file(capture_src, dst) != 0) goto failed;
             }
         }
+        const wchar_t *clipboard_files[] = { L"asb_clipboard_temp.c", L"asb_clipboard_temp.h" };
+        BOOL clipboard_temp = FALSE;
+        for (size_t i = 0; i < ARRAYSIZE(clipboard_files); ++i) {
+            swprintf_s(capture_src, MAX_PATH, L"%s\\tools\\transport\\%s", extracted_root, clipboard_files[i]);
+            if (GetFileAttributesW(capture_src) != INVALID_FILE_ATTRIBUTES) clipboard_temp = TRUE;
+        }
+        if (clipboard_temp) for (size_t i = 0; i < ARRAYSIZE(clipboard_files); ++i) {
+            swprintf_s(capture_src, MAX_PATH, L"%s\\tools\\transport\\%s", extracted_root, clipboard_files[i]);
+            swprintf_s(dst, MAX_PATH, L"%s\\transport\\%s", out_agent, clipboard_files[i]);
+            if (u_cp_file(capture_src, dst) != 0) goto failed;
+        }
         wchar_t protocol_src[MAX_PATH];
         swprintf_s(protocol_src, MAX_PATH, L"%s\\src\\core\\protocol.h", extracted_root);
         swprintf_s(dst, MAX_PATH, L"%s\\protocol.h", out_agent);

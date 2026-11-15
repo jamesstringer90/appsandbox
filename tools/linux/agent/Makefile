@@ -53,8 +53,8 @@ appsandbox-audio: appsandbox-audio.c
 # Clipboard daemon: XCB (with XFIXES) for X11 selection ownership,
 # libc iconv for text format conversion. libpng would be added when
 # we wire the DIB ↔ PNG path; today CF_DIB → image/bmp is header-munge.
-appsandbox-clipboard: appsandbox-clipboard.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) -lxcb -lxcb-xfixes
+appsandbox-clipboard: appsandbox-clipboard.c $(CAPTURE_DIR)/asb_clipboard_temp.c $(CAPTURE_DIR)/asb_clipboard_temp.h
+	$(CC) $(CFLAGS) -I$(CAPTURE_DIR) -o $@ appsandbox-clipboard.c $(CAPTURE_DIR)/asb_clipboard_temp.c $(LDFLAGS) -lxcb -lxcb-xfixes
 
 install-pointer:
 	install -d $(DESTDIR)$(EXTENSIONDIR)

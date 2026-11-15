@@ -13,6 +13,7 @@
 
 #include "vm_clipboard.h"
 #include "clipboard_file.h"
+#include "../../tools/transport/asb_clipboard_temp.h"
 #include "hcs_vm.h"
 #include <shlobj.h>
 #include <stdio.h>
@@ -122,6 +123,8 @@ struct VmClipboardData {
 
     /* Temp directory for file transfers */
     wchar_t          temp_dir[MAX_PATH];
+    wchar_t          temp_parent[MAX_PATH];
+    AsbClipboardTemp *temp;
 };
 
 /* ---- Logging ---- */
@@ -234,28 +237,6 @@ static BOOL clip_should_skip(UINT fmt)
     }
 }
 
-static void clip_remove_dir_recursive(const wchar_t *dir)
-{
-    WIN32_FIND_DATAW fd;
-    wchar_t pattern[MAX_PATH];
-    HANDLE h;
-
-    swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
-    h = FindFirstFileW(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        wchar_t path[MAX_PATH];
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        swprintf_s(path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            clip_remove_dir_recursive(path);
-        else
-            DeleteFileW(path);
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    RemoveDirectoryW(dir);
-}
-
 static void clip_ensure_parent_dir(const wchar_t *file_path)
 {
     wchar_t dir[MAX_PATH];
@@ -276,7 +257,7 @@ static void clip_ensure_parent_dir(const wchar_t *file_path)
 
 static BOOL clip_path_is_safe(const wchar_t *rel_path)
 {
-    if (wcsstr(rel_path, L"..")) return FALSE;
+    if (wcsstr(rel_path, L"..") || wcschr(rel_path, L':')) return FALSE;
     if (rel_path[0] == L'\\' || rel_path[0] == L'/') return FALSE;
     if (wcslen(rel_path) > MAX_PATH - 50) return FALSE;
     return TRUE;
@@ -391,6 +372,7 @@ static BOOL clip_send_file_entry(VmClipboard clip, SOCKET s, const wchar_t *full
 
 static HGLOBAL clip_build_hdrop_from_temp(const wchar_t *temp_dir)
 {
+    if (!temp_dir || !*temp_dir) return NULL;
     WIN32_FIND_DATAW fd;
     wchar_t pattern[MAX_PATH];
     HANDLE h;
@@ -754,6 +736,12 @@ static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHea
         return TRUE;
     }
 
+    if (!clip->temp) {
+        clip->temp = asb_clipboard_temp_create(clip->temp_parent);
+        if (!clip->temp) return FALSE;
+        wcscpy_s(clip->temp_dir, MAX_PATH, asb_clipboard_temp_path(clip->temp));
+    }
+    if (wcslen(clip->temp_dir) + wcslen(rel_path) + 2 > MAX_PATH) return FALSE;
     swprintf_s(full_path, MAX_PATH, L"%s\\%s", clip->temp_dir, rel_path);
 
     if (fi.is_directory) {
@@ -800,6 +788,9 @@ static void clip_reader_free_pending(VmClipboard clip)
             clip->reader_fmts[i].data = NULL;
         }
     }
+    asb_clipboard_temp_discard(clip->temp);
+    clip->temp = NULL;
+    clip->temp_dir[0] = 0;
 }
 
 static void clip_reader_request_next(VmClipboard clip, SOCKET s)
@@ -808,6 +799,14 @@ static void clip_reader_request_next(VmClipboard clip, SOCKET s)
 
     if (!clip->sharing_enabled || clip->reader_generation != clip->sharing_generation) return;
     if (clip->reader_fetch_idx >= clip->reader_fmt_count) {
+        if (clip->temp && !asb_clipboard_temp_prepare(clip->temp)) {
+            EnterCriticalSection(&clip->reader_cs);
+            clip_reader_free_pending(clip);
+            clip->reader_fmt_count = 0;
+            LeaveCriticalSection(&clip->reader_cs);
+            clip_log(clip, L"CLIP-R: Could not prepare clipboard file permissions.");
+            return;
+        }
         EnterCriticalSection(&clip->reader_cs);
         clip->reader_ready = TRUE;
         LeaveCriticalSection(&clip->reader_cs);
@@ -895,9 +894,6 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
 
         HeapFree(GetProcessHeap(), 0, buf);
 
-        clip_remove_dir_recursive(clip->temp_dir);
-        CreateDirectoryW(clip->temp_dir, NULL);
-
         clip_log(clip, L"CLIP-R: Received format list (%d formats), fetching data...",
                  clip->reader_fmt_count);
         clip_reader_request_next(clip, s);
@@ -928,9 +924,16 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         return TRUE;
     }
 
-    case CLIP_MSG_FILE_DATA:
-        CreateDirectoryW(clip->temp_dir, NULL);
+    case CLIP_MSG_FILE_DATA: {
+        EnterCriticalSection(&clip->reader_cs);
+        int idx = clip->reader_fetch_idx;
+        BOOL active = !clip->reader_ready && clip->sharing_enabled &&
+            clip->reader_generation == clip->sharing_generation && idx >= 0 && idx < clip->reader_fmt_count &&
+            clip->reader_fmts[idx].remote_id == CF_HDROP;
+        LeaveCriticalSection(&clip->reader_cs);
+        if (!active) return FALSE;
         return clip_reader_recv_file_data(clip, s, hdr);
+    }
 
     default:
         if (hdr->data_size > 0) {
@@ -991,7 +994,6 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
         clip->reader_ready = FALSE;
         clip_reader_free_pending(clip);
         LeaveCriticalSection(&clip->reader_cs);
-        clip_remove_dir_recursive(clip->temp_dir);
         /* Atomically claim the socket so the reader thread and clip_stop()
            never double-close the same handle (App Verifier invalid-handle). */
         {
@@ -1037,9 +1039,14 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
     clip->pending_sync = 0;
     InitializeCriticalSection(&clip->reader_cs);
 
-    GetTempPathW(MAX_PATH, tmp);
-    swprintf_s(clip->temp_dir, MAX_PATH, L"%sAppSandboxClip", tmp);
-    CreateDirectoryW(clip->temp_dir, NULL);
+    DWORD temp_length = GetTempPathW(MAX_PATH, tmp);
+    if (!temp_length || temp_length >= MAX_PATH) {
+        DeleteCriticalSection(&clip->reader_cs);
+        HeapFree(GetProcessHeap(), 0, clip);
+        return NULL;
+    }
+    wcscpy_s(clip->temp_parent, MAX_PATH, tmp);
+    asb_clipboard_temp_collect(clip->temp_parent);
 
     /* Initial writer connection */
     hcs_service_guid(clip->os_type, 5, &svc);
@@ -1100,7 +1107,8 @@ ASB_API void vm_clipboard_destroy(VmClipboard clip)
     }
 
     clip_reader_free_pending(clip);
-    clip_remove_dir_recursive(clip->temp_dir);
+    asb_clipboard_temp_retire_owner(clip);
+    asb_clipboard_temp_collect(clip->temp_parent);
 
     DeleteCriticalSection(&clip->reader_cs);
 
@@ -1134,6 +1142,7 @@ ASB_API void vm_clipboard_set_sharing_enabled(VmClipboard clip, BOOL enabled)
 ASB_API void vm_clipboard_on_clipboard_update(VmClipboard clip)
 {
     if (!clip) return;
+    asb_clipboard_temp_changed((uint64_t)(UINT_PTR)GetClipboardOwner());
 
     /* Echo suppression */
     if (InterlockedExchange(&clip->writer_suppress, 0)) {
@@ -1173,13 +1182,16 @@ ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)
         return;
     }
 
+    BOOL files_published = FALSE;
     EmptyClipboard();
 
     for (i = 0; i < clip->reader_fmt_count; i++) {
         if (clip->reader_fmts[i].is_hdrop) {
             HGLOBAL hDrop = clip_build_hdrop_from_temp(clip->temp_dir);
-            if (hDrop)
-                SetClipboardData(clip->reader_fmts[i].local_id, hDrop);
+            if (hDrop) {
+                if (SetClipboardData(clip->reader_fmts[i].local_id, hDrop)) files_published = TRUE;
+                else GlobalFree(hDrop);
+            }
         } else if (clip->reader_fmts[i].data && clip->reader_fmts[i].data_size > 0) {
             HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, clip->reader_fmts[i].data_size);
             if (hMem) {
@@ -1195,7 +1207,15 @@ ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)
         }
     }
 
-    InterlockedExchange(&clip->pushed_sequence, (LONG)GetClipboardSequenceNumber());
+    DWORD sequence = GetClipboardSequenceNumber();
+    uint64_t owner = (uint64_t)(UINT_PTR)GetClipboardOwner();
+    asb_clipboard_temp_retire_owner(clip);
+    asb_clipboard_temp_changed(owner);
+    if (files_published) asb_clipboard_temp_publish(clip->temp, clip, owner);
+    else asb_clipboard_temp_discard(clip->temp);
+    clip->temp = NULL;
+    clip->temp_dir[0] = 0;
+    InterlockedExchange(&clip->pushed_sequence, (LONG)sequence);
     CloseClipboard();
     clip_log(clip, L"CLIP-R: Applied %d formats to host clipboard.", clip->reader_fmt_count);
     clip_reader_free_pending(clip);

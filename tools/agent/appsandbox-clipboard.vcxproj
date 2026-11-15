@@ -158,6 +158,7 @@ xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
     <ClCompile Include="appsandbox-clipboard.c" />
     <ClCompile Include="..\transport\asb_transport.c" />
     <ClCompile Include="..\..\src\backend_win\clipboard_file.c" />
+    <ClCompile Include="..\transport\asb_clipboard_temp.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

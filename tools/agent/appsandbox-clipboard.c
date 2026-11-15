@@ -25,6 +25,7 @@
 #include <shlobj.h>
 #include "../transport/asb_transport.h"   /* AF_HYPERV on PC, ivshmem on Mac */
 #include "../../src/backend_win/clipboard_file.h"
+#include "../transport/asb_clipboard_temp.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "user32.lib")
@@ -88,6 +89,8 @@ typedef struct {
 /* File transfer for CF_HDROP */
 #define CLIP_FILE_CHUNK     (1024 * 1024)  /* 1 MB — HV socket is basically memcpy */
 static wchar_t g_clip_temp_dir[MAX_PATH];
+static wchar_t g_clip_temp_parent[MAX_PATH];
+static AsbClipboardTemp *g_clip_temp;
 
 #pragma pack(push, 1)
 typedef struct {
@@ -183,44 +186,22 @@ static void clip_init_temp_dir(void)
         WTSQueryUserToken(session_id, &user_token)) {
         if (ExpandEnvironmentStringsForUserW(user_token, L"%TEMP%",
                                               tmp, MAX_PATH)) {
-            swprintf_s(g_clip_temp_dir, MAX_PATH, L"%s\\AppSandboxClip", tmp);
+            wcscpy_s(g_clip_temp_parent, MAX_PATH, tmp);
             CloseHandle(user_token);
-            CreateDirectoryW(g_clip_temp_dir, NULL);
-            clip_log("Temp dir: %ls", g_clip_temp_dir);
+            clip_log("Temp dir: %ls", g_clip_temp_parent);
             return;
         }
         CloseHandle(user_token);
     }
 
     /* Fallback: SYSTEM temp (should not normally happen) */
-    GetTempPathW(MAX_PATH, tmp);
-    swprintf_s(g_clip_temp_dir, MAX_PATH, L"%sAppSandboxClip", tmp);
-    CreateDirectoryW(g_clip_temp_dir, NULL);
-    clip_log("Temp dir (fallback): %ls", g_clip_temp_dir);
+    DWORD length = GetTempPathW(MAX_PATH, tmp);
+    if (length && length < MAX_PATH) wcscpy_s(g_clip_temp_parent, MAX_PATH, tmp);
+    else g_clip_temp_parent[0] = 0;
+    clip_log("Temp dir (fallback): %ls", g_clip_temp_parent);
 }
 
 /* ---- File transfer helpers ---- */
-
-static void clip_remove_dir_recursive(const wchar_t *dir)
-{
-    WIN32_FIND_DATAW fd;
-    wchar_t pattern[MAX_PATH];
-    HANDLE h;
-    swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
-    h = FindFirstFileW(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        wchar_t path[MAX_PATH];
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        swprintf_s(path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            clip_remove_dir_recursive(path);
-        else
-            DeleteFileW(path);
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    RemoveDirectoryW(dir);
-}
 
 static void clip_ensure_parent_dir(const wchar_t *file_path)
 {
@@ -242,7 +223,7 @@ static void clip_ensure_parent_dir(const wchar_t *file_path)
 
 static BOOL clip_path_is_safe(const wchar_t *rel_path)
 {
-    if (wcsstr(rel_path, L"..")) return FALSE;
+    if (wcsstr(rel_path, L"..") || wcschr(rel_path, L':')) return FALSE;
     if (rel_path[0] == L'\\' || rel_path[0] == L'/') return FALSE;
     if (wcslen(rel_path) > MAX_PATH - 50) return FALSE;
     return TRUE;
@@ -250,6 +231,7 @@ static BOOL clip_path_is_safe(const wchar_t *rel_path)
 
 static HGLOBAL clip_build_hdrop_from_temp(void)
 {
+    if (!g_clip_temp_dir[0]) return NULL;
     WIN32_FIND_DATAW fd;
     wchar_t pattern[MAX_PATH];
     HANDLE h;
@@ -319,6 +301,9 @@ static void clip_free_pending(void)
             g_clip_fmts[i].data = NULL;
         }
     }
+    asb_clipboard_temp_discard(g_clip_temp);
+    g_clip_temp = NULL;
+    g_clip_temp_dir[0] = 0;
 }
 
 /* Send FORMAT_DATA_REQ for the next format, or post WM_CLIP_APPLY_FMTS if all done.
@@ -328,6 +313,14 @@ static void clip_request_next_format(void)
     ClipHeader hdr;
 
     if (g_clip_fetch_idx >= g_clip_fmt_count) {
+        if (g_clip_temp && !asb_clipboard_temp_prepare(g_clip_temp)) {
+            EnterCriticalSection(&g_pending_cs);
+            clip_free_pending();
+            g_clip_fmt_count = 0;
+            LeaveCriticalSection(&g_pending_cs);
+            clip_log("Could not prepare clipboard file permissions.");
+            return;
+        }
         EnterCriticalSection(&g_pending_cs);
         g_clip_ready = TRUE;
         LeaveCriticalSection(&g_pending_cs);
@@ -376,13 +369,16 @@ static void clip_apply_format_list(void)
         return;
     }
 
+    BOOL files_published = FALSE;
     EmptyClipboard();
 
     for (i = 0; i < g_clip_fmt_count; i++) {
         if (g_clip_fmts[i].is_hdrop) {
             HGLOBAL hDrop = clip_build_hdrop_from_temp();
-            if (hDrop)
-                SetClipboardData(g_clip_fmts[i].local_id, hDrop);
+            if (hDrop) {
+                if (SetClipboardData(g_clip_fmts[i].local_id, hDrop)) files_published = TRUE;
+                else GlobalFree(hDrop);
+            }
         } else if (g_clip_fmts[i].data && g_clip_fmts[i].data_size > 0) {
             HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, g_clip_fmts[i].data_size);
             if (hMem) {
@@ -398,6 +394,13 @@ static void clip_apply_format_list(void)
         }
     }
 
+    uint64_t owner = (uint64_t)(UINT_PTR)GetClipboardOwner();
+    asb_clipboard_temp_retire_owner(g_msg_hwnd);
+    asb_clipboard_temp_changed(owner);
+    if (files_published) asb_clipboard_temp_publish(g_clip_temp, g_msg_hwnd, owner);
+    else asb_clipboard_temp_discard(g_clip_temp);
+    g_clip_temp = NULL;
+    g_clip_temp_dir[0] = 0;
     CloseClipboard();
     clip_log("Applied %d formats to clipboard.", g_clip_fmt_count);
     clip_free_pending();
@@ -409,6 +412,9 @@ static void clip_apply_format_list(void)
 static LRESULT CALLBACK clip_msg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_DESTROYCLIPBOARD:
+        asb_clipboard_temp_retire_owner(hwnd);
+        return 0;
     case WM_CLIP_APPLY_FMTS:
         clip_log("WM_CLIP_APPLY_FMTS — applying fetched data.");
         clip_apply_format_list();
@@ -497,6 +503,12 @@ static BOOL clip_recv_file_data(AsbConn *s, const ClipHeader *hdr)
         return TRUE;
     }
 
+    if (!g_clip_temp) {
+        g_clip_temp = asb_clipboard_temp_create(g_clip_temp_parent);
+        if (!g_clip_temp) return FALSE;
+        wcscpy_s(g_clip_temp_dir, MAX_PATH, asb_clipboard_temp_path(g_clip_temp));
+    }
+    if (wcslen(g_clip_temp_dir) + wcslen(rel_path) + 2 > MAX_PATH) return FALSE;
     swprintf_s(full_path, MAX_PATH, L"%s\\%s", g_clip_temp_dir, rel_path);
 
     if (fi.is_directory) {
@@ -625,10 +637,6 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
 
             clip_log("Received format list (%u formats), fetching data...", g_clip_fmt_count);
 
-            /* Clean temp dir for potential file transfers */
-            clip_remove_dir_recursive(g_clip_temp_dir);
-            CreateDirectoryW(g_clip_temp_dir, NULL);
-
             /* Start fetching format data one at a time */
             clip_request_next_format();
             break;
@@ -658,10 +666,16 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
             break;
         }
 
-        case CLIP_MSG_FILE_DATA:
-            CreateDirectoryW(g_clip_temp_dir, NULL);
+        case CLIP_MSG_FILE_DATA: {
+            EnterCriticalSection(&g_pending_cs);
+            int idx = g_clip_fetch_idx;
+            BOOL active = !g_clip_ready && idx >= 0 && idx < g_clip_fmt_count &&
+                g_clip_fmts[idx].remote_id == CF_HDROP;
+            LeaveCriticalSection(&g_pending_cs);
+            if (!active) goto done;
             if (!clip_recv_file_data(s, &hdr)) goto done;
             break;
+        }
 
         default:
             clip_log("Unknown msg_type %u.", hdr.msg_type);
@@ -717,7 +731,7 @@ static void handle_client(AsbConn *s)
     clip_free_pending();
     g_clip_fmt_count = 0;
     LeaveCriticalSection(&g_pending_cs);
-    clip_remove_dir_recursive(g_clip_temp_dir);
+    asb_clipboard_temp_retire_owner(g_msg_hwnd);
     clip_log("Client disconnected.");
 }
 
@@ -736,6 +750,7 @@ int main(void)
     InitializeCriticalSection(&g_pending_cs);
     g_clip_fetch_idx = 0;
     clip_init_temp_dir();
+    asb_clipboard_temp_collect(g_clip_temp_parent);
 
     g_sync_event = CreateEventW(NULL, TRUE, FALSE, CLIP_SYNC_EVENT_NAME);
     if (!g_sync_event)

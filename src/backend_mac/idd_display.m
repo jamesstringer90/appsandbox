@@ -23,6 +23,7 @@
 #import "vm_dir.h"
 #import "agent_overlay.h"
 #include "headless_vm.h"
+#include "../../tools/transport/asb_clipboard_temp.h"
 #import <AudioToolbox/AudioToolbox.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -305,6 +306,16 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 static __weak IddDisplayWindow *g_hotkeyOwner;
 static __weak IddDisplayWindow *g_mouseOwner;
 
+@interface IddClipboardFiles : NSObject
+@property (nonatomic, assign) AsbClipboardTemp *temp;
+@end
+
+@implementation IddClipboardFiles
+- (void)dealloc {
+    asb_clipboard_temp_discard(_temp);
+}
+@end
+
 @interface IddDisplayView : NSView
 @property (nonatomic, weak) IddDisplayWindow *owner;
 @property (nonatomic, strong) NSTrackingArea *track;
@@ -336,8 +347,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
 - (BOOL)clipServe:(int)fd format:(uint32_t)fmt;
 - (BOOL)clipSendFileEntry:(int)fd full:(NSString *)full rel:(NSString *)rel generation:(uint64_t)generation;
 - (BOOL)clipFetch:(int)fd format:(uint32_t)fmt pbType:(NSString *)pbType
-            items:(NSMutableDictionary *)items urls:(NSMutableArray *)urls;
-- (BOOL)clipRecvFiles:(int)fd urls:(NSMutableArray *)urls;
+            items:(NSMutableDictionary *)items urls:(NSMutableArray *)urls files:(IddClipboardFiles *)files;
+- (BOOL)clipRecvFiles:(int)fd urls:(NSMutableArray *)urls files:(IddClipboardFiles *)files;
 /* View callbacks (main thread): render-buffer + cursor access and input dispatch. */
 - (void)renderTick;
 - (void)renderMetal;   /* the view calls this on resize so the frame redraws synchronously while dragging */
@@ -1864,6 +1875,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
         uint32_t ready = 0;
         if (idd_rd_full(fd, &ready, 4) && ready == CLIP_READY_MAGIC) {
             long last = -1;
+            long observed = -1;
             int sync = -1;
             uint64_t generation = atomic_load(&_clipGeneration);
             while (!_stop) {
@@ -1876,8 +1888,14 @@ static __weak IddDisplayWindow *g_mouseOwner;
                     if (!idd_wr_full(fd, &se, sizeof(se)) || !idd_wr_full(fd, &flag, 1)) break;
                     sync = (int)enabled;
                 }
+                long cc = [[NSPasteboard generalPasteboard] changeCount];
+                if (cc != observed) {
+                    observed = cc;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        asb_clipboard_temp_changed((uint64_t)NSPasteboard.generalPasteboard.changeCount);
+                    });
+                }
                 if (enabled) {
-                    long cc = [[NSPasteboard generalPasteboard] changeCount];
                     if (cc != last) { last = cc; if (cc != atomic_load(&_clipSuppress)) { if (![self clipSendFormatList:fd]) break; } }
                 }
                 /* Non-blocking peek for an inbound DATA_REQ: the pump fd has no MSG_PEEK length API,
@@ -2006,6 +2024,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
    copy; we DATA_REQ each format we want and apply it to the Mac pasteboard (on the main thread).
    Mirrors the reader path in src/backend_win/vm_clipboard.c (fetch-and-apply + file receive). ===== */
 - (void)clipReaderLoop {
+    NSString *parent = geteuid() == 0 ? @"/tmp" : NSTemporaryDirectory();
+    asb_clipboard_temp_collect(parent.fileSystemRepresentation);
     while (!_stop) {
         int fd = [_transport connectChannel:ASB_CH_CLIPBOARD_READER timeoutMs:2000];
         if (fd < 0) { if (_stop) break; usleep(200000); continue; }
@@ -2045,12 +2065,13 @@ static __weak IddDisplayWindow *g_mouseOwner;
                 free(buf);
                 NSMutableDictionary *items = [NSMutableDictionary dictionary];
                 NSMutableArray *urls = [NSMutableArray array];
+                IddClipboardFiles *files = [IddClipboardFiles new];
                 BOOL ok = YES;
-                if (fileFormat) ok = ok && [self clipFetch:fd format:fileFormat pbType:nil items:items urls:urls];
-                if (textFormat) ok = ok && [self clipFetch:fd format:textFormat pbType:NSPasteboardTypeString items:items urls:urls];
-                if (rtfFormat) ok = ok && [self clipFetch:fd format:rtfFormat pbType:NSPasteboardTypeRTF items:items urls:urls];
-                if (htmlFormat) ok = ok && [self clipFetch:fd format:htmlFormat pbType:NSPasteboardTypeHTML items:items urls:urls];
-                if (imageFormat) ok = ok && [self clipFetch:fd format:imageFormat pbType:NSPasteboardTypePNG items:items urls:urls];
+                if (fileFormat) ok = ok && [self clipFetch:fd format:fileFormat pbType:nil items:items urls:urls files:files];
+                if (textFormat) ok = ok && [self clipFetch:fd format:textFormat pbType:NSPasteboardTypeString items:items urls:urls files:files];
+                if (rtfFormat) ok = ok && [self clipFetch:fd format:rtfFormat pbType:NSPasteboardTypeRTF items:items urls:urls files:files];
+                if (htmlFormat) ok = ok && [self clipFetch:fd format:htmlFormat pbType:NSPasteboardTypeHTML items:items urls:urls files:files];
+                if (imageFormat) ok = ok && [self clipFetch:fd format:imageFormat pbType:NSPasteboardTypePNG items:items urls:urls files:files];
                 if (!ok) break;
                 if (items.count || urls.count) {
                     NSDictionary *itemsCopy = [items copy];
@@ -2062,26 +2083,35 @@ static __weak IddDisplayWindow *g_mouseOwner;
                     dispatch_async(dispatch_get_main_queue(), ^{     /* NSPasteboard writes belong on the main thread */
                         if (self->_stop || !atomic_load(&self->_shareClipboard) || generation != atomic_load(&self->_clipGeneration)) return;
                         NSPasteboard *pb = [NSPasteboard generalPasteboard];
+                        asb_clipboard_temp_retire_owner((__bridge const void *)self);
                         [pb clearContents];
-                        if (urlsCopy.count) [pb writeObjects:urlsCopy];
+                        BOOL filesWritten = urlsCopy.count && [pb writeObjects:urlsCopy];
                         for (NSString *t in itemsCopy) [pb setData:itemsCopy[t] forType:t];
                         self->_clipSuppress = [pb changeCount];      /* don't echo this back over ch5 */
+                        asb_clipboard_temp_changed((uint64_t)pb.changeCount);
+                        if (filesWritten) {
+                            asb_clipboard_temp_publish(files.temp, (__bridge const void *)self, (uint64_t)pb.changeCount);
+                            files.temp = NULL;
+                        }
                     });
                 }
             }
         }
         [self setClipReaderFd:-1];
         close(fd);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            asb_clipboard_temp_retire_owner((__bridge const void *)self);
+        });
         if (!_stop) usleep(100000);
     }
 }
 
 /* DATA_REQ one Windows format off ch6 and stash the converted bytes in `items` (or files in `urls`). */
 - (BOOL)clipFetch:(int)fd format:(uint32_t)fmt pbType:(NSString *)pbType
-            items:(NSMutableDictionary *)items urls:(NSMutableArray *)urls {
+            items:(NSMutableDictionary *)items urls:(NSMutableArray *)urls files:(IddClipboardFiles *)files {
     ClipHeader req = { CLIP_MAGIC, CLIP_MSG_FORMAT_DATA_REQ, fmt, 0 };
     if (!idd_wr_full(fd, &req, sizeof(req))) return NO;
-    if (fmt == WF_HDROP) return [self clipRecvFiles:fd urls:urls];
+    if (fmt == WF_HDROP) return [self clipRecvFiles:fd urls:urls files:files];
     ClipHeader h;
     if (!idd_rd_full(fd, &h, sizeof(h)) || h.magic != CLIP_MAGIC || h.msg_type != CLIP_MSG_FORMAT_DATA_RESP ||
         h.format != fmt || h.data_size > 64u * 1024u * 1024u) return NO;
@@ -2109,42 +2139,45 @@ static __weak IddDisplayWindow *g_mouseOwner;
 }
 
 /* Receive a CF_HDROP file set off ch6 into a temp dir and append the top-level NSURLs to `urls`. */
-- (BOOL)clipRecvFiles:(int)fd urls:(NSMutableArray *)urls {
+- (BOOL)clipRecvFiles:(int)fd urls:(NSMutableArray *)urls files:(IddClipboardFiles *)files {
     uint64_t generation = atomic_load(&_clipGeneration);
-    NSFileManager *fm = [NSFileManager defaultManager];
     /* Stage the received files where the PASTING user can read them. When the daemon runs as root (for
        vmnet networking), NSTemporaryDirectory() is root's PRIVATE /var/folders/.../T (mode 700): the file
        transfers fine but the file URL we put on the pasteboard is then unreadable by the logged-in user,
        so paste yields nothing (text works only because it's inline pasteboard bytes, not a file ref). So
        when root, stage under world-traversable /tmp and hand the tree to the console user; otherwise keep
        the per-user temp (already user-owned). */
-    uid_t cuid = 0; gid_t cgid = 0;
-    BOOL chownToUser = (geteuid() == 0) && idd_console_user(&cuid, &cgid);
-    NSString *base = chownToUser ? @"/tmp" : NSTemporaryDirectory();
-    NSString *root = [base stringByAppendingPathComponent:
-                      [NSString stringWithFormat:@"asbclip-%u", arc4random()]];
-    if (![fm createDirectoryAtPath:root withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions: @0700} error:nil]) return NO;
+    uid_t cuid = [VmDir ownerUID]; gid_t cgid = [VmDir ownerGID];
+    if (geteuid() == 0 && !cuid && !idd_console_user(&cuid, &cgid)) return NO;
+    NSString *base = geteuid() == 0 ? @"/tmp" : NSTemporaryDirectory();
+    files.temp = asb_clipboard_temp_create(base.fileSystemRepresentation);
+    if (!files.temp) return NO;
+    NSString *root = @(asb_clipboard_temp_path(files.temp));
     NSMutableArray *tops = [NSMutableArray array];
     for (;;) {
-        if (!atomic_load(&_shareClipboard) || generation != atomic_load(&_clipGeneration)) { [fm removeItemAtPath:root error:nil]; return NO; }
+        if (!atomic_load(&_shareClipboard) || generation != atomic_load(&_clipGeneration)) return NO;
         ClipHeader h;
         if (!idd_rd_full(fd, &h, sizeof(h))) return NO;
         if (h.magic != CLIP_MAGIC) return NO;
-        if (h.msg_type == CLIP_MSG_FORMAT_DATA_RESP) break;       /* terminator */
+        if (h.msg_type == CLIP_MSG_FORMAT_DATA_RESP) {
+            if (h.format != WF_HDROP || !idd_clip_discard(fd, h.data_size)) return NO;
+            break;
+        }
         if (h.msg_type != CLIP_MSG_FILE_DATA) {
             if (!idd_clip_discard(fd, h.data_size)) return NO;
             continue;
         }
         ClipFileInfo fi;
-        if (h.data_size < sizeof(fi)) { [fm removeItemAtPath:root error:nil]; return NO; }
+        if (h.data_size < sizeof(fi)) return NO;
         if (!idd_rd_full(fd, &fi, sizeof(fi))) return NO;
-        if (fi.path_len != h.data_size - sizeof(fi) || fi.path_len > 65536 || (fi.path_len & 1)) { [fm removeItemAtPath:root error:nil]; return NO; }
+        if (fi.path_len != h.data_size - sizeof(fi) || fi.path_len > 65536 || (fi.path_len & 1)) return NO;
         uint8_t *pb = malloc(fi.path_len ? fi.path_len : 1);
-        if (!pb) { [fm removeItemAtPath:root error:nil]; return NO; }
+        if (!pb) return NO;
         if (fi.path_len && !idd_rd_full(fd, pb, (int)fi.path_len)) { free(pb); return NO; }
         NSString *rel = [[NSString alloc] initWithBytes:pb length:fi.path_len encoding:NSUTF16LittleEndianStringEncoding];
         free(pb);
         rel = [rel stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
+        if (!rel || [rel rangeOfString:@"\0"].location != NSNotFound) return NO;
         NSString *full = [root stringByAppendingPathComponent:rel];
         /* Path-traversal guard (the daemon runs as root): reject absolute paths / ".." components
            and require the standardized path to stay under `root`, so a malicious guest cannot
@@ -2160,37 +2193,32 @@ static __weak IddDisplayWindow *g_mouseOwner;
         NSString *top = [[rel pathComponents] firstObject];
         if (safe && top && ![tops containsObject:top]) [tops addObject:top];
         if (fi.is_directory) {
-            if (safe && ![fm createDirectoryAtPath:full withIntermediateDirectories:YES attributes:nil error:nil]) { [fm removeItemAtPath:root error:nil]; return NO; }
+            if (safe && !asb_clipboard_temp_directory(files.temp, rel.fileSystemRepresentation)) return NO;
         } else {
             FILE *f = NULL;
             if (safe) {
-                [fm createDirectoryAtPath:[full stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
-                f = fopen(full.fileSystemRepresentation, "wb");
-                if (!f) { [fm removeItemAtPath:root error:nil]; return NO; }
+                int file = asb_clipboard_temp_file(files.temp, rel.fileSystemRepresentation);
+                if (file < 0) return NO;
+                f = fdopen(file, "wb");
+                if (!f) { close(file); return NO; }
             }
             uint64_t rem = fi.file_size; uint8_t buf[65536];
             while (rem > 0) {
                 if (!atomic_load(&_shareClipboard) || generation != atomic_load(&_clipGeneration)) {
                     if (f) fclose(f);
-                    [fm removeItemAtPath:root error:nil];
                     return NO;
                 }
                 uint32_t chunk = rem > sizeof(buf) ? (uint32_t)sizeof(buf) : (uint32_t)rem;
                 if (!idd_rd_full(fd, buf, (int)chunk)) { if (f) fclose(f); return NO; }
-                if (f && fwrite(buf, 1, chunk, f) != chunk) { fclose(f); [fm removeItemAtPath:root error:nil]; return NO; }
+                if (f && fwrite(buf, 1, chunk, f) != chunk) { fclose(f); return NO; }
                 rem -= chunk;
             }
-            if (f && fclose(f)) { [fm removeItemAtPath:root error:nil]; return NO; }
+            if (f && fclose(f)) return NO;
         }
     }
     /* Hand the received tree to the console user so the pasteboard file URL is readable on paste, and
        lock it to that user (0700) so other local users can't read clipboard contents from /tmp. */
-    if (chownToUser) {
-        chown(root.fileSystemRepresentation, cuid, cgid);
-        chmod(root.fileSystemRepresentation, 0700);
-        for (NSString *sub in [fm enumeratorAtPath:root])
-            chown([root stringByAppendingPathComponent:sub].fileSystemRepresentation, cuid, cgid);
-    }
+    if (!asb_clipboard_temp_set_owner(files.temp, cuid, cgid)) return NO;
     for (NSString *t in tops) [urls addObject:[NSURL fileURLWithPath:[root stringByAppendingPathComponent:t]]];
     return YES;
 }
@@ -2367,6 +2395,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
         pthread_join(_clipReaderThread, NULL);
         _threadsStarted = NO;
     }
+    asb_clipboard_temp_retire_owner((__bridge const void *)self);
     pthread_mutex_lock(&_inqLock);
     _inqHead = _inqTail = 0;
     pthread_mutex_unlock(&_inqLock);
