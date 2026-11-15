@@ -17,7 +17,7 @@
  *     manager auto-bridges the X11 CLIPBOARD selection to the Wayland
  *     wl_data_device, so owning CLIPBOARD covers both ecosystems.
  *   - One epoll loop with: two vsock listeners, ≤two accepted client fds,
- *     the XCB file descriptor. No threads, no locks.
+ *     the XCB file descriptor.
  *   - Pending-request state machines route asynchronous X11 selection
  *     traffic across the synchronous vsock host roundtrip.
  *   - Single instance per user session — installed as a systemd USER unit
@@ -62,6 +62,7 @@
 
 #include <xcb/xcb.h>
 #include <xcb/xfixes.h>
+#include "asb_clipboard_temp.h"
 
 /* ============================================================
  *   Wire protocol constants — must match vm_clipboard.c
@@ -79,6 +80,7 @@
 #define CLIP_MAX_FORMATS          64u
 #define CLIP_MAX_PAYLOAD          (64u * 1024u * 1024u)
 #define CLIP_FILE_CHUNK           (1u * 1024u * 1024u)
+#define CLIP_FILE_CACHE_LIMIT     (16u * 1024u * 1024u)
 
 #define VSOCK_PORT_WRITER         5u
 #define VSOCK_PORT_READER         6u
@@ -1139,37 +1141,17 @@ static void deliver_hdrop_to_host(const uint8_t *body, size_t body_len)
  * body (text/uri-list or x-special/gnome-copied-files) and complete
  * the X SelectionRequest by writing the property + sending
  * SelectionNotify.
- *
- * tmp_dir is created in $XDG_RUNTIME_DIR (tmpfs, auto-cleaned at
- * logout) with a timestamp+pid suffix so consecutive pastes don't
- * fight over the same files. Old tmp dirs are not actively cleaned
- * mid-session — they go away when /run/user/$UID is recycled. */
+ */
 struct hdrop_collect {
     bool   active;
+    AsbClipboardTemp *temp;
     char   tmp_dir[512];
     char **uris;
     size_t n_uris;
     size_t cap_uris;
 };
 static struct hdrop_collect g_hdrop;
-
-static int mkdir_p(const char *path)
-{
-    char tmp[512];
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    size_t len = strlen(tmp);
-    if (len == 0) return -1;
-    if (tmp[len - 1] == '/') tmp[len - 1] = '\0';
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            if (mkdir(tmp, 0700) < 0 && errno != EEXIST) return -1;
-            *p = '/';
-        }
-    }
-    if (mkdir(tmp, 0700) < 0 && errno != EEXIST) return -1;
-    return 0;
-}
+static uint64_t g_clipboard_token = 1;
 
 /* Reject any path that could write outside tmp_dir. */
 static bool path_safe(const char *p)
@@ -1181,24 +1163,23 @@ static bool path_safe(const char *p)
     return true;
 }
 
-static void hdrop_collect_start(void)
+static bool hdrop_collect_start(void)
 {
-    const char *rt = getenv("XDG_RUNTIME_DIR");
-    if (!rt || !*rt) rt = "/tmp";
-    snprintf(g_hdrop.tmp_dir, sizeof(g_hdrop.tmp_dir),
-             "%s/appsandbox-clip-%ld-%d",
-             rt, (long)time(NULL), (int)getpid());
-    if (mkdir(g_hdrop.tmp_dir, 0700) < 0 && errno != EEXIST) {
+    asb_clipboard_temp_retire_owner(&g_hdrop);
+    g_hdrop.temp = asb_clipboard_temp_create("/var/tmp");
+    if (!g_hdrop.temp) {
         clip_log("hdrop: mkdir(%s) failed: %s",
                  g_hdrop.tmp_dir, strerror(errno));
         g_hdrop.tmp_dir[0] = '\0';
-        return;
+        return false;
     }
+    snprintf(g_hdrop.tmp_dir, sizeof(g_hdrop.tmp_dir), "%s", asb_clipboard_temp_path(g_hdrop.temp));
     g_hdrop.active = true;
     g_hdrop.uris = NULL;
     g_hdrop.n_uris = 0;
     g_hdrop.cap_uris = 0;
     clip_log("hdrop: collecting into %s", g_hdrop.tmp_dir);
+    return true;
 }
 
 static void hdrop_add_uri(const char *uri)
@@ -1221,7 +1202,16 @@ static void hdrop_collect_clear(void)
     g_hdrop.n_uris = 0;
     g_hdrop.cap_uris = 0;
     g_hdrop.active = false;
-    /* Leave tmp_dir on disk — Nautilus may still be copying from it. */
+    asb_clipboard_temp_discard(g_hdrop.temp);
+    g_hdrop.temp = NULL;
+    g_hdrop.tmp_dir[0] = 0;
+}
+
+static void hdrop_clipboard_changed(void)
+{
+    if (++g_clipboard_token == 0) ++g_clipboard_token;
+    asb_clipboard_temp_changed(g_clipboard_token);
+    hdrop_collect_clear();
 }
 
 /* Pending X SelectionRequest waiting on a host roundtrip. We only
@@ -1529,6 +1519,10 @@ static void deliver_hdrop_to_x(void)
         }
     }
 
+    if (g_hdrop.temp) {
+        asb_clipboard_temp_publish(g_hdrop.temp, &g_hdrop, g_clipboard_token);
+        g_hdrop.temp = NULL;
+    }
     xcb_change_property(g_xcb, XCB_PROP_MODE_REPLACE,
                         g_pending_x.requestor, g_pending_x.property,
                         g_pending_x.target, 8,
@@ -1589,7 +1583,12 @@ static void handle_selection_request(xcb_selection_request_event_t *ev)
 
     /* CF_HDROP needs streaming file collection — start a fresh tmpdir
      * BEFORE we send the request so we don't miss the first FILE_DATA. */
-    if (cf == CF_HDROP) hdrop_collect_start();
+    if (cf == CF_HDROP && !hdrop_collect_start()) {
+        send_selection_notify(ev->requestor, ev->selection, ev->target,
+                              XCB_ATOM_NONE, ev->time);
+        finish_pending_x();
+        return;
+    }
 
     if (send_clip_msg(g_writer_fd, CLIP_MSG_FORMAT_DATA_REQ, cf, NULL, 0) < 0) {
         clip_log("send FORMAT_DATA_REQ failed");
@@ -1641,7 +1640,6 @@ static void finish_pending_host(bool failed)
 static void handle_xfixes_selection_notify(xcb_xfixes_selection_notify_event_t *ev)
 {
     if (ev->selection != a_CLIPBOARD) return;
-
     g_selection_owner = ev->owner;
     g_selection_time = ev->selection_timestamp;
     g_guest_format_count = 0;
@@ -1891,6 +1889,7 @@ static void take_clipboard_ownership(xcb_timestamp_t time)
 static void release_clipboard_ownership(void)
 {
     if (!g_we_own_clipboard) return;
+    hdrop_clipboard_changed();
     g_guest_format_count = 0;
     g_selection_owner = XCB_NONE;
     g_targets_dirty = false;
@@ -1937,6 +1936,7 @@ static int handle_writer_message(int fd, const struct ClipHeader *h)
         if (recv_exact(fd, buf, h->data_size) < 0) { free(buf); return -1; }
 
         if (!g_sync_enabled) { free(buf); return 0; }
+        hdrop_clipboard_changed();
 
         /* Parse: uint32 count; per-format { uint32 fmt_id; uint32 name_len; char name[]; } */
         uint32_t count = *(uint32_t *)buf;
@@ -2063,7 +2063,12 @@ static int handle_writer_message(int fd, const struct ClipHeader *h)
             snprintf(full, sizeof(full), "%s/%s", g_hdrop.tmp_dir, u8);
 
             if (fi.is_directory) {
-                int mk = mkdir_p(full);   /* 0 on success/EEXIST, -1 on failure */
+                int mk = asb_clipboard_temp_directory(g_hdrop.temp, u8) ? 0 : -1;
+                if (mk < 0) {
+                    clip_log("hdrop: mkdir(%s): %s", full, strerror(errno));
+                    free(u8);
+                    return -1;
+                }
                 /* Directories carry no body bytes (file_size==0). A *top-level*
                    directory (no '/' in its relative path) is itself a dropped
                    item, so list its URI — the file manager then copies the whole
@@ -2079,35 +2084,68 @@ static int handle_writer_message(int fd, const struct ClipHeader *h)
                     hdrop_add_uri(uri);
                 }
             } else {
-                /* Ensure parent exists. */
-                char parent[1024];
-                snprintf(parent, sizeof(parent), "%s", full);
-                char *slash = strrchr(parent, '/');
-                if (slash && slash != parent) {
-                    *slash = '\0';
-                    mkdir_p(parent);
+                int file_fd = asb_clipboard_temp_file(g_hdrop.temp, u8);
+                FILE *fp = file_fd >= 0 ? fdopen(file_fd, "wb") : NULL;
+                if (!fp) {
+                    if (file_fd >= 0) close(file_fd);
+                    clip_log("hdrop: fopen(%s): %s", full, strerror(errno));
+                    free(u8);
+                    return -1;
                 }
 
-                FILE *fp = fopen(full, "wb");
-                if (!fp) clip_log("hdrop: fopen(%s): %s", full, strerror(errno));
-
                 uint64_t remaining = fi.file_size;
+                uint64_t discarded = 0;
                 uint8_t buf[64 * 1024];
                 while (remaining > 0) {
                     size_t c = remaining > sizeof(buf) ? sizeof(buf)
                                                        : (size_t)remaining;
                     if (recv_exact(fd, buf, c) < 0) {
-                        if (fp) fclose(fp);
+                        fclose(fp);
+                        unlink(full);
                         free(u8);
                         return -1;
                     }
-                    if (fp) {
-                        size_t w = fwrite(buf, 1, c, fp);
-                        if (w != c) clip_log("hdrop: fwrite short");
+                    if (fwrite(buf, 1, c, fp) != c) {
+                        clip_log("hdrop: fwrite(%s): %s", full, strerror(errno));
+                        fclose(fp);
+                        unlink(full);
+                        free(u8);
+                        return -1;
                     }
                     remaining -= c;
+                    uint64_t completed = fi.file_size - remaining;
+                    if (fi.file_size > CLIP_FILE_CACHE_LIMIT &&
+                        (completed - discarded >= CLIP_FILE_CACHE_LIMIT || remaining == 0)) {
+                        int flushed = fflush(fp);
+                        if (flushed == 0) {
+                            do { flushed = fdatasync(fileno(fp)); } while (flushed < 0 && errno == EINTR);
+                        }
+                        if (flushed != 0) {
+                            clip_log("hdrop: flush(%s): %s", full, strerror(errno));
+                            fclose(fp);
+                            unlink(full);
+                            free(u8);
+                            return -1;
+                        }
+                        int advised = posix_fadvise(fileno(fp), (off_t)discarded,
+                                                   (off_t)(completed - discarded), POSIX_FADV_DONTNEED);
+                        if (advised != 0) {
+                            clip_log("hdrop: discard cache(%s): %s", full, strerror(advised));
+                            fclose(fp);
+                            unlink(full);
+                            free(u8);
+                            return -1;
+                        }
+                        discarded = completed;
+                    }
                 }
-                if (fp) { fclose(fp); wrote_locally = true; }
+                if (fclose(fp) != 0) {
+                    clip_log("hdrop: fclose(%s): %s", full, strerror(errno));
+                    unlink(full);
+                    free(u8);
+                    return -1;
+                }
+                wrote_locally = true;
 
                 /* Only list TOP-LEVEL files. A file nested inside a dropped
                    folder is reached via that folder's URI (added above); listing
@@ -2234,6 +2272,7 @@ static void process_x_events(void)
             break;
         case XCB_SELECTION_CLEAR:
             /* Another app took CLIPBOARD ownership from us. */
+            if (g_we_own_clipboard) hdrop_clipboard_changed();
             g_we_own_clipboard = false;
             clip_log("SelectionClear — another owner took CLIPBOARD");
             break;
@@ -2260,6 +2299,7 @@ int main(void)
     clip_log("appsandbox-clipboard starting (pid=%d)", getpid());
 
     if (xcb_setup() < 0) return 1;
+    asb_clipboard_temp_collect("/var/tmp");
 
     /* Inherit pre-bound listen sockets from the agent if we were
      * launched as its helper (systemd LISTEN_FDS / LISTEN_PID
@@ -2375,6 +2415,9 @@ int main(void)
     }
 
     clip_log("shutting down");
+    hdrop_collect_clear();
+    asb_clipboard_temp_retire_owner(&g_hdrop);
+    asb_clipboard_temp_shutdown();
     if (g_writer_fd >= 0) close(g_writer_fd);
     if (g_reader_fd >= 0) close(g_reader_fd);
     close(listen_writer);

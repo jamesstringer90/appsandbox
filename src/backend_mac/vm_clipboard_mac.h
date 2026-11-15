@@ -39,6 +39,8 @@ typedef void (^VmClipboardLog)(NSString *line);
  * DATA_REQ_V2 from the guest (returns empty). Disabled is the safe
  * default — only flip on when the user is actively using the VM. */
 - (void)setSyncEnabled:(BOOL)enabled;
+- (void)setSharingEnabled:(BOOL)enabled;
+- (BOOL)sharingEnabled;
 
 @end
 

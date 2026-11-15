@@ -23,6 +23,7 @@
 #include "prereq.h"
 #include "ui.h"
 #include "../core/linux_deps.h"
+#include "../../tools/transport/asb_clipboard_temp.h"
 
 #include <stdio.h>
 #include <io.h>
@@ -3108,6 +3109,7 @@ ASB_API void asb_cleanup(void)
 
     hcs_cleanup();
     hcn_cleanup();
+    asb_clipboard_temp_shutdown();
     DeleteCriticalSection(&g_cs);
     g_initialized = FALSE;
 }
@@ -3141,6 +3143,7 @@ ASB_API void asb_detach(void)
         VM_AT(i).handle = NULL;  /* abandon handle - OS will close it */
     }
 
+    asb_clipboard_temp_shutdown();
     g_initialized = FALSE;
 }
 

@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+        A5BC11000000000000000001 = {isa = PBXBuildFile; fileRef = A5BC11000000000000000003; };
+        A5BC11000000000000000002 = {isa = PBXBuildFile; fileRef = A5BC11000000000000000003; };
         A5B3D0000000000000000001 = {isa = PBXBuildFile; fileRef = A5B3D0000000000000000002; };
         A5B3C0000000000000000002 = {isa = PBXBuildFile; fileRef = A5B3C0000000000000000001; };
         A5B3C0000000000000000003 = {isa = PBXBuildFile; fileRef = A5B2A0000000000000000018; };
@@ -178,6 +180,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+        A5BC11000000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "tools/transport/asb_clipboard_temp.c"; sourceTree = SOURCE_ROOT; };
+        A5BC11000000000000000004 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "tools/transport/asb_clipboard_temp.h"; sourceTree = SOURCE_ROOT; };
         A5B3D0000000000000000002 = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOSurface.framework; path = System/Library/Frameworks/IOSurface.framework; sourceTree = SDKROOT; };
         A5B3C0000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = src/backend_mac/headless_capture_native.m; sourceTree = SOURCE_ROOT; };
         A5B2A0000000000000000022 = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
@@ -456,6 +460,8 @@
 		7006000000000000000000AA /* core */ = {
 			isa = PBXGroup;
 			children = (
+                A5BC11000000000000000003,
+                A5BC11000000000000000004,
                 A5B2A0000000000000000010,
                 A5B2A0000000000000000012,
 
@@ -815,6 +821,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                A5BC11000000000000000001,
                 A5B3C0000000000000000002,
                 A5B3C0000000000000000003,
 
@@ -879,6 +886,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                A5BC11000000000000000002,
 
 				2040000000000000000000EE /* appsandbox-clipboard.m in Sources */,
 			);

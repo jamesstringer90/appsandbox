@@ -12,6 +12,8 @@
  */
 
 #include "vm_clipboard.h"
+#include "clipboard_file.h"
+#include "../../tools/transport/asb_clipboard_temp.h"
 #include "hcs_vm.h"
 #include <shlobj.h>
 #include <stdio.h>
@@ -94,6 +96,8 @@ struct VmClipboardData {
     HWND             hwnd;
     volatile BOOL    stop;
     volatile BOOL    sync_enabled;
+    volatile LONG    sharing_enabled;
+    volatile LONG    sharing_generation;
 
     VmClipboardLogFn log_fn;
     void            *log_ud;
@@ -102,7 +106,9 @@ struct VmClipboardData {
     volatile SOCKET  writer_socket;
     volatile LONG    writer_suppress;
     HANDLE           writer_thread;
-    CRITICAL_SECTION writer_cs;
+    volatile LONG    pending_sync;
+    volatile LONG    pending_push;
+    volatile LONG    pushed_sequence;
 
     /* Reader channel (:0006 guest->host) */
     volatile SOCKET  reader_socket;
@@ -112,9 +118,14 @@ struct VmClipboardData {
     ClipFmtEntry     reader_fmts[CLIP_MAX_FORMATS];
     int              reader_fmt_count;
     int              reader_fetch_idx;
+    BOOL             reader_ready;
+    LONG             reader_generation;
+    HGLOBAL          reader_hdrop;
 
     /* Temp directory for file transfers */
     wchar_t          temp_dir[MAX_PATH];
+    wchar_t          temp_parent[MAX_PATH];
+    AsbClipboardTemp *temp;
 };
 
 /* ---- Logging ---- */
@@ -201,6 +212,8 @@ static SOCKET clip_connect_hv(const GUID *vm_runtime_id, const GUID *service_gui
     ioctlsocket(s, FIONBIO, &nonblock);
     sock_timeout = 5000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&sock_timeout, sizeof(sock_timeout));
+    sock_timeout = 10000;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char *)&sock_timeout, sizeof(sock_timeout));
     return s;
 }
 
@@ -225,28 +238,6 @@ static BOOL clip_should_skip(UINT fmt)
     }
 }
 
-static void clip_remove_dir_recursive(const wchar_t *dir)
-{
-    WIN32_FIND_DATAW fd;
-    wchar_t pattern[MAX_PATH];
-    HANDLE h;
-
-    swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
-    h = FindFirstFileW(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        wchar_t path[MAX_PATH];
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        swprintf_s(path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            clip_remove_dir_recursive(path);
-        else
-            DeleteFileW(path);
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    RemoveDirectoryW(dir);
-}
-
 static void clip_ensure_parent_dir(const wchar_t *file_path)
 {
     wchar_t dir[MAX_PATH];
@@ -267,7 +258,7 @@ static void clip_ensure_parent_dir(const wchar_t *file_path)
 
 static BOOL clip_path_is_safe(const wchar_t *rel_path)
 {
-    if (wcsstr(rel_path, L"..")) return FALSE;
+    if (wcsstr(rel_path, L"..") || wcschr(rel_path, L':')) return FALSE;
     if (rel_path[0] == L'\\' || rel_path[0] == L'/') return FALSE;
     if (wcslen(rel_path) > MAX_PATH - 50) return FALSE;
     return TRUE;
@@ -275,13 +266,15 @@ static BOOL clip_path_is_safe(const wchar_t *rel_path)
 
 /* ---- File transfer: host->guest (send files from host clipboard) ---- */
 
-static BOOL clip_send_file_entry(SOCKET s, const wchar_t *full_path, const wchar_t *rel_path)
+static BOOL clip_send_file_entry(VmClipboard clip, SOCKET s, const wchar_t *full_path, const wchar_t *rel_path, LONG generation)
 {
     ClipHeader hdr;
     ClipFileInfo fi;
-    DWORD attrs = GetFileAttributesW(full_path);
+    DWORD attrs;
     UINT32 path_bytes;
 
+    if (!clip->sharing_enabled || generation != clip->sharing_generation) return FALSE;
+    attrs = GetFileAttributesW(full_path);
     if (attrs == INVALID_FILE_ATTRIBUTES) return TRUE;
 
     path_bytes = (UINT32)(wcslen(rel_path) * sizeof(wchar_t));
@@ -312,7 +305,7 @@ static BOOL clip_send_file_entry(SOCKET s, const wchar_t *full_path, const wchar
                 if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
                 swprintf_s(child_full, MAX_PATH, L"%s\\%s", full_path, fd.cFileName);
                 swprintf_s(child_rel, MAX_PATH, L"%s\\%s", rel_path, fd.cFileName);
-                if (!clip_send_file_entry(s, child_full, child_rel)) {
+                if (!clip_send_file_entry(clip, s, child_full, child_rel, generation)) {
                     FindClose(h);
                     return FALSE;
                 }
@@ -331,7 +324,11 @@ static BOOL clip_send_file_entry(SOCKET s, const wchar_t *full_path, const wchar
         chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
         if (!chunk) { CloseHandle(hFile); return FALSE; }
 
-        GetFileSizeEx(hFile, &size);
+        if (!GetFileSizeEx(hFile, &size)) {
+            HeapFree(GetProcessHeap(), 0, chunk);
+            CloseHandle(hFile);
+            return FALSE;
+        }
         fi.file_size = (UINT64)size.QuadPart;
         fi.is_directory = 0;
 
@@ -352,12 +349,14 @@ static BOOL clip_send_file_entry(SOCKET s, const wchar_t *full_path, const wchar
         while (remaining > 0) {
             DWORD to_read = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : (DWORD)remaining;
             DWORD bytes_read;
-            if (!ReadFile(hFile, chunk, to_read, &bytes_read, NULL) || bytes_read == 0) {
+            if (!clip->sharing_enabled || generation != clip->sharing_generation ||
+                !ReadFile(hFile, chunk, to_read, &bytes_read, NULL) || bytes_read == 0) {
                 HeapFree(GetProcessHeap(), 0, chunk);
                 CloseHandle(hFile);
                 return FALSE;
             }
-            if (!clip_send_all(s, chunk, (int)bytes_read)) {
+            if (!clip->sharing_enabled || generation != clip->sharing_generation ||
+                !clip_send_all(s, chunk, (int)bytes_read)) {
                 HeapFree(GetProcessHeap(), 0, chunk);
                 CloseHandle(hFile);
                 return FALSE;
@@ -370,72 +369,14 @@ static BOOL clip_send_file_entry(SOCKET s, const wchar_t *full_path, const wchar
     return TRUE;
 }
 
-/* ---- HDROP builder (reader: guest->host file transfer) ---- */
-
-static HGLOBAL clip_build_hdrop_from_temp(const wchar_t *temp_dir)
-{
-    WIN32_FIND_DATAW fd;
-    wchar_t pattern[MAX_PATH];
-    HANDLE h;
-    wchar_t paths[CLIP_MAX_FORMATS][MAX_PATH];
-    int count = 0;
-    SIZE_T total_size;
-    HGLOBAL hMem;
-    DROPFILES *df;
-    wchar_t *ptr;
-    int i;
-
-    swprintf_s(pattern, MAX_PATH, L"%s\\*", temp_dir);
-    h = FindFirstFileW(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return NULL;
-
-    do {
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        swprintf_s(paths[count], MAX_PATH, L"%s\\%s", temp_dir, fd.cFileName);
-        count++;
-        if (count >= CLIP_MAX_FORMATS) break;
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-
-    if (count == 0) return NULL;
-
-    total_size = sizeof(DROPFILES);
-    for (i = 0; i < count; i++)
-        total_size += (wcslen(paths[i]) + 1) * sizeof(wchar_t);
-    total_size += sizeof(wchar_t);
-
-    hMem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_size);
-    if (!hMem) return NULL;
-
-    df = (DROPFILES *)GlobalLock(hMem);
-    if (!df) { GlobalFree(hMem); return NULL; }
-
-    df->pFiles = sizeof(DROPFILES);
-    df->fWide = TRUE;
-
-    ptr = (wchar_t *)((BYTE *)df + sizeof(DROPFILES));
-    for (i = 0; i < count; i++) {
-        /* destsz must be this entry's reserved slice (wcslen+1), NOT MAX_PATH:
-           the buffer is sized tightly per path (see total_size above), so passing
-           MAX_PATH makes wcscpy_s's secure-CRT tail-fill memset run past the
-           allocation -> heap overflow (caught by full page heap at memset). */
-        wcscpy_s(ptr, wcslen(paths[i]) + 1, paths[i]);
-        ptr += wcslen(paths[i]) + 1;
-    }
-    *ptr = L'\0';
-
-    GlobalUnlock(hMem);
-    return hMem;
-}
-
 /* ---- Writer channel: send SYNC_ENABLE ---- */
 
-static void clip_send_sync_enable(VmClipboard clip, BOOL enabled)
+static BOOL clip_send_sync_enable(VmClipboard clip, BOOL enabled)
 {
     ClipHeader hdr;
     UINT8 flag;
     SOCKET s = clip->writer_socket;
-    if (s == INVALID_SOCKET) return;
+    if (s == INVALID_SOCKET) return FALSE;
 
     flag = enabled ? 1 : 0;
     hdr.magic = CLIP_MAGIC;
@@ -443,17 +384,16 @@ static void clip_send_sync_enable(VmClipboard clip, BOOL enabled)
     hdr.format = 0;
     hdr.data_size = 1;
 
-    EnterCriticalSection(&clip->writer_cs);
-    clip_send_all(s, &hdr, sizeof(hdr));
-    clip_send_all(s, &flag, 1);
-    LeaveCriticalSection(&clip->writer_cs);
+    if (!clip_send_all(s, &hdr, sizeof(hdr)) || !clip_send_all(s, &flag, 1))
+        return FALSE;
 
     clip_log(clip, L"CLIP: Sent SYNC_ENABLE(%d) to guest.", (int)flag);
+    return TRUE;
 }
 
 /* ---- Writer channel: send FORMAT_LIST ---- */
 
-static void clip_send_format_list(VmClipboard clip)
+static BOOL clip_send_format_list(VmClipboard clip)
 {
     ClipHeader hdr;
     SOCKET s;
@@ -461,11 +401,25 @@ static void clip_send_format_list(VmClipboard clip)
     BYTE buf[16384];
     int offset = 4;
     UINT32 count = 0;
+    DWORD sequence;
+    LONG generation = clip->sharing_generation;
 
     s = clip->writer_socket;
-    if (s == INVALID_SOCKET) return;
+    if (s == INVALID_SOCKET) return FALSE;
+    if (!clip->sync_enabled || !clip->sharing_enabled) return TRUE;
 
-    if (!OpenClipboard(clip->hwnd)) return;
+    sequence = GetClipboardSequenceNumber();
+    if (sequence && (LONG)sequence == InterlockedCompareExchange(&clip->pushed_sequence, 0, 0))
+        return TRUE;
+
+    if (!OpenClipboard(clip->hwnd)) {
+        InterlockedExchange(&clip->pending_push, 1);
+        return TRUE;
+    }
+    if (!clip->sharing_enabled || generation != clip->sharing_generation) {
+        CloseClipboard();
+        return TRUE;
+    }
 
     {
         BOOL has_hdrop = IsClipboardFormatAvailable(CF_HDROP);
@@ -491,9 +445,12 @@ static void clip_send_format_list(VmClipboard clip)
             count++;
         }
     }
+    sequence = GetClipboardSequenceNumber();
+    if (count) InterlockedExchange(&clip->pushed_sequence, (LONG)sequence);
     CloseClipboard();
 
-    if (count == 0) return;
+    if (!clip->sharing_enabled || generation != clip->sharing_generation) return TRUE;
+    if (count == 0) return TRUE;
 
     *(UINT32 *)buf = count;
 
@@ -504,107 +461,78 @@ static void clip_send_format_list(VmClipboard clip)
 
     InterlockedExchange(&clip->reader_suppress, 1);
 
-    EnterCriticalSection(&clip->writer_cs);
-    clip_send_all(s, &hdr, sizeof(hdr));
-    clip_send_all(s, buf, offset);
-    LeaveCriticalSection(&clip->writer_cs);
+    if (!clip_send_all(s, &hdr, sizeof(hdr)) || !clip_send_all(s, buf, offset)) {
+        InterlockedCompareExchange(&clip->pushed_sequence, 0, (LONG)sequence);
+        return FALSE;
+    }
 
     clip_log(clip, L"CLIP: Sent format list (%u formats) to guest.", count);
+    return TRUE;
 }
 
 /* ---- Writer channel: handle DATA_REQ from guest ---- */
 
-static void clip_handle_data_request(VmClipboard clip, UINT fmt)
+static BOOL clip_handle_data_request(VmClipboard clip, UINT fmt)
 {
-    ClipHeader hdr;
+    ClipHeader hdr = { CLIP_MAGIC, CLIP_MSG_FORMAT_DATA_RESP, fmt, 0 };
     SOCKET s = clip->writer_socket;
+    BYTE *data = NULL;
+    wchar_t (*paths)[MAX_PATH] = NULL;
+    UINT path_count = 0;
+    BOOL sent = TRUE;
+    LONG generation = clip->sharing_generation;
 
-    if (s == INVALID_SOCKET) return;
+    if (s == INVALID_SOCKET) return FALSE;
 
     clip_log(clip, L"CLIP: Data request from guest for format %u.", fmt);
 
-    /* When sync is disabled, return empty — don't leak host clipboard. */
-    if (!clip->sync_enabled) {
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = 0;
-        EnterCriticalSection(&clip->writer_cs);
-        clip_send_all(s, &hdr, sizeof(hdr));
-        LeaveCriticalSection(&clip->writer_cs);
-        return;
-    }
-
-    if (fmt == CF_HDROP) {
-        if (OpenClipboard(NULL)) {
-            HANDLE hData = GetClipboardData(CF_HDROP);
-            if (hData) {
-                HDROP hDrop = (HDROP)hData;
-                UINT file_count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
-                UINT fi;
-                EnterCriticalSection(&clip->writer_cs);
-                for (fi = 0; fi < file_count; fi++) {
-                    wchar_t path[MAX_PATH];
-                    wchar_t *name;
-                    DragQueryFileW(hDrop, fi, path, MAX_PATH);
-                    name = wcsrchr(path, L'\\');
-                    name = name ? name + 1 : path;
-                    clip_send_file_entry(s, path, name);
+    if (!clip->sync_enabled) InterlockedExchange(&clip->pushed_sequence, 0);
+    if (clip->sync_enabled && clip->sharing_enabled && OpenClipboard(NULL)) {
+        DWORD sequence = GetClipboardSequenceNumber();
+        HANDLE hData = clip->sharing_enabled && generation == clip->sharing_generation ? GetClipboardData(fmt) : NULL;
+        if (fmt == CF_HDROP && hData) {
+            UINT count = DragQueryFileW((HDROP)hData, 0xFFFFFFFF, NULL, 0);
+            if (count && count <= CLIP_MAX_PAYLOAD / sizeof(*paths))
+                paths = (wchar_t (*)[MAX_PATH])HeapAlloc(GetProcessHeap(), 0, (SIZE_T)count * sizeof(*paths));
+            if (paths) {
+                for (path_count = 0; path_count < count; path_count++) {
+                    UINT length = DragQueryFileW((HDROP)hData, path_count, NULL, 0);
+                    if (!length || length >= MAX_PATH ||
+                        DragQueryFileW((HDROP)hData, path_count, paths[path_count], MAX_PATH) != length) {
+                        path_count = 0;
+                        break;
+                    }
                 }
-                hdr.magic = CLIP_MAGIC;
-                hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-                hdr.format = CF_HDROP;
-                hdr.data_size = 0;
-                clip_send_all(s, &hdr, sizeof(hdr));
-                LeaveCriticalSection(&clip->writer_cs);
-            } else {
-                CloseClipboard();
-                goto send_empty;
             }
-            CloseClipboard();
-        } else {
-            goto send_empty;
+        } else if (hData) {
+            void *ptr = GlobalLock(hData);
+            SIZE_T size = ptr ? GlobalSize(hData) : 0;
+            if (size && size <= CLIP_MAX_PAYLOAD)
+                data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, size);
+            if (data) {
+                memcpy(data, ptr, size);
+                hdr.data_size = (UINT32)size;
+            }
+            if (ptr) GlobalUnlock(hData);
         }
-        return;
-
-    send_empty:
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = 0;
-        EnterCriticalSection(&clip->writer_cs);
-        clip_send_all(s, &hdr, sizeof(hdr));
-        LeaveCriticalSection(&clip->writer_cs);
-        return;
-    }
-
-    if (OpenClipboard(NULL)) {
-        HANDLE hData = GetClipboardData(fmt);
-        void *ptr = hData ? GlobalLock(hData) : NULL;
-        SIZE_T size = ptr ? GlobalSize(hData) : 0;
-
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = (ptr && size <= CLIP_MAX_PAYLOAD) ? (UINT32)size : 0;
-
-        EnterCriticalSection(&clip->writer_cs);
-        clip_send_all(s, &hdr, sizeof(hdr));
-        if (hdr.data_size > 0)
-            clip_send_all(s, ptr, (int)hdr.data_size);
-        LeaveCriticalSection(&clip->writer_cs);
-
-        if (ptr) GlobalUnlock(hData);
+        if (sequence)
+            InterlockedCompareExchange(&clip->pushed_sequence, (LONG)GetClipboardSequenceNumber(), (LONG)sequence);
         CloseClipboard();
-    } else {
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = 0;
-        EnterCriticalSection(&clip->writer_cs);
-        clip_send_all(s, &hdr, sizeof(hdr));
-        LeaveCriticalSection(&clip->writer_cs);
+    } else if (clip->sync_enabled) {
+        InterlockedExchange(&clip->pushed_sequence, 0);
     }
+
+    if (generation != clip->sharing_generation) sent = FALSE;
+    for (UINT i = 0; i < path_count && sent; i++) {
+        const wchar_t *name = wcsrchr(paths[i], L'\\');
+        sent = clip_send_file_entry(clip, s, paths[i], name ? name + 1 : paths[i], generation);
+    }
+    if (!clip->sharing_enabled && (path_count || data)) sent = FALSE;
+    if (sent) sent = clip_send_all(s, &hdr, sizeof(hdr));
+    if (sent && data) sent = clip_send_all(s, data, (int)hdr.data_size);
+    if (paths) HeapFree(GetProcessHeap(), 0, paths);
+    if (data) HeapFree(GetProcessHeap(), 0, data);
+    return sent;
 }
 
 /* ---- Writer recv thread ---- */
@@ -613,8 +541,8 @@ static BOOL clip_writer_handle_message(VmClipboard clip, SOCKET s, const ClipHea
 {
     switch (hdr->msg_type) {
     case CLIP_MSG_FORMAT_DATA_REQ:
-        clip_handle_data_request(clip, hdr->format);
-        return TRUE;
+        if (hdr->data_size) return FALSE;
+        return clip_handle_data_request(clip, hdr->format);
     default:
         if (hdr->data_size > 0) {
             BYTE skip[256];
@@ -639,6 +567,22 @@ static DWORD WINAPI clip_writer_thread_proc(LPVOID param)
         s = clip->writer_socket;
 
         while (!clip->stop) {
+            fd_set reads;
+            struct timeval timeout = { 0, 100000 };
+            LONG sync;
+            LONG push;
+            int ready;
+
+            if (s == INVALID_SOCKET) break;
+            sync = InterlockedExchange(&clip->pending_sync, -1);
+            push = InterlockedExchange(&clip->pending_push, 0);
+            if (sync >= 0 && !clip_send_sync_enable(clip, sync != 0 && clip->sharing_enabled)) break;
+            if (push && clip->sync_enabled && clip->sharing_enabled && !clip_send_format_list(clip)) break;
+            FD_ZERO(&reads);
+            FD_SET(s, &reads);
+            ready = select(0, &reads, NULL, NULL, &timeout);
+            if (ready < 0) break;
+            if (!ready) continue;
             if (!clip_recv_exact(s, &hdr, sizeof(hdr))) break;
             if (hdr.magic != CLIP_MAGIC) break;
             if (!clip_writer_handle_message(clip, s, &hdr)) break;
@@ -670,23 +614,18 @@ static DWORD WINAPI clip_writer_thread_proc(LPVOID param)
                     DWORD no_timeout = 0;
                     setsockopt(ws, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
                     clip->writer_socket = ws;
+                    InterlockedExchange(&clip->pushed_sequence, 0);
                     clip_log(clip, L"CLIP: Writer reconnected (GUID :0005).");
-                    if (clip->sync_enabled) {
-                        clip_send_sync_enable(clip, TRUE);
-                        clip_send_format_list(clip);
-                    } else {
-                        clip_send_sync_enable(clip, FALSE);
-                    }
+                    InterlockedExchange(&clip->pending_sync, clip->sync_enabled && clip->sharing_enabled ? 1 : 0);
+                    InterlockedExchange(&clip->pending_push, 1);
                     break;
                 }
                 closesocket(ws);
             }
         }
 
-        if (clip->stop) break;
     }
 
-    clip->writer_thread = NULL;
     return 0;
 }
 
@@ -700,68 +639,51 @@ static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHea
     if (hdr->data_size < sizeof(fi)) return FALSE;
     if (!clip_recv_exact(s, &fi, sizeof(fi))) return FALSE;
 
-    if (fi.path_len == 0 || fi.path_len > (MAX_PATH - 1) * sizeof(wchar_t)) {
-        UINT32 skip_hdr = hdr->data_size - (UINT32)sizeof(fi);
-        BYTE skip[4096];
-        while (skip_hdr > 0) {
-            int chunk = skip_hdr > 4096 ? 4096 : (int)skip_hdr;
-            if (!clip_recv_exact(s, skip, chunk)) return FALSE;
-            skip_hdr -= chunk;
-        }
-        { UINT64 rem = fi.file_size;
-          while (rem > 0) { int c = rem > 4096 ? 4096 : (int)rem;
-          if (!clip_recv_exact(s, skip, c)) return FALSE; rem -= c; } }
-        return TRUE;
-    }
+    if (!fi.path_len || fi.path_len > sizeof(rel_path) - sizeof(wchar_t) ||
+        fi.path_len % sizeof(wchar_t) || hdr->data_size != sizeof(fi) + fi.path_len ||
+        fi.is_directory > 1 || (fi.is_directory && fi.file_size)) return FALSE;
 
     if (!clip_recv_exact(s, rel_path, (int)fi.path_len)) return FALSE;
     rel_path[fi.path_len / sizeof(wchar_t)] = L'\0';
 
-    if (!clip_path_is_safe(rel_path)) {
-        BYTE skip[4096];
-        UINT64 rem = fi.file_size;
-        while (rem > 0) { int c = rem > 4096 ? 4096 : (int)rem;
-          if (!clip_recv_exact(s, skip, c)) return FALSE; rem -= c; }
-        return TRUE;
-    }
+    if (wcslen(rel_path) != fi.path_len / sizeof(wchar_t) || !clip_path_is_safe(rel_path)) return FALSE;
 
+    if (!clip->temp) {
+        clip->temp = asb_clipboard_temp_create(clip->temp_parent);
+        if (!clip->temp) return FALSE;
+        wcscpy_s(clip->temp_dir, MAX_PATH, asb_clipboard_temp_path(clip->temp));
+    }
+    if (wcslen(clip->temp_dir) + wcslen(rel_path) + 2 > MAX_PATH) return FALSE;
     swprintf_s(full_path, MAX_PATH, L"%s\\%s", clip->temp_dir, rel_path);
 
     if (fi.is_directory) {
         clip_ensure_parent_dir(full_path);
         CreateDirectoryW(full_path, NULL);
     } else {
-        HANDLE hFile;
+        ClipFileWriter file;
         clip_ensure_parent_dir(full_path);
-        hFile = CreateFileW(full_path, GENERIC_WRITE, 0, NULL,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile != INVALID_HANDLE_VALUE) {
+        if (clip_file_writer_open(&file, full_path, fi.file_size)) {
             UINT64 remaining = fi.file_size;
-            BYTE *chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
-            if (!chunk) { CloseHandle(hFile); return FALSE; }
             while (remaining > 0) {
-                DWORD to_read = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : (DWORD)remaining;
-                DWORD written;
-                if (!clip_recv_exact(s, chunk, (int)to_read)) {
-                    HeapFree(GetProcessHeap(), 0, chunk);
-                    CloseHandle(hFile);
+                DWORD to_read = remaining > CLIP_FILE_BUFFER_SIZE ? CLIP_FILE_BUFFER_SIZE : (DWORD)remaining;
+                if (!clip_recv_exact(s, file.buffer, (int)to_read)) {
+                    clip_file_writer_abort(&file);
                     return FALSE;
                 }
-                WriteFile(hFile, chunk, to_read, &written, NULL);
+                if (!clip_file_writer_write(&file, to_read)) {
+                    clip_log(clip, L"CLIP-R: File write failed (%lu).", GetLastError());
+                    clip_file_writer_abort(&file);
+                    return FALSE;
+                }
                 remaining -= to_read;
             }
-            HeapFree(GetProcessHeap(), 0, chunk);
-            CloseHandle(hFile);
-        } else {
-            UINT64 remaining = fi.file_size;
-            BYTE *chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
-            if (!chunk) return FALSE;
-            while (remaining > 0) {
-                int c = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : (int)remaining;
-                if (!clip_recv_exact(s, chunk, c)) { HeapFree(GetProcessHeap(), 0, chunk); return FALSE; }
-                remaining -= c;
+            if (!clip_file_writer_finish(&file)) {
+                clip_log(clip, L"CLIP-R: File completion failed (%lu).", GetLastError());
+                return FALSE;
             }
-            HeapFree(GetProcessHeap(), 0, chunk);
+        } else {
+            clip_log(clip, L"CLIP-R: File creation failed (%lu).", GetLastError());
+            return FALSE;
         }
     }
     return TRUE;
@@ -778,13 +700,31 @@ static void clip_reader_free_pending(VmClipboard clip)
             clip->reader_fmts[i].data = NULL;
         }
     }
+    if (clip->reader_hdrop) GlobalFree(clip->reader_hdrop);
+    clip->reader_hdrop = NULL;
+    asb_clipboard_temp_discard(clip->temp);
+    clip->temp = NULL;
+    clip->temp_dir[0] = 0;
 }
 
 static void clip_reader_request_next(VmClipboard clip, SOCKET s)
 {
     ClipHeader hdr;
 
+    if (!clip->sharing_enabled || clip->reader_generation != clip->sharing_generation) return;
     if (clip->reader_fetch_idx >= clip->reader_fmt_count) {
+        if (clip->temp && (!asb_clipboard_temp_prepare(clip->temp) ||
+            !(clip->reader_hdrop = clip_file_build_hdrop(clip->temp_dir)))) {
+            EnterCriticalSection(&clip->reader_cs);
+            clip_reader_free_pending(clip);
+            clip->reader_fmt_count = 0;
+            LeaveCriticalSection(&clip->reader_cs);
+            clip_log(clip, L"CLIP-R: Could not prepare clipboard files.");
+            return;
+        }
+        EnterCriticalSection(&clip->reader_cs);
+        clip->reader_ready = TRUE;
+        LeaveCriticalSection(&clip->reader_cs);
         if (clip->hwnd && IsWindow(clip->hwnd))
             PostMessageW(clip->hwnd, WM_CLIP_READER_APPLY, 0, 0);
         return;
@@ -795,9 +735,7 @@ static void clip_reader_request_next(VmClipboard clip, SOCKET s)
     hdr.format = clip->reader_fmts[clip->reader_fetch_idx].remote_id;
     hdr.data_size = 0;
 
-    EnterCriticalSection(&clip->reader_cs);
     clip_send_all(s, &hdr, sizeof(hdr));
-    LeaveCriticalSection(&clip->reader_cs);
 }
 
 /* ---- Reader channel: handle messages ---- */
@@ -810,6 +748,7 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         BYTE *buf;
         UINT32 count, i;
         int off;
+        BOOL valid = TRUE;
 
         /* Need at least the 4-byte leading count; reject short frames so the
            `*(UINT32 *)buf` read below cannot over-read the allocation. */
@@ -826,17 +765,22 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         }
 
         /* Focus gate: discard if sync is off */
-        if (!clip->sync_enabled) {
+        if (!clip->sync_enabled || !clip->sharing_enabled) {
             clip_log(clip, L"CLIP-R: FORMAT_LIST discarded (sync disabled).");
             HeapFree(GetProcessHeap(), 0, buf);
             return TRUE;
         }
 
         count = *(UINT32 *)buf;
-        if (count > CLIP_MAX_FORMATS) count = CLIP_MAX_FORMATS;
+        if (count > CLIP_MAX_FORMATS || count > (hdr->data_size - 4) / 8) {
+            HeapFree(GetProcessHeap(), 0, buf);
+            return FALSE;
+        }
         off = 4;
 
         EnterCriticalSection(&clip->reader_cs);
+        clip->reader_ready = FALSE;
+        clip->reader_generation = clip->sharing_generation;
         clip_reader_free_pending(clip);
         clip->reader_fmt_count = 0;
         for (i = 0; i < count && off + 8 <= (int)hdr->data_size; i++) {
@@ -847,15 +791,22 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
             /* off is in [8, data_size] here; reject a name_len that runs past
                the buffer (or whose signed cast would corrupt off) before the
                unconditional `off += name_len` advance below. */
-            if (name_len > (UINT32)((int)hdr->data_size - off)) break;
+            if (name_len >= 256 || name_len > (UINT32)((int)hdr->data_size - off) ||
+                !fmt_id || fmt_id > 0xFFFF ||
+                (name_len && (fmt_id < 0xC000 || memchr(buf + off, 0, name_len)))) {
+                valid = FALSE;
+                break;
+            }
 
-            if (name_len > 0 && name_len < 256 && off + (int)name_len <= (int)hdr->data_size) {
+            if (name_len > 0) {
                 char name[256];
                 memcpy(name, buf + off, name_len);
                 name[name_len] = '\0';
                 local_id = RegisterClipboardFormatA(name);
+                if (!local_id) { valid = FALSE; break; }
             }
             off += (int)name_len;
+            if (clip_should_skip(fmt_id) || (fmt_id >= CF_GDIOBJFIRST && fmt_id <= CF_GDIOBJLAST)) continue;
 
             clip->reader_fmts[clip->reader_fmt_count].local_id = local_id;
             clip->reader_fmts[clip->reader_fmt_count].remote_id = fmt_id;
@@ -868,9 +819,7 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         LeaveCriticalSection(&clip->reader_cs);
 
         HeapFree(GetProcessHeap(), 0, buf);
-
-        clip_remove_dir_recursive(clip->temp_dir);
-        CreateDirectoryW(clip->temp_dir, NULL);
+        if (!valid || i != count || off != (int)hdr->data_size) return FALSE;
 
         clip_log(clip, L"CLIP-R: Received format list (%d formats), fetching data...",
                  clip->reader_fmt_count);
@@ -881,28 +830,38 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
     case CLIP_MSG_FORMAT_DATA_RESP: {
         int idx = clip->reader_fetch_idx;
 
-        if (idx >= 0 && idx < clip->reader_fmt_count) {
-            if (hdr->format == CF_HDROP && hdr->data_size == 0) {
-                clip->reader_fmts[idx].is_hdrop = TRUE;
-            } else if (hdr->data_size > 0 && hdr->data_size <= CLIP_MAX_PAYLOAD) {
-                BYTE *data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr->data_size);
-                if (data && clip_recv_exact(s, data, (int)hdr->data_size)) {
-                    clip->reader_fmts[idx].data = data;
-                    clip->reader_fmts[idx].data_size = hdr->data_size;
-                } else {
-                    if (data) HeapFree(GetProcessHeap(), 0, data);
-                    return FALSE;
-                }
+        if (idx < 0 || idx >= clip->reader_fmt_count ||
+            hdr->format != clip->reader_fmts[idx].remote_id || hdr->data_size > CLIP_MAX_PAYLOAD ||
+            (hdr->format == CF_HDROP && hdr->data_size)) return FALSE;
+        if (hdr->format == CF_HDROP) {
+            clip->reader_fmts[idx].is_hdrop = TRUE;
+        } else if (hdr->data_size > 0) {
+            BYTE *data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr->data_size);
+            if (data && clip_recv_exact(s, data, (int)hdr->data_size)) {
+                EnterCriticalSection(&clip->reader_cs);
+                clip->reader_fmts[idx].data = data;
+                clip->reader_fmts[idx].data_size = hdr->data_size;
+                LeaveCriticalSection(&clip->reader_cs);
+            } else {
+                if (data) HeapFree(GetProcessHeap(), 0, data);
+                return FALSE;
             }
-            clip->reader_fetch_idx++;
-            clip_reader_request_next(clip, s);
         }
+        clip->reader_fetch_idx++;
+        clip_reader_request_next(clip, s);
         return TRUE;
     }
 
-    case CLIP_MSG_FILE_DATA:
-        CreateDirectoryW(clip->temp_dir, NULL);
+    case CLIP_MSG_FILE_DATA: {
+        EnterCriticalSection(&clip->reader_cs);
+        int idx = clip->reader_fetch_idx;
+        BOOL active = !clip->reader_ready && clip->sharing_enabled &&
+            clip->reader_generation == clip->sharing_generation && idx >= 0 && idx < clip->reader_fmt_count &&
+            clip->reader_fmts[idx].remote_id == CF_HDROP;
+        LeaveCriticalSection(&clip->reader_cs);
+        if (!active) return FALSE;
         return clip_reader_recv_file_data(clip, s, hdr);
+    }
 
     default:
         if (hdr->data_size > 0) {
@@ -952,8 +911,6 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
                 Sleep(500);
         }
 
-        if (clip->stop) break;
-
         s = clip->reader_socket;
         while (!clip->stop) {
             if (!clip_recv_exact(s, &hdr, sizeof(hdr))) break;
@@ -961,8 +918,10 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
             if (!clip_reader_handle_message(clip, s, &hdr)) break;
         }
 
+        EnterCriticalSection(&clip->reader_cs);
+        clip->reader_ready = FALSE;
         clip_reader_free_pending(clip);
-        clip_remove_dir_recursive(clip->temp_dir);
+        LeaveCriticalSection(&clip->reader_cs);
         /* Atomically claim the socket so the reader thread and clip_stop()
            never double-close the same handle (App Verifier invalid-handle). */
         {
@@ -974,7 +933,6 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
         if (clip->stop) break;
     }
 
-    clip->reader_thread = NULL;
     return 0;
 }
 
@@ -1000,17 +958,23 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
     clip->log_ud = log_ud;
     clip->stop = FALSE;
     clip->sync_enabled = FALSE;
+    clip->sharing_enabled = TRUE;
     clip->writer_socket = INVALID_SOCKET;
     clip->reader_socket = INVALID_SOCKET;
     clip->writer_suppress = 0;
     clip->reader_suppress = 0;
 
-    InitializeCriticalSection(&clip->writer_cs);
+    clip->pending_sync = 0;
     InitializeCriticalSection(&clip->reader_cs);
 
-    GetTempPathW(MAX_PATH, tmp);
-    swprintf_s(clip->temp_dir, MAX_PATH, L"%sAppSandboxClip", tmp);
-    CreateDirectoryW(clip->temp_dir, NULL);
+    DWORD temp_length = GetTempPathW(MAX_PATH, tmp);
+    if (!temp_length || temp_length >= MAX_PATH) {
+        DeleteCriticalSection(&clip->reader_cs);
+        HeapFree(GetProcessHeap(), 0, clip);
+        return NULL;
+    }
+    wcscpy_s(clip->temp_parent, MAX_PATH, tmp);
+    asb_clipboard_temp_collect(clip->temp_parent);
 
     /* Initial writer connection */
     hcs_service_guid(clip->os_type, 5, &svc);
@@ -1022,7 +986,6 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
             DWORD no_timeout = 0;
             setsockopt(writer_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
             clip->writer_socket = writer_s;
-            clip_send_sync_enable(clip, FALSE);
         } else {
             closesocket(writer_s);
         }
@@ -1030,6 +993,10 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
 
     clip->writer_thread = CreateThread(NULL, 0, clip_writer_thread_proc, clip, 0, NULL);
     clip->reader_thread = CreateThread(NULL, 0, clip_reader_thread_proc, clip, 0, NULL);
+    if (!clip->writer_thread || !clip->reader_thread) {
+        vm_clipboard_destroy(clip);
+        return NULL;
+    }
 
     return clip;
 }
@@ -1053,19 +1020,24 @@ ASB_API void vm_clipboard_destroy(VmClipboard clip)
         if (old != INVALID_SOCKET) closesocket(old);
     }
 
-    if (clip->writer_thread) {
-        WaitForSingleObject(clip->writer_thread, 3000);
-        CloseHandle(clip->writer_thread);
-    }
-    if (clip->reader_thread) {
-        WaitForSingleObject(clip->reader_thread, 3000);
-        CloseHandle(clip->reader_thread);
+    {
+        HANDLE threads[2];
+        DWORD count = 0;
+        if (clip->writer_thread) threads[count++] = clip->writer_thread;
+        if (clip->reader_thread) threads[count++] = clip->reader_thread;
+        for (DWORD i = 0; i < count; i++) {
+            while (MsgWaitForMultipleObjects(1, &threads[i], FALSE, INFINITE, QS_SENDMESSAGE) == WAIT_OBJECT_0 + 1) {
+                MSG msg;
+                PeekMessageW(&msg, NULL, 0, 0, PM_NOREMOVE);
+            }
+            CloseHandle(threads[i]);
+        }
     }
 
     clip_reader_free_pending(clip);
-    clip_remove_dir_recursive(clip->temp_dir);
+    asb_clipboard_temp_retire_owner(clip);
+    asb_clipboard_temp_collect(clip->temp_parent);
 
-    DeleteCriticalSection(&clip->writer_cs);
     DeleteCriticalSection(&clip->reader_cs);
 
     HeapFree(GetProcessHeap(), 0, clip);
@@ -1077,19 +1049,28 @@ ASB_API void vm_clipboard_set_sync_enabled(VmClipboard clip, BOOL enabled)
     if ((BOOL)clip->sync_enabled == enabled) return;
 
     clip->sync_enabled = enabled;
+    if (enabled && _wcsicmp(clip->os_type, L"Linux") == 0)
+        InterlockedExchange(&clip->pushed_sequence, 0);
     clip_log(clip, L"CLIP: Window %s — clipboard sync %s.",
              enabled ? L"focused" : L"unfocused",
              enabled ? L"ON" : L"OFF");
-    clip_send_sync_enable(clip, enabled);
+    InterlockedExchange(&clip->pending_sync, enabled && clip->sharing_enabled ? 1 : 0);
+    if (enabled) InterlockedExchange(&clip->pending_push, 1);
+}
 
-    if (enabled) {
-        clip_send_format_list(clip);
-    }
+ASB_API void vm_clipboard_set_sharing_enabled(VmClipboard clip, BOOL enabled)
+{
+    if (!clip || InterlockedExchange(&clip->sharing_enabled, enabled != FALSE) == (enabled != FALSE)) return;
+    InterlockedIncrement(&clip->sharing_generation);
+    InterlockedExchange(&clip->pushed_sequence, 0);
+    InterlockedExchange(&clip->pending_sync, enabled && clip->sync_enabled ? 1 : 0);
+    InterlockedExchange(&clip->pending_push, enabled ? 1 : 0);
 }
 
 ASB_API void vm_clipboard_on_clipboard_update(VmClipboard clip)
 {
     if (!clip) return;
+    asb_clipboard_temp_changed((uint64_t)(UINT_PTR)GetClipboardOwner());
 
     /* Echo suppression */
     if (InterlockedExchange(&clip->writer_suppress, 0)) {
@@ -1098,9 +1079,9 @@ ASB_API void vm_clipboard_on_clipboard_update(VmClipboard clip)
     }
 
     /* Focus gate */
-    if (!clip->sync_enabled) return;
+    if (!clip->sync_enabled || !clip->sharing_enabled) return;
 
-    clip_send_format_list(clip);
+    InterlockedExchange(&clip->pending_push, 1);
 }
 
 ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)
@@ -1109,7 +1090,13 @@ ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)
     if (!clip) return;
 
     EnterCriticalSection(&clip->reader_cs);
-    if (clip->reader_fmt_count == 0) {
+    if (!clip->reader_ready || clip->reader_fmt_count == 0) {
+        LeaveCriticalSection(&clip->reader_cs);
+        return;
+    }
+    clip->reader_ready = FALSE;
+    if (!clip->sharing_enabled || clip->reader_generation != clip->sharing_generation) {
+        clip_reader_free_pending(clip);
         LeaveCriticalSection(&clip->reader_cs);
         return;
     }
@@ -1123,13 +1110,15 @@ ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)
         return;
     }
 
+    BOOL files_published = FALSE;
     EmptyClipboard();
 
     for (i = 0; i < clip->reader_fmt_count; i++) {
         if (clip->reader_fmts[i].is_hdrop) {
-            HGLOBAL hDrop = clip_build_hdrop_from_temp(clip->temp_dir);
-            if (hDrop)
-                SetClipboardData(clip->reader_fmts[i].local_id, hDrop);
+            if (clip->reader_hdrop && SetClipboardData(clip->reader_fmts[i].local_id, clip->reader_hdrop)) {
+                clip->reader_hdrop = NULL;
+                files_published = TRUE;
+            }
         } else if (clip->reader_fmts[i].data && clip->reader_fmts[i].data_size > 0) {
             HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, clip->reader_fmts[i].data_size);
             if (hMem) {
@@ -1145,8 +1134,16 @@ ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)
         }
     }
 
+    DWORD sequence = GetClipboardSequenceNumber();
+    uint64_t owner = (uint64_t)(UINT_PTR)GetClipboardOwner();
+    asb_clipboard_temp_retire_owner(clip);
+    asb_clipboard_temp_changed(owner);
+    if (files_published) asb_clipboard_temp_publish(clip->temp, clip, owner);
+    else asb_clipboard_temp_discard(clip->temp);
+    clip->temp = NULL;
+    clip->temp_dir[0] = 0;
+    InterlockedExchange(&clip->pushed_sequence, (LONG)sequence);
     CloseClipboard();
-    InterlockedExchange(&clip->writer_suppress, 0);
     clip_log(clip, L"CLIP-R: Applied %d formats to host clipboard.", clip->reader_fmt_count);
     clip_reader_free_pending(clip);
     LeaveCriticalSection(&clip->reader_cs);
