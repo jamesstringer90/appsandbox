@@ -56,10 +56,21 @@ static const GUID CLIPBOARD_READER_SERVICE_GUID =
 #define CLIP_MSG_FORMAT_DATA_REQ  2
 #define CLIP_MSG_FORMAT_DATA_RESP 3
 #define CLIP_MSG_FILE_DATA        4
+#define CLIP_MSG_FILE_LIST        5   /* guest -> host: file metadata for lazy files */
+#define CLIP_MSG_FILE_DATA_REQ    6   /* host -> guest: request one file's bytes */
+#define CLIP_MSG_PULL_LIST        7   /* host -> guest: re-send the current list */
+
+/* Appended after the FORMAT_LIST entries when the guest will follow up with
+   CLIP_MSG_FILE_LIST and wants files rendered lazily (on paste).  Old hosts
+   stop parsing at the last entry and ignore the trailing bytes. */
+#define CLIP_LAZY_MARKER          0x5A594C46u   /* "FLZY" */
 
 #define CLIP_MAX_FORMATS    64
 #define CLIP_MAX_PAYLOAD    (64 * 1024 * 1024)  /* 64 MB */
 #define CLIP_FILE_CHUNK     (1024 * 1024)        /* 1 MB */
+#define CLIP_META_MAX       4096
+#define CLIP_ROOT_MAX       64
+#define CLIP_WALK_MAX_DEPTH 64
 
 #pragma pack(push, 1)
 typedef struct {
@@ -98,6 +109,24 @@ static BOOL clip_sync_is_enabled(void)
 }
 
 #define WM_CLIP_DATA_REQ (WM_USER + 201)
+#define WM_CLIP_PUSH_LIST (WM_USER + 202)
+
+/* Lazy file serving: the host asks for one file at a time by index into the
+ * metadata most recently sent in CLIP_MSG_FILE_LIST.  g_serving defers a new
+ * FORMAT_LIST while a file is streaming, so a list can never appear in the
+ * middle of a file body on the wire. */
+typedef struct {
+    wchar_t rel[MAX_PATH];
+    wchar_t full[MAX_PATH];
+    UINT64  size;
+    DWORD   attrs;
+    int     is_dir;
+} GFileMeta;
+
+static GFileMeta * volatile g_reader_meta = NULL;
+static volatile LONG g_reader_meta_count = 0;
+static volatile LONG g_serving = 0;
+static volatile LONG g_update_pending = 0;
 
 /* ---- Logging ---- */
 
@@ -148,8 +177,24 @@ static BOOL send_all_locked(const void *buf, int len)
 
 /* ---- Skip non-transferable formats ---- */
 
+/* OLE "shell file" formats.  The guest clipboard writer advertises files with
+ * FileGroupDescriptorW + FileContents (lazy, streamed on paste); those cannot
+ * be read with GetClipboardData() and must never be echoed back to the host.
+ * The normal guest->host file path is CF_HDROP. */
+static UINT g_cf_file_desc_w = 0;
+static UINT g_cf_file_desc_a = 0;
+static UINT g_cf_file_contents = 0;
+static UINT g_cf_file_name_w = 0;
+static UINT g_cf_file_name_a = 0;
+
 static BOOL should_skip_format(UINT fmt)
 {
+    if (fmt != 0 &&
+        (fmt == g_cf_file_desc_w || fmt == g_cf_file_desc_a ||
+         fmt == g_cf_file_contents ||
+         fmt == g_cf_file_name_w || fmt == g_cf_file_name_a))
+        return TRUE;
+
     switch (fmt) {
     case 0:
     case CF_BITMAP:
@@ -258,6 +303,207 @@ static BOOL clip_send_file_entry(const wchar_t *full_path, const wchar_t *rel_pa
     return TRUE;
 }
 
+/* ---- Lazy file metadata (guest -> host) ---- */
+
+static void clip_meta_walk(GFileMeta *arr, int *count, int cap,
+                           const wchar_t *full, const wchar_t *rel, int depth)
+{
+    GFileMeta *e;
+    DWORD attrs;
+
+    if (*count >= cap || depth > CLIP_WALK_MAX_DEPTH) return;
+
+    attrs = GetFileAttributesW(full);
+    if (attrs == INVALID_FILE_ATTRIBUTES) return;
+
+    e = &arr[*count];
+    wcscpy_s(e->rel, MAX_PATH, rel);
+    wcscpy_s(e->full, MAX_PATH, full);
+    e->attrs  = attrs;
+    e->is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+    e->size   = 0;
+    if (!e->is_dir) {
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(full, GetFileExInfoStandard, &fad))
+            e->size = ((UINT64)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+    }
+    (*count)++;
+
+    if (e->is_dir) {
+        WIN32_FIND_DATAW fd;
+        wchar_t pattern[MAX_PATH];
+        HANDLE h;
+
+        _snwprintf_s(pattern, MAX_PATH, _TRUNCATE, L"%s\\*", full);
+        h = FindFirstFileW(pattern, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                wchar_t child_full[MAX_PATH], child_rel[MAX_PATH];
+                if (wcscmp(fd.cFileName, L".") == 0 ||
+                    wcscmp(fd.cFileName, L"..") == 0) continue;
+                _snwprintf_s(child_full, MAX_PATH, _TRUNCATE,
+                             L"%s\\%s", full, fd.cFileName);
+                _snwprintf_s(child_rel, MAX_PATH, _TRUNCATE,
+                             L"%s\\%s", rel, fd.cFileName);
+                clip_meta_walk(arr, count, cap, child_full, child_rel, depth + 1);
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    }
+}
+
+/* Send the metadata for the snapshot just published as g_reader_meta.
+   Caller holds g_send_cs. */
+static void clip_send_file_list_locked(void)
+{
+    ClipHeader hdr;
+    BYTE *buf;
+    int i, off, total = 4;
+
+    for (i = 0; i < (int)g_reader_meta_count; i++)
+        total += 4 + (int)(wcslen(g_reader_meta[i].rel) * sizeof(wchar_t)) + 8 + 4 + 1;
+
+    buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)total);
+    if (!buf) {
+        reader_log("clip_send_file_list: out of memory (%d bytes).", total);
+        return;
+    }
+
+    *(UINT32 *)buf = (UINT32)g_reader_meta_count;
+    off = 4;
+    for (i = 0; i < (int)g_reader_meta_count; i++) {
+        UINT32 name_len = (UINT32)(wcslen(g_reader_meta[i].rel) * sizeof(wchar_t));
+        *(UINT32 *)(buf + off) = name_len; off += 4;
+        memcpy(buf + off, g_reader_meta[i].rel, name_len); off += name_len;
+        memcpy(buf + off, &g_reader_meta[i].size, 8); off += 8;
+        *(UINT32 *)(buf + off) = g_reader_meta[i].attrs; off += 4;
+        buf[off++] = g_reader_meta[i].is_dir ? 1 : 0;
+    }
+
+    hdr.magic = CLIP_MAGIC;
+    hdr.msg_type = CLIP_MSG_FILE_LIST;
+    hdr.format = 0;
+    hdr.data_size = (UINT32)off;
+
+    send_all_locked(&hdr, sizeof(hdr));
+    send_all_locked(buf, off);
+    HeapFree(GetProcessHeap(), 0, buf);
+
+    reader_log("FILE_LIST sent: %d entries.", (int)g_reader_meta_count);
+    for (i = 0; i < (int)g_reader_meta_count && i < 8; i++)
+        reader_log("  [%d] '%ls' %llu bytes%s", i, g_reader_meta[i].rel,
+                   (unsigned long long)g_reader_meta[i].size,
+                   g_reader_meta[i].is_dir ? " (dir)" : "");
+    if ((int)g_reader_meta_count > 8)
+        reader_log("  ... and %d more.", (int)g_reader_meta_count - 8);
+}
+
+/* Serve one file's bytes for a host paste (CLIP_MSG_FILE_DATA_REQ).  Runs on
+   the recv thread: no clipboard access, only disk I/O on the snapshot. */
+static void clip_serve_file_request(UINT32 idx)
+{
+    ClipHeader hdr;
+    ClipFileInfo fi;
+    GFileMeta *e = NULL;
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+
+    InterlockedIncrement(&g_serving);
+    EnterCriticalSection(&g_send_cs);
+
+    if (idx < (UINT32)g_reader_meta_count)
+        e = &g_reader_meta[idx];
+
+    ZeroMemory(&fi, sizeof(fi));
+    if (e) {
+        fi.path_len = (UINT32)(wcslen(e->rel) * sizeof(wchar_t));
+        if (!e->is_dir) {
+            LARGE_INTEGER size;
+            /* Share everything: the guest app may still hold the source file
+               open.  If it still cannot be opened, clear path_len so the host
+               aborts the paste instead of saving an empty file. */
+            hFile = CreateFileW(e->full, GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hFile == INVALID_HANDLE_VALUE) {
+                reader_log("Cannot open '%ls' for paste (error %lu); failing request.",
+                           e->full, GetLastError());
+                fi.path_len = 0;
+            } else if (GetFileSizeEx(hFile, &size)) {
+                fi.file_size = (UINT64)size.QuadPart;
+            } else {
+                CloseHandle(hFile);
+                hFile = INVALID_HANDLE_VALUE;
+                fi.path_len = 0;
+            }
+        }
+    } else {
+        reader_log("File data request for unknown index %u.", idx);
+    }
+
+    hdr.magic = CLIP_MAGIC;
+    hdr.msg_type = CLIP_MSG_FILE_DATA;
+    /* Tag the reply with the requested index (1-based) so the host can tell it
+       apart from an eager CF_HDROP file stream that may be interleaved on the
+       wire; 0 means "eager stream". */
+    hdr.format = idx + 1;
+    hdr.data_size = (UINT32)sizeof(fi) + fi.path_len;
+
+    if (e)
+        reader_log("Serving idx=%u '%ls' (%llu bytes, dir=%d, open=%d).",
+                   idx, e->rel, (unsigned long long)fi.file_size,
+                   e->is_dir ? 1 : 0,
+                   hFile != INVALID_HANDLE_VALUE ? 1 : 0);
+
+    if (send_all_locked(&hdr, sizeof(hdr)) &&
+        send_all_locked(&fi, sizeof(fi)) &&
+        (fi.path_len == 0 || send_all_locked(e->rel, (int)fi.path_len))) {
+        if (hFile != INVALID_HANDLE_VALUE) {
+            BYTE *chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
+            UINT64 remaining = fi.file_size;
+            UINT64 total = fi.file_size;
+            BOOL served = TRUE;
+
+            while (chunk && remaining > 0) {
+                DWORD to_read = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : (DWORD)remaining;
+                DWORD bytes_read = 0;
+                if (!ReadFile(hFile, chunk, to_read, &bytes_read, NULL) || bytes_read == 0) {
+                    reader_log("Read of '%ls' failed at %llu/%llu bytes (error %lu).",
+                               e->full,
+                               (unsigned long long)(total - remaining),
+                               (unsigned long long)total, GetLastError());
+                    served = FALSE;
+                    break;
+                }
+                if (!send_all_locked(chunk, (int)bytes_read)) {
+                    /* The host released the paste (cancel) or the channel died. */
+                    reader_log("Send of file %u failed at %llu/%llu bytes "
+                               "(host closed the connection).",
+                               idx,
+                               (unsigned long long)(total - remaining),
+                               (unsigned long long)total);
+                    served = FALSE;
+                    break;
+                }
+                remaining -= bytes_read;
+            }
+            if (chunk) HeapFree(GetProcessHeap(), 0, chunk);
+            if (served)
+                reader_log("Served file %u (%llu bytes).", idx,
+                           (unsigned long long)fi.file_size);
+        }
+    } else {
+        reader_log("Could not send the reply header for file %u (host gone).", idx);
+    }
+
+    if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+
+    LeaveCriticalSection(&g_send_cs);
+    InterlockedDecrement(&g_serving);
+
+    if (InterlockedExchange(&g_update_pending, 0) && g_msg_hwnd)
+        PostMessageW(g_msg_hwnd, WM_CLIP_PUSH_LIST, 0, 0);
+}
+
 /* ---- Send format list to host (clipboard changed locally) ---- */
 
 static void clip_send_format_list(void)
@@ -267,6 +513,13 @@ static void clip_send_format_list(void)
     BYTE buf[16384];
     int offset = 4;
     UINT32 count = 0;
+    BOOL has_hdrop = FALSE;
+    wchar_t roots[CLIP_ROOT_MAX][MAX_PATH];
+    int root_count = 0;
+    GFileMeta *meta = NULL;
+    int meta_count = 0;
+    BOOL lazy = FALSE;
+    BOOL lazy_sent = FALSE;
 
     if (g_client_sock == NULL) return;
 
@@ -276,7 +529,7 @@ static void clip_send_format_list(void)
     }
 
     {
-        BOOL has_hdrop = IsClipboardFormatAvailable(CF_HDROP);
+        has_hdrop = IsClipboardFormatAvailable(CF_HDROP);
 
         fmt = 0;
         while ((fmt = EnumClipboardFormats(fmt)) != 0 && count < CLIP_MAX_FORMATS) {
@@ -299,12 +552,49 @@ static void clip_send_format_list(void)
             }
             count++;
         }
+
+        /* Snapshot the dropped paths while the clipboard is open; walking the
+           tree happens after CloseClipboard so other apps are not blocked. */
+        if (has_hdrop) {
+            HANDLE hData = GetClipboardData(CF_HDROP);
+            if (hData) {
+                UINT n = DragQueryFileW((HDROP)hData, 0xFFFFFFFF, NULL, 0);
+                UINT i;
+                if (n > CLIP_ROOT_MAX) n = CLIP_ROOT_MAX;
+                for (i = 0; i < n; i++) {
+                    if (DragQueryFileW((HDROP)hData, i, roots[root_count], MAX_PATH) > 0)
+                        root_count++;
+                }
+            }
+        }
     }
     CloseClipboard();
 
     if (count == 0) {
-        reader_log("No formats to send.");
-        return;
+        /* An empty list is still sent: the host pairs every push with one
+           echoed FORMAT_LIST to suppress it, and a discarded echo would make
+           the next genuine guest copy disappear.  A zero-format list is a
+           no-op for old and new hosts. */
+        reader_log("No transferable formats; sending empty list.");
+    }
+
+    /* Build the metadata snapshot for lazy FileContents. */
+    if (root_count > 0) {
+        int i;
+        meta = (GFileMeta *)HeapAlloc(GetProcessHeap(), 0,
+                                      sizeof(GFileMeta) * (size_t)CLIP_META_MAX);
+        if (meta) {
+            for (i = 0; i < root_count && meta_count < CLIP_META_MAX; i++) {
+                const wchar_t *name = wcsrchr(roots[i], L'\\');
+                name = name ? name + 1 : roots[i];
+                clip_meta_walk(meta, &meta_count, CLIP_META_MAX, roots[i], name, 0);
+            }
+            lazy = (meta_count > 0);
+            if (!lazy) {
+                HeapFree(GetProcessHeap(), 0, meta);
+                meta = NULL;
+            }
+        }
     }
 
     *(UINT32 *)buf = count;
@@ -312,14 +602,58 @@ static void clip_send_format_list(void)
     hdr.magic = CLIP_MAGIC;
     hdr.msg_type = CLIP_MSG_FORMAT_LIST;
     hdr.format = 0;
-    hdr.data_size = (UINT32)offset;
+
+    /* Check before taking g_send_cs: the recv thread holds it for the whole
+       file body, and blocking the window thread there would freeze the guest
+       clipboard for the duration of a paste.  The serve posts
+       WM_CLIP_PUSH_LIST when it finishes, so a deferred list is retried. */
+    if (InterlockedCompareExchange(&g_serving, 0, 0) > 0) {
+        InterlockedExchange(&g_update_pending, 1);
+        if (meta) HeapFree(GetProcessHeap(), 0, meta);
+        if (InterlockedCompareExchange(&g_serving, 0, 0) == 0 && g_msg_hwnd)
+            PostMessageW(g_msg_hwnd, WM_CLIP_PUSH_LIST, 0, 0);
+        reader_log("Format list deferred (file transfer in progress).");
+        return;
+    }
 
     EnterCriticalSection(&g_send_cs);
+
+    /* Re-check under the lock: a serve may have started meanwhile. */
+    if (InterlockedCompareExchange(&g_serving, 0, 0) > 0) {
+        InterlockedExchange(&g_update_pending, 1);
+        LeaveCriticalSection(&g_send_cs);
+        if (meta) HeapFree(GetProcessHeap(), 0, meta);
+        if (InterlockedCompareExchange(&g_serving, 0, 0) == 0 && g_msg_hwnd)
+            PostMessageW(g_msg_hwnd, WM_CLIP_PUSH_LIST, 0, 0);
+        reader_log("Format list deferred (file transfer in progress).");
+        return;
+    }
+
+    if (lazy && offset + 4 <= (int)sizeof(buf)) {
+        *(UINT32 *)(buf + offset) = CLIP_LAZY_MARKER;
+        offset += 4;
+        lazy_sent = TRUE;
+
+        /* Publish the snapshot (safe: an in-flight serve holds g_send_cs). */
+        if (g_reader_meta) HeapFree(GetProcessHeap(), 0, (void *)g_reader_meta);
+        g_reader_meta = meta;
+        g_reader_meta_count = meta_count;
+        meta = NULL;
+    }
+
+    hdr.data_size = (UINT32)offset;
     send_all_locked(&hdr, sizeof(hdr));
     send_all_locked(buf, offset);
+
+    if (lazy_sent && g_reader_meta_count > 0)
+        clip_send_file_list_locked();
+
     LeaveCriticalSection(&g_send_cs);
 
-    reader_log("Sent format list (%u formats).", count);
+    if (meta) HeapFree(GetProcessHeap(), 0, meta);
+
+    reader_log("Sent format list (%u formats)%s.", count,
+               lazy ? " [lazy files]" : "");
 }
 
 /* ---- Handle FORMAT_DATA_REQ from host ---- */
@@ -329,50 +663,77 @@ static void clip_handle_data_request(UINT fmt)
     ClipHeader hdr;
 
     if (fmt == CF_HDROP) {
+        wchar_t (*paths)[MAX_PATH] = NULL;
+        int path_count = 0;
+        int snap_failed = 0;
+
+        /* Snapshot the dropped paths while the clipboard is open, then release
+           it again. Holding OpenClipboard() across a multi-gigabyte transfer
+           would lock every other application on the guest out of the clipboard
+           for the whole transfer (the host side already does this). */
         if (OpenClipboard(g_msg_hwnd)) {
             HANDLE hData = GetClipboardData(CF_HDROP);
             if (hData) {
                 HDROP hDrop = (HDROP)hData;
                 UINT file_count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
                 UINT fi;
-                reader_log("Data request CF_HDROP — %u files.", file_count);
-                EnterCriticalSection(&g_send_cs);
-                for (fi = 0; fi < file_count; fi++) {
-                    wchar_t path[MAX_PATH];
-                    wchar_t *name;
-                    DragQueryFileW(hDrop, fi, path, MAX_PATH);
-                    name = wcsrchr(path, L'\\');
-                    name = name ? name + 1 : path;
-                    clip_send_file_entry(path, name);
+                if (file_count > CLIP_MAX_FORMATS) file_count = CLIP_MAX_FORMATS;
+                paths = (wchar_t (*)[MAX_PATH])HeapAlloc(
+                    GetProcessHeap(), 0, sizeof(wchar_t[MAX_PATH]) * file_count);
+                if (paths) {
+                    for (fi = 0; fi < file_count; fi++)
+                        DragQueryFileW(hDrop, fi, paths[path_count++], MAX_PATH);
+                } else {
+                    snap_failed = 1;
                 }
-                hdr.magic = CLIP_MAGIC;
-                hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-                hdr.format = CF_HDROP;
-                hdr.data_size = 0;
-                send_all_locked(&hdr, sizeof(hdr));
-                LeaveCriticalSection(&g_send_cs);
+                reader_log("Data request CF_HDROP - %u file(s).", file_count);
             } else {
                 reader_log("GetClipboardData(CF_HDROP) returned NULL.");
-                goto send_empty;
             }
             CloseClipboard();
         } else {
             reader_log("OpenClipboard failed for CF_HDROP (%lu).", GetLastError());
-            goto send_empty;
         }
-        return;
 
-    send_empty:
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = 0;
+        if (path_count == 0 || snap_failed) {
+            if (paths) HeapFree(GetProcessHeap(), 0, paths);
+            hdr.magic = CLIP_MAGIC;
+            hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
+            hdr.format = CF_HDROP;
+            hdr.data_size = 0;
+            EnterCriticalSection(&g_send_cs);
+            send_all_locked(&hdr, sizeof(hdr));
+            LeaveCriticalSection(&g_send_cs);
+            return;
+        }
+
+        /* Block new format lists from interleaving (counter, so a lazy serve
+           on the recv thread is not clobbered). */
+        InterlockedIncrement(&g_serving);
         EnterCriticalSection(&g_send_cs);
-        send_all_locked(&hdr, sizeof(hdr));
+        {
+            int i;
+            for (i = 0; i < path_count; i++) {
+                wchar_t *name = wcsrchr(paths[i], L'\\');
+                name = name ? name + 1 : paths[i];
+                clip_send_file_entry(paths[i], name);
+            }
+            hdr.magic = CLIP_MAGIC;
+            hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
+            hdr.format = CF_HDROP;
+            hdr.data_size = 0;
+            send_all_locked(&hdr, sizeof(hdr));
+        }
         LeaveCriticalSection(&g_send_cs);
+        InterlockedDecrement(&g_serving);
+
+        if (paths) HeapFree(GetProcessHeap(), 0, paths);
+
+        /* Drain a format list that was deferred while we streamed. */
+        if (InterlockedExchange(&g_update_pending, 0) && g_msg_hwnd)
+            PostMessageW(g_msg_hwnd, WM_CLIP_PUSH_LIST, 0, 0);
         return;
     }
-
     /* Regular format */
     if (OpenClipboard(g_msg_hwnd)) {
         HANDLE hData = GetClipboardData(fmt);
@@ -430,6 +791,44 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
             PostMessageW(g_msg_hwnd, WM_CLIP_DATA_REQ, (WPARAM)hdr.format, 0);
             break;
 
+        case CLIP_MSG_FILE_DATA_REQ: {
+            UINT32 idx = 0;
+            UINT32 extra = hdr.data_size;
+
+            if (extra >= 4) {
+                if (!recv_exact(s, &idx, 4)) goto done;
+                extra -= 4;
+            }
+            if (extra > 0) {
+                BYTE skip[4096];
+                UINT32 remaining = extra;
+                while (remaining > 0) {
+                    int chunk = remaining > 4096 ? 4096 : (int)remaining;
+                    if (!recv_exact(s, skip, chunk)) goto done;
+                    remaining -= chunk;
+                }
+            }
+            clip_serve_file_request(idx);
+            break;
+        }
+
+        case CLIP_MSG_PULL_LIST: {
+            /* The host's advertised list is stale (a paste was refused).
+               Re-send the current clipboard list; if a file body is being
+               served, clip_send_format_list defers and posts again when the
+               serve finishes.  Old hosts never send this. */
+            UINT32 remaining = hdr.data_size;
+            BYTE skip[256];
+            while (remaining > 0) {
+                int chunk = remaining > (UINT32)sizeof(skip)
+                                ? (int)sizeof(skip) : (int)remaining;
+                if (!recv_exact(s, skip, chunk)) goto done;
+                remaining -= (UINT32)chunk;
+            }
+            reader_log("Host asked for the current clipboard list.");
+            if (g_msg_hwnd) PostMessageW(g_msg_hwnd, WM_CLIP_PUSH_LIST, 0, 0);
+            break;
+        }
         default:
             reader_log("Unknown msg_type %u.", hdr.msg_type);
             if (hdr.data_size > 0) {
@@ -466,6 +865,10 @@ static LRESULT CALLBACK clip_msg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
 
     case WM_CLIP_DATA_REQ:
         clip_handle_data_request((UINT)wp);
+        return 0;
+
+    case WM_CLIP_PUSH_LIST:
+        clip_send_format_list();
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -555,6 +958,12 @@ int main(void)
                WTSGetActiveConsoleSessionId());
 
     InitializeCriticalSection(&g_send_cs);
+
+    g_cf_file_desc_w   = RegisterClipboardFormatW(L"FileGroupDescriptorW");
+    g_cf_file_desc_a   = RegisterClipboardFormatW(L"FileGroupDescriptor");
+    g_cf_file_contents = RegisterClipboardFormatW(L"FileContents");
+    g_cf_file_name_w   = RegisterClipboardFormatW(L"FileNameW");
+    g_cf_file_name_a   = RegisterClipboardFormatW(L"FileName");
 
     g_sync_event = OpenEventW(SYNCHRONIZE, FALSE, CLIP_SYNC_EVENT_NAME);
     if (!g_sync_event)
