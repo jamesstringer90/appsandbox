@@ -15,8 +15,6 @@
 
 #include "../../tools/transport/asb_shm_layout.h"   /* asb_shm_publish + region sizing */
 
-#define QEMU_IVSHMEM_SIZE  (128ull * 1024 * 1024)
-
 @interface QemuVm ()
 @property (nonatomic, copy)   NSString *name;
 @property (nonatomic, strong) NSURL *vmDir;
@@ -137,16 +135,16 @@
 - (BOOL)prepareIvshmemBacking:(NSString *)path error:(NSError **)err {
     int fd = open(path.fileSystemRepresentation, O_RDWR | O_CREAT, 0666);
     if (fd < 0) { if (err) *err = [self posixError:@"open ivshmem.bin"]; return NO; }
-    if (ftruncate(fd, (off_t)QEMU_IVSHMEM_SIZE) != 0) {
+    if (ftruncate(fd, (off_t)ASB_SHM_BAR_SIZE) != 0) {
         int e = errno; close(fd);
         if (err) *err = [self err:[NSString stringWithFormat:@"ftruncate ivshmem.bin: %s", strerror(e)]];
         return NO;
     }
-    void *bar = mmap(NULL, (size_t)QEMU_IVSHMEM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void *bar = mmap(NULL, (size_t)ASB_SHM_BAR_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (bar == MAP_FAILED) { close(fd); if (err) *err = [self posixError:@"mmap ivshmem.bin"]; return NO; }
-    asb_shm_publish((uint8_t *)bar, QEMU_IVSHMEM_SIZE);
+    asb_shm_publish((uint8_t *)bar, ASB_SHM_BAR_SIZE);
     msync(bar, 4096, MS_SYNC);
-    munmap(bar, (size_t)QEMU_IVSHMEM_SIZE);
+    munmap(bar, (size_t)ASB_SHM_BAR_SIZE);
     close(fd);
     return YES;
 }
@@ -217,7 +215,7 @@
         @"-drive", [NSString stringWithFormat:@"if=pflash,format=raw,readonly=on,file=%@", edk2Code],
         @"-drive", [NSString stringWithFormat:@"if=pflash,format=raw,file=%@", varsPath],
         @"-object", [NSString stringWithFormat:@"memory-backend-file,id=ivshm,size=%llu,mem-path=%@,share=on",
-                     QEMU_IVSHMEM_SIZE, ivsPath],
+                     ASB_SHM_BAR_SIZE, ivsPath],
         @"-device", @"ivshmem-plain,memdev=ivshm",
         /* No ramfb: with -display none nothing renders QEMU's framebuffer anyway, and a second guest
          * display adapter competes with the VDD for the desktop/primary path (we have no

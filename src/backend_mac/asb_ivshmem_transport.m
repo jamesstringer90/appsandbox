@@ -10,9 +10,8 @@
 #include <sys/select.h>
 #include <mach/mach_time.h>   /* mach_absolute_time() -> per-host-process generation (residue id) */
 
-#include "../../tools/transport/asb_transport.h"   /* AsbShmDirectory, AsbRing, ASB_SLOT_*, ASB_SLOT_HDR */
+#include "../../tools/transport/asb_shm_layout.h"
 
-#define ASB_RING_HDR ((uint32_t)sizeof(AsbRing))
 #define MAX_PUMPS    32
 #define ASB_RESIDUE_QUIESCE_US 4000   /* host-crash residue reclaim: us to let a stale guest observe CLOSED + stop producing */
 /* host->guest liveness: if the h2g ring stays full with undelivered bytes (no drain progress) this long,
@@ -35,12 +34,14 @@ static uint64_t asb_mono_ms(void)
 
 /* ---- SPSC ring helpers (host side). Host is consumer of g2h, producer of h2g.
  * Identical math to asb_transport.c's ring_read_host/ring_write_host. ---- */
-static int ring_read_host(AsbRing *r, uint8_t *data, void *buf, int len)
+static int ring_read_host(AsbRing *r, uint8_t *data, uint32_t cap, void *buf, int len)
 {
+    if (!r || !data || !buf || len < 0 || cap == 0 || (cap & (cap - 1)) != 0) return -1;
     __sync_synchronize();
-    uint64_t head = r->head, tail = r->tail; uint32_t cap = r->cap;
-    uint32_t used = (uint32_t)(tail - head);
-    uint32_t n = (uint32_t)len < used ? (uint32_t)len : used;
+    uint64_t head = r->head, tail = r->tail;
+    uint64_t used = tail - head;
+    if (r->cap != cap || used > cap) return -1;
+    uint32_t n = (uint64_t)(uint32_t)len < used ? (uint32_t)len : (uint32_t)used;
     if (n == 0) return 0;
     __sync_synchronize();   /* ACQUIRE: order the `tail` load before the data read. Without it, weak
                              * memory (ARM64) lets the read be speculated ahead of the tail load and
@@ -54,11 +55,14 @@ static int ring_read_host(AsbRing *r, uint8_t *data, void *buf, int len)
     return (int)n;
 }
 
-static int ring_write_host(AsbRing *r, uint8_t *data, const void *buf, int len)
+static int ring_write_host(AsbRing *r, uint8_t *data, uint32_t cap, const void *buf, int len)
 {
+    if (!r || !data || !buf || len < 0 || cap == 0 || (cap & (cap - 1)) != 0) return -1;
     __sync_synchronize();
-    uint64_t head = r->head, tail = r->tail; uint32_t cap = r->cap;
-    uint32_t freeb = cap - (uint32_t)(tail - head);
+    uint64_t head = r->head, tail = r->tail;
+    uint64_t used = tail - head;
+    if (r->cap != cap || used > cap) return -1;
+    uint32_t freeb = cap - (uint32_t)used;
     uint32_t n = (uint32_t)len < freeb ? (uint32_t)len : freeb;
     if (n == 0) return 0;
     uint32_t pos = (uint32_t)(tail & (cap - 1)), first = cap - pos;
@@ -80,6 +84,8 @@ typedef struct {
     volatile uint64_t *guest_hb;      /* off 40; guest-sole liveness beacon (READ-ONLY here; staleness => dead) */
     AsbRing *g2h; uint8_t *g2hData;   /* guest -> host (we read)  */
     AsbRing *h2g; uint8_t *h2gData;   /* host  -> guest (we write) */
+    uint32_t g2hCap;
+    uint32_t h2gCap;
     int      internal_fd;             /* our end of the socketpair; caller holds the other */
     pthread_mutex_t *lock;            /* &transport->_lock: serializes the pump's terminal *state=FREE write against a concurrent connectChannel arm */
     volatile int    *closed;          /* &transport->_closed: skip the terminal write while -close tears down */
@@ -92,7 +98,7 @@ typedef struct {
     int                 _fd;
     uint8_t            *_bar;
     uint64_t            _barSize;
-    AsbShmDirectory    *_dir;
+    uint32_t            _layoutRegionCount;
     AsbPump            *_pumps[MAX_PUMPS];
     int                 _pumpCount;
     uint64_t            _host_gen;   /* this host process's generation (mach_absolute_time @ init); identifies
@@ -112,23 +118,35 @@ typedef struct {
     _fd = -1;
     pthread_mutex_init(&_lock, NULL);
 
-    int fd = open(path.fileSystemRepresentation, O_RDWR);
+    int fd = open(path.fileSystemRepresentation, O_RDWR | O_CLOEXEC);
     if (fd < 0) return nil;
     struct stat st;
-    if (fstat(fd, &st) != 0) { close(fd); return nil; }
-    void *bar = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size != (off_t)ASB_SHM_BAR_SIZE) {
+        close(fd);
+        return nil;
+    }
+    void *bar = mmap(NULL, (size_t)ASB_SHM_BAR_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (bar == MAP_FAILED) { close(fd); return nil; }
 
     AsbShmDirectory *dir = (AsbShmDirectory *)bar;
-    if (dir->magic != ASB_SHM_DIR_MAGIC) {   /* launcher hasn't published yet */
-        munmap(bar, (size_t)st.st_size);
+    if (dir->magic != ASB_SHM_DIR_MAGIC) {
+        munmap(bar, (size_t)ASB_SHM_BAR_SIZE);
+        close(fd);
+        return nil;
+    }
+    __sync_synchronize();
+    AsbShmDirectory snapshot;
+    memcpy(&snapshot, dir, sizeof(snapshot));
+    uint32_t layoutRegionCount = asb_shm_validate_directory(&snapshot, ASB_SHM_BAR_SIZE);
+    if (layoutRegionCount == 0) {
+        munmap(bar, (size_t)ASB_SHM_BAR_SIZE);
         close(fd);
         return nil;
     }
     _fd = fd;
     _bar = (uint8_t *)bar;
-    _barSize = (uint64_t)st.st_size;
-    _dir = dir;
+    _barSize = ASB_SHM_BAR_SIZE;
+    _layoutRegionCount = layoutRegionCount;
     _host_gen = (uint64_t)mach_absolute_time();
     if (_host_gen == 0) _host_gen = 1;   /* 0 == "no arm"; never use it as a live generation */
     _arm_seq = 0;
@@ -137,13 +155,9 @@ typedef struct {
 
 - (BOOL)mapped { return _bar != NULL; }
 
-- (const AsbShmRegionDesc *)regionForChannel:(int)channel
+- (const AsbShmRegionLayout *)regionForChannel:(int)channel
 {
-    if (!_dir) return NULL;
-    uint32_t n = _dir->n_regions < 16 ? _dir->n_regions : 16;
-    for (uint32_t i = 0; i < n; i++)
-        if (_dir->regions[i].channel_id == (uint32_t)channel) return &_dir->regions[i];
-    return NULL;
+    return asb_shm_region_for_channel((uint32_t)channel, _layoutRegionCount);
 }
 
 - (int)connectChannel:(int)channel timeoutMs:(int)timeoutMs
@@ -153,12 +167,11 @@ typedef struct {
      * our token into guest_ack, then publish ESTABLISHED. The guest never writes `state`, so there is no
      * two-writer clobber and no hardware atomic is needed (atomics fault on the ivshmem BAR / QEMU+HVF). */
     pthread_mutex_lock(&_lock);
-    if (_closed || !_bar || !_dir) { pthread_mutex_unlock(&_lock); return -1; }
+    if (_closed || !_bar || _layoutRegionCount == 0) { pthread_mutex_unlock(&_lock); return -1; }
     if (_pumpCount >= MAX_PUMPS) { pthread_mutex_unlock(&_lock); return -1; }
-    /* regionForChannel dereferences _dir (a pointer INTO the BAR); resolve it UNDER _lock with the
-     * _closed/_bar guard so -close (which munmaps under _lock on guest shutdown) can't free it mid-deref. */
-    const AsbShmRegionDesc *r = [self regionForChannel:channel];
-    if (!r) { pthread_mutex_unlock(&_lock); return -1; }
+    const AsbShmRegionLayout *layout = [self regionForChannel:channel];
+    if (!layout) { pthread_mutex_unlock(&_lock); return -1; }
+    const AsbShmRegionDesc *r = &layout->region;
 
     /* Scan: prefer a FREE/CLOSED slot; else fall back to a DEAD host generation's residue (a non-FREE/
      * CLOSED slot whose host_gen is neither 0 nor ours — a crashed prior host left it; host-crash recov). */
@@ -190,9 +203,12 @@ typedef struct {
     volatile uint64_t *hgen  = (volatile uint64_t *)(slot + ASB_SLOT_HOST_GEN_OFFSET);
     AsbRing *g2h = (AsbRing *)(slot + ASB_SLOT_HDR);
     uint8_t *g2hData = (uint8_t *)g2h + ASB_RING_HDR;
-    uint32_t g2hCap = g2h->cap;                            /* published by the launcher */
-    AsbRing *h2g = (AsbRing *)(g2hData + g2hCap);
+    AsbRing *h2g = (AsbRing *)(g2hData + layout->g2h_cap);
     uint8_t *h2gData = (uint8_t *)h2g + ASB_RING_HDR;
+    if (g2h->cap != layout->g2h_cap || h2g->cap != layout->h2g_cap) {
+        pthread_mutex_unlock(&_lock);
+        return -1;
+    }
 
     uint64_t tok = ((_host_gen & 0xffffffffull) << 32) | (uint64_t)(++_arm_seq);
     g2h->head = g2h->tail = 0;
@@ -257,6 +273,7 @@ typedef struct {
     p->host_token = htok; p->guest_ack = gack;
     p->guest_hb = (volatile uint64_t *)(slot + ASB_SLOT_GUEST_HB_OFFSET);
     p->g2h = g2h; p->g2hData = g2hData; p->h2g = h2g; p->h2gData = h2gData;
+    p->g2hCap = layout->g2h_cap; p->h2gCap = layout->h2g_cap;
     p->internal_fd = sp[1];
     p->lock = &_lock; p->closed = &_closed;
     p->my_owner_id = my_owner; p->my_host_token = tok;
@@ -315,7 +332,7 @@ typedef struct {
     _pumpCount = 0;
     /* munmap UNDER _lock: connectChannel only reads the BAR while holding _lock with a _closed/_bar
      * guard, so this can never pull the mapping out from under a live dereference. */
-    if (_bar) { munmap(_bar, (size_t)_barSize); _bar = NULL; _dir = NULL; }
+    if (_bar) { munmap(_bar, (size_t)_barSize); _bar = NULL; _layoutRegionCount = 0; }
     if (_fd >= 0) { close(_fd); _fd = -1; }
     pthread_mutex_unlock(&_lock);
 }
@@ -372,7 +389,8 @@ void *asb_ivshmem_pump_main(void *arg)
         /* host -> guest: push any pending bytes into the h2g ring (partial ok, never blocks). */
         int h2g_progress = 0;
         while (h2goff < h2glen) {
-            int w = ring_write_host(p->h2g, p->h2gData, h2gbuf + h2goff, h2glen - h2goff);
+            int w = ring_write_host(p->h2g, p->h2gData, p->h2gCap, h2gbuf + h2goff, h2glen - h2goff);
+            if (w < 0) goto done;
             if (w > 0) { h2goff += w; did_work = 1; h2g_progress = 1; } else break;   /* ring full: guest draining */
         }
         if (h2goff >= h2glen) { h2goff = h2glen = 0; h2g_stall_since = 0; }   /* delivered -> not stalled */
@@ -392,7 +410,8 @@ void *asb_ivshmem_pump_main(void *arg)
         /* guest -> host: refill the staging buffer from g2h when it's empty. */
         if (g2hoff >= g2hlen) {
             g2hoff = g2hlen = 0;
-            int n = ring_read_host(p->g2h, p->g2hData, g2hbuf, (int)sizeof(g2hbuf));
+            int n = ring_read_host(p->g2h, p->g2hData, p->g2hCap, g2hbuf, (int)sizeof(g2hbuf));
+            if (n < 0) goto done;
             if (n > 0) { g2hlen = n; did_work = 1; }
         }
         /* ...and flush as much of it to the socketpair as fits right now (non-blocking). */
