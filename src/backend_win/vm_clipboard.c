@@ -792,8 +792,7 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
                the buffer (or whose signed cast would corrupt off) before the
                unconditional `off += name_len` advance below. */
             if (name_len >= 256 || name_len > (UINT32)((int)hdr->data_size - off) ||
-                fmt_id > 0xFFFF || clip_should_skip(fmt_id) ||
-                (fmt_id >= CF_GDIOBJFIRST && fmt_id <= CF_GDIOBJLAST) ||
+                !fmt_id || fmt_id > 0xFFFF ||
                 (name_len && (fmt_id < 0xC000 || memchr(buf + off, 0, name_len)))) {
                 valid = FALSE;
                 break;
@@ -807,6 +806,7 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
                 if (!local_id) { valid = FALSE; break; }
             }
             off += (int)name_len;
+            if (clip_should_skip(fmt_id) || (fmt_id >= CF_GDIOBJFIRST && fmt_id <= CF_GDIOBJLAST)) continue;
 
             clip->reader_fmts[clip->reader_fmt_count].local_id = local_id;
             clip->reader_fmts[clip->reader_fmt_count].remote_id = fmt_id;

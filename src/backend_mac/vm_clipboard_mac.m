@@ -85,6 +85,7 @@ static NSData *clip_readlink(NSString *path) {
 @property (nonatomic, assign) AsbClipboardTemp *fileTemp;
 @property (nonatomic, assign) int32_t fileCountExpected;
 @property (nonatomic, strong) NSURL *fileURL;
+@property (nonatomic, assign) BOOL expectsChunks;
 @property (nonatomic, assign) BOOL completed;
 @property (nonatomic, assign) BOOL failed;
 @end
@@ -405,12 +406,14 @@ static NSData *clip_readlink(NSString *path) {
 /* Fetch one item's typed data synchronously. */
 - (nullable NSData *)fetchItemData:(uint32_t)itemIndex
                               type:(NSString *)type
+                          sizeHint:(uint64_t)sizeHint
                            timeout:(NSTimeInterval)timeout {
     if (_sock < 0 || !self.sharingEnabled) return nil;
     uint64_t generation = atomic_load(&_sharingGeneration);
 
     VmClipPending *p = [VmClipPending new];
     p.seqId = [self allocSeq];
+    p.expectsChunks = sizeHint > CLIP_LARGE_THRESHOLD;
     [self pendingRegister:p];
 
     if ([self sendDataReqV2:p.seqId item:itemIndex format:type] <= 0) {
@@ -1530,7 +1533,7 @@ static int wr_full(int fd, const void *buf, size_t n) {
             [p.cond lock];
             if (!p.completed) {
                 if (body) [p.body appendData:body];
-                if (h.msg_type == CLIP_MSG_FORMAT_DATA_RESP_V2) {
+                if (h.msg_type == CLIP_MSG_FORMAT_DATA_RESP_V2 && (remaining || !p.expectsChunks)) {
                     p.completed = YES;
                     [p.cond broadcast];
                 }
@@ -1659,7 +1662,7 @@ provideDataForType:(NSString *)type {
         NSTimeInterval timeout = hint > 10ULL * 1024 * 1024 ? 60.0
                                : hint > 1ULL  * 1024 * 1024 ? 10.0
                                : 2.0;
-        result = [clip fetchItemData:self.itemIndex type:type timeout:timeout];
+        result = [clip fetchItemData:self.itemIndex type:type sizeHint:hint timeout:timeout];
     }
 
     if (!result || !clip.sharingEnabled || self.generation != [clip currentLazyGeneration] || self.pasteboardToken != (uint64_t)pb.changeCount) return;
