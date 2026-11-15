@@ -1,0 +1,9 @@
+[
+  {"id":"values-256-20hz","mode":"values","nodes":256,"hz":20},
+  {"id":"churn-256-20hz","mode":"churn","nodes":256,"hz":20,"coldStart":true},
+  {"id":"values-1024-60hz","mode":"values","nodes":1024,"hz":60},
+  {"id":"slow-capture-1024-10hz","mode":"slow-capture","nodes":1024,"hz":10},
+  {"id":"slow-churn-1024-10hz","mode":"slow-churn","nodes":1024,"hz":10,"coldStart":true},
+  {"id":"web-512-20hz","mode":"web","nodes":512,"hz":20},
+  {"id":"mixed-256-20hz","mode":"mixed","nodes":256,"hz":20}
+]

@@ -105,7 +105,7 @@ static NSDictionary *names(AXUIElementRef target, BOOL actions) {
 }
 static NSDictionary *secureValue(id value) {
     if ([value isKindOfClass:NSString.class]) {
-        NSCharacterSet *masks = [NSCharacterSet characterSetWithCharactersInString:@"•●*∙◦"];
+        NSCharacterSet *masks = [NSCharacterSet characterSetWithCharactersInString:@"•●*∙◦\uf79a"];
         if ([value rangeOfCharacterFromSet:masks.invertedSet].location == NSNotFound) return encode(value, 0);
     }
     return @{@"redacted": @YES};

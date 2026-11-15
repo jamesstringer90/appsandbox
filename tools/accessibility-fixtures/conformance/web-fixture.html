@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>AX web conformance</title>
+<style>body{font:15px Helvetica,Arial;color:#111;background:white;margin:16px}input,button,select{font:inherit;margin:4px}section{margin:18px 0}[contenteditable]{border:1px solid #555;padding:8px;white-space:pre-wrap}table{border-collapse:collapse}td,th{padding:5px;border:1px solid #777}</style>
+<main aria-label="Web conformance document">
+<h1>Web accessibility</h1>
+<section aria-label="Text markers">
+<div contenteditable="true" role="textbox" aria-multiline="true" aria-label="Web document" id="web-editor">First line: café β 😀.
+Second line has words and punctuation.
+Third paragraph ends here.</div>
+</section>
+<section aria-label="Forms">
+<label>Required name <input id="web-name" aria-required="true" required placeholder="Your name" aria-describedby="web-help" aria-invalid="true" aria-errormessage="web-error"></label>
+<p id="web-help">A descriptive help message.</p><p id="web-error">Enter a name.</p>
+<label>Quantity <input type="number" aria-label="Web quantity" value="2" min="1" max="9" step="1"></label>
+<label>Volume <input type="range" aria-label="Web volume" value="4" min="0" max="10"></label>
+<label><input type="checkbox" id="web-check">Web checkbox</label>
+<button id="web-button" onclick="count++;publish()">Web count</button>
+<button disabled>Web disabled</button>
+<input type="search" aria-label="Web search" placeholder="Search fixtures">
+<input type="password" aria-label="Web password" value="fixture-secret">
+<select aria-label="Web destination"><option>Gore</option><option>Queenstown</option><option>Dunedin</option></select>
+<progress aria-label="Web progress" max="100" value="65"></progress>
+<meter aria-label="Web level" min="0" max="100" value="40"></meter>
+</section>
+<section aria-label="Relationships">
+<span id="web-title">Label source</span><span id="web-description">Description source</span>
+<button aria-labelledby="web-title" aria-describedby="web-description" aria-controls="web-controlled">Related button</button>
+<div id="web-controlled" role="region" aria-label="Controlled region">Related contents</div>
+<details><summary>Disclosure summary</summary><p>Disclosed details</p></details>
+<a href="#web-controlled" aria-label="Local document link">Local document link</a>
+<figure><svg role="img" aria-label="Blue square" width="50" height="50"><rect width="50" height="50" fill="blue"/></svg><figcaption>Image caption</figcaption></figure>
+</section>
+<table aria-label="Web reservations"><caption>Reservation summary</caption><thead><tr><th scope="col">Name</th><th scope="col">City</th></tr></thead><tbody><tr><th scope="row">Reservation 001</th><td>Gore</td></tr><tr><th scope="row">Reservation 002</th><td>Queenstown</td></tr></tbody></table>
+<div role="grid" aria-label="Web grid" aria-rowcount="4" aria-colcount="2" aria-multiselectable="true"><div role="row" aria-rowindex="1"><div role="columnheader">Column one</div><div role="columnheader">Column two</div></div><div role="row" aria-rowindex="2" aria-selected="true"><div role="gridcell" aria-colindex="1">Cell one</div><div role="gridcell" aria-colindex="2">Cell two</div></div></div>
+<ul role="tree" aria-label="Web outline"><li role="treeitem" aria-expanded="true" aria-level="1" aria-posinset="1" aria-setsize="2">Parent<ul role="group"><li role="treeitem" aria-level="2" aria-selected="true">Child</li></ul></li><li role="treeitem" aria-expanded="false" aria-level="1" aria-posinset="2" aria-setsize="2">Collapsed</li></ul>
+<div role="tablist" aria-label="Web tabs"><button role="tab" aria-selected="true" aria-controls="web-panel">Overview tab</button><button role="tab" aria-selected="false">Details tab</button></div><div role="tabpanel" id="web-panel">Overview contents</div>
+<div role="toolbar" aria-label="Web toolbar"><button aria-pressed="mixed">Mixed toggle</button><button aria-haspopup="menu" aria-expanded="false">Menu button</button></div>
+<div role="listbox" aria-label="Web choices" aria-multiselectable="true"><div role="option" aria-selected="true">First option</div><div role="option" aria-selected="false">Second option</div></div>
+<div role="status" aria-label="Web live status" aria-live="polite" aria-atomic="true" aria-relevant="additions text" id="web-live">Ready</div>
+<button onclick="document.getElementById('web-live').textContent='Live update complete'">Update live region</button>
+<math aria-label="Fraction expression"><mfrac><mrow><mi>x</mi><mo>+</mo><mn>1</mn></mrow><msqrt><mn>2</mn></msqrt></mfrac></math>
+<math aria-label="Script expression"><msubsup><mi>x</mi><mn>2</mn><mn>3</mn></msubsup><mo>=</mo><mroot><mn>8</mn><mn>3</mn></mroot></math>
+<p role="note">A document note.</p><p><del>Removed words</del> <ins>Inserted words</ins> <mark>Highlighted words</mark> <abbr title="Accessibility">AX</abbr></p>
+<output aria-label="Web fixture state" id="web-state"></output>
+</main>
+<script>
+let count=0;
+function publish(){document.getElementById('web-state').textContent=JSON.stringify({count,checked:document.getElementById('web-check').checked,name:document.getElementById('web-name').value});}
+function resetFixture(){count=0;document.getElementById('web-check').checked=false;document.getElementById('web-name').value='';document.getElementById('web-live').textContent='Ready';publish();}
+document.addEventListener('input',publish);document.addEventListener('change',publish);resetFixture();
+</script></html>

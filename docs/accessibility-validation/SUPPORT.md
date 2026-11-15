@@ -2,7 +2,7 @@
 
 **Canonical support chart for macOS and Windows guests.** Reference this file for support claims, known failures and testing priorities. Update this same file after relevant testing, attribution or implementation changes.
 
-Last updated: **2026-11-02 UTC**. Branch: `mac-accessibility`. Latest scoped production workflow test: `f23d89fe0872686e4b74533e5a27596dfafbbc9c`; read-only tree and viewer lifecycle test: `e930e98`. Earlier broad source audit: `a0d0960a61f653804233b812de2b451ca199ffc6`.
+Last updated: **2026-11-03 UTC**. Branch: `mac-accessibility`. Latest production workflow run: signed Release build from `d411c3b` plus local fixes. Earlier scoped workflow test: `f23d89fe0872686e4b74533e5a27596dfafbbc9c`; read-only tree and viewer lifecycle test: `e930e98`. Earlier broad source audit: `a0d0960a61f653804233b812de2b451ca199ffc6`.
 
 **Release qualification: NOT VALIDATED on either platform.** Common interactions have observed passes, but complete accessibility support and Mac/Windows parity are not established. Small trees can also fail. There is no defensible percentage of all realistic application support.
 
@@ -41,6 +41,210 @@ These are initial-state read-only comparisons, not repeats of the 51 workflows.
 Supported actions/queries are metadata, not proof of successful execution.
 Local captures and provenance: `docs/accessibility-validation/runs/20261102-public-tree-reader/`.
 
+## Proxy fidelity follow-up, 2026-11-02 UTC
+
+Local changes preserve boolean types, native attribute absence/errors, and
+parameterized-query errors. The signed Release bundle rebuilt both changed helpers;
+the installed Mac guest helper matched the bundled binary. Tests used the real VMs,
+headless viewer lifecycle, and public host AX. Independent native guest reads used
+SSH only for fixture setup and baseline observation.
+
+| Check | Result |
+|---|---|
+| Mac Controls page | All 13 control checks PASS; strict 36-node subtree comparison PASS. |
+| Mac Lists and outline page | Strict 509-node subtree comparison PASS. |
+| Mac text queries | Six valid results, three invalid-range errors (`-25201`), and one unsupported-query error (`-25213`) match the native baseline. |
+| Mac Text editing page | All compared values and structure match across 12 nodes; strict comparison still differs because secure-field `AXBoundsForRange` is filtered. The reader now recognizes AppKit's U+F79A password mask; native and proxy both returned 11 masks. |
+| Windows guest on Mac host | Five controls match native UIA enabled/range reads; one button press updates its guest status; three table-cell lookups match native cell names and counts. |
+
+This earlier follow-up found Windows WPF out-of-range cell queries returning null
+natively but `cannotComplete` publicly. The expanded run below fixes that translation. A negative index
+returns `illegalArgument` publicly. One Windows tab-selection request timed out
+although the page changed; it is not counted as a passing action. The original
+browser-table error case and Windows-host path were not rerun. These results do
+not qualify the full interaction suite or performance.
+
+Local evidence: `docs/accessibility-validation/runs/20261102-proxy-fidelity/`.
+
+## Expanded native, browser and stress run, 2026-11-02 UTC
+
+All **51 workflows on each guest (102 platform cases)** were attempted through the
+public AX API of the real headless-launched viewers. Both VMs used their normally
+installed helpers and production transports. SSH served fixture setup and independent
+native AX/UIA baselines. No computer-use client or guest socket dump supplied candidate
+results. The complete 306-slot, three-repetition qualification plan was **not** run.
+
+| Inventory | macOS guest | Windows guest |
+|---|---:|---:|
+| Native controls and text | 22/22 attempted | 22/22 attempted |
+| HTML workflows | 16/16 attempted | 16/16 attempted |
+| Extra native/browser/folder cases | 8/8 attempted | 8/8 attempted |
+| Large-tree, recovery and timing cases | 5/5 attempted | 5/5 attempted |
+
+The signed Release build was restarted before testing the two new Mac-host adapter
+fixes. First selection in Windows text fields now uses the provider's selection
+capability, even when its current selection is empty. Three fresh Edge trials passed
+selection of `quiet morning` and exact replacement with `calm afternoon`; independent
+native UIA confirmed the first selection before typing. One trial's broader initial
+tree capture was incomplete, so these are not three clean full-workflow passes.
+Native null grid cells now return `noValue`: three valid WPF cells, two out-of-range
+null results and the existing negative-index rejection passed through the viewer.
+
+| Follow-up | Observed result |
+|---|---|
+| HTML table relationships | Both platforms match all nine cells, counts, indices, spans, supported headers, traversal/query identities and invalid-coordinate errors. Windows focus/scroll/selection side-effect checks pass; Mac global focus and ancestor scroll remain unmeasured. |
+| Text and lists | Both native text chains produce the expected replacement and queried bold/italic spans. Both HTML multiselect cases select items 23 and 24. Windows native row/outline reveal and selection work; native keyboard multiselection remains unsuccessful. |
+| Large trees | Both expose all 1,000 unique targets and activate target 1,000. The first Mac post-action read remained updating; later public and native reads agree on `STRESS RESULT 01000`. This is not latency qualification. |
+| Helper pause/recovery | Both resume the same helper after a confirmed 20-second pause, retain Meal=0 without a late toggle, and accept a fresh 0→1 action. Mac's retained request returns at about 5.00 seconds; Windows rejects earlier, around 1.04 seconds. Both errors surface as generic `illegalArgument`; error fidelity and broader races remain unqualified. |
+| Timing | Three matched toggle sequences per guest. Mac public actions take about 105 ms versus 102–106 ms natively; Windows public actions take 35–38 ms versus 2.6–3.2 ms natively. These are API-call timings, not CPU/60 Hz measurements or a declared performance pass. |
+
+Direct native tests reproduce Safari's unfocused title/search setters reporting success
+without changing values, Edge's `Go` setter producing no suggestion popup, and dialog
+focus returning to the opener instead of Travelers on both browsers. AppKit also
+rejects the explicit row-reveal action; the proxy incorrectly changes that error from
+`actionUnsupported` to `illegalArgument`. The original date input remains inconclusive
+on the Mac locale; Windows passes after the driver replaces the existing date text.
+
+This run found missing Windows native secure-mask readback. It also found seven
+Color-dialog panes whose enabled flags differ from the .NET UIA baseline. A later
+native UIA8 comparison—the API used by the helper—reports all seven enabled, matching
+the proxy. The enabled-state discrepancy is an API/provider difference, not a proven
+proxy defect. Earlier modal-owner and application
+focus gaps remain open. Browser popup dismissal and native multiselection retain their
+recorded limitations; this run does not establish complete compatibility.
+
+Failed launches, incomplete reads, premature update checks and incorrect synthetic
+modifier events remain in the evidence. Corrected repetitions and separate replays
+identify those driver failures without erasing them. The runner's PASS flag covers its
+implemented assertions only; it is not an original-suite or release verdict. Full tree
+captures also expose native getter failures, including Finder errors mirrored correctly
+by the proxy, even when folder navigation succeeds.
+
+Release build, strict bundle signature verification, nine reader tests and focused
+adapter checks pass. The first-selection regression check fails against the previous
+source. Changes remain local; nothing was committed or pushed. Local evidence and
+per-case attempts: `docs/accessibility-validation/runs/20261102-browser-expanded/`.
+
+## Compatibility fixes follow-up, 2026-11-02 UTC
+
+The rebuilt headless host and installed Windows helper were tested through the public
+AX trees of the actual viewers. The helper was built on Windows with its existing
+MSBuild project for ARM64 and x64; the ARM64 test binary runs from
+`C:\Windows\AppSandbox` under the existing agent watchdog. This local test binary is
+unsigned; signed release packaging and Windows-host execution remain unqualified.
+No build or deployment code changed.
+
+| Change | Production evidence |
+|---|---|
+| Windows secure TextPattern masks | WPF and Edge now match independent native UIA8 reads at 11 masks, 9 masks, empty, and four UTF-16 mask units after Unicode input. Non-mask TextPattern output is rejected; existing masked ValuePattern values retain precedence. Secure range queries and selection/character metadata remain unavailable. |
+| Action and write errors | Mac unsupported row reveal now returns native `actionUnsupported`. Paused-helper action and writable-slider requests return `cannotComplete` at about five seconds, with no late mutation after recovery; fresh requests then work. Windows rejects its retained request with `cannotComplete` at about 0.67 seconds and recovers without a late toggle; that earlier rejection does not exercise the full five-second timeout. |
+| Proxy-root focus relationship | The root now exposes `AXFocusedUIElement`, returning the focused native field on both guests. Host application-wide lookup still returns `noValue`; I12 remains open. |
+| Regressions | Native AppKit and Safari secure fields pass the same four value states and query restrictions. Windows browser nonsecure selection/replacement passes. |
+
+Safari rejected the fixture file URL after reboot, so its repeat used the identical
+HTML bytes served over guest loopback HTTP. Candidate accessibility still used the
+production transport. The Windows browser retained its file URL. Browser-origin and
+binary provenance are saved with the results.
+
+The earlier Color-dialog enabled-state claim was corrected: native UIA8 agrees with
+the proxy on all seven panes; .NET UIA disagrees. Failed login/setup, early-read and
+baseline-selection attempts are retained separately from successful repeats.
+
+Signed Mac Release build and strict signature verification pass, as do both Windows
+builds, 19 adapter checks and 11 presenter checks. Local evidence:
+`docs/accessibility-validation/runs/20261102-compatibility-fixes/`.
+
+## Modal ownership and resize follow-up, 2026-11-02–03 UTC
+
+The Windows collector now follows explicit HWND ownership and traverses owner trees
+before auxiliary windows. The normal guest-agent watchdog restarted its ARM64 build;
+the existing project builds successfully for both ARM64 and x64. The local Windows test
+binary is unsigned; signed release packaging and Windows-host execution remain unqualified.
+
+The presenter now preserves its cache while geometry is temporarily incompatible and
+accepts snapshots received during that interval. A cache-only live repeat still lost
+the Safari field. The Mac guest helper now also observes display-configuration changes
+and schedules a refresh through the existing event path. No polling loop was added.
+The signed Release host was restarted; the rebuilt guest helper runs under its normal
+LaunchAgent. Candidate results below come from public AX on the actual viewers.
+
+| Check | Result |
+|---|---|
+| WPF confirmation dialog | All 80 native/public nodes match labels, mapped roles, enabled states and ordered children. Confirm, reopen and Cancel pass. |
+| Win32 Color dialog | The same structural comparison matches all 98 nodes. Cancel, subsequent checkbox toggles and the disabled-control flag pass. |
+| Mac Safari resize | Three alternating wide/right-half transitions recover without keyboard input or manual refresh. All 306 page nodes match native AX in seven compared attributes and ordered children, with element references normalized by tree path. Secure-field edits pass after each transition. |
+| Windows Edge resize | The same three transitions preserve secure masks matching native UIA8; edits pass afterward. This compares secure values, not the complete translated page. |
+| Viewer lifecycle | Both guests pass minimize/restore, headless close/reopen and a fresh edit after reopening. The closed viewer is absent from public AX. |
+| Cache regression checks | Ten checks pass, including restoration without retransmission, a snapshot arriving while hidden, and clearing after failure/disconnect. The previous source fails restoration. |
+
+Mac resize recovery was first observed at 4.75–5.78 seconds after the frame-setting
+commands, with temporary tree gaps; Windows' first reads completed at 0.61–0.62 seconds.
+Complete post-reopen reads arrived at 11.05 seconds for Mac and 2.51 seconds for Windows.
+These observations satisfy the declared 30-second observation bound, not a latency
+qualification. The Mac reopen also had an earlier incomplete read, retained in evidence.
+
+Startup-focus, initial Safari page omissions, early reads and corrected comparison
+matchers remain recorded separately. Fresh-open Safari omission remains unresolved
+(I15). Authentication used computer use only; candidate tests used the helper reader.
+This is targeted verification, not full-suite or release qualification. Local evidence:
+`docs/accessibility-validation/runs/20261102-compatibility-next/`.
+
+## Large-page streaming follow-up, 2026-11-03 UTC
+
+The current local changes publish partial trees during collection, retain readable
+content during refresh, and coalesce background changes without restarting an
+unfinished capture. Mac attribute writability is queried on demand. Tests use the
+real headless-launched VM, installed helper, production transport and public host
+AX reader; native reads provide independent baselines. One VM runs at a time.
+
+| Current Mac build check | Observed result |
+|---|---|
+| Wikipedia fresh navigation | Heading and search field first observed after 3.09–3.91 seconds, including navigation and reader time; 3.16 seconds with the final presenter. |
+| Wikipedia complete page | All 18,770 page nodes match native AX for role, title, description, value, busy state and ordered children, including a repeat with the final presenter. An earlier comparison during streaming exposes 17,726 nodes with busy=true; that partial result is retained. |
+| Wikipedia actions | Light→Dark→Light succeeds; changed values observed after 3.70–3.76 seconds. Calls themselves take 1.21–1.30 seconds; full-tree target lookup adds time. |
+| Continuously changing page | All 3,000 final targets exposed; first and last button actions succeed. Settled page matches the native tree for the same five fields and ordered children. Safari menu references can expire during a read; these incomplete reads are retained separately. |
+| Host responsiveness | During the final changing-page run, all 499 headless status requests succeed; maximum response time 25.4 ms. This measures API responsiveness, not CPU overhead. |
+| Small-tree regressions | Button, checkbox, slider, sheet, Unicode title and secure-value checks pass. Text replacement initially reads the cached value; a measured follow-up observes the update after 0.82 seconds and matches native. Formatting action/query succeeds; exact formatting spans were not requalified. |
+
+Windows builds pass ARM64 and x64 through the existing project with warnings as
+errors. The current helper batches child property reads, skips vanished UIA nodes,
+retains published branches across failed captures and accepts actions on published
+partial trees. Focused-control metadata is refreshed before partial publication,
+and text-selection validation uses the text that was published. The following
+checks use the installed helper over the production transport; diagnostic collector
+runs are excluded.
+
+| Current Windows build check | Observed result |
+|---|---|
+| Continuously changing page | Page remains exposed in all 30 observations over 40 seconds after setup. A button press during loading succeeds. All 3,000 targets appear after pausing; the last target activates. All 3,009 page nodes match native UIA names, child order and button roles. |
+| Change latency under heavy churn | The sampled status advances throughout loading, then about every 8–9 seconds during continuous replacement. Paused content converges in 7.46 seconds. These are observation timings, not an instantaneous-tree guarantee. |
+| Viewer close/reopen during changes | Usable controls return in 0.89 seconds; the next counted press appears after 0.84 seconds. |
+| Wikipedia fresh navigation | Heading and Search link appear after 3.11 seconds on the final helper (2.54 seconds on the preceding helper). The original search-field matcher never passes because this responsive layout collapses the field; its raw observations are retained. |
+| Wikipedia complete page | All 11,429 page nodes match native UIA names, child order and button roles. The final complete public-tree walk takes 9.91 seconds; an earlier complete read of the partial tree exposes 1,558 nodes in 1.46 seconds. |
+| Wikipedia selected-state update | **Fixed in nine current-helper transitions:** all actions and selected readbacks succeed. First readback takes 3.98 seconds; subsequent eight take 0.75–0.83 seconds. Earlier stale values persist for at least 49 seconds despite native selected=true; diagnostic traces attribute these to stale properties in the guest partial snapshot. Those failures and host-lock interruptions remain recorded. |
+| Host responsiveness | All 614 headless status requests succeed during the final changing-page run; p95 1.98 ms, maximum 22.77 ms. This measures API responsiveness, not CPU overhead. |
+
+Seven Windows small-control workflows pass directly: button, checkbox, slider,
+Unicode title, secure value, text selection/replacement and formatting action/query.
+Exact formatting spans are not requalified. The sheet workflow's first read catches
+closing references and retains its original FAIL; the next complete read matches
+native after 0.78 seconds. A later timed repetition passes with complete trees: modal
+opens in 0.48 seconds and dismisses in 0.66 seconds, with matching native state.
+The app-restart check exposed a mixed-snapshot child-resolution race in the host.
+Structural children now resolve from one captured state; a deterministic regression
+fails on the previous method and passes on the current method, and all three live
+fixture restarts produce complete trees. A final read-only browser comparison with
+that presenter matches all 3,009 Windows fixture page nodes for native names, child
+order and button roles. The final presenter also passes the
+20-second helper-suspension test: complete trees before/after, bounded action
+rejection, same-helper recovery and no delayed checkbox mutation. The headless
+status request during suspension takes 22.95 ms. Diagnostic and host-lock-interrupted
+runs are not qualified. These results do not qualify Windows-host support, signed
+release distribution, every provider or unlimited trees. Local evidence is in
+`docs/accessibility-validation/runs/20261103-tree-loading/`; `candidate-final-manifest.json`
+records source and binary hashes and the scope of the final comparisons. Earlier
+failures remain alongside the passing repetitions.
+
 ## Reading the status
 
 | Label | Meaning |
@@ -62,29 +266,29 @@ IDs are stable; maintain both platform columns independently. Evidence reference
 
 | ID and capability | macOS guest | Windows guest | Evidence |
 |---|---|---|---|
-| C01 Metadata and hierarchy | Common roles/labels observed; disabled enabled=false and two progress value/range/read-only comparisons PASS. Complete property/type fidelity unverified. | Matching disabled/progress comparisons PASS; status text preserved in AXDescription. Full UIA property coverage absent. | [Native controls comparison][E01], [M1], [W1], [A1] |
+| C01 Metadata and hierarchy | Controls and list/outline subtrees match native in the scoped fidelity follow-up (36 and 509 nodes); boolean types and captured attribute errors preserved. Complete provider coverage unverified. | Matching disabled/progress comparisons PASS; status text preserved in AXDescription. Full UIA property coverage absent. The seven Color-dialog pane flags match native UIA8; the older .NET UIA baseline disagrees. | [Native controls comparison][E01], [M1], [W1], [A1] |
 | C02 Buttons and toggle states | Existing semantic passes retained. Latest disabled client workflow PROVISIONAL after disclosed desktop interference; separate native AXPress returns success with no effect. | Existing button/toggle passes retained. Latest disabled client workflow PROVISIONAL; no AXPress advertised/traced, native Invoke throws ElementNotEnabled. Equivalent semantic error path unqualified. | [Native controls comparison][E01], [M1], [W1], [F1], [F2] |
 | C03 Text values and numeric setters | Unicode/text setters and native slider cases pass. Read-only progress 0.65/0..1 and level 40/0..100 match native. | Same progress values/ranges/read-only flags PASS, alongside existing text/slider passes. | [Native controls comparison][E01], [M1], [W1], [R1] |
-| C04 Increment and decrement | Native stepper passes; prescribed HTML action client blocked. | Native stepper no-op reproduced locally; HTML action client blocked despite exposed capability. | [M1], [W1], [N1] |
+| C04 Increment and decrement | Native stepper and HTML 2→3→2 actions pass with the direct reader; the HTML maximum-bound setup still fails. | Native stepper no-op remains; direct-reader HTML increment/decrement and min/max checks pass. | [M1], [W1], [N1] |
 | C05 Menus tabs dialogs and disclosure | Partial: standard disclosure has functional passes; semantic route unproved. **Custom expansion no-op reproduced with both native AXDisclosing and AXExpanded setters; viewer state matches native.** | Partial: working paths; popup completion failures reproduced natively. | [Disclosure attribution][E02], [M1], [W1], [N1], [R1] |
-| C06 Text selection replacement and formatting | **All four native text-chain workflows observed PASS**, including selected replacement, inherited bold, menu italic and Command+B. Repetitions/timing qualification incomplete; HTML selection client blocked. | **The same four native workflows observed PASS**, confirming historical passes. Windows readbacks meet the batch deadline; full repetition/qualification remains incomplete. | [T2], [M1], [W1] |
-| C07 Parameterized queries and text markers | Six valid string ranges and attributed text/font runs match native. **Three invalid-range errors are lost in host presentation.** Geometry, other types and markers remain unqualified. | Nine valid table-cell queries match native. **Three invalid-coordinate errors reach the host and lose their meaning in presentation.** Text-query, geometry and marker equivalence remain unqualified. | [T2], [Table comparison][E03], [A1], [MAC], [UIA], [CODEC] |
-| C08 Table and grid relationships | **Original 3×3 HTML table:** relationships PASS; all nine cell bounds also PASS at the user's resized viewer pose. Other variants and complete side-effect qualification remain incomplete. | **Same table:** matching relationships PASS; native column information preserved without structural column objects. Invalid requests reject, but error meaning is lost. Other variants and full bounds remain unqualified. | [Table comparison][E03], [Geometry comparison][E04], [M1], [W1], [A1] |
-| C09 Explicit offscreen reveal before selection | Client blocked in examined list/outline cases; native/proxy capabilities exposed. | Same gap; automatic reveal-and-press does not prove the explicit sequence. | [M1], [W1] |
-| C10 Multiselection and virtualization | Selection forwarding implemented where advertised; prescribed multiselection prerequisite blocked. | Known-item selection/realization implemented; multiselection unverified; ItemContainer discovery unimplemented. | [M1], [W1], [UIA] |
-| C11 Focus modal return geometry and hit testing | Six native controls **and the modal Confirm button** pass bounds/frame/window identity and precise center hits. Sheet ownership and focused flags match native. **Application focused-element lookup fails** despite a correctly focused mirrored control. Original nine HTML cell bounds pass. | Same native geometry and hit assertions pass. **The modal's owner window and background controls are missing from the public tree. Application focused-element lookup also fails**, while individual focused flags match native in foreground observations. | [Modal comparison][E05], [Native controls][E06], [HTML geometry][E04] |
-| C12 Secure input | Original native 11→9 workflow PASS. **HTML native/public/CU masks and pixels also pass after explicit recovery from I14.** Tested public reads expose no plaintext; native HTML RTF privacy remains unqualified. | **HTML 11→9 native/public/CU masks PASS through ValuePattern.** The native fixture still loses TextPattern-only mask readback (I13). Secure/writable flags retained; exact pixel counts unqualified. | [HTML comparison][E07], [Native comparison][E08] |
+| C06 Text selection replacement and formatting | **All four native text-chain workflows observed PASS**, including selected replacement, inherited bold, menu italic and Command+B. The direct-reader follow-up also passes HTML first selection/replacement; complete repetitions/timing qualification remain incomplete. | **The same four native workflows observed PASS**, confirming historical passes. The empty-selection setter fix also passes three fresh Edge selection/replacement checks; one initial full-tree capture is incomplete. Full qualification remains incomplete. | [T2], [M1], [W1] |
+| C07 Parameterized queries and text markers | Scoped text-query follow-up passes six valid results, three invalid-range errors and an unsupported-query error. Geometry, other types and markers remain unqualified. | Nine valid table-cell queries match native. The presenter propagates translated query errors; the original browser table repeat matches all three invalid-coordinate errors. Native WPF null-cell results now become noValue, verified in the restarted production viewer. Text-query, geometry and marker equivalence remain unqualified. | [T2], [Table comparison][E03], [A1], [MAC], [UIA], [CODEC] |
+| C08 Table and grid relationships | **Original 3×3 HTML table:** relationships PASS; all nine cell bounds also PASS at the user's resized viewer pose. Other variants and complete side-effect qualification remain incomplete. | **Same table:** matching relationships PASS; native column information preserved without structural column objects. The latest original-table repeat preserves invalid-coordinate errors; native null WPF cells now map to noValue. Other variants and full bounds remain unqualified. | [Table comparison][E03], [Geometry comparison][E04], [M1], [W1], [A1] |
+| C09 Explicit offscreen reveal before selection | Direct-reader HTML reveal/selection works. AppKit native rows reject AXScrollToVisible; the current proxy preserves the native actionUnsupported error. | Direct-reader explicit reveal followed by selection works for the original HTML list, native table row and native outline targets. Broader geometry qualification remains incomplete. | [M1], [W1] |
+| C10 Multiselection and virtualization | HTML Shift+Up selects packing items 23 and 24 in the direct-reader repeat. Native table Shift+Down remains unsuccessful with the original focus requirements. | HTML Shift+Up selects packing items 23 and 24; native table Shift+Down remains unsuccessful. ItemContainer discovery is unimplemented. | [M1], [W1], [UIA] |
+| C11 Focus modal return geometry and hit testing | Six native controls **and the modal Confirm button** pass bounds/frame/window identity and precise center hits. Sheet ownership and focused flags match native. **Application focused-element lookup fails** despite a correctly focused mirrored control. Original nine HTML cell bounds pass. | Same native geometry and hit assertions pass. **Current WPF and Color-dialog comparisons preserve owner/background hierarchy. Application focused-element lookup still fails**, while individual focused flags match native in foreground observations. | [Modal comparison][E05], [Native controls][E06], [HTML geometry][E04] |
+| C12 Secure input | Original native 11→9 workflow PASS. **HTML native/public/CU masks and pixels also pass after explicit recovery from I14.** Tested public reads expose no plaintext; native HTML RTF privacy remains unqualified. | **Current direct-reader WPF and Edge checks PASS:** native/public masks match for 11→9, empty and Unicode values. Secure range and selection/character reads remain blocked. Historical HTML CU passes retained; full privacy and pixel qualification remain incomplete. | [HTML comparison][E07], [Native comparison][E08] |
 | C13 Guest-originated updates | Checkbox value update: **3/3 monitored PASS**. Other event-update variants remain unrun. | Same checkbox value update: **3/3 monitored PASS**. Other event-update variants remain unrun. | [P1], [P2] |
-| C14 Large trees and availability during refresh | **Bridge failures:** native content can be absent publicly, including small controls during refresh. **After a viewer resize, the page tree remained absent in repeated observations despite native controls and a non-busy public root; one Escape restored it (I14).** | All 1000 fixture targets exposed; general completeness, latency and truncation behavior unqualified. Matching I14 resize sequence unrun. | [HTML comparison][E07], [T2], [L1], [S1], [W1] |
+| C14 Large trees and availability during refresh | Current large-page run exposes all 3,000 changing targets and matches the 18,770-node Wikipedia page to native AX for five fields and ordered children. The earlier three Safari resize transitions recover all 306 page nodes, with 4.75–5.78-second gaps. The separate initial control-page omission (I15) remains unqualified. | Current run exposes all 3,000 changing targets; 3,009 fixture nodes and 11,429 Wikipedia nodes match native names, ordered children and button roles. Page remains available during all sampled changes; close/reopen and three app restarts pass. Earlier Edge resize checks preserve secure values and edits. Provider-wide completeness and truncation remain unqualified. | [HTML comparison][E07], [T2], [L1], [S1], [W1]; current follow-up above |
 | C15 Events and announcements | Selected snapshot-derived notifications; full native event stream not relayed. Announcement parity unqualified. | Same host notification subset; complete UIA event semantics not relayed/qualified. | [HOST], [ELEMENT], [A1] |
-| C16 Recovery expiry and concurrent actions | Recovery observed; timeout/error, no-late-action and overlap guarantees incomplete. | Recovery observed; retained client target rejected before bridge timeout; other race guarantees incomplete. | [M1], [W1], [R1] |
-| C17 Refresh latency and performance | Selected setters improve after shared scheduling change; no general latency guarantee. | Selected setters improve; repeated slow attributed-text query unattributed; no general latency guarantee. | [F1], [F2], [R1], [Q1] |
+| C16 Recovery expiry and concurrent actions | A confirmed 20-second pause resumes the same helper, preserves value 0 and permits a fresh 0→1 action. Action and writable-slider timeouts now return `cannotComplete` at about five seconds. Broader overlap guarantees remain incomplete. | A confirmed 20-second pause resumes the same helper, preserves value 0 and permits a fresh 0→1 action. The latest retained target rejects with `cannotComplete` before the bridge timeout; other race guarantees remain incomplete. | [M1], [W1], [R1] |
+| C17 Refresh latency and performance | Wikipedia heading/search appear in 3.09–3.91 seconds; tested theme readbacks take 3.70–3.76 seconds after the action. No general latency guarantee. | Wikipedia heading/search appear in 3.11 seconds. Focused-control refresh fixes scoped stale selected-state reads: eight post-action readbacks take 0.75–0.83 seconds after the first takes 3.98 seconds. Background status changes on the 3,000-target stress page still advance about every 8–9 seconds. | [F1], [F2], [R1], [Q1]; current follow-up above |
 
 ## Production refactor follow-up — 2026-10-31
 
 The [production run and inconclusive-check repeats][E09] used the rebuilt, restarted Release headless daemon, normal Windows helper, IVSHMEM and public Mac viewer. Six independent native/public text-state comparisons PASS after repeating an interrupted selection check. A supplemental button/disabled-button retry produced the expected count changes without a click-away interruption. Lists recovered after an updating interval, but explicit reveal-before-select remains client blocked and exact latency is unqualified.
 
-Common native controls and five HTML control cases also produced their expected observed results. Existing stepper, popup, modal-owner and native secure-mask limitations remain. This is a scoped Windows-guest functional follow-up, not a full rerun of the historical 51 workflows; it does not promote unrun browser, macOS-guest, stress, Hyper-V or release-distribution cases to current-build passes. The capability and historical workflow tables retain their previously documented scopes.
+Common native controls and five HTML control cases also produced their expected observed results. At that time, stepper, popup, modal-owner and native secure-mask limitations remained. The current secure-mask fix is documented above. This is a scoped Windows-guest functional follow-up, not a full rerun of the historical 51 workflows; it does not promote unrun browser, macOS-guest, stress, Hyper-V or release-distribution cases to current-build passes. The capability and historical workflow tables retain their previously documented scopes.
 
 ## Controlled comparison — 2026-10-30
 
@@ -115,7 +319,7 @@ These are implementation boundaries, not conformance passes.
 | Specialized functionality | Generic dispatch is not proof every custom attribute, setter, parameter or type survives translation. | Transform, Dock, MultipleView, ItemContainer discovery and specialized spreadsheet/annotation interfaces lack mappings; some implemented patterns are partial. |
 | Window embedding | Guest windows/sheets embedded as groups; host relationships/geometry intentionally adapted. | Same host embedding; modal state mapped, WindowPattern Close/SetWindowVisualState not directly dispatched. |
 | Notifications | Selected value, selection, layout, focus and destruction notifications. | Same host notification subset. |
-| Protected contents | Masked AXValue preserved; secure text/character metadata and parameterized reads restricted. Some unadvertised native Safari range queries return masks but are denied publicly. | Masked/empty ValuePattern preserved; secure TextPattern readback excluded. Native-provided masks available only through TextPattern are lost (I13). |
+| Protected contents | Masked AXValue preserved; secure text/character metadata and parameterized reads restricted. Some unadvertised native Safari range queries return masks but are denied publicly. | Masked/empty ValuePattern preserved; validated secure TextPattern masks fill absent/empty ValuePattern values. Non-mask text and secure text queries remain blocked; WPF/Edge scoped checks pass (I13). |
 | Size and time budgets | Shared safety bounds, not guaranteed capacities. | Shared safety bounds plus collector-specific limits. |
 
 Exact source inventory and operation lists: [A1], [MAC], [UIA], [UIA_HOST], [CODEC], [ATTR], [PROTOCOL], [SESSION], [HOST], [ELEMENT]. Windows guests send UIA data; the Mac host adapter performs UIA-to-AX translation. An absent specialized interface does not imply ordinary buttons or text in that application are inaccessible.
@@ -218,11 +422,12 @@ Completed tested cases: **I01 checkbox update — PASS on both platforms**, thre
 | I07 Reveal and raw-query coverage | Both | Client blocked or partial oracle | Exercise prescribed exposed operations when available; report independent bridge evidence separately. No replacement control harness or weaker procedure. |
 | I08 Specialized capability coverage | Both | Mac generic conformance unverified; Windows mappings absent | Enumerate required v1 operations/platform equivalents; prove native capability before generalized implementation. |
 | I09 Qualification incomplete | Both | UNRUN and partial evidence | Pin actual host/guest artifacts, enumerate variants and complete required repetitions; retain blocked cases. |
-| I10 Native query errors discarded | **Observed on both guest platforms** | **Our presentation-layer defect** | Native Mac invalid-range `-25201` and Windows invalid-cell `-2147024809` errors reach the host, but its parameterized getter returns nil and public AX reports `-25212`. Three invalid requests fail error fidelity on each platform; six valid Mac ranges and nine valid Windows cell lookups pass. [T2], [Table comparison][E03] |
-| I11 Owned modal drops background window | Windows | **Our bridge boundary mismatch; loss stage unisolated** | Native UIA exposes the visible main window with its modal child; Win32 independently confirms ownership. The complete public tree contains only the dialog. The same Mac sheet preserves owner/background hierarchy. Open/Confirm and modal geometry still pass. [Modal comparison][E05] |
-| I12 Application focused-element lookup missing | Both | **Our public focus relationship fails** | In monitored foreground observations, native AX/UIA identifies a focused element and the public element carries the matching focused flag, but host application `AXFocusedUIElement` returns `-25212`/no value. Data reaches the mirrored element; the exact failure in the public focus-query route remains unisolated. [Modal comparison][E05] |
-| I13 Secure TextPattern masks omitted | Windows | **Our secure-text mapping gap** | Original native control supplies 11→9 masks through TextPattern while ValuePattern stays empty; public masked readback is missing. The HTML control supplies masks through ValuePattern too, and that path passes. Current secure TextPattern exclusion remains the gap; the HTML pass does not close it. [Native comparison][E08], [HTML comparison][E07] |
-| I14 Guest tree lost after viewer resize | macOS; Windows matched case unrun | **Our end-to-end bridge availability failure; exact loss stage unisolated** | Native AX supplies the field before/after a complete public scan with no target. Foreground/input audit passes; a later public root reports not busy. One separate Escape restores the tree without changing the field. Preserve/recover snapshots across geometry changes and qualify the same resize sequence on both guests; do not treat later setter success as closing this failure. [HTML comparison][E07] |
+| I10 Native query errors discarded | Both guest platforms | **Presenter fixed; Mac invalid-range cases verified** | Local fidelity follow-up preserves all three Mac invalid-range errors and an unsupported-query error. Windows browser invalid-coordinate errors match native in the expanded repeat, and WPF null cells now map to `noValue`. Other query families and provider variants remain unqualified. Historical failures: [T2], [Table comparison][E03]. |
+| I11 Owned modal drops background window | Windows | **Fixed in scoped current-helper repeats** | Explicit HWND ownership replaces the root-ancestor lookup that omitted the WPF owner. Owner-first UIA traversal preserves native hierarchy. WPF (80 nodes) and Color (98 nodes) match native UIA8 labels, mapped roles, enabled states and ordered edges. Confirm, reopen, Cancel and subsequent checkbox actions pass. Nested/hidden-owner and Windows-host variants remain unqualified. Historical evidence: [Modal comparison][E05]. |
+| I12 Application focused-element lookup missing | Both | **Our public focus relationship fails** | In monitored foreground observations, native AX/UIA identifies a focused element and the public element carries the matching focused flag, but host application `AXFocusedUIElement` returns `-25212`/no value. The proxy-root `AXFocusedUIElement` relationship now returns the focused field on both platforms. Host application-wide lookup still fails; that remaining route is unisolated. [Modal comparison][E05] |
+| I13 Secure TextPattern masks omitted | Windows | **Fixed; WPF and Edge verified** | **Fixed in the current scoped run:** WPF TextPattern-only masks and Edge values match native UIA8 at 11, 9, empty and Unicode states. Secure text queries remain blocked. Broader provider/privacy variants remain unqualified; historical failures are retained. [Native comparison][E08], [HTML comparison][E07] |
+| I14 Guest tree lost after viewer resize | Both guests tested on Mac host | **Persistent loss fixed in scoped repeats; transient gaps remain** | Presenter cache retention plus guest display-change refresh restore the Mac page without Escape or manual refresh across three transitions. All 306 page nodes match native; post-resize edits pass. Matched Windows secure-value/edit checks pass. Minimize/restore and close/reopen pass on both. Recovery timing and limits are recorded above; broader resize/geometry variants remain unqualified. Historical failure: [HTML comparison][E07]. |
+| I15 Initial Safari page subtree omitted | macOS | **Observed mismatch; current-helper repeat unrun** | During browser setup, native AX contains the secure field while the complete public tree contains browser chrome but no page. An explicit setup refresh restores it. Reproduced before the guest display-notification change; fresh-open behavior with that final helper has not been qualified. Raw attempts r1/r3 are retained in the current run. |
 
 ## Next testing and harness work
 
@@ -243,6 +448,50 @@ Reuse the existing fixtures, native observers, suite plan and result schema. The
 Completed paired harness scope includes the external checkbox-value comparison above and independent replay of all six states in the four native text workflows on both platforms. Text replay checks exact text, UTF-16 selection, formatting coverage and font metadata; broader repetition and timing qualification remain incomplete. Other listed work remains planned or partial. The checkers reject incomplete scans, ambiguous targets, getter errors, altered artifacts, wrong runtime identities and contradictory observations; controlled workflow qualification also requires input/focus coverage. Rejection checks are component checks and earn no VM compatibility passes. Internal collection/transport/presentation boundary instrumentation is still absent; endpoint observations alone cannot isolate those stages individually.
 
 The detailed execution contract remains in [the existing validation design][E11] and [tester instructions][E12]. Keep the full baseline fixtures unchanged; use separately versioned fixtures for new conformance scenarios. Report direct API evidence separately whenever the client cannot express the required operation.
+
+## Automated conformance run, 2026-11-03 UTC
+
+The native Objective-C runner exercised the real `ax-test-macos` VM through the
+production viewer's public AX interface. Host and guest run macOS 27.2. The native
+baseline and guest fixture have matching source revisions; SSH only copied and
+launched the fixture. This run used a background standalone baseline while the
+existing paired host retained its older embedded fixture. No computer-use input
+or window activation was performed by the runner.
+
+**441 cases classified in 98.49 seconds:** 358 PASS, 56 FAIL, 17 BASELINE_MISMATCH,
+5 INCOMPLETE, 2 native unsupported/no-value results, and 3 REQUIRES_FOCUS.
+The median case took 3.24 ms; the 95th percentile took 1.10 seconds.
+A three-repetition follow-up covering actions, descriptions, dynamic controls,
+basic controls, and geometry echoes recorded 89 PASS and 4 INCOMPLETE in 33.13
+seconds. The incomplete reads exposed invalid children on the proxy side; they
+were not retried into passing results.
+
+| Test layer | Cases | PASS | Remaining results |
+|---|---:|---:|---|
+| Native controls, text, geometry, and embedded WebKit | 180 | 154 | 18 comparison failures; 3 incomplete; 2 native unsupported/no-value; 3 focus-only |
+| Synthetic action execution, descriptions, enumeration | 25 | 25 | None in this run |
+| Synthetic metadata and role declarations | 164 | 161 | Three intentional window/application-to-group mappings differ from literal native roles |
+| Synthetic notification delivery | 54 | 0 | 35 comparison failures; 17 notifications absent from the native baseline; 2 incomplete |
+| Synthetic typed values | 18 | 18 | None in this run |
+
+The fixture's legacy provider now uses `NSObject` and implements observer lifecycle
+support; its previous base class rejected action enumeration. Dynamic control
+creation no longer queries an unsupported label getter during AX dispatch. Outline
+postconditions run after state convergence. Color/geometry comparisons allow only
+floating-point round-off; other typed values and errors remain exact.
+
+Outstanding observations include notification posts without a tree-state change
+not reaching the host, invalid child references during repeated transitions,
+missing custom rotors, secure-field metadata filtering, browser position-query
+differences, and native/proxy error-code differences. Notification posts are
+synthetic transport checks, not evidence that real application lifecycle events
+work. The three focus cases and expanded Windows conformance suite remain unrun.
+
+The SDK inventory contains 1,597 declarations, including constants and types:
+514 have assigned cases and 1,083 remain gaps. These counts do not measure complete
+feature support. Coverage rejects changed fixture, case, reader, or runner evidence;
+this run has no stale evidence or unknown catalog symbols.
+Local evidence: `/tmp/asb-conformance/production-proxy-r5/`.
 
 ## Planned conformance coverage
 
@@ -287,9 +536,9 @@ The [capability catalog][CATALOG] defines **45 families and 169 mandatory assert
 | `cap/live-queries` | 4 | UNRUN | UNRUN |
 | `cap/geometry` | 4 | PARTIAL: six native controls, modal Confirm button and nine HTML cells pass bounds/frame/window identity at observed poses; other variants unrun | PARTIAL: same six native controls and modal Confirm button pass bounds/frame/window identity; HTML and other variants pending |
 | `cap/hit-testing` | 3 | PARTIAL: six native control centers and modal Confirm button return precise targets; 18 HTML cell/text centers preserve native coarse page results. Other variants unrun | PARTIAL: same six native centers and modal Confirm button preserve precise target-descendant hits; other variants unrun |
-| `cap/secure-text` | 4 | PARTIAL: native workflow PASS; HTML 11→9 masks/pixels PASS after I14 recovery; tested public reads contain no plaintext; native RTF and broader privacy variants unqualified | PARTIAL: HTML 11→9 masks/readback PASS through ValuePattern; native TextPattern-only public readback FAIL; pixel counts and broader privacy variants unqualified |
+| `cap/secure-text` | 4 | PARTIAL: native workflow PASS; HTML 11→9 masks/pixels PASS after I14 recovery; tested public reads contain no plaintext; native RTF and broader privacy variants unqualified | PARTIAL: HTML 11→9 masks/readback PASS through ValuePattern; current WPF TextPattern-only and Edge direct-reader mask states PASS; pixel counts and broader privacy variants unqualified |
 | `cap/session-lifecycle` | 4 | UNRUN | UNRUN |
-| `cap/provider-errors` | 4 | PARTIAL: invalid-range error preservation FAIL; other variants pending | PARTIAL: invalid-cell error preservation FAIL; native invalid-argument error arrives at host then becomes no-value. Other variants pending. |
+| `cap/provider-errors` | 4 | PARTIAL: scoped invalid-range error preservation PASS; other variants pending | PARTIAL: browser invalid-coordinate and WPF null-cell errors now verified; paused-helper failure preserves `cannotComplete`. Other variants remain unqualified. |
 | `cap/expiry-and-recovery` | 5 | UNRUN | UNRUN |
 | `cap/request-races` | 5 | UNRUN | UNRUN |
 | `cap/completeness-and-limits` | 5 | UNRUN | UNRUN |

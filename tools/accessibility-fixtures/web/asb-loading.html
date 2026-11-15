@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>AppSandbox changing page</title>
+<style>
+body { font: 16px system-ui; margin: 24px; }
+section { margin: 16px 0; }
+button { margin: 4px; }
+</style>
+<h1>AppSandbox changing page</h1>
+<button id="press">Count press</button>
+<output id="result">Press count: 0</output>
+<button id="pause">Pause changes</button>
+<output id="state" aria-live="polite">Loading</output>
+<main id="content"></main>
+<script>
+const options = new URLSearchParams(location.search);
+const count = Math.min(12000, Math.max(50, Number(options.get('count')) || 3000));
+const delay = Math.min(1000, Math.max(10, Number(options.get('delay')) || 250));
+const content = document.querySelector('#content');
+const state = document.querySelector('#state');
+const result = document.querySelector('#result');
+const groups = [];
+let loaded = 0, ticks = 0, presses = 0, paused = false;
+document.querySelector('#press').onclick = () => result.textContent = `Press count: ${++presses}`;
+document.querySelector('#pause').onclick = event => {
+  paused = !paused;
+  event.target.textContent = paused ? 'Resume changes' : 'Pause changes';
+  state.textContent = `${paused ? 'Paused' : 'Changing'}: ${loaded} targets, tick ${ticks}`;
+};
+function fill(group, first, end) {
+  const fragment = document.createDocumentFragment();
+  for (let i = first; i < end; i++) {
+    const button = document.createElement('button');
+    button.id = `target-${i}`;
+    button.textContent = `LOAD TARGET ${String(i).padStart(5, '0')}`;
+    button.onclick = () => result.textContent = `LOAD RESULT ${String(i).padStart(5, '0')}`;
+    fragment.append(button);
+  }
+  group.replaceChildren(fragment);
+}
+setInterval(() => {
+  if (loaded >= count) return;
+  const first = loaded + 1, end = Math.min(count + 1, first + 50);
+  const group = document.createElement('section');
+  fill(group, first, end);
+  groups.push({group, first, end});
+  content.append(group);
+  loaded = end - 1;
+}, delay);
+setInterval(() => {
+  if (paused) return;
+  ticks++;
+  if (groups.length) {
+    const {group, first, end} = groups[ticks % groups.length];
+    fill(group, first, end);
+  }
+  state.textContent = `Changing: ${loaded} targets, tick ${ticks}`;
+}, 120);
+</script>
+</html>

@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+reader_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+command=${1:?Usage: tree snapshot|pair|compare [options]}
+shift
+exec "$reader_dir/../conformance/build/ax-suite" "tree-$command" "$@"
