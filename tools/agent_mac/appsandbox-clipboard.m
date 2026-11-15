@@ -130,7 +130,6 @@ static NSString *g_cache_base;   /* ~/Library/Caches/com.appsandbox.clipboard */
 @property (nonatomic, assign) AsbClipboardTemp *fileTemp;
 @property (nonatomic, assign) int32_t   fileCountExpected;
 @property (nonatomic, strong) NSURL *fileURL;
-@property (nonatomic, assign) BOOL expectsChunks;
 @property (nonatomic, assign) BOOL      completed;
 @property (nonatomic, assign) BOOL      failed;
 @property (nonatomic, copy)   NSString *failureReason;
@@ -314,7 +313,6 @@ static NSString * const kLazySentinelUTI = @"com.appsandbox.clipboard.lazy";
     if (fd < 0) return nil;
     AsbClipPending *p = [AsbClipPending new];
     p.seqId = alloc_seq();
-    p.expectsChunks = self.sizeHints[type].unsignedLongLongValue > CLIP_LARGE_THRESHOLD;
     pending_register(p);
     if (send_data_req_v2(fd, p.seqId, self.itemIndex, type) <= 0) {
         pending_remove(p.seqId);
@@ -1411,10 +1409,8 @@ static int handle_inbound(int fd) {
             }
             [p.cond lock];
             if (buf) [p.body appendData:buf];
-            if (h.data_size || !p.expectsChunks) {
-                p.completed = YES;
-                [p.cond broadcast];
-            }
+            p.completed = YES;
+            [p.cond broadcast];
             [p.cond unlock];
             return 1;
         }
