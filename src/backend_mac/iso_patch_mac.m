@@ -560,7 +560,7 @@ static NSString *ensure_virtio_zip_cached(NSString *name, NSString *ref) {
 }
 
 + (nullable NSString *)ensureVioscsiZipCached {
-    return ensure_virtio_zip_cached(@"vioscsi-arm64-0.1.302.zip", @"windows-arm-scsi-iothread");
+    return ensure_virtio_zip_cached(@"vioscsi-arm64-0.1.302.zip", @"main");
 }
 
 #pragma mark - stage (privileged)
