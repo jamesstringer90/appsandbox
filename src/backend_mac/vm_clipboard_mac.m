@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <limits.h>
 
 /* ---- Wire protocol (mirrors appsandbox-clipboard.m exactly) ---- */
 
@@ -81,10 +82,9 @@ static NSData *clip_readlink(NSString *path) {
 @property (atomic, assign)   uint32_t seqId;
 @property (nonatomic, strong) NSCondition *cond;
 @property (nonatomic, strong) NSMutableData *body;
-@property (nonatomic, copy)   NSString *fileTreeDir;
 @property (nonatomic, assign) AsbClipboardTemp *fileTemp;
 @property (nonatomic, assign) int32_t fileCountExpected;
-@property (nonatomic, strong) NSMutableArray<NSURL *> *fileTreeUrls;
+@property (nonatomic, strong) NSURL *fileURL;
 @property (nonatomic, assign) BOOL completed;
 @property (nonatomic, assign) BOOL failed;
 @end
@@ -439,8 +439,7 @@ static NSData *clip_readlink(NSString *path) {
     p.seqId = [self allocSeq];
     p.fileTemp = asb_clipboard_temp_create(self.cacheBase.fileSystemRepresentation);
     if (!p.fileTemp) return nil;
-    p.fileTreeDir = @(asb_clipboard_temp_path(p.fileTemp));
-    p.fileCountExpected = INT32_MAX;
+    p.fileCountExpected = -1;
     [self pendingRegister:p];
 
     if ([self sendDataReqV2:p.seqId item:itemIndex
@@ -1154,7 +1153,8 @@ static int wr_full(int fd, const void *buf, size_t n) {
     uint32_t path_len  = ntohl(info.path_len);
     uint64_t file_size = CFSwapInt64BigToHost(info.file_size);
     uint32_t is_dir    = ntohl(info.is_directory);
-    if ((uint64_t)sizeof(info) + path_len != h.data_size) return NO;
+    if (!path_len || path_len >= PATH_MAX || (uint64_t)sizeof(info) + path_len != h.data_size ||
+        is_dir > CLIP_ENTRY_SYMLINK || (is_dir == CLIP_ENTRY_DIR && file_size)) return NO;
 
     char *pb = malloc((size_t)path_len + 1);
     if (!pb) return NO;
@@ -1499,66 +1499,48 @@ static int wr_full(int fd, const void *buf, size_t n) {
             return 1;
         }
 
-        if (h.msg_type == CLIP_MSG_FORMAT_DATA_RESP_V2) {
-            if (p.fileTreeDir) {
-                if (remaining < 4) {
-                    if (remaining) {
-                        NSMutableData *trash = [NSMutableData dataWithLength:remaining];
-                        rd_full(_sock, trash.mutableBytes, remaining);
-                    }
-                    [p.cond lock];
-                    p.failed = YES; p.completed = YES;
-                    [p.cond broadcast];
-                    [p.cond unlock];
-                    return 1;
-                }
-                uint32_t cnt = 0;
-                if (rd_full(_sock, &cnt, 4) <= 0) return -1;
-                cnt = ntohl(cnt);
-                if (cnt > INT32_MAX) return -1;
-                if (remaining > 4) {
-                    NSMutableData *trash = [NSMutableData dataWithLength:remaining - 4];
-                    rd_full(_sock, trash.mutableBytes, remaining - 4);
-                }
-                [p.cond lock];
-                p.fileCountExpected = (int32_t)cnt;
-                if (cnt == 0) {
-                    p.completed = YES;
-                    [p.cond broadcast];
-                }
-                [p.cond unlock];
-                return 1;
-            }
-            NSMutableData *body = nil;
-            if (remaining) {
-                body = [NSMutableData dataWithLength:remaining];
-                if (rd_full(_sock, body.mutableBytes, remaining) <= 0) return -1;
-            }
+        if (h.msg_type == CLIP_MSG_FORMAT_DATA_RESP_V2 && p.fileTemp) {
+            if (remaining != 4) return -1;
+            uint32_t cnt = 0;
+            if (rd_full(_sock, &cnt, 4) <= 0) return -1;
+            cnt = ntohl(cnt);
+            if (cnt > INT32_MAX) return -1;
             [p.cond lock];
-            if (body) [p.body appendData:body];
-            p.completed = YES;
-            [p.cond broadcast];
+            if (p.completed || p.fileCountExpected >= 0) { [p.cond unlock]; return -1; }
+            p.fileCountExpected = (int32_t)cnt;
+            if (cnt == 0) {
+                p.completed = YES;
+                [p.cond broadcast];
+            }
             [p.cond unlock];
             return 1;
         }
 
-        if (h.msg_type == CLIP_MSG_FORMAT_DATA_CHUNK) {
+        if (h.msg_type == CLIP_MSG_FORMAT_DATA_RESP_V2 || h.msg_type == CLIP_MSG_FORMAT_DATA_CHUNK) {
+            [p.cond lock];
+            BOOL valid = !p.completed && !p.fileTemp && p.body.length <= CLIP_MAX_PAYLOAD &&
+                remaining <= CLIP_MAX_PAYLOAD - p.body.length;
+            [p.cond unlock];
+            if (!valid) return -1;
             NSMutableData *body = nil;
             if (remaining) {
                 body = [NSMutableData dataWithLength:remaining];
                 if (rd_full(_sock, body.mutableBytes, remaining) <= 0) return -1;
             }
             [p.cond lock];
-            if (body) [p.body appendData:body];
+            if (!p.completed) {
+                if (body) [p.body appendData:body];
+                if (h.msg_type == CLIP_MSG_FORMAT_DATA_RESP_V2) {
+                    p.completed = YES;
+                    [p.cond broadcast];
+                }
+            }
             [p.cond unlock];
             return 1;
         }
 
         if (h.msg_type == CLIP_MSG_FORMAT_DATA_END) {
-            if (remaining) {
-                NSMutableData *trash = [NSMutableData dataWithLength:remaining];
-                rd_full(_sock, trash.mutableBytes, remaining);
-            }
+            if (remaining || p.fileTemp) return -1;
             [p.cond lock];
             p.completed = YES;
             [p.cond broadcast];
@@ -1568,18 +1550,15 @@ static int wr_full(int fd, const void *buf, size_t n) {
 
         if (h.msg_type == CLIP_MSG_FILE_DATA_V2) {
             [p.cond lock];
-            BOOL receiving = !p.completed;
+            BOOL receiving = !p.completed && p.fileTemp && p.fileCountExpected > 0;
             [p.cond unlock];
             if (!receiving) return -1;
             h.data_size = remaining;
             NSURL *topLevel = nil;
             if (![self streamFileData:h destDir:p.fileTemp outTopLevel:&topLevel]) return -1;
-            if (p.fileTreeDir) {
+            if (p.fileTemp) {
                 [p.cond lock];
-                if (topLevel) {
-                    if (!p.fileTreeUrls) p.fileTreeUrls = [NSMutableArray array];
-                    [p.fileTreeUrls addObject:topLevel];
-                }
+                if (topLevel && !p.fileURL) p.fileURL = topLevel;
                 if (--p.fileCountExpected <= 0) {
                     p.completed = YES;
                     [p.cond broadcast];
@@ -1673,7 +1652,7 @@ provideDataForType:(NSString *)type {
                                 : hint > 100ULL  * 1024 * 1024 ? 300.0
                                 : 60.0;
         files = [clip fetchItemFiles:self.itemIndex timeout:ftimeout];
-        NSURL *url = files.fileTreeUrls.firstObject;
+        NSURL *url = files.fileURL;
         if (!url) return;
         result = [url.absoluteString dataUsingEncoding:NSUTF8StringEncoding];
     } else {

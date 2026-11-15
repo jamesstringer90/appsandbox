@@ -127,10 +127,9 @@ static NSString *g_cache_base;   /* ~/Library/Caches/com.appsandbox.clipboard */
 /* For multi-file (file-url) transfers: destination cache directory, a
  * countdown of expected file messages, and the materialised top-level
  * URLs for the pasteboard to return. */
-@property (nonatomic, copy)   NSString *fileTreeDir;
 @property (nonatomic, assign) AsbClipboardTemp *fileTemp;
 @property (nonatomic, assign) int32_t   fileCountExpected;
-@property (nonatomic, strong) NSMutableArray<NSURL *> *fileTreeUrls;
+@property (nonatomic, strong) NSURL *fileURL;
 @property (nonatomic, assign) BOOL      completed;
 @property (nonatomic, assign) BOOL      failed;
 @property (nonatomic, copy)   NSString *failureReason;
@@ -338,7 +337,6 @@ static NSString * const kLazySentinelUTI = @"com.appsandbox.clipboard.lazy";
     p.seqId = alloc_seq();
     p.fileTemp = asb_clipboard_temp_create(g_cache_base.fileSystemRepresentation);
     if (!p.fileTemp) return nil;
-    p.fileTreeDir = @(asb_clipboard_temp_path(p.fileTemp));
     p.fileCountExpected = INT32_MAX;
     pending_register(p);
     if (send_data_req_v2(fd, p.seqId, self.itemIndex,
@@ -388,7 +386,7 @@ provideDataForType:(NSString *)type {
         clip_log(@"provider: fetching file-url item=%u (hint=%llu, timeout=%.0fs)",
                  self.itemIndex, (unsigned long long)hint, ftimeout);
         files = [self fetchFilesWithTimeout:ftimeout];
-        NSURL *url = files.fileTreeUrls.firstObject;
+        NSURL *url = files.fileURL;
         if (!url) return;
         result = [url.absoluteString dataUsingEncoding:NSUTF8StringEncoding];
     } else {
@@ -1372,7 +1370,7 @@ static int handle_inbound(int fd) {
              * completed — caller expects N FILE_DATA_V2 messages to
              * follow, tracked via p.fileCountExpected. For anything
              * else, this is the single-shot body. */
-            if (p.fileTreeDir) {
+            if (p.fileTemp) {
                 if (h.data_size < 4) {
                     if (h.data_size) {
                         NSMutableData *trash = [NSMutableData dataWithLength:h.data_size];
@@ -1439,14 +1437,11 @@ static int handle_inbound(int fd) {
             BOOL receiving = !p.completed;
             [p.cond unlock];
             if (!receiving) return -1;
-            if (p.fileTreeDir) {
+            if (p.fileTemp) {
                 NSURL *topLevel = nil;
                 if (!stream_file_data(fd, h, p.fileTemp, &topLevel)) return -1;
                 [p.cond lock];
-                if (topLevel) {
-                    if (!p.fileTreeUrls) p.fileTreeUrls = [NSMutableArray array];
-                    [p.fileTreeUrls addObject:topLevel];
-                }
+                if (topLevel && !p.fileURL) p.fileURL = topLevel;
                 if (--p.fileCountExpected <= 0) {
                     p.completed = YES;
                     [p.cond broadcast];

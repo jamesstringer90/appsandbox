@@ -369,80 +369,6 @@ static BOOL clip_send_file_entry(VmClipboard clip, SOCKET s, const wchar_t *full
     return TRUE;
 }
 
-/* ---- HDROP builder (reader: guest->host file transfer) ---- */
-
-static HGLOBAL clip_build_hdrop_from_temp(const wchar_t *temp_dir)
-{
-    if (!temp_dir || !*temp_dir) return NULL;
-    WIN32_FIND_DATAW fd;
-    wchar_t pattern[MAX_PATH];
-    HANDLE h;
-    wchar_t (*paths)[MAX_PATH];
-    SIZE_T capacity = CLIP_MAX_FORMATS;
-    int count = 0;
-    SIZE_T total_size;
-    HGLOBAL hMem;
-    DROPFILES *df;
-    wchar_t *ptr;
-    int i;
-
-    paths = (wchar_t (*)[MAX_PATH])HeapAlloc(GetProcessHeap(), 0, capacity * sizeof(*paths));
-    if (!paths) return NULL;
-    swprintf_s(pattern, MAX_PATH, L"%s\\*", temp_dir);
-    h = FindFirstFileW(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) { HeapFree(GetProcessHeap(), 0, paths); return NULL; }
-
-    do {
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        if ((SIZE_T)count == capacity) {
-            wchar_t (*grown)[MAX_PATH] = NULL;
-            if (capacity <= CLIP_MAX_PAYLOAD / (2 * sizeof(*paths)))
-                grown = (wchar_t (*)[MAX_PATH])HeapReAlloc(GetProcessHeap(), 0, paths, capacity * 2 * sizeof(*paths));
-            if (!grown) {
-                FindClose(h);
-                HeapFree(GetProcessHeap(), 0, paths);
-                return NULL;
-            }
-            paths = grown;
-            capacity *= 2;
-        }
-        swprintf_s(paths[count], MAX_PATH, L"%s\\%s", temp_dir, fd.cFileName);
-        count++;
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-
-    if (count == 0) { HeapFree(GetProcessHeap(), 0, paths); return NULL; }
-
-    total_size = sizeof(DROPFILES);
-    for (i = 0; i < count; i++)
-        total_size += (wcslen(paths[i]) + 1) * sizeof(wchar_t);
-    total_size += sizeof(wchar_t);
-
-    hMem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_size);
-    if (!hMem) { HeapFree(GetProcessHeap(), 0, paths); return NULL; }
-
-    df = (DROPFILES *)GlobalLock(hMem);
-    if (!df) { HeapFree(GetProcessHeap(), 0, paths); GlobalFree(hMem); return NULL; }
-
-    df->pFiles = sizeof(DROPFILES);
-    df->fWide = TRUE;
-
-    ptr = (wchar_t *)((BYTE *)df + sizeof(DROPFILES));
-    for (i = 0; i < count; i++) {
-        /* destsz must be this entry's reserved slice (wcslen+1), NOT MAX_PATH:
-           the buffer is sized tightly per path (see total_size above), so passing
-           MAX_PATH makes wcscpy_s's secure-CRT tail-fill memset run past the
-           allocation -> heap overflow (caught by full page heap at memset). */
-        wcscpy_s(ptr, wcslen(paths[i]) + 1, paths[i]);
-        ptr += wcslen(paths[i]) + 1;
-    }
-    *ptr = L'\0';
-
-    HeapFree(GetProcessHeap(), 0, paths);
-    GlobalUnlock(hMem);
-    return hMem;
-}
-
 /* ---- Writer channel: send SYNC_ENABLE ---- */
 
 static BOOL clip_send_sync_enable(VmClipboard clip, BOOL enabled)
@@ -615,6 +541,7 @@ static BOOL clip_writer_handle_message(VmClipboard clip, SOCKET s, const ClipHea
 {
     switch (hdr->msg_type) {
     case CLIP_MSG_FORMAT_DATA_REQ:
+        if (hdr->data_size) return FALSE;
         return clip_handle_data_request(clip, hdr->format);
     default:
         if (hdr->data_size > 0) {
@@ -712,30 +639,14 @@ static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHea
     if (hdr->data_size < sizeof(fi)) return FALSE;
     if (!clip_recv_exact(s, &fi, sizeof(fi))) return FALSE;
 
-    if (fi.path_len == 0 || fi.path_len > (MAX_PATH - 1) * sizeof(wchar_t)) {
-        UINT32 skip_hdr = hdr->data_size - (UINT32)sizeof(fi);
-        BYTE skip[4096];
-        while (skip_hdr > 0) {
-            int chunk = skip_hdr > 4096 ? 4096 : (int)skip_hdr;
-            if (!clip_recv_exact(s, skip, chunk)) return FALSE;
-            skip_hdr -= chunk;
-        }
-        { UINT64 rem = fi.file_size;
-          while (rem > 0) { int c = rem > 4096 ? 4096 : (int)rem;
-          if (!clip_recv_exact(s, skip, c)) return FALSE; rem -= c; } }
-        return TRUE;
-    }
+    if (!fi.path_len || fi.path_len > sizeof(rel_path) - sizeof(wchar_t) ||
+        fi.path_len % sizeof(wchar_t) || hdr->data_size != sizeof(fi) + fi.path_len ||
+        fi.is_directory > 1 || (fi.is_directory && fi.file_size)) return FALSE;
 
     if (!clip_recv_exact(s, rel_path, (int)fi.path_len)) return FALSE;
     rel_path[fi.path_len / sizeof(wchar_t)] = L'\0';
 
-    if (!clip_path_is_safe(rel_path)) {
-        BYTE skip[4096];
-        UINT64 rem = fi.file_size;
-        while (rem > 0) { int c = rem > 4096 ? 4096 : (int)rem;
-          if (!clip_recv_exact(s, skip, c)) return FALSE; rem -= c; }
-        return TRUE;
-    }
+    if (wcslen(rel_path) != fi.path_len / sizeof(wchar_t) || !clip_path_is_safe(rel_path)) return FALSE;
 
     if (!clip->temp) {
         clip->temp = asb_clipboard_temp_create(clip->temp_parent);
@@ -803,7 +714,7 @@ static void clip_reader_request_next(VmClipboard clip, SOCKET s)
     if (!clip->sharing_enabled || clip->reader_generation != clip->sharing_generation) return;
     if (clip->reader_fetch_idx >= clip->reader_fmt_count) {
         if (clip->temp && (!asb_clipboard_temp_prepare(clip->temp) ||
-            !(clip->reader_hdrop = clip_build_hdrop_from_temp(clip->temp_dir)))) {
+            !(clip->reader_hdrop = clip_file_build_hdrop(clip->temp_dir)))) {
             EnterCriticalSection(&clip->reader_cs);
             clip_reader_free_pending(clip);
             clip->reader_fmt_count = 0;
@@ -837,6 +748,7 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         BYTE *buf;
         UINT32 count, i;
         int off;
+        BOOL valid = TRUE;
 
         /* Need at least the 4-byte leading count; reject short frames so the
            `*(UINT32 *)buf` read below cannot over-read the allocation. */
@@ -860,7 +772,10 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         }
 
         count = *(UINT32 *)buf;
-        if (count > CLIP_MAX_FORMATS) count = CLIP_MAX_FORMATS;
+        if (count > CLIP_MAX_FORMATS || count > (hdr->data_size - 4) / 8) {
+            HeapFree(GetProcessHeap(), 0, buf);
+            return FALSE;
+        }
         off = 4;
 
         EnterCriticalSection(&clip->reader_cs);
@@ -876,13 +791,20 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
             /* off is in [8, data_size] here; reject a name_len that runs past
                the buffer (or whose signed cast would corrupt off) before the
                unconditional `off += name_len` advance below. */
-            if (name_len > (UINT32)((int)hdr->data_size - off)) break;
+            if (name_len >= 256 || name_len > (UINT32)((int)hdr->data_size - off) ||
+                fmt_id > 0xFFFF || clip_should_skip(fmt_id) ||
+                (fmt_id >= CF_GDIOBJFIRST && fmt_id <= CF_GDIOBJLAST) ||
+                (name_len && (fmt_id < 0xC000 || memchr(buf + off, 0, name_len)))) {
+                valid = FALSE;
+                break;
+            }
 
-            if (name_len > 0 && name_len < 256 && off + (int)name_len <= (int)hdr->data_size) {
+            if (name_len > 0) {
                 char name[256];
                 memcpy(name, buf + off, name_len);
                 name[name_len] = '\0';
                 local_id = RegisterClipboardFormatA(name);
+                if (!local_id) { valid = FALSE; break; }
             }
             off += (int)name_len;
 
@@ -897,6 +819,7 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         LeaveCriticalSection(&clip->reader_cs);
 
         HeapFree(GetProcessHeap(), 0, buf);
+        if (!valid || i != count || off != (int)hdr->data_size) return FALSE;
 
         clip_log(clip, L"CLIP-R: Received format list (%d formats), fetching data...",
                  clip->reader_fmt_count);
@@ -907,24 +830,25 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
     case CLIP_MSG_FORMAT_DATA_RESP: {
         int idx = clip->reader_fetch_idx;
 
-        if (idx >= 0 && idx < clip->reader_fmt_count) {
-            if (hdr->format == CF_HDROP && hdr->data_size == 0) {
-                clip->reader_fmts[idx].is_hdrop = TRUE;
-            } else if (hdr->data_size > 0 && hdr->data_size <= CLIP_MAX_PAYLOAD) {
-                BYTE *data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr->data_size);
-                if (data && clip_recv_exact(s, data, (int)hdr->data_size)) {
-                    EnterCriticalSection(&clip->reader_cs);
-                    clip->reader_fmts[idx].data = data;
-                    clip->reader_fmts[idx].data_size = hdr->data_size;
-                    LeaveCriticalSection(&clip->reader_cs);
-                } else {
-                    if (data) HeapFree(GetProcessHeap(), 0, data);
-                    return FALSE;
-                }
+        if (idx < 0 || idx >= clip->reader_fmt_count ||
+            hdr->format != clip->reader_fmts[idx].remote_id || hdr->data_size > CLIP_MAX_PAYLOAD ||
+            (hdr->format == CF_HDROP && hdr->data_size)) return FALSE;
+        if (hdr->format == CF_HDROP) {
+            clip->reader_fmts[idx].is_hdrop = TRUE;
+        } else if (hdr->data_size > 0) {
+            BYTE *data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr->data_size);
+            if (data && clip_recv_exact(s, data, (int)hdr->data_size)) {
+                EnterCriticalSection(&clip->reader_cs);
+                clip->reader_fmts[idx].data = data;
+                clip->reader_fmts[idx].data_size = hdr->data_size;
+                LeaveCriticalSection(&clip->reader_cs);
+            } else {
+                if (data) HeapFree(GetProcessHeap(), 0, data);
+                return FALSE;
             }
-            clip->reader_fetch_idx++;
-            clip_reader_request_next(clip, s);
         }
+        clip->reader_fetch_idx++;
+        clip_reader_request_next(clip, s);
         return TRUE;
     }
 

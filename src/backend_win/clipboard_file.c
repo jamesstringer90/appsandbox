@@ -1,5 +1,65 @@
 #include "clipboard_file.h"
 #include <wchar.h>
+#include <shlobj.h>
+#include <string.h>
+
+HGLOBAL clip_file_build_hdrop(const wchar_t *temp_dir)
+{
+    if (!temp_dir || !*temp_dir) return NULL;
+    SIZE_T directory_length = wcslen(temp_dir);
+    if (directory_length > MAX_PATH - 3) return NULL;
+    WIN32_FIND_DATAW entry;
+    wchar_t pattern[MAX_PATH];
+    if (swprintf_s(pattern, MAX_PATH, L"%s\\*", temp_dir) < 0) return NULL;
+    HANDLE find = FindFirstFileW(pattern, &entry);
+    if (find == INVALID_HANDLE_VALUE) return NULL;
+    const SIZE_T limit = 64 * 1024 * 1024;
+    SIZE_T capacity = 64, count = 0;
+    SIZE_T total = sizeof(DROPFILES) + sizeof(wchar_t);
+    wchar_t (*paths)[MAX_PATH] = HeapAlloc(GetProcessHeap(), 0, capacity * sizeof(*paths));
+    if (!paths) { FindClose(find); return NULL; }
+    BOOL valid = TRUE;
+    do {
+        if (!wcscmp(entry.cFileName, L".") || !wcscmp(entry.cFileName, L"..")) continue;
+        if (wcslen(entry.cFileName) > MAX_PATH - directory_length - 2) { valid = FALSE; break; }
+        if (count == capacity) {
+            wchar_t (*grown)[MAX_PATH] = NULL;
+            if (capacity <= limit / (2 * sizeof(*paths)))
+                grown = HeapReAlloc(GetProcessHeap(), 0, paths, capacity * 2 * sizeof(*paths));
+            if (!grown) { valid = FALSE; break; }
+            paths = grown;
+            capacity *= 2;
+        }
+        int length = swprintf_s(paths[count], MAX_PATH, L"%s\\%s", temp_dir, entry.cFileName);
+        if (length < 0) { valid = FALSE; break; }
+        SIZE_T bytes = ((SIZE_T)length + 1) * sizeof(wchar_t);
+        if (bytes > limit - total) { valid = FALSE; break; }
+        total += bytes;
+        count++;
+    } while (FindNextFileW(find, &entry));
+    if (valid && GetLastError() != ERROR_NO_MORE_FILES) valid = FALSE;
+    FindClose(find);
+    if (!valid || !count) { HeapFree(GetProcessHeap(), 0, paths); return NULL; }
+    HGLOBAL result = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total);
+    DROPFILES *drop = result ? GlobalLock(result) : NULL;
+    if (!drop) {
+        if (result) GlobalFree(result);
+        HeapFree(GetProcessHeap(), 0, paths);
+        return NULL;
+    }
+    drop->pFiles = sizeof(DROPFILES);
+    drop->fWide = TRUE;
+    wchar_t *destination = (wchar_t *)((BYTE *)drop + sizeof(DROPFILES));
+    for (SIZE_T i = 0; i < count; ++i) {
+        SIZE_T length = wcslen(paths[i]) + 1;
+        memcpy(destination, paths[i], length * sizeof(wchar_t));
+        destination += length;
+    }
+    *destination = L'\0';
+    GlobalUnlock(result);
+    HeapFree(GetProcessHeap(), 0, paths);
+    return result;
+}
 
 void clip_file_writer_abort(ClipFileWriter *file)
 {

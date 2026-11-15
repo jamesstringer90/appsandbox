@@ -18,3 +18,4 @@ BOOL clip_file_writer_open(ClipFileWriter *file, const wchar_t *path, UINT64 siz
 BOOL clip_file_writer_write(ClipFileWriter *file, DWORD length);
 BOOL clip_file_writer_finish(ClipFileWriter *file);
 void clip_file_writer_abort(ClipFileWriter *file);
+HGLOBAL clip_file_build_hdrop(const wchar_t *temp_dir);

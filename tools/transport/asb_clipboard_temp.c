@@ -341,14 +341,6 @@ int asb_clipboard_temp_prepare(AsbClipboardTemp *temp)
     return ok;
 }
 
-void asb_clipboard_temp_discard(AsbClipboardTemp *temp)
-{
-    if (!temp) return;
-    release_handles(temp, 0);
-    if (temp->record.magic == ASB_CLIP_TEMP_MAGIC) queue_retired(temp, (uint64_t)time(NULL));
-    else temp_close(temp);
-}
-
 static int write_retired(AsbClipboardTemp *temp)
 {
     HANDLE root = CreateFileW(temp->root, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
@@ -641,14 +633,6 @@ int asb_clipboard_temp_set_owner(AsbClipboardTemp *temp, uid_t uid, gid_t gid)
     return change_owner(temp->root_fd, uid, gid);
 }
 
-void asb_clipboard_temp_discard(AsbClipboardTemp *temp)
-{
-    if (!temp) return;
-    release_handles(temp, 0);
-    if (temp->record.magic == ASB_CLIP_TEMP_MAGIC) queue_retired(temp, (uint64_t)time(NULL));
-    else temp_close(temp);
-}
-
 static int write_retired(AsbClipboardTemp *temp)
 {
     int root = open(temp->root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -728,6 +712,14 @@ static void collect_parent(const char *parent)
     closedir(dir);
 }
 #endif
+
+void asb_clipboard_temp_discard(AsbClipboardTemp *temp)
+{
+    if (!temp) return;
+    release_handles(temp, 0);
+    if (temp->record.magic == ASB_CLIP_TEMP_MAGIC) queue_retired(temp, (uint64_t)time(NULL));
+    else temp_close(temp);
+}
 
 const AsbClipboardPathChar *asb_clipboard_temp_path(const AsbClipboardTemp *temp)
 {

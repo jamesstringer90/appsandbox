@@ -2160,7 +2160,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
         if (!idd_rd_full(fd, &h, sizeof(h))) return NO;
         if (h.magic != CLIP_MAGIC) return NO;
         if (h.msg_type == CLIP_MSG_FORMAT_DATA_RESP) {
-            if (h.format != WF_HDROP || !idd_clip_discard(fd, h.data_size)) return NO;
+            if (h.format != WF_HDROP || h.data_size) return NO;
             break;
         }
         if (h.msg_type != CLIP_MSG_FILE_DATA) {
@@ -2170,7 +2170,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
         ClipFileInfo fi;
         if (h.data_size < sizeof(fi)) return NO;
         if (!idd_rd_full(fd, &fi, sizeof(fi))) return NO;
-        if (fi.path_len != h.data_size - sizeof(fi) || fi.path_len > 65536 || (fi.path_len & 1)) return NO;
+        if (!fi.path_len || fi.path_len != h.data_size - sizeof(fi) || fi.path_len > 65536 ||
+            (fi.path_len & 1) || fi.is_directory > 1 || (fi.is_directory && fi.file_size)) return NO;
         uint8_t *pb = malloc(fi.path_len ? fi.path_len : 1);
         if (!pb) return NO;
         if (fi.path_len && !idd_rd_full(fd, pb, (int)fi.path_len)) { free(pb); return NO; }
