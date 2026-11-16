@@ -194,8 +194,104 @@ BOOL asb_vdd_screenshot_reply(AsbVddScreenshot *s,const DisplayGpuPacket *packet
     return TRUE;
 }
 
+void asb_gpu_waiter_destroy(AsbGpuWaiter *w)
+{
+    if (!w) return;
+    if (w->fence) ID3D11Fence_Release(w->fence);
+    if (w->context) ID3D11DeviceContext4_Release(w->context);
+    if (w->event) CloseHandle(w->event);
+    ZeroMemory(w,sizeof(*w));
+}
+
+static BOOL gpu_waiter_prepare(AsbGpuWaiter *w,ID3D11Device *device,ID3D11DeviceContext *context)
+{
+    if (w->device!=device) {
+        asb_gpu_waiter_destroy(w);
+        w->device=device;
+    }
+    if (w->fence) return TRUE;
+    if (w->fenceUnavailable) return FALSE;
+    ID3D11Device5 *device5=NULL;
+    HRESULT hr=ID3D11Device_QueryInterface(device,&IID_ID3D11Device5,(void **)&device5);
+    if (SUCCEEDED(hr)) hr=ID3D11DeviceContext_QueryInterface(context,
+        &IID_ID3D11DeviceContext4,(void **)&w->context);
+    if (SUCCEEDED(hr)) hr=ID3D11Device5_CreateFence(device5,0,D3D11_FENCE_FLAG_NONE,
+        &IID_ID3D11Fence,(void **)&w->fence);
+    if (SUCCEEDED(hr) && !(w->event=CreateEventW(NULL,FALSE,FALSE,NULL)))
+        hr=HRESULT_FROM_WIN32(GetLastError());
+    if (device5) ID3D11Device5_Release(device5);
+    if (FAILED(hr)) {
+        asb_gpu_waiter_destroy(w);
+        w->device=device;
+        w->fenceUnavailable=TRUE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static HRESULT gpu_waiter_fence(AsbGpuWaiter *w,ID3D11DeviceContext *context,
+    HANDLE stop,DWORD timeout)
+{
+    UINT64 value=w->value+1;
+    HRESULT hr=ID3D11DeviceContext4_Signal(w->context,w->fence,value);
+    if (FAILED(hr)) return hr;
+    w->value=value;
+    ID3D11DeviceContext_Flush(context);
+    ULONGLONG deadline=GetTickCount64()+timeout;
+    for (;;) {
+        UINT64 completed=ID3D11Fence_GetCompletedValue(w->fence);
+        if (completed==UINT64_MAX) return DXGI_ERROR_DEVICE_REMOVED;
+        if (completed>=value) return S_OK;
+        ULONGLONG now=GetTickCount64();
+        if (now>=deadline) return (HRESULT)WAIT_TIMEOUT;
+        hr=ID3D11Fence_SetEventOnCompletion(w->fence,value,w->event);
+        if (FAILED(hr)) return hr;
+        HANDLE handles[2]={w->event,stop};
+        DWORD wait=WaitForMultipleObjects(stop?2:1,handles,FALSE,(DWORD)(deadline-now));
+        if (wait==WAIT_OBJECT_0+1) return S_FALSE;
+        if (wait==WAIT_FAILED) return HRESULT_FROM_WIN32(GetLastError());
+    }
+}
+
+static HRESULT gpu_waiter_query(ID3D11Device *device,ID3D11DeviceContext *context,
+    HANDLE stop,DWORD timeout)
+{
+    D3D11_QUERY_DESC desc={D3D11_QUERY_EVENT,0};
+    ID3D11Query *query=NULL;
+    HRESULT hr=ID3D11Device_CreateQuery(device,&desc,&query);
+    if (FAILED(hr)) return hr;
+    ID3D11DeviceContext_End(context,(ID3D11Asynchronous *)query);
+    ID3D11DeviceContext_Flush(context);
+    LARGE_INTEGER frequency,start,now;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    ULONGLONG deadline=GetTickCount64()+timeout;
+    for (;;) {
+        hr=ID3D11DeviceContext_GetData(context,(ID3D11Asynchronous *)query,
+            NULL,0,D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr!=S_FALSE) break;
+        if (GetTickCount64()>=deadline) { hr=(HRESULT)WAIT_TIMEOUT;break; }
+        if (stop && WaitForSingleObject(stop,0)==WAIT_OBJECT_0) { hr=S_FALSE;break; }
+        QueryPerformanceCounter(&now);
+        if ((now.QuadPart-start.QuadPart)*1000<frequency.QuadPart*4) SwitchToThread();
+        else if (stop) {
+            if (WaitForSingleObject(stop,1)==WAIT_OBJECT_0) { hr=S_FALSE;break; }
+        } else Sleep(1);
+    }
+    ID3D11Query_Release(query);
+    return hr;
+}
+
+HRESULT asb_gpu_waiter_wait(AsbGpuWaiter *w,ID3D11Device *device,ID3D11DeviceContext *context,
+    HANDLE stop,DWORD timeout)
+{
+    if (!w || !device || !context) return E_INVALIDARG;
+    if (gpu_waiter_prepare(w,device,context)) return gpu_waiter_fence(w,context,stop,timeout);
+    return gpu_waiter_query(device,context,stop,timeout);
+}
+
 void asb_vdd_screenshot_handoff(AsbVddScreenshot *s,IDXGIKeyedMutex *mutex,
-    ID3D11Texture2D *texture,UINT64 sequence)
+    ID3D11Texture2D *texture,UINT64 sequence,AsbGpuWaiter *waiter)
 {
     if (InterlockedCompareExchange(&s->handoffState,0,0)!=ASB_SCREENSHOT_HANDOFF_READY) return;
     HRESULT hr=(HRESULT)s->handoff.status;
@@ -204,7 +300,16 @@ void asb_vdd_screenshot_handoff(AsbVddScreenshot *s,IDXGIKeyedMutex *mutex,
         if (hr==(HRESULT)WAIT_TIMEOUT) return;
         if (hr==S_OK) {
             asb_vdd_screenshot_frame(s,texture,sequence,TRUE,s->handoff.handle);
-            hr=IDXGIKeyedMutex_ReleaseSync(mutex,1);
+            hr=asb_gpu_waiter_wait(waiter,s->pDevice,s->pDeviceContext,
+                s->hTerminateEvent,ASB_GPU_HANDOFF_WAIT_MS);
+            if (hr==S_OK) hr=IDXGIKeyedMutex_ReleaseSync(mutex,1);
+            else {
+                HRESULT released=IDXGIKeyedMutex_ReleaseSync(mutex,2);
+                if (hr==(HRESULT)WAIT_TIMEOUT || hr==S_FALSE) {
+                    if (released==S_OK) return;
+                    hr=released;
+                }
+            }
         }
     }
     if (hr!=S_OK) {
