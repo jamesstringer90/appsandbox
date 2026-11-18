@@ -1345,6 +1345,24 @@ static int handle_request(int fd, HttpReq *r) {
 
         if ([sub isEqualToString:@"display"]) {
             BOOL isDELETE = strcmp(r->method, "DELETE") == 0;
+            if (strcmp(r->method, "PUT") == 0) {
+                id enabled = requestBody[@"automaticallyDisableExtraDisplays"];
+                if (![enabled isKindOfClass:NSNumber.class] ||
+                    CFGetTypeID((__bridge CFTypeRef)enabled) != CFBooleanGetTypeID()) {
+                    send_err(fd, 400, "Bad Request", @"invalid_arg",
+                             @"automaticallyDisableExtraDisplays must be a boolean");
+                    return 0;
+                }
+                __block int result = ASB_NOT_SUPPORTED;
+                on_main(^{ result = asb_mac_vm_set_display_monitor_enabled(vm_id, [enabled boolValue]); });
+                if (result == ASB_NOT_SUPPORTED)
+                    send_err(fd, 409, "Conflict", @"not_supported",
+                             @"the connected Windows guest does not support watcher controls");
+                else if (result != ASB_OK)
+                    send_err(fd, 409, "Conflict", @"busy", @"the guest agent is busy; retry shortly");
+                else send_json(fd, 202, "Accepted", @"{\"ok\":true,\"accepted\":true}");
+                return 0;
+            }
             if (isPOST) {   /* open (or focus) the display window */
                 __block int rc = BACKEND_OK;
                 on_main(^{ rc = asb_mac_open_display(vm_id); });
@@ -1379,20 +1397,23 @@ static int handle_request(int fd, HttpReq *r) {
                    a Windows guest streams VDD frames over ivshmem and is ready only once its IDD
                    driver is up (idd_ready) -- matching the open precondition (asb_mac_open_display). */
                 __block BOOL open = NO, ready = NO;
+                __block int monitor = -1;
                 on_main(^{
                     AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
                     if (!v) return;
                     BOOL is_win = (strcasecmp(v->os_type, "Windows") == 0);
+                    monitor = asb_mac_vm_display_monitor_state(vm_id);
                     open  = (v->display != nil && !v->display.userClosed);
                     ready = open || (v->running && v->agent_online && (!is_win || v->idd_ready));
                 });
                 send_json(fd, 200, "OK",
                           json_str(@{ @"open": open ? @YES : @NO,
-                                      @"ready": ready ? @YES : @NO }));
+                                      @"ready": ready ? @YES : @NO,
+                                      @"automaticallyDisableExtraDisplays": monitor < 0 ? NSNull.null : @(monitor != 0) }));
                 return 0;
             }
             send_err(fd, 405, "Method Not Allowed", @"method",
-                     @"use GET to poll state, POST to open the display, DELETE to close it");
+                     @"use GET to read state, PUT to configure the watcher, POST to open the display, DELETE to close it");
             return 0;
         }
 

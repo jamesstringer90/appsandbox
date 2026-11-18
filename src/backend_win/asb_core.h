@@ -183,6 +183,8 @@ ASB_API BOOL    asb_vm_agent_online(AsbVm vm);
    would itself become the single consumer and blank the display. Poll it on an interval
    (it disturbs nothing) and gate display-open on it. */
 ASB_API BOOL    asb_vm_idd_ready(AsbVm vm);
+ASB_API int     asb_vm_display_monitor_state(AsbVm vm);
+ASB_API HRESULT asb_vm_set_display_monitor_enabled(AsbVm vm, BOOL enabled);
 ASB_API void    asb_vm_set_display_suppressed(AsbVm vm, BOOL suppressed);
 ASB_API BOOL    asb_vm_is_building(AsbVm vm);
 ASB_API DWORD   asb_vm_ram_mb(AsbVm vm);

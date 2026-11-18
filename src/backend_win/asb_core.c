@@ -4327,6 +4327,21 @@ ASB_API BOOL asb_vm_idd_ready(AsbVm vm)
     return inst->agent_online && inst->idd_ready;
 }
 
+ASB_API int asb_vm_display_monitor_state(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    if (!inst || !inst->agent_online || _wcsicmp(inst->os_type, L"Windows")) return -1;
+    LONG state = InterlockedCompareExchange(&inst->display_monitor_state, 0, 0);
+    return state ? state == 1 : -1;
+}
+
+ASB_API HRESULT asb_vm_set_display_monitor_enabled(AsbVm vm, BOOL enabled)
+{
+    if (asb_vm_display_monitor_state(vm) < 0) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    return vm_agent_send(vm_inst(vm), enabled ? "display_monitor:1" : "display_monitor:0",
+                         NULL, 0, 0) ? S_OK : HRESULT_FROM_WIN32(ERROR_BUSY);
+}
+
 ASB_API void asb_vm_set_display_suppressed(AsbVm vm, BOOL suppressed)
 {
     VmInstance *inst = vm_inst(vm);

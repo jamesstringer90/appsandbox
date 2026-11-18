@@ -59,6 +59,7 @@ typedef struct AgentConn {
 
 #define MAX_AGENTS 16
 static AgentConn g_conns[MAX_AGENTS];
+static SRWLOCK   g_cmd_locks[MAX_AGENTS] = { SRWLOCK_INIT };
 static BOOL      g_wsa_init = FALSE;
 
 static AgentConn *find_conn(VmInstance *vm)
@@ -76,23 +77,30 @@ static AgentConn *alloc_conn(VmInstance *vm)
     int i;
     if (!vm || vm->unique_id == 0) return NULL;
     for (i = 0; i < MAX_AGENTS; i++) {
+        if (g_conns[i].vm_id != 0) continue;
+        AcquireSRWLockExclusive(&g_cmd_locks[i]);
         if (g_conns[i].vm_id == 0) {
             memset(&g_conns[i], 0, sizeof(AgentConn));
             g_conns[i].vm_id = vm->unique_id;
             g_conns[i].sock = INVALID_SOCKET;
             g_conns[i].cmd_done = CreateEventW(NULL, FALSE, FALSE, NULL);
+            ReleaseSRWLockExclusive(&g_cmd_locks[i]);
             return &g_conns[i];
         }
+        ReleaseSRWLockExclusive(&g_cmd_locks[i]);
     }
     return NULL;
 }
 
 static void free_conn(AgentConn *conn)
 {
+    SRWLOCK *lock = &g_cmd_locks[conn - g_conns];
+    AcquireSRWLockExclusive(lock);
     if (conn->cmd_done) CloseHandle(conn->cmd_done);
     if (conn->thread) CloseHandle(conn->thread);
     memset(conn, 0, sizeof(AgentConn));
     conn->sock = INVALID_SOCKET;
+    ReleaseSRWLockExclusive(lock);
 }
 
 /* ---- Line I/O ---- */
@@ -253,6 +261,10 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         ui_log(L"[%s] GPU device recovered successfully.", vm->name);
     } else if (strncmp(buf, "gpu_device_failed:", 18) == 0) {
         ui_log(L"[%s] GPU device still failing (problem %S).", vm->name, buf + 18);
+    } else if (strncmp(buf, "display_monitor:", 16) == 0) {
+        LONG state = !strcmp(buf + 16, "enabled") ? 1 : !strcmp(buf + 16, "disabled") ? 2 : 0;
+        InterlockedExchange(&vm->display_monitor_state, state);
+        asb_events_changed();
     } else if (strncmp(buf, "idd_status:", 11) == 0) {
         /* Latch display readiness from the guest's own driver-state report
            ("running" via devcon). This is the non-destructive readiness
@@ -392,6 +404,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         }
 
         vm->agent_online = TRUE;
+        InterlockedExchange(&vm->display_monitor_state, 0);
         vm->idd_ready = FALSE;   /* re-evaluated by the agent's idd_status, sent right after hello */
         vm->shutdown_requested = FALSE;
         vm->last_heartbeat = GetTickCount64();
@@ -483,8 +496,8 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                     n = recv_line(s, conn->rsp, sizeof(conn->rsp));
                     if (n <= 0) {
                         conn->rsp[0] = '\0';
-                        conn->cmd_pending = FALSE;
                         SetEvent(conn->cmd_done);
+                        conn->cmd_pending = FALSE;
                         goto disconnected;
                     }
                     /* Check for our sequence tag */
@@ -502,8 +515,8 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                     /* Untagged = async message, process inline */
                     process_async_message(vm, s, conn->rsp);
                 }
-                conn->cmd_pending = FALSE;
                 SetEvent(conn->cmd_done);
+                conn->cmd_pending = FALSE;
                 continue;
             }
 
@@ -528,6 +541,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         disconnected:
         /* Connection lost */
         vm->agent_online = FALSE;
+        InterlockedExchange(&vm->display_monitor_state, 0);
         vm->idd_ready = FALSE;
         /* Atomically claim the socket so we never double-close a handle that
            vm_agent_stop() may have already closed (and whose value could have
@@ -544,8 +558,8 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         /* Wake up any blocked command sender */
         if (conn->cmd_pending) {
             conn->rsp[0] = '\0';
-            conn->cmd_pending = FALSE;
             SetEvent(conn->cmd_done);
+            conn->cmd_pending = FALSE;
         }
 
         /* Don't reconnect if the VM is no longer running */
@@ -613,6 +627,7 @@ void vm_agent_stop(VmInstance *instance)
 BOOL vm_agent_send(VmInstance *instance, const char *command,
                    char *response, int response_max, DWORD timeout_ms)
 {
+    UINT64 vm_id = instance ? instance->unique_id : 0;
     AgentConn *conn = find_conn(instance);
     BOOL ok;
 
@@ -621,10 +636,13 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
         return FALSE;
     }
 
-    /* Hand the command to the connection thread (it owns the socket and is the
-       sole sender). NOTE: this is a single slot per VM (conn->cmd), not a queue,
-       so concurrent callers for the SAME VM would clobber -- safe here because
-       per VM only one caller exists (shutdown). */
+    SRWLOCK *lock = &g_cmd_locks[conn - g_conns];
+    if (!command || strlen(command) >= sizeof(conn->cmd) ||
+        !TryAcquireSRWLockExclusive(lock)) return FALSE;
+    if (conn->vm_id != vm_id || conn->cmd_pending || conn->stop || !instance->agent_online) {
+        ReleaseSRWLockExclusive(lock);
+        return FALSE;
+    }
     ResetEvent(conn->cmd_done);
     strcpy_s(conn->cmd, sizeof(conn->cmd), command);
     conn->cmd_pending = TRUE;
@@ -636,15 +654,17 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
        we return immediately, so we never block the single-threaded HTTP request
        loop / the GUI thread. Delivery is confirmed by the HCS SystemExited
        monitor, not by this reply. */
-    if (timeout_ms == 0)
+    if (timeout_ms == 0) {
+        ReleaseSRWLockExclusive(lock);
         return TRUE;
+    }
 
     /* Otherwise wait up to timeout_ms for the agent's tagged reply (idd_connect
        expects a prompt "ok"). A real disconnect unblocks us: agent_thread_proc
        SetEvent()s cmd_done with an empty rsp on recv<=0, so we return FALSE. */
     if (WaitForSingleObject(conn->cmd_done, timeout_ms) != WAIT_OBJECT_0) {
         ui_log(L"Agent: command \"%S\" timed out", command);
-        conn->cmd_pending = FALSE;
+        ReleaseSRWLockExclusive(lock);
         return FALSE;
     }
 
@@ -653,6 +673,7 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
 
     ok = (strcmp(conn->rsp, "ok") == 0);
     ui_log(L"Agent: %S -> %S", command, conn->rsp);
+    ReleaseSRWLockExclusive(lock);
     return ok;
 }
 

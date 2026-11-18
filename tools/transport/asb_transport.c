@@ -28,7 +28,6 @@
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "setupapi.lib")
-#pragma comment(lib, "advapi32.lib")   /* registry (transport override) */
 
 /* ASB_SLOT_HDR comes from asb_transport.h (shared with the host). */
 #define ASB_RING_HDR   ((uint32_t)sizeof(AsbRing))  /* head/tail/cap/pad = 24 */
@@ -258,19 +257,10 @@ static int open_ivshmem(void) {
 int asb_transport_init(void) {
     static int inited = 0;
     WSADATA wsa;
-    char val[16]; DWORD vlen = sizeof(val); HKEY k; int force_hv = 0, force_iv = 0;
     if (inited) return 0;        /* idempotent: multiple callers in one process (agent + p9copy) */
     inited = 1;
-    /* 1. explicit override */
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\AppSandbox", 0, KEY_READ, &k) == ERROR_SUCCESS) {
-        if (RegQueryValueExA(k, "Transport", NULL, NULL, (BYTE *)val, &vlen) == ERROR_SUCCESS) {
-            if (_stricmp(val, "ivshmem") == 0) force_iv = 1;
-            else if (_stricmp(val, "hyperv") == 0) force_hv = 1;
-        }
-        RegCloseKey(k);
-    }
     WSAStartup(MAKEWORD(2, 2), &wsa);   /* needed by PC backend + the ssh/9p TCP relays either way */
-    if (!force_hv && (force_iv || open_ivshmem() == 0)) {
+    if (open_ivshmem() == 0) {
         g_is_ivshmem = 1;
         g_guest_pid  = (uint32_t)GetCurrentProcessId();
         g_accept_seq = (LONG)(GetTickCount64() & 0x3FFFFFFF);   /* nonzero seed: owner_id unique across PID reuse */

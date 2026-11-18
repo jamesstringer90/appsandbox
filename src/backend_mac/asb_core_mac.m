@@ -1813,6 +1813,21 @@ void asb_mac_vm_set_audio_muted(AsbVmId vm_id, BOOL muted) {
     });
 }
 
+int asb_mac_vm_display_monitor_state(AsbVmId vm_id) {
+    int idx = vm_index_of(vm_id);
+    if (idx < 0 || !vm_is_windows_idx(idx) || !g_vms[idx].agent_online) return -1;
+    VmAgentMac *agent = g_agent_refs[idx];
+    return agent ? (int)agent.displayMonitorState : -1;
+}
+
+int asb_mac_vm_set_display_monitor_enabled(AsbVmId vm_id, BOOL enabled) {
+    int idx = vm_index_of(vm_id);
+    if (idx < 0 || asb_mac_vm_display_monitor_state(vm_id) < 0) return ASB_NOT_SUPPORTED;
+    VmAgentMac *agent = g_agent_refs[idx];
+    return [[agent sendCommand:enabled ? @"display_monitor:1" : @"display_monitor:0"
+                        timeout:0] isEqualToString:@"queued"] ? ASB_OK : ASB_BUSY;
+}
+
 /* ---- Display window (headless daemon, opened on demand) ----
  * The same window the GUI auto-creates on the Running transition, but opened
  * only on an explicit API request. macOS has no separate frame channel/driver

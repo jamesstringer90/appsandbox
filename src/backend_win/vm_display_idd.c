@@ -369,6 +369,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_SHOW_LOG       0x1020
 #define IDM_MATCH_WINDOW   0x1030
 #define IDM_SHARE_CLIPBOARD 0x1040
+#define IDM_AUTO_DISPLAYS  0x1050
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -3193,8 +3194,11 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHARE_CLIPBOARD, L"Share clipboard");
-            AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
+            if (!_wcsicmp(d->os_type, L"Windows"))
+                AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_AUTO_DISPLAYS,
+                            L"Automatically disable non AppSandbox displays");
             AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_MATCH_WINDOW, L"Match window size");
+            AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
             CheckMenuItem(sysmenu, IDM_SHARE_CLIPBOARD,
@@ -3369,9 +3373,21 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             EnableMenuItem(menu, IDM_MATCH_WINDOW, MF_BYCOMMAND | (enabled ? MF_ENABLED : MF_GRAYED));
             CheckMenuItem(menu, IDM_MATCH_WINDOW, MF_BYCOMMAND |
                 (d->size_mode == DISPLAY_SIZE_WINDOW ? MF_CHECKED : MF_UNCHECKED));
+            if (!_wcsicmp(d->os_type, L"Windows")) {
+                int state = asb_vm_display_monitor_state((AsbVm)asb_find_vm_by_id(d->vm_id));
+                EnableMenuItem(menu, IDM_AUTO_DISPLAYS, MF_BYCOMMAND | (state >= 0 ? MF_ENABLED : MF_GRAYED));
+                CheckMenuItem(menu, IDM_AUTO_DISPLAYS, MF_BYCOMMAND | (state > 0 ? MF_CHECKED : MF_UNCHECKED));
+            }
         }
         break;
     case WM_SYSCOMMAND:
+        if (d && (wp & 0xFFF0) == IDM_AUTO_DISPLAYS) {
+            AsbVm vm = (AsbVm)asb_find_vm_by_id(d->vm_id);
+            int state = asb_vm_display_monitor_state(vm);
+            if (state >= 0 && FAILED(asb_vm_set_display_monitor_enabled(vm, !state)))
+                idd_log(d, L"Could not queue the display watcher setting.");
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_SHARE_CLIPBOARD) {
             HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
             d->share_clipboard = !d->share_clipboard;

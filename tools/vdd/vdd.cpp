@@ -27,6 +27,7 @@ Environment:
 --*/
 
 #include "vdd.h"
+#include "../agent/display_settings.h"
 
 #include <stdlib.h>  /* malloc, free */
 #include <stdarg.h>  /* va_list, va_start, va_end */
@@ -1741,12 +1742,13 @@ static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx,
 static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
 {
     if (InterlockedCompareExchange(&ctx->stopping, 0, 0)) return;
+    BOOL recoveryEnabled = asb_display_settings_enabled();
     DisplayGpuPacket request = {};
     UINT64 session;
     AcquireSRWLockExclusive(&ctx->swapLock);
     IDDCX_MONITOR monitor = ctx->hMonitor;
     VDD_SWAP_PROC* proc = ctx->pSwapProc;
-    if (ctx->swapChanging) {
+    if (ctx->swapChanging || (!proc && !recoveryEnabled)) {
         ReleaseSRWLockExclusive(&ctx->swapLock);
         return;
     }

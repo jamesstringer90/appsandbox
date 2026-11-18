@@ -18,11 +18,14 @@
     NSString                   *_cmdPending;
     NSString                   *_cmdResponse;
     BOOL                        _cmdReady;
+    BOOL                        _cmdBusy;
+    BOOL                        _cmdWaiting;
 }
 @property (nonatomic, strong) VZVirtioSocketDevice *socketDevice;
 @property (nonatomic, strong) AsbIvshmemTransport *ivshmemTransport;   /* set => Windows/ivshmem path */
 @property (nonatomic, copy)   NSString *vmName;
 @property (nonatomic, assign) BOOL online;
+@property (atomic, assign) NSInteger displayMonitorState;
 @property (nonatomic, assign) uint64_t lastHeartbeatMs;
 @property (nonatomic, assign) BOOL stopRequested;
 @property (nonatomic, assign) BOOL running;
@@ -40,6 +43,7 @@
         _cmdSeq = 0;
         _queue = dispatch_queue_create("com.appsandbox.agent", DISPATCH_QUEUE_SERIAL);
         _cmdCond = [[NSCondition alloc] init];
+        _displayMonitorState = -1;
     }
     return self;
 }
@@ -53,6 +57,7 @@
         _cmdSeq = 0;
         _queue = dispatch_queue_create("com.appsandbox.agent", DISPATCH_QUEUE_SERIAL);
         _cmdCond = [[NSCondition alloc] init];
+        _displayMonitorState = -1;
     }
     return self;
 }
@@ -73,10 +78,7 @@
 - (void)stop {
     self.stopRequested = YES;
     [self closeSocket];
-    [_cmdCond lock];
-    _cmdReady = YES;
-    [_cmdCond broadcast];
-    [_cmdCond unlock];
+    [self deliverResponse:nil];
     if (self.online) {
         [self setOnlineOnMain:NO];
     }
@@ -300,6 +302,11 @@
 }
 
 - (void)processAsyncMessage:(const char *)line {
+    if (strncmp(line, "display_monitor:", 16) == 0) {
+        self.displayMonitorState = !strcmp(line + 16, "enabled") ? 1 :
+            !strcmp(line + 16, "disabled") ? 0 : -1;
+        return;
+    }
     if (strcmp(line, "heartbeat") == 0) {
         self.lastHeartbeatMs = [self nowMs];
         return;
@@ -352,30 +359,39 @@
 #pragma mark - Command dispatch
 
 - (NSString *)sendCommand:(NSString *)cmd timeout:(NSTimeInterval)timeoutSec {
-    if (!self.online) return nil;
-
     [_cmdCond lock];
+    if (_cmdBusy || self.stopRequested || !self.online) {
+        [_cmdCond unlock];
+        return nil;
+    }
+    _cmdBusy = YES;
+    _cmdWaiting = timeoutSec > 0;
     _cmdPending = [cmd copy];
     _cmdResponse = nil;
     _cmdReady = NO;
-    [_cmdCond unlock];
-
+    if (!_cmdWaiting) {
+        [_cmdCond unlock];
+        return @"queued";
+    }
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeoutSec];
     NSString *resp = nil;
-    [_cmdCond lock];
     while (!_cmdReady) {
         if (![_cmdCond waitUntilDate:deadline]) break;
     }
     resp = _cmdResponse;
     _cmdResponse = nil;
+    _cmdWaiting = NO;
+    if (_cmdReady) _cmdBusy = NO;
     [_cmdCond unlock];
     return resp;
 }
 
 - (void)deliverResponse:(nullable NSString *)resp {
     [_cmdCond lock];
-    _cmdResponse = resp;
+    _cmdPending = nil;
+    _cmdResponse = _cmdWaiting ? resp : nil;
     _cmdReady = YES;
+    if (!_cmdWaiting) _cmdBusy = NO;
     [_cmdCond broadcast];
     [_cmdCond unlock];
 }
@@ -412,6 +428,7 @@
 }
 
 - (void)setOnlineOnMain:(BOOL)online {
+    if (!online) self.displayMonitorState = -1;
     if (self.online == online) return;
     self.online = online;
     VmAgentOnlineChange block = self.onOnlineChange;

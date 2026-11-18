@@ -119,6 +119,8 @@ void asb_mac_vm_set_audio_muted(AsbVmId vm_id, BOOL muted);
 void asb_mac_vm_set_clipboard_sync(AsbVmId vm_id, BOOL enabled);
 BOOL asb_mac_vm_clipboard_sharing_enabled(AsbVmId vm_id);
 BOOL asb_mac_vm_set_clipboard_sharing_enabled(AsbVmId vm_id, BOOL enabled);
+int asb_mac_vm_display_monitor_state(AsbVmId vm_id);
+int asb_mac_vm_set_display_monitor_enabled(AsbVmId vm_id, BOOL enabled);
 
 /* Headless mode -- call BEFORE asb_mac_init / any VM start. Gates the parts of
  * the core that need a GUI login session:
