@@ -36,6 +36,7 @@ const char *asb_api_operations_json(void)
         OP("display_configure","Set automatic guest display recovery and extra-display suppression. Requires an updated Windows guest and is saved inside the VM. Changes are asynchronous; read display_status to confirm.","PUT","/vm-ids/{vm_id}/display",VM ",\"automaticallyDisableExtraDisplays\":" BOOL,"\"vm_id\",\"automaticallyDisableExtraDisplays\"") ","
         OP("display_open","Open or focus the local VM viewer when a host desktop is available.","POST","/vm-ids/{vm_id}/display",VM,"\"vm_id\"") ","
         OP("display_close","Close the local viewer without finishing agent input work.","DELETE","/vm-ids/{vm_id}/display",VM,"\"vm_id\"") ","
+        OP("send_sas","Request Ctrl+Alt+Del in a Windows guest. Requires display_status.sasSupported. Asynchronous acceptance does not confirm that Windows displayed the security screen; guest failures are logged.","POST","/vm-ids/{vm_id}/sas",VM,"\"vm_id\"") ","
         OP("snapshot_list","Read snapshots, branches, and the current pointer.","GET","/vm-ids/{vm_id}/snapshots",VM,"\"vm_id\"") ","
         OP("snapshot_take","Take a snapshot of a stopped VM.","POST","/vm-ids/{vm_id}/snapshots",VM ",\"name\":" STR,"\"vm_id\"") ","
         OP("snapshot_delete","Delete a snapshot by integer index.","DELETE","/vm-ids/{vm_id}/snapshots/{snapshot_index}",VM ",\"snapshot_index\":" INT,"\"vm_id\",\"snapshot_index\"") ","

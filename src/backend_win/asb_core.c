@@ -4342,6 +4342,19 @@ ASB_API HRESULT asb_vm_set_display_monitor_enabled(AsbVm vm, BOOL enabled)
                          NULL, 0, 0) ? S_OK : HRESULT_FROM_WIN32(ERROR_BUSY);
 }
 
+ASB_API BOOL asb_vm_sas_supported(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst && inst->agent_online && !_wcsicmp(inst->os_type, L"Windows") &&
+        InterlockedCompareExchange(&inst->sas_supported, 0, 0) != 0;
+}
+
+ASB_API HRESULT asb_vm_send_sas(AsbVm vm)
+{
+    if (!asb_vm_sas_supported(vm)) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    return vm_agent_send(vm_inst(vm), "sas", NULL, 0, 0) ? S_OK : HRESULT_FROM_WIN32(ERROR_BUSY);
+}
+
 ASB_API void asb_vm_set_display_suppressed(AsbVm vm, BOOL suppressed)
 {
     VmInstance *inst = vm_inst(vm);

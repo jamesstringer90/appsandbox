@@ -1654,6 +1654,20 @@ static int handle_request(PHTTP_REQUEST req)
             return 0;
         }
 
+        if (wcscmp(sub, L"sas") == 0) {
+            if (verb != HttpVerbPOST) {
+                send_err(req->RequestId, 405, "Method Not Allowed", "method", "use POST to send Ctrl+Alt+Del");
+                return 0;
+            }
+            HRESULT result = asb_vm_send_sas(vm);
+            if (result == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED))
+                send_err(req->RequestId, 409, "Conflict", "not_supported", "the connected Windows guest does not support Ctrl+Alt+Del");
+            else if (FAILED(result))
+                send_err(req->RequestId, 409, "Conflict", "busy", "the guest agent is busy; retry shortly");
+            else send_json(req->RequestId, 202, "Accepted", "{\"ok\":true,\"accepted\":true}");
+            return 0;
+        }
+
         if (wcscmp(sub, L"display") == 0) {
             VmInstance *v = asb_vm_instance(vm);
             if (!v) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
@@ -1742,9 +1756,10 @@ static int handle_request(PHTTP_REQUEST req)
                 BOOL open = display_is_open(v->unique_id);
                 BOOL ready = open || asb_vm_idd_ready(vm);
                 int monitor = asb_vm_display_monitor_state(vm);
-                sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s,\"automaticallyDisableExtraDisplays\":%s}",
+                sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s,\"automaticallyDisableExtraDisplays\":%s,\"sasSupported\":%s}",
                           open ? "true" : "false", ready ? "true" : "false",
-                          monitor < 0 ? "null" : monitor ? "true" : "false");
+                          monitor < 0 ? "null" : monitor ? "true" : "false",
+                          asb_vm_sas_supported(vm) ? "true" : "false");
                 send_json(req->RequestId, 200, "OK", b);
                 return 0;
             }

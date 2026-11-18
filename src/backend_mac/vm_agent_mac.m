@@ -26,6 +26,7 @@
 @property (nonatomic, copy)   NSString *vmName;
 @property (nonatomic, assign) BOOL online;
 @property (atomic, assign) NSInteger displayMonitorState;
+@property (atomic, assign) BOOL sasSupported;
 @property (nonatomic, assign) uint64_t lastHeartbeatMs;
 @property (nonatomic, assign) BOOL stopRequested;
 @property (nonatomic, assign) BOOL running;
@@ -302,6 +303,10 @@
 }
 
 - (void)processAsyncMessage:(const char *)line {
+    if (!strncmp(line, "sas:", 4)) {
+        self.sasSupported = !strcmp(line + 4, "supported");
+        return;
+    }
     if (strncmp(line, "display_monitor:", 16) == 0) {
         self.displayMonitorState = !strcmp(line + 16, "enabled") ? 1 :
             !strcmp(line + 16, "disabled") ? 0 : -1;
@@ -429,6 +434,7 @@
 
 - (void)setOnlineOnMain:(BOOL)online {
     if (!online) self.displayMonitorState = -1;
+    if (!online) self.sasSupported = NO;
     if (self.online == online) return;
     self.online = online;
     VmAgentOnlineChange block = self.onOnlineChange;

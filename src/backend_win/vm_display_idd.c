@@ -370,6 +370,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_MATCH_WINDOW   0x1030
 #define IDM_SHARE_CLIPBOARD 0x1040
 #define IDM_AUTO_DISPLAYS  0x1050
+#define IDM_SEND_SAS       0x1060
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -3198,6 +3199,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
                 AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_AUTO_DISPLAYS,
                             L"Automatically disable non AppSandbox displays");
             AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_MATCH_WINDOW, L"Match window size");
+            if (!_wcsicmp(d->os_type, L"Windows"))
+                AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_SEND_SAS, L"Send Ctrl+Alt+Del");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
@@ -3377,10 +3380,17 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 int state = asb_vm_display_monitor_state((AsbVm)asb_find_vm_by_id(d->vm_id));
                 EnableMenuItem(menu, IDM_AUTO_DISPLAYS, MF_BYCOMMAND | (state >= 0 ? MF_ENABLED : MF_GRAYED));
                 CheckMenuItem(menu, IDM_AUTO_DISPLAYS, MF_BYCOMMAND | (state > 0 ? MF_CHECKED : MF_UNCHECKED));
+                EnableMenuItem(menu, IDM_SEND_SAS, MF_BYCOMMAND |
+                    (asb_vm_sas_supported((AsbVm)asb_find_vm_by_id(d->vm_id)) ? MF_ENABLED : MF_GRAYED));
             }
         }
         break;
     case WM_SYSCOMMAND:
+        if (d && (wp & 0xFFF0) == IDM_SEND_SAS) {
+            if (FAILED(asb_vm_send_sas((AsbVm)asb_find_vm_by_id(d->vm_id))))
+                idd_log(d, L"Could not queue Ctrl+Alt+Del.");
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_AUTO_DISPLAYS) {
             AsbVm vm = (AsbVm)asb_find_vm_by_id(d->vm_id);
             int state = asb_vm_display_monitor_state(vm);

@@ -258,6 +258,7 @@ class Client:
         displayOpen, which also goes false if the user closes the window."""
         return self._req("POST", (self._vm_path(name,vm_id=vm_id) + "/display"))
     def close_display(self, name=None, *, vm_id=None): return self._req("DELETE", (self._vm_path(name,vm_id=vm_id) + "/display"))
+    def send_sas(self, name=None, *, vm_id=None): return self._req("POST", self._vm_path(name,vm_id=vm_id) + "/sas")
     def configure_display(self, name=None, *, vm_id=None, automatically_disable_extra_displays):
         return self._req('PUT', self._vm_path(name,vm_id=vm_id) + '/display',
                          {'automaticallyDisableExtraDisplays': automatically_disable_extra_displays})

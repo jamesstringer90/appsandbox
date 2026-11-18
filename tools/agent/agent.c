@@ -78,6 +78,8 @@ static HANDLE                g_stop_event;
 static AsbConn *             g_client_sock = NULL; /* Active persistent connection */
 static volatile BOOL         g_os_shutting_down = FALSE;
 static CRITICAL_SECTION      g_send_cs;     /* Protects send_line from concurrent callers */
+static HMODULE              g_sas_module;
+static void (WINAPI *g_send_sas)(BOOL);
 
 /* ---- Logging ---- */
 
@@ -1845,6 +1847,52 @@ static ULONG primary_nic_index(void)
     return index;
 }
 
+static DWORD send_sas(void)
+{
+    static const wchar_t policy[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System";
+    HKEY key = NULL;
+    BOOL restore = FALSE;
+    DWORD session = WTSGetActiveConsoleSessionId();
+    DWORD value = 0, type = 0, size = sizeof(value);
+    DWORD result;
+    if (!g_send_sas) return ERROR_NOT_SUPPORTED;
+    if (!session || session == 0xFFFFFFFF) return ERROR_NO_SUCH_LOGON_SESSION;
+    result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, policy, 0,
+        KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY, &key);
+    if (result != ERROR_SUCCESS) {
+        agent_log("SAS: opening the Windows software-SAS policy failed (%lu).", result);
+        return result;
+    }
+    result = RegQueryValueExW(key, L"SoftwareSASGeneration", NULL, &type, (BYTE *)&value, &size);
+    if (result == ERROR_FILE_NOT_FOUND) {
+        value = 1;
+        result = RegSetValueExW(key, L"SoftwareSASGeneration", 0, REG_DWORD,
+                                (const BYTE *)&value, sizeof(value));
+        restore = result == ERROR_SUCCESS;
+    } else if (result == ERROR_SUCCESS &&
+        (type != REG_DWORD || size != sizeof(value) || (value != 1 && value != 3))) {
+        result = ERROR_ACCESS_DISABLED_BY_POLICY;
+    }
+    if (result != ERROR_SUCCESS) goto done;
+    g_send_sas(FALSE);
+    agent_log("SAS: requested for console session %lu.", session);
+done:
+    if (restore) {
+        size = sizeof(value);
+        if (RegQueryValueExW(key, L"SoftwareSASGeneration", NULL, &type,
+                            (BYTE *)&value, &size) == ERROR_SUCCESS &&
+            type == REG_DWORD && size == sizeof(value) && value == 1) {
+            DWORD cleanup = RegDeleteValueW(key, L"SoftwareSASGeneration");
+            if (cleanup != ERROR_SUCCESS) {
+                agent_log("SAS: policy restoration failed (%lu).", cleanup);
+                if (result == ERROR_SUCCESS) result = cleanup;
+            }
+        }
+    }
+    RegCloseKey(key);
+    return result;
+}
+
 static void handle_client(AsbConn *client)
 {
     char buf[256];
@@ -1871,6 +1919,7 @@ static void handle_client(AsbConn *client)
     /* Report IDD driver status to host (force: always send on connect so a reconnect re-syncs) */
     report_idd_status(client, 1);
     report_display_monitor(client);
+    send_line(client, g_send_sas ? "sas:supported" : "sas:unsupported");
 
     /* Initial device checks */
     ensure_vdd_running();
@@ -2080,6 +2129,17 @@ static void handle_client(AsbConn *client)
         }
         else if (strcmp(cmd, "idd_connect") == 0) {
             handle_idd_connect(client, tag);
+        }
+        else if (!strcmp(cmd, "sas")) {
+            DWORD result = send_sas();
+            if (result == ERROR_SUCCESS) REPLY("ok");
+            else {
+                char response[64];
+                agent_log("SAS: request failed (%lu).", result);
+                agent_log_to_host("Send Ctrl+Alt+Del failed (%lu).", result);
+                sprintf_s(response, sizeof(response), "error:sas:%lu", result);
+                REPLY(response);
+            }
         }
         else if (!strcmp(cmd, "display_monitor:0") || !strcmp(cmd, "display_monitor:1")) {
             DWORD result = set_display_monitor_enabled(cmd[16] == '1');
@@ -2501,6 +2561,7 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
 static void WINAPI service_main(DWORD argc, LPSTR *argv)
 {
     HANDLE thread;
+    BOOL listener_stopped = TRUE;
     g_display_monitor_enabled = asb_display_settings_enabled();
 
     (void)argc; (void)argv;
@@ -2522,6 +2583,8 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     /* Wire p9copy logging into agent_log */
     p9_set_log(p9copy_log);
 
+    g_sas_module = LoadLibraryExW(L"sas.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (g_sas_module) g_send_sas = (void (WINAPI *)(BOOL))GetProcAddress(g_sas_module, "SendSAS");
     disable_hyperv_adapter();
 
     /* Start listener on a worker thread */
@@ -2573,7 +2636,7 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
        polls g_stop_event every 1s and exits on its own. Nothing socket-level to close here. */
     if (thread) {
         agent_log("Waiting for listener thread...");
-        WaitForSingleObject(thread, 5000);
+        listener_stopped = WaitForSingleObject(thread, 5000) == WAIT_OBJECT_0;
         CloseHandle(thread);
         agent_log("Listener thread exited.");
     }
@@ -2582,6 +2645,11 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     DeleteCriticalSection(&g_send_cs);
 
     agent_log("Service stopped.");
+    if (listener_stopped) {
+        g_send_sas = NULL;
+        if (g_sas_module) FreeLibrary(g_sas_module);
+        g_sas_module = NULL;
+    }
     set_service_status(SERVICE_STOPPED, 0);
 }
 

@@ -78,6 +78,7 @@ typedef struct {
     BOOL        network_cleaned;  /* TRUE after network teardown (idempotent guard) */
     BOOL        agent_online;     /* TRUE when persistent agent connection is active */
     volatile LONG display_monitor_state;
+    volatile LONG sas_supported;
     BOOL        idd_ready;        /* TRUE once the agent reports the display driver is up (idd_status:ok) */
     BOOL        is_template;     /* TRUE = template VM (sysprep after install) */
     BOOL        install_complete; /* TRUE after guest agent first comes online */

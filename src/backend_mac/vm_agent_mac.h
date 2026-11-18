@@ -34,6 +34,7 @@ typedef void (^VmAgentIddStatus)(BOOL ready);
 @property (nonatomic, copy, readonly)     NSString *vmName;
 @property (nonatomic, assign, readonly)   BOOL online;
 @property (atomic, assign, readonly)      NSInteger displayMonitorState;
+@property (atomic, assign, readonly)      BOOL sasSupported;
 @property (nonatomic, assign, readonly)   uint64_t lastHeartbeatMs;
 
 /* Fires on main queue when online flips. */

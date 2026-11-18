@@ -261,6 +261,9 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         ui_log(L"[%s] GPU device recovered successfully.", vm->name);
     } else if (strncmp(buf, "gpu_device_failed:", 18) == 0) {
         ui_log(L"[%s] GPU device still failing (problem %S).", vm->name, buf + 18);
+    } else if (strncmp(buf, "sas:", 4) == 0) {
+        InterlockedExchange(&vm->sas_supported, !strcmp(buf + 4, "supported"));
+        asb_events_changed();
     } else if (strncmp(buf, "display_monitor:", 16) == 0) {
         LONG state = !strcmp(buf + 16, "enabled") ? 1 : !strcmp(buf + 16, "disabled") ? 2 : 0;
         InterlockedExchange(&vm->display_monitor_state, state);
@@ -405,6 +408,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
 
         vm->agent_online = TRUE;
         InterlockedExchange(&vm->display_monitor_state, 0);
+        InterlockedExchange(&vm->sas_supported, 0);
         vm->idd_ready = FALSE;   /* re-evaluated by the agent's idd_status, sent right after hello */
         vm->shutdown_requested = FALSE;
         vm->last_heartbeat = GetTickCount64();
@@ -542,6 +546,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         /* Connection lost */
         vm->agent_online = FALSE;
         InterlockedExchange(&vm->display_monitor_state, 0);
+        InterlockedExchange(&vm->sas_supported, 0);
         vm->idd_ready = FALSE;
         /* Atomically claim the socket so we never double-close a handle that
            vm_agent_stop() may have already closed (and whose value could have
