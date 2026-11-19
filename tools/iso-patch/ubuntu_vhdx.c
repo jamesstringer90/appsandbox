@@ -1954,7 +1954,7 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
         ZeroMemory(&params, sizeof(params));
         params.Version = CREATE_VIRTUAL_DISK_VERSION_2;
         params.Version2.MaximumSize = total_bytes;
-        params.Version2.BlockSizeInBytes = 0;
+        params.Version2.BlockSizeInBytes = 1024 * 1024;
         params.Version2.SectorSizeInBytes = 512;
         params.Version2.PhysicalSectorSizeInBytes = 4096;
         /* Dynamic VHDX: file grows on demand, matches the Windows
