@@ -509,7 +509,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
     NSRect frame = NSMakeRect(0, 0, 1280, 720);
     NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                               NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
-    NSWindow *window = [[AsbViewerWindow alloc] initWithContentRect:frame
+    AsbViewerWindow *window = [[AsbViewerWindow alloc] initWithContentRect:frame
                                                   styleMask:style
                                                     backing:NSBackingStoreBuffered
                                                       defer:NO];
@@ -522,6 +522,9 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
     _name = [name copy];
     _vmId = vmId;
+    window.vmName = _name;
+    __weak IddDisplayWindow *weakSelf = self;
+    window.populateViewerOptions = ^(NSMenu *menu) { [weakSelf populateViewerOptions:menu]; };
     _transport = transport;
     _stop = 1;
     _displayFd = -1;
@@ -617,10 +620,9 @@ static __weak IddDisplayWindow *g_mouseOwner;
     if (follow) _followDisplaySize = YES;
     BOOL ready = [self canMatchWindowSize];
     _adjustingDisplaySize = YES;
-    BOOL fullscreen=((AsbViewerWindow *)self.window).viewerFullscreen;
-    if (!fullscreen) self.window.contentMinSize = _matchWindow && ready
+    self.window.contentMinSize = _matchWindow && ready
         ? [self.view convertSizeFromBacking:NSMakeSize(DISPLAY_MIN_WIDTH, DISPLAY_MIN_HEIGHT)] : _normalMinSize;
-    if (!fullscreen) self.window.contentMaxSize = _matchWindow && ready
+    self.window.contentMaxSize = _matchWindow && ready
         ? [self.view convertSizeFromBacking:NSMakeSize(DISPLAY_MAX_WIDTH, DISPLAY_MAX_HEIGHT)] : _normalMaxSize;
     _adjustingDisplaySize = NO;
     if (self.view.inLiveResize || self.window.isMiniaturized || _fullscreenSizing) return;
@@ -637,11 +639,11 @@ static __weak IddDisplayWindow *g_mouseOwner;
         height = (uint32_t)fmax(DISPLAY_MIN_HEIGHT, fmin(DISPLAY_MAX_HEIGHT, round(pixels.height)));
         resizeWindow = fabs(pixels.width - width) > 0.5 || fabs(pixels.height - height) > 0.5;
         _followDisplaySize = NO;
-    } else if (_followDisplaySize && !fullscreen && !(self.window.styleMask & NSWindowStyleMaskFullScreen)) {
+    } else if (_followDisplaySize && !(self.window.styleMask & NSWindowStyleMaskFullScreen)) {
         resizeWindow = YES;
         _followDisplaySize = NO;
     }
-    if (resizeWindow && !fullscreen && !(self.window.styleMask & NSWindowStyleMaskFullScreen)) {
+    if (resizeWindow && !(self.window.styleMask & NSWindowStyleMaskFullScreen)) {
         _adjustingDisplaySize = YES;
         [self.window setContentSize:[self.view convertSizeFromBacking:NSMakeSize(width, height)]];
         _adjustingDisplaySize = NO;
@@ -681,9 +683,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
     [self performSelector:@selector(flushDisplaySize) withObject:nil afterDelay:0.15];
 }
 
-- (void)showTitlebarMenuAtPoint:(NSPoint)point {
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
-    menu.autoenablesItems = NO;
+- (void)populateViewerOptions:(NSMenu *)menu {
     NSMenuItem *mute = [menu addItemWithTitle:@"Mute audio" action:@selector(toggleAudioMute:) keyEquivalent:@""];
     mute.target = self;
     mute.state = _audioMuted ? NSControlStateValueOn : NSControlStateValueOff;
@@ -694,11 +694,6 @@ static __weak IddDisplayWindow *g_mouseOwner;
     NSMenuItem *clipboard = [menu addItemWithTitle:@"Share clipboard" action:@selector(toggleClipboardSharing:) keyEquivalent:@""];
     clipboard.target = self;
     clipboard.state = self.clipboardSharingEnabled ? NSControlStateValueOn : NSControlStateValueOff;
-    AsbViewerWindow *window=(AsbViewerWindow *)self.window;
-    NSMenuItem *fullscreen=[menu addItemWithTitle:@"Borderless fullscreen" action:@selector(toggleViewerFullscreen:) keyEquivalent:@""];
-    fullscreen.target=window;
-    fullscreen.enabled=_agentOverlay.ready && !(window.styleMask&NSWindowStyleMaskFullScreen);
-    fullscreen.state=window.viewerFullscreen?NSControlStateValueOn:NSControlStateValueOff;
     int displayMonitor = asb_mac_vm_display_monitor_state(self.vmId);
     NSMenuItem *displays = [menu addItemWithTitle:@"Automatically disable non AppSandbox displays"
         action:@selector(toggleDisplayMonitor:) keyEquivalent:@""];
@@ -713,6 +708,12 @@ static __weak IddDisplayWindow *g_mouseOwner;
     NSMenuItem *sas = [menu addItemWithTitle:@"Send Ctrl+Alt+Del" action:@selector(sendSas:) keyEquivalent:@""];
     sas.target = self;
     sas.enabled = asb_mac_vm_sas_supported(self.vmId);
+}
+
+- (void)showTitlebarMenuAtPoint:(NSPoint)point {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+    menu.autoenablesItems = NO;
+    [(AsbViewerWindow *)self.window populateViewerMenu:menu];
     _trackingMenus++;
     [self releaseKeyboardCapture];
     [self releaseMouseCapture];
@@ -726,24 +727,6 @@ static __weak IddDisplayWindow *g_mouseOwner;
     (void)sender;
     if (asb_mac_vm_send_sas(self.vmId) != ASB_OK)
         NSLog(@"IDD [%@]: Could not queue Ctrl+Alt+Del.", self.name);
-}
-
-- (NSDictionary *)performViewerOption:(NSUInteger)option {
-    switch (option) {
-    case 0: [self sendSas:nil];break;
-    case 1: [self toggleMatchWindowSize:nil];break;
-    case 2: [self toggleClipboardSharing:nil];break;
-    case 3: [self toggleTransmitHotkeys:nil];break;
-    case 4: [self toggleAudioMute:nil];break;
-    }
-    unsigned enabled=28,checked=0;
-    if (asb_mac_vm_sas_supported(self.vmId)) enabled|=1;
-    if ([self canMatchWindowSize]) enabled|=2;
-    if (_matchWindow) checked|=2;
-    if (self.clipboardSharingEnabled) checked|=4;
-    if (_transmitHotkeys) checked|=8;
-    if (_audioMuted) checked|=16;
-    return @{@"enabled":@(enabled),@"checked":@(checked)};
 }
 
 - (void)toggleDisplayMonitor:(id)sender {
@@ -1184,11 +1167,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
             _asbInput=asb_mac_input_session(&target);asb_mac_channel_release(target.channel);
         }
     }
-    if (!_agentOverlay) {
-        _agentOverlay=[[AsbAgentOverlay alloc] initWithView:self.view vmId:self.vmId];
-        __weak IddDisplayWindow *weakSelf=self;
-        _agentOverlay.viewerOptions=^NSDictionary *(NSUInteger option) { return [weakSelf performViewerOption:option]; };
-    }
+    if (!_agentOverlay) _agentOverlay=[[AsbAgentOverlay alloc] initWithView:self.view vmId:self.vmId];
     self.userClosed = NO;
     [self setClipboardSyncEnabled:NSApp.isActive && self.window.isKeyWindow && !self.window.isMiniaturized];
     asb_events_changed();
@@ -2333,13 +2312,13 @@ static __weak IddDisplayWindow *g_mouseOwner;
 }
 
 - (void)windowDidFailToEnterFullScreen:(NSWindow *)window {
-    (void)window;
+    [(AsbViewerWindow *)window fullscreenTransitionFinished];
     _fullscreenSizing = NO;
     [self flushDisplaySize];
 }
 
 - (void)windowDidFailToExitFullScreen:(NSWindow *)window {
-    (void)window;
+    [(AsbViewerWindow *)window fullscreenTransitionFinished];
     _fullscreenSizing = NO;
     [self flushDisplaySize];
 }

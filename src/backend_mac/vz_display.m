@@ -236,6 +236,12 @@ int asb_mac_native_input_connect(const AsbMacHeadlessTarget *target)
     if (_preparingInput) --_preparingInput;
     [self updateInputControl];
 }
+- (void)populateViewerOptions:(NSMenu *)menu {
+    NSMenuItem *item = [menu addItemWithTitle:@"Share clipboard" action:@selector(toggleClipboardSharing:) keyEquivalent:@""];
+    item.target = self;
+    item.state = asb_mac_vm_clipboard_sharing_enabled(self.vmId) ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
 - (NSEvent *)routeViewerInput:(NSEvent *)event {
     if (event.window!=self.window) return event;
     if (event.type == NSEventTypeRightMouseDown && !self.window.attachedSheet) {
@@ -243,14 +249,7 @@ int asb_mac_native_input_connect(const AsbMacHeadlessTarget *target)
         if (location.y >= NSMaxY(self.window.contentLayoutRect) && location.y < self.window.frame.size.height) {
             NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
             menu.autoenablesItems=NO;
-            NSMenuItem *item = [menu addItemWithTitle:@"Share clipboard" action:@selector(toggleClipboardSharing:) keyEquivalent:@""];
-            item.target = self;
-            item.state = asb_mac_vm_clipboard_sharing_enabled(self.vmId) ? NSControlStateValueOn : NSControlStateValueOff;
-            AsbViewerWindow *window=(AsbViewerWindow *)self.window;
-            item=[menu addItemWithTitle:@"Borderless fullscreen" action:@selector(toggleViewerFullscreen:) keyEquivalent:@""];
-            item.target=window;
-            item.enabled=_overlay.ready && !(window.styleMask&NSWindowStyleMaskFullScreen);
-            item.state=window.viewerFullscreen?NSControlStateValueOn:NSControlStateValueOff;
+            [(AsbViewerWindow *)self.window populateViewerMenu:menu];
             [menu popUpMenuPositioningItem:nil atLocation:[self.window convertPointToScreen:location] inView:nil];
             return nil;
         }
@@ -313,6 +312,12 @@ int asb_mac_native_input_connect(const AsbMacHeadlessTarget *target)
     _vm = vm;
     _vmId = vmId;
     _offscreen=offscreen;
+    if (!offscreen) {
+        AsbViewerWindow *viewer = (AsbViewerWindow *)window;
+        viewer.vmName = vm.name;
+        __weak VzDisplayWindow *weakSelf = self;
+        viewer.populateViewerOptions = ^(NSMenu *menu) { [weakSelf populateViewerOptions:menu]; };
+    }
     self.userClosed=offscreen;
     _vmView = [[VZVirtualMachineView alloc] initWithFrame:frame];
     _vmView.capturesSystemKeys = !offscreen;
@@ -332,12 +337,6 @@ int asb_mac_native_input_connect(const AsbMacHeadlessTarget *target)
         _overlay=[[AsbAgentOverlay alloc] initWithView:self.vmView vmId:self.vmId];
         __weak VzDisplayWindow *weak=self;
         _overlay.prepareForAgentInput=^{ [weak prepareForAgentInput];[weak finishPreparingForAgentInput]; };
-        _overlay.viewerOptions=^NSDictionary *(NSUInteger option) {
-            VzDisplayWindow *owner=weak;
-            if (!owner) return nil;
-            if (option==2) [owner toggleClipboardSharing:nil];
-            return @{@"enabled":@4,@"checked":@(asb_mac_vm_clipboard_sharing_enabled(owner.vmId)?4:0)};
-        };
         NSEventMask mask=NSEventMaskKeyDown|NSEventMaskKeyUp|NSEventMaskFlagsChanged|NSEventMaskMouseMoved|
             NSEventMaskLeftMouseDown|NSEventMaskLeftMouseUp|NSEventMaskRightMouseDown|NSEventMaskRightMouseUp|
             NSEventMaskOtherMouseDown|NSEventMaskOtherMouseUp|NSEventMaskLeftMouseDragged|NSEventMaskRightMouseDragged|
@@ -365,6 +364,14 @@ int asb_mac_native_input_connect(const AsbMacHeadlessTarget *target)
 }
 
 #pragma mark - NSWindowDelegate
+
+- (void)windowDidFailToEnterFullScreen:(NSWindow *)window {
+    [(AsbViewerWindow *)window fullscreenTransitionFinished];
+}
+
+- (void)windowDidFailToExitFullScreen:(NSWindow *)window {
+    [(AsbViewerWindow *)window fullscreenTransitionFinished];
+}
 
 - (void)windowWillClose:(NSNotification *)notification {
     self.userClosed=YES;

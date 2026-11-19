@@ -1384,7 +1384,7 @@ static int handle_request(int fd, HttpReq *r) {
                 else if (result != ASB_OK)
                     send_err(fd, 409, "Conflict", @"busy", @"the guest agent is busy; retry shortly");
                 else if (!viewerReady)
-                    send_err(fd,409,"Conflict",@"display_not_ready",@"open the viewer and wait for its overlay before configuring fullscreen");
+                    send_err(fd,409,"Conflict",@"display_not_ready",@"open the viewer and wait for any fullscreen transition to finish");
                 else send_json(fd, 202, "Accepted", @"{\"ok\":true,\"accepted\":true}");
                 return 0;
             }

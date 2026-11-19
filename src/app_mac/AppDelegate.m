@@ -1,6 +1,7 @@
 #import "AppDelegate.h"
 #import "MainWindowController.h"
 #import "asb_core_mac.h"
+#import "agent_overlay.h"
 #import "ui.h"
 #include "asb_types.h"
 #include "asb_events.h"
@@ -13,6 +14,8 @@ typedef NS_ENUM(NSInteger, VmMenuAction) {
 
 @interface AppDelegate () <NSMenuDelegate, NSMenuItemValidation>
 @property (nonatomic, strong) NSStatusItem *statusItem;
+@property (nonatomic, strong) NSMenuItem *viewerMenuItem;
+@property (nonatomic, weak) AsbViewerWindow *viewerMenuWindow;
 @property (nonatomic) BOOL statusMenuOpen;
 @property (nonatomic, strong) id statusMouseMonitor;
 @property (nonatomic, strong) id statusActivationObserver;
@@ -155,6 +158,12 @@ static NSImage *menuBarLogo(void) {
 }
 
 - (void)menuNeedsUpdate:(NSMenu *)menu {
+    if (menu == self.viewerMenuItem.submenu) {
+        AsbViewerWindow *viewer = self.viewerMenuWindow;
+        if (viewer) [viewer populateViewerMenu:menu];
+        else [menu removeAllItems];
+        return;
+    }
     if (menu != self.statusItem.menu) return;
     [self refreshStatusMenu];
 }
@@ -255,6 +264,22 @@ static NSImage *menuBarLogo(void) {
     return YES;
 }
 
+- (void)updateViewerMenuForWindow:(NSWindow *)window {
+    AsbViewerWindow *viewer = [window isKindOfClass:AsbViewerWindow.class] ? (AsbViewerWindow *)window : nil;
+    self.viewerMenuWindow = viewer;
+    self.viewerMenuItem.title = viewer.vmName ?: @"";
+    self.viewerMenuItem.submenu.title = self.viewerMenuItem.title;
+    self.viewerMenuItem.hidden = !viewer.vmName.length;
+    if (viewer) [viewer populateViewerMenu:self.viewerMenuItem.submenu];
+}
+
+- (void)viewerMenuFocusChanged:(NSNotification *)notification {
+    if ([notification.name isEqualToString:NSWindowDidBecomeKeyNotification])
+        [self updateViewerMenuForWindow:notification.object];
+    else if (notification.object == self.viewerMenuWindow)
+        [self updateViewerMenuForWindow:NSApp.keyWindow == notification.object ? nil : NSApp.keyWindow];
+}
+
 - (void)installMenuItems {
     NSMenu *mainMenu = [NSApp mainMenu];
     if (!mainMenu) mainMenu = [[NSMenu alloc] init];
@@ -273,6 +298,18 @@ static NSImage *menuBarLogo(void) {
     quit.target = NSApp;
     quit.keyEquivalent = @"q";
     quit.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+
+    NSMenu *viewerMenu = [[NSMenu alloc] initWithTitle:@""];
+    viewerMenu.delegate = self;
+    viewerMenu.autoenablesItems = NO;
+    self.viewerMenuItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    self.viewerMenuItem.submenu = viewerMenu;
+    [mainMenu addItem:self.viewerMenuItem];
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    for (NSNotificationName name in @[NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification,
+                                      NSWindowWillCloseNotification])
+        [center addObserver:self selector:@selector(viewerMenuFocusChanged:) name:name object:nil];
+    [self updateViewerMenuForWindow:NSApp.keyWindow];
     [NSApp setMainMenu:mainMenu];
 }
 
