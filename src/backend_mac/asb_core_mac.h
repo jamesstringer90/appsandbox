@@ -157,6 +157,8 @@ int  asb_mac_open_display(AsbVmId vm_id);
 
 /* Close the VM's display window if open (no-op otherwise). */
 void asb_mac_close_display(AsbVmId vm_id);
+BOOL asb_mac_display_fullscreen(AsbVmId vm_id);
+BOOL asb_mac_set_display_fullscreen(AsbVmId vm_id, BOOL enabled);
 void asb_mac_display_did_close(AsbVmId vm_id, id controller);
 
 /* Path of the AppSandbox SSH private key (~/Library/Application Support/

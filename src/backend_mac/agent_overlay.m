@@ -2,6 +2,7 @@
 #import <WebKit/WebKit.h>
 #import <QuartzCore/QuartzCore.h>
 #include "headless_vm.h"
+#include "asb_events.h"
 #include <math.h>
 
 NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
@@ -49,13 +50,81 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
 - (NSArray *)accessibilityChildren { return @[]; }
 @end
 
-@implementation AsbViewerWindow
+static __weak AsbViewerWindow *g_fullscreenOwner;
+static NSApplicationPresentationOptions g_windowedPresentation;
+
+@implementation AsbViewerWindow {
+    NSRect _windowedFrame;
+    NSWindowStyleMask _windowedStyle;
+    NSSize _windowedMin,_windowedMax;
+    BOOL _viewerFullscreen;
+}
+- (instancetype)initWithContentRect:(NSRect)rect styleMask:(NSWindowStyleMask)style backing:(NSBackingStoreType)backing defer:(BOOL)defer {
+    self=[super initWithContentRect:rect styleMask:style backing:backing defer:defer];
+    if (!self) return nil;
+    NSNotificationCenter *nc=NSNotificationCenter.defaultCenter;
+    for (NSNotificationName name in @[NSWindowDidBecomeKeyNotification,NSWindowDidResignKeyNotification,NSWindowWillCloseNotification])
+        [nc addObserver:self selector:@selector(viewerEnvironmentChanged:) name:name object:self];
+    for (NSNotificationName name in @[NSApplicationDidBecomeActiveNotification,NSApplicationDidResignActiveNotification,
+        NSApplicationDidChangeScreenParametersNotification])
+        [nc addObserver:self selector:@selector(viewerEnvironmentChanged:) name:name object:NSApp];
+    return self;
+}
+- (BOOL)viewerFullscreen { return _viewerFullscreen; }
+- (BOOL)canBecomeKeyWindow { return _viewerFullscreen || [super canBecomeKeyWindow]; }
+- (BOOL)canBecomeMainWindow { return _viewerFullscreen || [super canBecomeMainWindow]; }
+- (void)viewerEnvironmentChanged:(NSNotification *)note {
+    if ([note.name isEqualToString:NSWindowWillCloseNotification]) _viewerFullscreen=NO;
+    if (_viewerFullscreen && [note.name isEqualToString:NSApplicationDidChangeScreenParametersNotification]) {
+        NSScreen *screen=self.screen?:NSScreen.mainScreen;
+        if (screen) [self setFrame:screen.frame display:YES];
+    }
+    BOOL active=_viewerFullscreen && self.isKeyWindow && NSApp.isActive;
+    if (active && g_fullscreenOwner!=self) {
+        if (!g_fullscreenOwner) g_windowedPresentation=NSApp.presentationOptions;
+        g_fullscreenOwner=self;
+        NSApp.presentationOptions=(g_windowedPresentation & ~(NSApplicationPresentationAutoHideDock|
+            NSApplicationPresentationAutoHideMenuBar))|NSApplicationPresentationHideDock|NSApplicationPresentationHideMenuBar;
+    } else if (!active && g_fullscreenOwner==self) {
+        g_fullscreenOwner=nil;NSApp.presentationOptions=g_windowedPresentation;
+    }
+}
+- (BOOL)setFullscreenEnabled:(BOOL)enabled {
+    if (_viewerFullscreen==enabled) return YES;
+    NSScreen *screen=self.screen?:NSScreen.mainScreen;
+    if (enabled && (!self.viewerOverlay.ready || !screen || (self.styleMask&NSWindowStyleMaskFullScreen))) return NO;
+    if (enabled) {
+        _windowedFrame=self.frame;_windowedStyle=self.styleMask;
+        _windowedMin=self.contentMinSize;_windowedMax=self.contentMaxSize;
+    }
+    [self.viewerOverlay cancelInput];
+    _viewerFullscreen=enabled;
+    if (enabled) {
+        self.contentMinSize=NSMakeSize(1,1);self.contentMaxSize=NSMakeSize(CGFLOAT_MAX,CGFLOAT_MAX);
+        self.styleMask=NSWindowStyleMaskBorderless;
+        [self setFrame:screen.frame display:YES];
+    } else {
+        self.styleMask=_windowedStyle;
+        self.contentMinSize=_windowedMin;self.contentMaxSize=_windowedMax;
+        [self setFrame:[self constrainFrameRect:_windowedFrame toScreen:screen] display:YES];
+    }
+    [self makeKeyAndOrderFront:nil];
+    [self viewerEnvironmentChanged:nil];
+    [self.viewerOverlay refresh];
+    asb_events_changed();
+    return YES;
+}
+- (void)toggleViewerFullscreen:(id)sender { (void)sender;[self setFullscreenEnabled:!_viewerFullscreen]; }
 - (BOOL)makeFirstResponder:(NSResponder *)responder {
     if ([responder isKindOfClass:NSView.class]) {
         for (NSView *view=(NSView *)responder;view;view=view.superview)
             if ([view isKindOfClass:AsbOverlayWebView.class]) return NO;
     }
     return [super makeFirstResponder:responder];
+}
+- (void)dealloc {
+    if (g_fullscreenOwner==self) { g_fullscreenOwner=nil;NSApp.presentationOptions=g_windowedPresentation; }
+    [NSNotificationCenter.defaultCenter removeObserver:self];
 }
 @end
 
@@ -72,7 +141,8 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
     NSTimer *_timer;
     NSMutableArray *_observers;
     unsigned _mouseButtons,_viewerButtons;
-    NSRect _menu;
+    NSRect _menu,_fullscreenExit,_viewerMenu;
+    int _fullscreenZone;
     uint64_t _identity;
     NSTimeInterval _pointerNext;
     BOOL _ready,_closed,_hovered,_updating;
@@ -82,6 +152,7 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
 {
     self=[super init];if (!self) return nil;
     _view=view;_identity=identity;
+    if ([view.window isKindOfClass:AsbViewerWindow.class]) ((AsbViewerWindow *)view.window).viewerOverlay=self;
     AsbMacHeadlessTarget target={0};
     if (asb_mac_target(identity,&target)) {
         _input=asb_mac_input_session(&target);asb_mac_channel_release(target.channel);
@@ -139,6 +210,7 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
 - (void)cancelInput
 {
     _hovered=NO;_mouseButtons=_viewerButtons=0;
+    _fullscreenZone=0;_fullscreenExit=_viewerMenu=NSZeroRect;
     [self post:@{@"type":@"input",@"kind":@"cancel"} completion:nil];
 }
 
@@ -157,8 +229,9 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
     BOOL active=(_status.flags&ASB_STATUS_AGENT_HAS_CONTROL)!=0;
     BOOL menu=!finished && (active || (_status.flags&ASB_STATUS_AGENT_WAITING));
     BOOL cursor=!finished && _status.x<=65535 && _status.y<=65535;
-    _web.hidden=!_ready || !(menu || cursor);
-    if (!menu && _hovered) [self cancelInput];
+    BOOL fullscreen=[_view.window isKindOfClass:AsbViewerWindow.class] && ((AsbViewerWindow *)_view.window).viewerFullscreen;
+    _web.hidden=!_ready || !(menu || cursor || fullscreen);
+    if (!menu && !fullscreen && _hovered) [self cancelInput];
     if (_updating || !_ready) return;
     NSSize bounds=_view.bounds.size;double x=0,y=0;
     if (cursor) {
@@ -170,7 +243,7 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
     NSDictionary *context=@{@"identity":@(_status.identity),@"vendor":@(_status.vendor),
         @"model":@(_status.model),@"purpose":@(_status.purpose)};
     _updating=YES;__weak AsbAgentOverlay *weakSelf=self;
-    [self post:@{@"active":@(active),@"menu":@(menu),@"showCursor":@(cursor),@"x":@(x),@"y":@(y),@"context":context}
+    [self post:@{@"active":@(active),@"menu":@(menu),@"showCursor":@(cursor),@"x":@(x),@"y":@(y),@"context":context,@"fullscreen":@(fullscreen)}
         completion:^{ AsbAgentOverlay *strongSelf=weakSelf;if (strongSelf) strongSelf->_updating=NO; }];
 }
 
@@ -196,14 +269,27 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
     BOOL up=event.type==NSEventTypeLeftMouseUp || event.type==NSEventTypeRightMouseUp || event.type==NSEventTypeOtherMouseUp;
     unsigned button=(unsigned)event.buttonNumber;
     unsigned bit=(down || up) && button<32?1u<<button:0;
+    double x=point.x,y=view.isFlipped?point.y:NSHeight(view.bounds)-point.y;
+    if ([window isKindOfClass:AsbViewerWindow.class] && ((AsbViewerWindow *)window).viewerFullscreen) {
+        int zone=0;
+        BOOL onExit=NSPointInRect(NSMakePoint(x,y),_fullscreenExit),onMenu=NSPointInRect(NSMakePoint(x,y),_viewerMenu);
+        if (window.isKeyWindow && NSApp.isActive && (onExit || onMenu || (!NSEvent.pressedMouseButtons && !down))) {
+            if (onExit || onMenu) zone=1;
+            else if (x>=NSWidth(view.bounds)*0.35 && x<NSWidth(view.bounds)*0.65 && y>=0 && y<60) zone=y<=1?2:1;
+        }
+        if (zone!=_fullscreenZone) {
+            _fullscreenZone=zone;
+            [self post:@{@"type":@"fullscreen_pointer",@"zone":@(zone)} completion:nil];
+        }
+    }
     if (_viewerButtons) {
         if (up) _viewerButtons&=~bit;
         return self.blocksInput;
     }
     BOOL ownedUp=up && (_mouseButtons&bit);
     if (up) _mouseButtons&=~bit;
-    double x=point.x,y=NSHeight(view.bounds)-point.y;
-    BOOL hit=inside && menu && _ready && NSPointInRect(NSMakePoint(x,y),_menu);
+    BOOL hit=inside && _ready && ((menu && NSPointInRect(NSMakePoint(x,y),_menu)) ||
+        NSPointInRect(NSMakePoint(x,y),_fullscreenExit) || NSPointInRect(NSMakePoint(x,y),_viewerMenu));
     if (hit) {
         NSString *kind=@"move";
         if (up && !ownedUp) return self.blocksInput;
@@ -236,6 +322,14 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
     if (!_mask) return;
     CGMutablePathRef shapes=CGPathCreateMutable();CGAffineTransform transform=[self cssTransform];
     CGPathAddRoundedRect(shapes,&transform,NSRectToCGRect(_menu),6,6);
+    if ([layout[@"fullscreen"] boolValue]) {
+        CGPathAddRect(shapes,&transform,CGRectMake(NSWidth(_view.bounds)*0.35,0,NSWidth(_view.bounds)*0.30,12));
+        if (!NSIsEmptyRect(_fullscreenExit)) {
+            CGPathAddRoundedRect(shapes,&transform,CGRectMake(NSMinX(_fullscreenExit),NSMinY(_fullscreenExit),36,36),18,18);
+            CGPathAddRoundedRect(shapes,&transform,CGRectMake(NSMaxX(_fullscreenExit)-36,NSMinY(_fullscreenExit),36,36),18,18);
+        }
+        CGPathAddRoundedRect(shapes,&transform,NSRectToCGRect(_viewerMenu),6,6);
+    }
     if ([layout[@"cursor"] boolValue]) {
         NSString *source=layout[@"cursorPath"];
         if ([source isKindOfClass:NSString.class] && source.length<512) {
@@ -273,10 +367,38 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
     if (_closed || !message.frameInfo.mainFrame || ![message.body isKindOfClass:NSString.class]) return;
     NSString *command=message.body;
     if ([command isEqualToString:@"ready"]) { _ready=YES;[self refresh];return; }
+    if (!NSIsEmptyRect(_fullscreenExit) && self.viewerOptions) {
+        NSUInteger option=NSNotFound;
+        if ([command isEqualToString:@"viewer_options"]) option=5;
+        else if (!NSIsEmptyRect(_viewerMenu) && command.length==15 && [command hasPrefix:@"viewer_option:"] &&
+            [command characterAtIndex:14]>='0' && [command characterAtIndex:14]<='4') option=[command characterAtIndex:14]-'0';
+        if (option!=NSNotFound) {
+            NSDictionary *state=self.viewerOptions(option);
+            if (state) [self post:@{@"type":@"viewer_options",@"enabled":state[@"enabled"]?:@0,@"checked":state[@"checked"]?:@0} completion:nil];
+            return;
+        }
+    }
+    if ([command isEqualToString:@"exit_fullscreen"] && !NSIsEmptyRect(_fullscreenExit) &&
+        [_view.window isKindOfClass:AsbViewerWindow.class]) {
+        [(AsbViewerWindow *)_view.window setFullscreenEnabled:NO];return;
+    }
     if ([command hasPrefix:@"layout:"]) {
         NSData *bytes=[[command substringFromIndex:7] dataUsingEncoding:NSUTF8StringEncoding];
         NSDictionary *layout=[NSJSONSerialization JSONObjectWithData:bytes options:0 error:nil];
         if (![layout isKindOfClass:NSDictionary.class]) return;
+        _fullscreenExit=_viewerMenu=NSZeroRect;
+        NSRect exit=NSMakeRect([layout[@"fx"] doubleValue],[layout[@"fy"] doubleValue],
+            [layout[@"fw"] doubleValue],[layout[@"fh"] doubleValue]);
+        if ([_view.window isKindOfClass:AsbViewerWindow.class] && ((AsbViewerWindow *)_view.window).viewerFullscreen &&
+            isfinite(exit.origin.x) && isfinite(exit.origin.y) && isfinite(exit.size.width) && isfinite(exit.size.height) &&
+            exit.size.width>0 && exit.size.height>0 && NSMinX(exit)>=0 && NSMinY(exit)>=0 &&
+            NSMaxX(exit)<=NSWidth(_view.bounds)+2 && NSMaxY(exit)<=NSHeight(_view.bounds)+2) _fullscreenExit=exit;
+        NSRect options=NSMakeRect([layout[@"ox"] doubleValue],[layout[@"oy"] doubleValue],
+            [layout[@"ow"] doubleValue],[layout[@"oh"] doubleValue]);
+        if (!NSIsEmptyRect(_fullscreenExit) && isfinite(options.origin.x) && isfinite(options.origin.y) &&
+            isfinite(options.size.width) && isfinite(options.size.height) && options.size.width>0 && options.size.height>0 &&
+            NSMinX(options)>=0 && NSMinY(options)>=0 && NSMaxX(options)<=NSWidth(_view.bounds)+2 &&
+            NSMaxY(options)<=NSHeight(_view.bounds)+2) _viewerMenu=options;
         NSRect rectangle=NSMakeRect([layout[@"x"] doubleValue],[layout[@"y"] doubleValue],
             [layout[@"width"] doubleValue],[layout[@"height"] doubleValue]);
         if (NSMinX(rectangle)>=0 && NSMinY(rectangle)>=0 && NSMaxX(rectangle)<=NSWidth(_view.bounds)+2 &&
@@ -305,6 +427,8 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
 - (void)invalidate
 {
     if (_closed) return;_closed=YES;
+    if ([_view.window isKindOfClass:AsbViewerWindow.class] && ((AsbViewerWindow *)_view.window).viewerOverlay==self)
+        ((AsbViewerWindow *)_view.window).viewerOverlay=nil;
     [_timer invalidate];_timer=nil;
     for (id observer in _observers) [NSNotificationCenter.defaultCenter removeObserver:observer];
     _observers=nil;
@@ -314,4 +438,5 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
 }
 
 - (void)dealloc { [self invalidate]; }
+- (BOOL)ready { return _ready && !_closed; }
 @end

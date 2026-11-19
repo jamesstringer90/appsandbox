@@ -1362,19 +1362,29 @@ static int handle_request(int fd, HttpReq *r) {
             BOOL isDELETE = strcmp(r->method, "DELETE") == 0;
             if (strcmp(r->method, "PUT") == 0) {
                 id enabled = requestBody[@"automaticallyDisableExtraDisplays"];
-                if (![enabled isKindOfClass:NSNumber.class] ||
-                    CFGetTypeID((__bridge CFTypeRef)enabled) != CFBooleanGetTypeID()) {
+                id fullscreen=requestBody[@"fullscreen"];
+                if ((!enabled && !fullscreen) ||
+                    (enabled && (![enabled isKindOfClass:NSNumber.class] ||
+                    CFGetTypeID((__bridge CFTypeRef)enabled) != CFBooleanGetTypeID())) ||
+                    (fullscreen && (![fullscreen isKindOfClass:NSNumber.class] ||
+                    CFGetTypeID((__bridge CFTypeRef)fullscreen) != CFBooleanGetTypeID()))) {
                     send_err(fd, 400, "Bad Request", @"invalid_arg",
-                             @"automaticallyDisableExtraDisplays must be a boolean");
+                             @"provide fullscreen or automaticallyDisableExtraDisplays as booleans");
                     return 0;
                 }
                 __block int result = ASB_NOT_SUPPORTED;
-                on_main(^{ result = asb_mac_vm_set_display_monitor_enabled(vm_id, [enabled boolValue]); });
+                __block BOOL viewerReady=YES;
+                on_main(^{
+                    result=enabled?asb_mac_vm_set_display_monitor_enabled(vm_id,[enabled boolValue]):ASB_OK;
+                    if (result==ASB_OK && fullscreen) viewerReady=asb_mac_set_display_fullscreen(vm_id,[fullscreen boolValue]);
+                });
                 if (result == ASB_NOT_SUPPORTED)
                     send_err(fd, 409, "Conflict", @"not_supported",
                              @"the connected Windows guest does not support watcher controls");
                 else if (result != ASB_OK)
                     send_err(fd, 409, "Conflict", @"busy", @"the guest agent is busy; retry shortly");
+                else if (!viewerReady)
+                    send_err(fd,409,"Conflict",@"display_not_ready",@"open the viewer and wait for its overlay before configuring fullscreen");
                 else send_json(fd, 202, "Accepted", @"{\"ok\":true,\"accepted\":true}");
                 return 0;
             }
@@ -1413,13 +1423,14 @@ static int handle_request(int fd, HttpReq *r) {
                    driver is up (idd_ready) -- matching the open precondition (asb_mac_open_display). */
                 __block BOOL open = NO, ready = NO;
                 __block int monitor = -1;
-                __block BOOL sas = NO;
+                __block BOOL sas = NO,fullscreen=NO;
                 on_main(^{
                     AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
                     if (!v) return;
                     BOOL is_win = (strcasecmp(v->os_type, "Windows") == 0);
                     monitor = asb_mac_vm_display_monitor_state(vm_id);
                     sas = asb_mac_vm_sas_supported(vm_id);
+                    fullscreen=asb_mac_display_fullscreen(vm_id);
                     open  = (v->display != nil && !v->display.userClosed);
                     ready = open || (v->running && v->agent_online && (!is_win || v->idd_ready));
                 });
@@ -1427,7 +1438,7 @@ static int handle_request(int fd, HttpReq *r) {
                           json_str(@{ @"open": open ? @YES : @NO,
                                       @"ready": ready ? @YES : @NO,
                                       @"automaticallyDisableExtraDisplays": monitor < 0 ? NSNull.null : (monitor ? @YES : @NO),
-                                      @"sasSupported": @(sas) }));
+                                      @"sasSupported": @(sas), @"fullscreen":@(fullscreen) }));
                 return 0;
             }
             send_err(fd, 405, "Method Not Allowed", @"method",

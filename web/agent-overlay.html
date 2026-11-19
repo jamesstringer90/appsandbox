@@ -32,6 +32,28 @@ button { box-sizing:border-box; height:26px; padding:4px 12px; border:1px solid 
 #take.hovered { background:#2a4a6a; }
 #stop { background:#5a1a1a; border-color:#8a2a2a; color:#ff8888; }
 #stop.hovered { background:#6a2a2a; }
+#fullscreen-glow { display:none; position:absolute; left:35%; top:0; width:30%; height:12px;
+  background:linear-gradient(90deg, transparent, #edf6ffd9 15%, #edf6ffd9 85%, transparent)
+    center top / 100% 1px no-repeat,
+    linear-gradient(90deg, transparent, #000a 15%, #000a 85%, transparent)
+    center 1px / 100% 2px no-repeat, radial-gradient(ellipse at 50% 0, #0004, transparent 80%); }
+#fullscreen-controls { display:none; position:absolute; left:calc(50% - 18px); top:8px; width:80px; height:36px; }
+#fullscreen-controls button { position:absolute; top:0; width:36px; height:36px;
+  padding:0; border-radius:50%; border-color:#ffffff38; background:#202020d9;
+  box-shadow:0 2px 10px #0005; color:#eee; }
+#exit-fullscreen { left:0; }
+#viewer-options { right:0; }
+#fullscreen-controls svg { position:absolute; inset:0; margin:auto; width:16px; height:16px; display:block; }
+#fullscreen-controls .hovered { background:#444e; border-color:#ffffff70; }
+#viewer-menu { display:none; position:absolute; left:calc(50% + 26px); top:52px; width:250px;
+  max-width:calc(50% - 30px); padding:5px; box-sizing:border-box; border:1px solid #ffffff38;
+  border-radius:6px; background:#252525f5; box-shadow:0 3px 12px #0006; color:var(--text); }
+#viewer-menu button { display:block; width:100%; height:29px; padding:4px 8px 4px 25px;
+  position:relative; text-align:left; border:0; background:transparent; white-space:nowrap; }
+#viewer-menu button::before { position:absolute; left:7px; content:''; }
+#viewer-menu button.checked::before { content:'\2713'; }
+#viewer-menu button.hovered { background:#ffffff16; }
+#viewer-menu button:disabled { opacity:0.4; }
 @media(max-width:340px) { #buttons { flex-direction:column; } #stop { width:100%; } }
 </style></head><body inert>
 <div id="cursor" aria-hidden="true"><svg viewBox="0 0 25 34"><path
@@ -42,10 +64,46 @@ fill="currentColor" stroke="white" stroke-width="1.5" stroke-linejoin="round"/><
 <div id="purpose-label">What the agent is doing:</div><div id="purpose"></div>
 <div id="buttons"><button id="take" tabindex="-1">Take control</button>
 <button id="stop" tabindex="-1">Stop agent</button></div></div>
+<div id="fullscreen-glow" aria-hidden="true"></div>
+<div id="fullscreen-controls"><button id="exit-fullscreen" tabindex="-1" aria-label="Exit fullscreen"><svg viewBox="0 0 16 16" aria-hidden="true">
+<path d="M4 4L12 12M12 4L4 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+</svg></button>
+<button id="viewer-options" tabindex="-1" aria-label="Viewer options"><svg viewBox="0 0 16 16" aria-hidden="true">
+<path d="M3 4H13M3 8H13M3 12H13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+</svg></button></div>
+<div id="viewer-menu"><button data-option="0" disabled tabindex="-1">Send Ctrl+Alt+Del</button>
+<button data-option="1" disabled tabindex="-1">Match window size</button>
+<button data-option="2" disabled tabindex="-1">Share clipboard</button>
+<button data-option="3" disabled tabindex="-1">Transmit Keyboard Hotkeys</button>
+<button data-option="4" disabled tabindex="-1">Mute audio</button></div>
 <script>
 const cursor=document.getElementById('cursor'), take=document.getElementById('take');
 const menu=document.getElementById('menu'), stop=document.getElementById('stop');
+const glow=document.getElementById('fullscreen-glow'), exit=document.getElementById('exit-fullscreen');
+const controls=document.getElementById('fullscreen-controls'), options=document.getElementById('viewer-options');
+const viewerMenu=document.getElementById('viewer-menu'), viewerItems=Array.from(viewerMenu.querySelectorAll('button'));
 let pressed=null, fadeTimer=0;
+let fullscreen=false, exitVisible=false, dwellTimer=0;
+function showExit(visible) {
+  visible=fullscreen && visible;
+  const showGlow=fullscreen?'block':'none';
+  if(exitVisible===visible && glow.style.display===showGlow) return;
+  exitVisible=visible;
+  glow.style.display=showGlow;
+  controls.style.display=exitVisible?'block':'none';
+  if(!exitVisible) { viewerMenu.style.display='none'; clearInput(); }
+  layout();
+}
+function cancelDwell() { clearTimeout(dwellTimer); dwellTimer=0; }
+function fullscreenPointer(s) {
+  if(!fullscreen) return;
+  if(!s.zone) {
+    cancelDwell(); showExit(false); return;
+  }
+  if(exitVisible) return;
+  if(s.zone!==2) { cancelDwell(); return; }
+  if(!dwellTimer) dwellTimer=setTimeout(()=>{ dwellTimer=0; showExit(true); },500);
+}
 function resetAppearance() {
   clearTimeout(fadeTimer);
   fadeTimer=0;
@@ -65,12 +123,33 @@ function clearInput() {
   pressed=null;
   take.classList.remove('hovered');
   stop.classList.remove('hovered');
+  exit.classList.remove('hovered');
+  options.classList.remove('hovered');
+  for(const item of viewerItems) item.classList.remove('hovered');
 }
 function contains(element,x,y) {
   const r=element.getBoundingClientRect();
   return x>=r.left && x<r.right && y>=r.top && y<r.bottom;
 }
 function activate(button) {
+  if(button===options) {
+    if(!fullscreen || !exitVisible) return;
+    const opening=viewerMenu.style.display!=='block';
+    viewerMenu.style.display=opening?'block':'none';
+    if(opening) window.chrome.webview.postMessage('viewer_options');
+    clearInput(); layout(); return;
+  }
+  if(viewerItems.includes(button)) {
+    if(button.disabled || viewerMenu.style.display!=='block') return;
+    window.chrome.webview.postMessage('viewer_option:'+button.dataset.option);
+    viewerMenu.style.display='none'; clearInput(); layout(); return;
+  }
+  if(button===exit) {
+    if(!fullscreen || !exitVisible) return;
+    window.chrome.webview.postMessage('exit_fullscreen');
+    clearInput(); cancelDwell();
+    return;
+  }
   if(menu.style.display==='none') return;
   menu.style.display='none';
   clearInput();
@@ -78,12 +157,23 @@ function activate(button) {
   window.chrome.webview.postMessage(button===take?take.dataset.command:'stop_agent');
 }
 function receiveInput(s) {
-  if(s.kind==='leave' || s.kind==='cancel') { clearInput(); return; }
+  if(s.kind==='leave' || s.kind==='cancel') {
+    clearInput();
+    if(s.kind==='cancel') { cancelDwell(); showExit(false); }
+    return;
+  }
   if(!['move','down','up','wheel','hwheel'].includes(s.kind)) return;
-  if(menu.style.display==='none' || !contains(menu,s.x,s.y)) { clearInput(); return; }
-  const target=contains(take,s.x,s.y)?take:contains(stop,s.x,s.y)?stop:null;
+  const onControls=exitVisible && contains(controls,s.x,s.y);
+  const onOptions=viewerMenu.style.display==='block' && contains(viewerMenu,s.x,s.y);
+  if(!onControls && !onOptions && (menu.style.display!=='block' || !contains(menu,s.x,s.y))) { clearInput(); return; }
+  const target=onControls?(contains(exit,s.x,s.y)?exit:contains(options,s.x,s.y)?options:null):
+    onOptions?viewerItems.find(item=>!item.disabled && contains(item,s.x,s.y)):
+    contains(take,s.x,s.y)?take:contains(stop,s.x,s.y)?stop:null;
   take.classList.toggle('hovered',target===take);
   stop.classList.toggle('hovered',target===stop);
+  exit.classList.toggle('hovered',target===exit);
+  options.classList.toggle('hovered',target===options);
+  for(const item of viewerItems) item.classList.toggle('hovered',target===item);
   if(s.kind==='down' && s.button===0) pressed=target;
   else if(s.kind==='up' && s.button===0) {
     const original=pressed;
@@ -102,19 +192,31 @@ for(const type of ['pointerdown','pointerup','pointermove','pointercancel','mous
   },{capture:true,passive:false});
 }
 function layout() {
-  if(menu.style.display==='none') return;
   const m=menu.getBoundingClientRect();
+  const f=controls.getBoundingClientRect(), o=viewerMenu.getBoundingClientRect();
   const c=cursor.getBoundingClientRect(), l=document.getElementById('label').getBoundingClientRect();
   window.chrome.webview.postMessage('layout:'+JSON.stringify({x:Math.round(m.x),y:Math.round(m.y),
     width:Math.round(m.width),height:Math.round(m.height),cursor:cursor.style.display!=='none',
     cx:c.x,cy:c.y,cursorPath:cursor.querySelector('path').getAttribute('d'),
-    label:{x:l.x,y:l.y,width:l.width,height:l.height}}));
+    label:{x:l.x,y:l.y,width:l.width,height:l.height},
+    fx:Math.round(f.x),fy:Math.round(f.y),fw:Math.round(f.width),fh:Math.round(f.height),
+    ox:Math.round(o.x),oy:Math.round(o.y),ow:Math.round(o.width),oh:Math.round(o.height),
+    fullscreen,exitVisible}));
 }
 new ResizeObserver(layout).observe(menu);
+window.addEventListener('resize',()=>{cancelDwell();showExit(false);});
 window.chrome.webview.addEventListener('message', e => {
   const s=e.data;
+  if(s.type==='viewer_options') {
+    for(const [i,item] of viewerItems.entries()) {
+      item.disabled=!(s.enabled&(1<<i)); item.classList.toggle('checked',!!(s.checked&(1<<i)));
+    }
+    return;
+  }
+  if(s.type==='fullscreen_pointer') { fullscreenPointer(s); return; }
   if(s.type==='input') { receiveInput(s); return; }
   if(s.type==='pointer_activity') { pointerActivity(); return; }
+  if(fullscreen!==!!s.fullscreen) { fullscreen=!!s.fullscreen; cancelDwell(); showExit(false); }
   const wasVisible=menu.style.display==='block';
   cursor.style.display=s.showCursor?'block':'none';
   cursor.style.transform=`translate(${s.x}px,${s.y}px)`;
@@ -122,7 +224,10 @@ window.chrome.webview.addEventListener('message', e => {
   menu.style.display=s.menu?'block':'none';
   if(s.menu && !wasVisible) menu.classList.toggle('appearing',true);
   menu.classList.toggle('paused',!s.active);
-  if(!s.menu) { clearInput(); resetAppearance(); }
+  if(!s.menu) {
+    if(pressed===take || pressed===stop) pressed=null;
+    take.classList.remove('hovered'); stop.classList.remove('hovered'); resetAppearance();
+  }
   const identity=s.context?.identity?.trim() || 'API';
   document.getElementById('identity').textContent=s.active?
     `${identity} has control of the mouse and keyboard.`:`${identity} wants to continue.`;

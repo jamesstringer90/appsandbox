@@ -13,6 +13,7 @@
 #import "vm_dir.h"
 #import "vz_vm.h"
 #import "vz_display.h"
+#import "agent_overlay.h"
 #import "vz_network.h"
 #import "vm_agent_mac.h"
 #import "vm_ssh_proxy_mac.h"
@@ -1913,6 +1914,20 @@ int asb_mac_open_display(AsbVmId vm_id) {
     g_vms[idx].display  = display;
     [display showDisplay];
     return BACKEND_OK;
+}
+
+BOOL asb_mac_display_fullscreen(AsbVmId vm_id) {
+    int idx=vm_index_of(vm_id);
+    if (idx<0 || !g_display_refs[idx] || ((VzDisplayWindow *)g_display_refs[idx]).userClosed) return NO;
+    NSWindow *window=[g_display_refs[idx] window];
+    return [window isKindOfClass:AsbViewerWindow.class] && ((AsbViewerWindow *)window).viewerFullscreen;
+}
+
+BOOL asb_mac_set_display_fullscreen(AsbVmId vm_id,BOOL enabled) {
+    int idx=vm_index_of(vm_id);
+    if (idx<0 || !g_display_refs[idx] || ((VzDisplayWindow *)g_display_refs[idx]).userClosed) return NO;
+    NSWindow *window=[g_display_refs[idx] window];
+    return [window isKindOfClass:AsbViewerWindow.class] && [(AsbViewerWindow *)window setFullscreenEnabled:enabled];
 }
 
 void asb_mac_close_display(AsbVmId vm_id) {

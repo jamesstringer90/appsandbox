@@ -102,6 +102,18 @@ static BOOL display_is_open(UINT64 vm_id)
     DisplayEntry *e = display_find(vm_id);
     return e && e->disp && vm_display_idd_is_open(e->disp);
 }
+static BOOL display_is_fullscreen(UINT64 vm_id)
+{
+    if (g_gui_hwnd) return ui_display_is_fullscreen(vm_id);
+    DisplayEntry *e=display_find(vm_id);
+    return e && vm_display_idd_is_fullscreen(e->disp);
+}
+static BOOL display_set_fullscreen(UINT64 vm_id,BOOL enabled)
+{
+    if (g_gui_hwnd) return ui_display_set_fullscreen(vm_id,enabled);
+    DisplayEntry *e=display_find(vm_id);
+    return e && vm_display_idd_set_fullscreen(e->disp,enabled);
+}
 /* If the user closed the window (X), vm_display_idd has already stopped its threads
    and freed the vsock frame connection (WM_CLOSE handler); drop our now-dead handle
    so the slot frees. Called before acting on any display request. */
@@ -1672,20 +1684,29 @@ static int handle_request(PHTTP_REQUEST req)
             VmInstance *v = asb_vm_instance(vm);
             if (!v) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
             if (verb == HttpVerbPUT) {
-                BOOL enabled = FALSE;
+                BOOL enabled = FALSE,fullscreen=FALSE;
                 const wchar_t *body = request_body();
-                if (!asb_api_validate_body(body) ||
-                    !api_json_get_bool(body, L"automaticallyDisableExtraDisplays", &enabled)) {
+                BOOL has_monitor=api_json_has_key(body,L"automaticallyDisableExtraDisplays");
+                BOOL has_fullscreen=api_json_has_key(body,L"fullscreen");
+                if (!asb_api_validate_body(body) || (!has_monitor && !has_fullscreen) ||
+                    (has_monitor && !api_json_get_bool(body,L"automaticallyDisableExtraDisplays",&enabled)) ||
+                    (has_fullscreen && !api_json_get_bool(body,L"fullscreen",&fullscreen))) {
                     send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
-                             "automaticallyDisableExtraDisplays must be a boolean");
+                             "provide fullscreen or automaticallyDisableExtraDisplays as booleans");
                     return 0;
                 }
-                HRESULT result = asb_vm_set_display_monitor_enabled(vm, enabled);
+                if (has_fullscreen && !display_is_open(v->unique_id)) {
+                    send_err(req->RequestId,409,"Conflict","no_display","open the viewer before configuring fullscreen");
+                    return 0;
+                }
+                HRESULT result = has_monitor ? asb_vm_set_display_monitor_enabled(vm, enabled) : S_OK;
                 if (result == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED))
                     send_err(req->RequestId, 409, "Conflict", "not_supported",
                              "the connected Windows guest does not support watcher controls");
                 else if (FAILED(result))
                     send_err(req->RequestId, 409, "Conflict", "busy", "the guest agent is busy; retry shortly");
+                else if (has_fullscreen && !display_set_fullscreen(v->unique_id,fullscreen))
+                    send_err(req->RequestId,409,"Conflict","display_not_ready","the viewer overlay is not ready");
                 else send_json(req->RequestId, 202, "Accepted", "{\"ok\":true,\"accepted\":true}");
                 return 0;
             }
@@ -1752,14 +1773,14 @@ static int handle_request(PHTTP_REQUEST req)
                    asb_vm_idd_ready: running + agent-online + the agent's latched
                    idd_status flag, so a client can poll this on an interval (it disturbs
                    nothing) and POST to open once ready. */
-                char b[160];
+                char b[192];
                 BOOL open = display_is_open(v->unique_id);
                 BOOL ready = open || asb_vm_idd_ready(vm);
                 int monitor = asb_vm_display_monitor_state(vm);
-                sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s,\"automaticallyDisableExtraDisplays\":%s,\"sasSupported\":%s}",
+                sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s,\"automaticallyDisableExtraDisplays\":%s,\"sasSupported\":%s,\"fullscreen\":%s}",
                           open ? "true" : "false", ready ? "true" : "false",
                           monitor < 0 ? "null" : monitor ? "true" : "false",
-                          asb_vm_sas_supported(vm) ? "true" : "false");
+                          asb_vm_sas_supported(vm) ? "true" : "false",display_is_fullscreen(v->unique_id)?"true":"false");
                 send_json(req->RequestId, 200, "OK", b);
                 return 0;
             }

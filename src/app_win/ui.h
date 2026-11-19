@@ -33,6 +33,8 @@ ASB_API BOOL vm_load_state_json(const wchar_t *vhdx_path);
 BOOL ui_command_active(void);
 void ui_refresh_from_core(void);
 BOOL ui_display_is_open(UINT64 id);
+BOOL ui_display_is_fullscreen(UINT64 id);
+BOOL ui_display_set_fullscreen(UINT64 id, BOOL enabled);
 BOOL ui_display_open(UINT64 id);
 void ui_display_close(UINT64 id);
 

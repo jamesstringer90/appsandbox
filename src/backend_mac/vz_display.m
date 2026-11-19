@@ -242,9 +242,15 @@ int asb_mac_native_input_connect(const AsbMacHeadlessTarget *target)
         NSPoint location = event.locationInWindow;
         if (location.y >= NSMaxY(self.window.contentLayoutRect) && location.y < self.window.frame.size.height) {
             NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+            menu.autoenablesItems=NO;
             NSMenuItem *item = [menu addItemWithTitle:@"Share clipboard" action:@selector(toggleClipboardSharing:) keyEquivalent:@""];
             item.target = self;
             item.state = asb_mac_vm_clipboard_sharing_enabled(self.vmId) ? NSControlStateValueOn : NSControlStateValueOff;
+            AsbViewerWindow *window=(AsbViewerWindow *)self.window;
+            item=[menu addItemWithTitle:@"Borderless fullscreen" action:@selector(toggleViewerFullscreen:) keyEquivalent:@""];
+            item.target=window;
+            item.enabled=_overlay.ready && !(window.styleMask&NSWindowStyleMaskFullScreen);
+            item.state=window.viewerFullscreen?NSControlStateValueOn:NSControlStateValueOff;
             [menu popUpMenuPositioningItem:nil atLocation:[self.window convertPointToScreen:location] inView:nil];
             return nil;
         }
@@ -326,6 +332,12 @@ int asb_mac_native_input_connect(const AsbMacHeadlessTarget *target)
         _overlay=[[AsbAgentOverlay alloc] initWithView:self.vmView vmId:self.vmId];
         __weak VzDisplayWindow *weak=self;
         _overlay.prepareForAgentInput=^{ [weak prepareForAgentInput];[weak finishPreparingForAgentInput]; };
+        _overlay.viewerOptions=^NSDictionary *(NSUInteger option) {
+            VzDisplayWindow *owner=weak;
+            if (!owner) return nil;
+            if (option==2) [owner toggleClipboardSharing:nil];
+            return @{@"enabled":@4,@"checked":@(asb_mac_vm_clipboard_sharing_enabled(owner.vmId)?4:0)};
+        };
         NSEventMask mask=NSEventMaskKeyDown|NSEventMaskKeyUp|NSEventMaskFlagsChanged|NSEventMaskMouseMoved|
             NSEventMaskLeftMouseDown|NSEventMaskLeftMouseUp|NSEventMaskRightMouseDown|NSEventMaskRightMouseUp|
             NSEventMaskOtherMouseDown|NSEventMaskOtherMouseUp|NSEventMaskLeftMouseDragged|NSEventMaskRightMouseDragged|
