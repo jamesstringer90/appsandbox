@@ -18,8 +18,6 @@
     NSString                   *_cmdPending;
     NSString                   *_cmdResponse;
     BOOL                        _cmdReady;
-    BOOL                        _cmdBusy;
-    BOOL                        _cmdWaiting;
 }
 @property (nonatomic, strong) VZVirtioSocketDevice *socketDevice;
 @property (nonatomic, strong) AsbIvshmemTransport *ivshmemTransport;   /* set => Windows/ivshmem path */
@@ -79,7 +77,10 @@
 - (void)stop {
     self.stopRequested = YES;
     [self closeSocket];
-    [self deliverResponse:nil];
+    [_cmdCond lock];
+    _cmdReady = YES;
+    [_cmdCond broadcast];
+    [_cmdCond unlock];
     if (self.online) {
         [self setOnlineOnMain:NO];
     }
@@ -364,39 +365,31 @@
 #pragma mark - Command dispatch
 
 - (NSString *)sendCommand:(NSString *)cmd timeout:(NSTimeInterval)timeoutSec {
+    if (!self.online) return nil;
+
     [_cmdCond lock];
-    if (_cmdBusy || self.stopRequested || !self.online) {
-        [_cmdCond unlock];
-        return nil;
-    }
-    _cmdBusy = YES;
-    _cmdWaiting = timeoutSec > 0;
     _cmdPending = [cmd copy];
     _cmdResponse = nil;
     _cmdReady = NO;
-    if (!_cmdWaiting) {
-        [_cmdCond unlock];
-        return @"queued";
-    }
+    [_cmdCond unlock];
+    if (timeoutSec == 0) return @"queued";
+
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeoutSec];
     NSString *resp = nil;
+    [_cmdCond lock];
     while (!_cmdReady) {
         if (![_cmdCond waitUntilDate:deadline]) break;
     }
     resp = _cmdResponse;
     _cmdResponse = nil;
-    _cmdWaiting = NO;
-    if (_cmdReady) _cmdBusy = NO;
     [_cmdCond unlock];
     return resp;
 }
 
 - (void)deliverResponse:(nullable NSString *)resp {
     [_cmdCond lock];
-    _cmdPending = nil;
-    _cmdResponse = _cmdWaiting ? resp : nil;
+    _cmdResponse = resp;
     _cmdReady = YES;
-    if (!_cmdWaiting) _cmdBusy = NO;
     [_cmdCond broadcast];
     [_cmdCond unlock];
 }
