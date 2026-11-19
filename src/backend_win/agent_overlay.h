@@ -3,7 +3,10 @@
 
 typedef struct AgentOverlay AgentOverlay;
 
-AgentOverlay *agent_overlay_create(HWND render, HWND notify, UINT take_control_message,UINT64 vm_id);
+AgentOverlay *agent_overlay_create(HWND render, HWND notify, UINT take_control_message, UINT fullscreen_message, UINT options_message, UINT64 vm_id);
+void agent_overlay_viewer_options(AgentOverlay *overlay, UINT enabled, UINT checked);
+void agent_overlay_set_fullscreen(AgentOverlay *overlay, BOOL enabled);
+BOOL agent_overlay_is_ready(AgentOverlay *overlay);
 void agent_overlay_destroy(AgentOverlay *overlay);
 void agent_overlay_update(AgentOverlay *overlay, int state, int x, int y,
                           UINT frame_width, UINT frame_height, BOOL waiting, BOOL finished);

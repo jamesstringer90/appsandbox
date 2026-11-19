@@ -295,6 +295,7 @@ static const Field fields[]={
     {L"openDisplay",API_JSON_TRUE,0},{L"force",API_JSON_TRUE,0},
     {L"closeStdin",API_JSON_TRUE,0},
     {L"automaticallyDisableExtraDisplays",API_JSON_TRUE,0},
+    {L"fullscreen",API_JSON_TRUE,0},
     {L"name",API_JSON_STRING,255},{L"osType",API_JSON_STRING,31},
     {L"imagePath",API_JSON_STRING,259},{L"diskDirectory",API_JSON_STRING,259},
     {L"templateName",API_JSON_STRING,255},{L"templateId",API_JSON_STRING,25},

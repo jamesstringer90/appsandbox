@@ -236,15 +236,20 @@ int asb_mac_native_input_connect(const AsbMacHeadlessTarget *target)
     if (_preparingInput) --_preparingInput;
     [self updateInputControl];
 }
+- (void)populateViewerOptions:(NSMenu *)menu {
+    NSMenuItem *item = [menu addItemWithTitle:@"Share clipboard" action:@selector(toggleClipboardSharing:) keyEquivalent:@""];
+    item.target = self;
+    item.state = asb_mac_vm_clipboard_sharing_enabled(self.vmId) ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
 - (NSEvent *)routeViewerInput:(NSEvent *)event {
     if (event.window!=self.window) return event;
     if (event.type == NSEventTypeRightMouseDown && !self.window.attachedSheet) {
         NSPoint location = event.locationInWindow;
         if (location.y >= NSMaxY(self.window.contentLayoutRect) && location.y < self.window.frame.size.height) {
             NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
-            NSMenuItem *item = [menu addItemWithTitle:@"Share clipboard" action:@selector(toggleClipboardSharing:) keyEquivalent:@""];
-            item.target = self;
-            item.state = asb_mac_vm_clipboard_sharing_enabled(self.vmId) ? NSControlStateValueOn : NSControlStateValueOff;
+            menu.autoenablesItems=NO;
+            [(AsbViewerWindow *)self.window populateViewerMenu:menu];
             [menu popUpMenuPositioningItem:nil atLocation:[self.window convertPointToScreen:location] inView:nil];
             return nil;
         }
@@ -307,6 +312,12 @@ int asb_mac_native_input_connect(const AsbMacHeadlessTarget *target)
     _vm = vm;
     _vmId = vmId;
     _offscreen=offscreen;
+    if (!offscreen) {
+        AsbViewerWindow *viewer = (AsbViewerWindow *)window;
+        viewer.vmName = vm.name;
+        __weak VzDisplayWindow *weakSelf = self;
+        viewer.populateViewerOptions = ^(NSMenu *menu) { [weakSelf populateViewerOptions:menu]; };
+    }
     self.userClosed=offscreen;
     _vmView = [[VZVirtualMachineView alloc] initWithFrame:frame];
     _vmView.capturesSystemKeys = !offscreen;
@@ -353,6 +364,14 @@ int asb_mac_native_input_connect(const AsbMacHeadlessTarget *target)
 }
 
 #pragma mark - NSWindowDelegate
+
+- (void)windowDidFailToEnterFullScreen:(NSWindow *)window {
+    [(AsbViewerWindow *)window fullscreenTransitionFinished];
+}
+
+- (void)windowDidFailToExitFullScreen:(NSWindow *)window {
+    [(AsbViewerWindow *)window fullscreenTransitionFinished];
+}
 
 - (void)windowWillClose:(NSNotification *)notification {
     self.userClosed=YES;

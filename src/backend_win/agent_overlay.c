@@ -19,12 +19,14 @@ struct AgentOverlay {
     AsbVmId vm_id;
     LONG refs;
     HWND render,notify;
-    UINT take_message;
+    UINT take_message,fullscreen_message,options_message;
+    BOOL fullscreen;
+    int fullscreen_zone;
     BOOL closed,ready,hovered,waiting,finished;
     int state,x,y;
     UINT frame_width,frame_height;
     double dpi;
-    RECT bounds,menu_bounds;
+    RECT bounds,menu_bounds,exit_bounds,options_bounds;
     wchar_t context_json[4096];
     ULONGLONG context_check;
     ULONGLONG pointer_next;
@@ -150,11 +152,12 @@ static void update(AgentOverlay *s)
         py=((height-s->frame_height*scale)/2+s->y/65535.0*s->frame_height*scale)/s->dpi;
     }
     swprintf_s(json,ARRAYSIZE(json),
-        L"{\"active\":%s,\"menu\":%s,\"showCursor\":%s,\"x\":%.3f,\"y\":%.3f,\"context\":%s}",
-        active(s)?L"true":L"false",menu_visible(s)?L"true":L"false",show?L"true":L"false",px,py,s->context_json);
+        L"{\"active\":%s,\"menu\":%s,\"showCursor\":%s,\"x\":%.3f,\"y\":%.3f,\"context\":%s,\"fullscreen\":%s}",
+        active(s)?L"true":L"false",menu_visible(s)?L"true":L"false",show?L"true":L"false",px,py,s->context_json,
+        s->fullscreen?L"true":L"false");
     s->webview->lpVtbl->PostWebMessageAsJson(s->webview,json);
-    if (!menu_visible(s)) leave(s);
-    s->controller->lpVtbl->put_IsVisible(s->controller,menu_visible(s)||show);
+    if (!menu_visible(s) && !s->fullscreen) leave(s);
+    s->controller->lpVtbl->put_IsVisible(s->controller,menu_visible(s)||show||s->fullscreen);
 }
 
 static void resize(AgentOverlay *s)
@@ -220,17 +223,28 @@ static BOOL refresh_context(AgentOverlay *s,BOOL force)
     return TRUE;
 }
 
-static void layout(AgentOverlay *s,const wchar_t *json)
+static void layout_rect(AgentOverlay *s,const wchar_t *json,const wchar_t *xkey,const wchar_t *ykey,
+    const wchar_t *wkey,const wchar_t *hkey,RECT *out)
 {
     int x,y,width,height;
-    if (!json_get_int(json,L"x",&x) || !json_get_int(json,L"y",&y) ||
-        !json_get_int(json,L"width",&width) || !json_get_int(json,L"height",&height) ||
-        x<0 || y<0 || width<=0 || height<=0 ||
-        (x+width)*s->dpi>s->bounds.right+2 || (y+height)*s->dpi>s->bounds.bottom+2) return;
-    s->menu_bounds.left=(LONG)lround(x*s->dpi);
-    s->menu_bounds.top=(LONG)lround(y*s->dpi);
-    s->menu_bounds.right=(LONG)lround((x+width)*s->dpi);
-    s->menu_bounds.bottom=(LONG)lround((y+height)*s->dpi);
+    SetRectEmpty(out);
+    if (json_get_int(json,xkey,&x) && json_get_int(json,ykey,&y) &&
+        json_get_int(json,wkey,&width) && json_get_int(json,hkey,&height) &&
+        x>=0 && y>=0 && width>0 && height>0 && width<=s->bounds.right/s->dpi && height<=s->bounds.bottom/s->dpi &&
+        x<=s->bounds.right/s->dpi-width+2 && y<=s->bounds.bottom/s->dpi-height+2) {
+        SetRect(out,(int)lround(x*s->dpi),(int)lround(y*s->dpi),
+            (int)lround((x+width)*s->dpi),(int)lround((y+height)*s->dpi));
+    }
+}
+
+static void layout(AgentOverlay *s,const wchar_t *json)
+{
+    layout_rect(s,json,L"x",L"y",L"width",L"height",&s->menu_bounds);
+    SetRectEmpty(&s->exit_bounds);SetRectEmpty(&s->options_bounds);
+    if (s->fullscreen) {
+        layout_rect(s,json,L"fx",L"fy",L"fw",L"fh",&s->exit_bounds);
+        layout_rect(s,json,L"ox",L"oy",L"ow",L"oh",&s->options_bounds);
+    }
 }
 
 static HRESULT STDMETHODCALLTYPE message_invoke(ICoreWebView2WebMessageReceivedEventHandler *self,
@@ -242,6 +256,13 @@ static HRESULT STDMETHODCALLTYPE message_invoke(ICoreWebView2WebMessageReceivedE
     if (s->closed) return S_OK;
     if (FAILED(args->lpVtbl->TryGetWebMessageAsString(args,&text))) return S_OK;
     if (!wcscmp(text,L"ready")) { s->ready=TRUE;resize(s); }
+    else if (!wcscmp(text,L"exit_fullscreen") && s->fullscreen && !IsRectEmpty(&s->exit_bounds))
+        PostMessageW(s->notify,s->fullscreen_message,FALSE,0);
+    else if (s->fullscreen && !IsRectEmpty(&s->exit_bounds) && !wcscmp(text,L"viewer_options"))
+        PostMessageW(s->notify,s->options_message,5,0);
+    else if (s->fullscreen && !IsRectEmpty(&s->options_bounds) && !wcsncmp(text,L"viewer_option:",14) &&
+        text[14]>=L'0' && text[14]<=L'4' && !text[15])
+        PostMessageW(s->notify,s->options_message,text[14]-L'0',0);
     else if (!wcscmp(text,L"take_control") && active(s)) {
         s->state=ASB_CONTROL_USER;
         s->waiting=TRUE;
@@ -255,7 +276,7 @@ static HRESULT STDMETHODCALLTYPE message_invoke(ICoreWebView2WebMessageReceivedE
         s->waiting=FALSE;
         update(s);
         PostMessageW(s->notify,s->take_message,ASB_INPUT_USER_CANCEL,s->work_id);
-    } else if (!wcsncmp(text,L"layout:",7) && menu_visible(s)) layout(s,text+7);
+    } else if (!wcsncmp(text,L"layout:",7)) layout(s,text+7);
     CoTaskMemFree(text);
     return S_OK;
 }
@@ -387,7 +408,7 @@ static const ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandlerVtbl env_
     env_qi,env_addref,env_release,env_invoke
 };
 
-AgentOverlay *agent_overlay_create(HWND render,HWND notify,UINT take_message,UINT64 vm_id)
+AgentOverlay *agent_overlay_create(HWND render,HWND notify,UINT take_message,UINT fullscreen_message,UINT options_message,UINT64 vm_id)
 {
     typedef HRESULT (STDAPICALLTYPE *CreateEnvironment)(PCWSTR,PCWSTR,ICoreWebView2EnvironmentOptions*,
         ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
@@ -400,6 +421,8 @@ AgentOverlay *agent_overlay_create(HWND render,HWND notify,UINT take_message,UIN
     s->refs=1;
     s->vm_id=vm_id;
     s->render=render;s->notify=notify;s->take_message=take_message;
+    s->fullscreen_message=fullscreen_message;
+    s->options_message=options_message;
     s->state=s->x=s->y=-1;s->finished=TRUE;s->dpi=1;
     wcscpy_s(s->context_json,ARRAYSIZE(s->context_json),L"{}");
     hr=DCompositionCreateDevice(NULL,&ASB_IID_DCOMP_DEVICE,(void**)&s->device);
@@ -453,7 +476,47 @@ void agent_overlay_resize(AgentOverlay *s)
 
 BOOL agent_overlay_hit_test(AgentOverlay *s,POINT point)
 {
-    return s && menu_visible(s) && PtInRect(&s->menu_bounds,point);
+    return s && !s->closed && s->ready && ((menu_visible(s) && PtInRect(&s->menu_bounds,point)) ||
+        (s->fullscreen && (PtInRect(&s->exit_bounds,point) || PtInRect(&s->options_bounds,point))));
+}
+
+void agent_overlay_viewer_options(AgentOverlay *s,UINT enabled,UINT checked)
+{
+    wchar_t json[100];
+    if (!agent_overlay_is_ready(s)) return;
+    swprintf_s(json,ARRAYSIZE(json),L"{\"type\":\"viewer_options\",\"enabled\":%u,\"checked\":%u}",enabled,checked);
+    s->webview->lpVtbl->PostWebMessageAsJson(s->webview,json);
+}
+
+BOOL agent_overlay_is_ready(AgentOverlay *s)
+{
+    return s && s->ready && !s->closed;
+}
+
+void agent_overlay_set_fullscreen(AgentOverlay *s,BOOL enabled)
+{
+    if (!s || s->closed || s->fullscreen==enabled) return;
+    agent_overlay_cancel_input(s);
+    s->fullscreen=enabled;s->fullscreen_zone=0;
+    SetRectEmpty(&s->exit_bounds);
+    SetRectEmpty(&s->options_bounds);
+    update(s);
+}
+
+static void fullscreen_pointer(AgentOverlay *s,POINT point,BOOL pressed)
+{
+    int zone=0;
+    wchar_t json[80];
+    if (!s->fullscreen || !s->ready || s->closed) return;
+    if (!pressed && GetForegroundWindow()==s->notify) {
+        if (PtInRect(&s->exit_bounds,point) || PtInRect(&s->options_bounds,point)) zone=1;
+        else if (point.x>=s->bounds.right*0.35 && point.x<s->bounds.right*0.65 && point.y>=0 && point.y<60*s->dpi)
+            zone=point.y<=s->dpi?2:1;
+    }
+    if (zone==s->fullscreen_zone) return;
+    s->fullscreen_zone=zone;
+    swprintf_s(json,ARRAYSIZE(json),L"{\"type\":\"fullscreen_pointer\",\"zone\":%d}",zone);
+    s->webview->lpVtbl->PostWebMessageAsJson(s->webview,json);
 }
 
 void agent_overlay_pointer_activity(AgentOverlay *s)
@@ -492,6 +555,9 @@ BOOL agent_overlay_mouse(AgentOverlay *s,UINT message,WPARAM keys,LPARAM positio
     default:return FALSE;
     }
     if (message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL) ScreenToClient(s->render,&point);
+    if (message==WM_MOUSEMOVE || message==WM_LBUTTONDOWN || message==WM_RBUTTONDOWN || message==WM_MBUTTONDOWN ||
+        message==WM_LBUTTONUP || message==WM_RBUTTONUP || message==WM_MBUTTONUP)
+        fullscreen_pointer(s,point,(keys&(MK_LBUTTON|MK_RBUTTON|MK_MBUTTON))!=0 && !agent_overlay_hit_test(s,point));
     switch (message) {
     case WM_MOUSEMOVE:kind=L"move";break;
     case WM_LBUTTONDOWN:kind=L"down";button=0;down=TRUE;break;
@@ -502,7 +568,7 @@ BOOL agent_overlay_mouse(AgentOverlay *s,UINT message,WPARAM keys,LPARAM positio
     case WM_MBUTTONUP:kind=L"up";button=1;up=TRUE;break;
     case WM_MOUSEWHEEL:kind=L"wheel";delta=(SHORT)HIWORD(keys);break;
     case WM_MOUSEHWHEEL:kind=L"hwheel";delta=(SHORT)HIWORD(keys);break;
-    case WM_MOUSELEAVE:leave(s);return FALSE;
+    case WM_MOUSELEAVE:point.x=point.y=-1;fullscreen_pointer(s,point,FALSE);leave(s);return FALSE;
     default:return FALSE;
     }
     if (button>=0) bit=1u<<button;
@@ -528,6 +594,7 @@ BOOL agent_overlay_mouse(AgentOverlay *s,UINT message,WPARAM keys,LPARAM positio
 void agent_overlay_cancel_input(AgentOverlay *s)
 {
     if (!s) return;
+    POINT outside={-1,-1};fullscreen_pointer(s,outside,FALSE);
     leave(s);
     s->mouse_buttons=0;
     if (GetCapture()==s->render) ReleaseCapture();

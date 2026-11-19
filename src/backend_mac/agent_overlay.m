@@ -2,6 +2,7 @@
 #import <WebKit/WebKit.h>
 #import <QuartzCore/QuartzCore.h>
 #include "headless_vm.h"
+#include "asb_events.h"
 #include <math.h>
 
 NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
@@ -49,13 +50,73 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
 - (NSArray *)accessibilityChildren { return @[]; }
 @end
 
-@implementation AsbViewerWindow
+@implementation AsbViewerWindow {
+    NSInteger _fullscreenTransition;
+}
+- (instancetype)initWithContentRect:(NSRect)rect styleMask:(NSWindowStyleMask)style backing:(NSBackingStoreType)backing defer:(BOOL)defer {
+    self = [super initWithContentRect:rect styleMask:style backing:backing defer:defer];
+    if (!self) return nil;
+    self.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    for (NSNotificationName name in @[NSWindowWillEnterFullScreenNotification, NSWindowWillExitFullScreenNotification,
+                                      NSWindowDidEnterFullScreenNotification, NSWindowDidExitFullScreenNotification])
+        [center addObserver:self selector:@selector(fullscreenChanged:) name:name object:self];
+    return self;
+}
+
+- (BOOL)viewerFullscreen {
+    return (self.styleMask & NSWindowStyleMaskFullScreen) != 0;
+}
+
+- (BOOL)canChangeFullscreen {
+    return !_fullscreenTransition && self.isVisible && !self.isMiniaturized && !self.attachedSheet && self.screen;
+}
+
+- (void)toggleFullScreen:(id)sender {
+    if (![self canChangeFullscreen]) return;
+    _fullscreenTransition = self.viewerFullscreen ? -1 : 1;
+    [super toggleFullScreen:sender];
+}
+
+- (BOOL)setFullscreenEnabled:(BOOL)enabled {
+    if (_fullscreenTransition) return _fullscreenTransition == (enabled ? 1 : -1);
+    if (self.viewerFullscreen == enabled) return YES;
+    if (![self canChangeFullscreen]) return NO;
+    [self toggleFullScreen:nil];
+    return YES;
+}
+
+- (void)fullscreenChanged:(NSNotification *)notification {
+    if ([notification.name isEqualToString:NSWindowWillEnterFullScreenNotification]) _fullscreenTransition = 1;
+    else if ([notification.name isEqualToString:NSWindowWillExitFullScreenNotification]) _fullscreenTransition = -1;
+    else [self fullscreenTransitionFinished];
+}
+
+- (void)fullscreenTransitionFinished {
+    _fullscreenTransition = 0;
+    asb_events_changed();
+}
+
+- (void)populateViewerMenu:(NSMenu *)menu {
+    [menu removeAllItems];
+    if (self.populateViewerOptions) self.populateViewerOptions(menu);
+    if (menu.numberOfItems) [menu addItem:NSMenuItem.separatorItem];
+    NSMenuItem *fullscreen = [menu addItemWithTitle:self.viewerFullscreen ? @"Exit Full Screen" : @"Enter Full Screen"
+                                            action:@selector(toggleFullScreen:) keyEquivalent:@""];
+    fullscreen.target = self;
+    fullscreen.enabled = [self canChangeFullscreen];
+}
+
 - (BOOL)makeFirstResponder:(NSResponder *)responder {
     if ([responder isKindOfClass:NSView.class]) {
         for (NSView *view=(NSView *)responder;view;view=view.superview)
             if ([view isKindOfClass:AsbOverlayWebView.class]) return NO;
     }
     return [super makeFirstResponder:responder];
+}
+
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
 }
 @end
 
@@ -202,7 +263,7 @@ NSString *const AsbAgentOverlayLayerName=@"AppSandbox agent overlay";
     }
     BOOL ownedUp=up && (_mouseButtons&bit);
     if (up) _mouseButtons&=~bit;
-    double x=point.x,y=NSHeight(view.bounds)-point.y;
+    double x=point.x,y=view.isFlipped?point.y:NSHeight(view.bounds)-point.y;
     BOOL hit=inside && menu && _ready && NSPointInRect(NSMakePoint(x,y),_menu);
     if (hit) {
         NSString *kind=@"move";

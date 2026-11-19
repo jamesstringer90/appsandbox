@@ -2,8 +2,13 @@
 #include <stdint.h>
 
 FOUNDATION_EXPORT NSString *const AsbAgentOverlayLayerName;
-
 @interface AsbViewerWindow:NSWindow
+@property(nonatomic,copy) NSString *vmName;
+@property(nonatomic,readonly) BOOL viewerFullscreen;
+@property(nonatomic,copy) void (^populateViewerOptions)(NSMenu *menu);
+- (BOOL)setFullscreenEnabled:(BOOL)enabled;
+- (void)fullscreenTransitionFinished;
+- (void)populateViewerMenu:(NSMenu *)menu;
 @end
 
 @interface AsbAgentOverlay:NSObject

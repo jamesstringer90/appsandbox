@@ -48,6 +48,7 @@
 #include "resource.h"
 #include "gpu_broker.h"
 #include "agent_overlay.h"
+#include "asb_events.h"
 #include "headless_vm.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -130,6 +131,8 @@ typedef struct AudioFrameHeader {
 #define WM_IDD_DISPLAY_SIZE     (WM_USER + 104)
 #define WM_IDD_TAKE_CONTROL     (WM_USER + 105)
 #define WM_IDD_CLIPBOARD_READY  (WM_USER + 106)
+#define WM_IDD_FULLSCREEN       (WM_USER + 107)
+#define WM_IDD_VIEWER_OPTIONS   (WM_USER + 108)
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -220,6 +223,9 @@ struct VmDisplayIdd {
     HWND         hwnd;
     volatile BOOL open;
     volatile BOOL stop;
+    volatile LONG fullscreen;
+    WINDOWPLACEMENT windowed_placement;
+    LONG_PTR windowed_style;
 
     /* D3D11 */
     ID3D11Device            *device;
@@ -371,6 +377,8 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_SHARE_CLIPBOARD 0x1040
 #define IDM_AUTO_DISPLAYS  0x1050
 #define IDM_SEND_SAS       0x1060
+#define IDM_FULLSCREEN     0x1070
+static const UINT g_viewer_commands[]={IDM_SEND_SAS,IDM_MATCH_WINDOW,IDM_SHARE_CLIPBOARD,IDM_XMIT_HOTKEYS,IDM_AUDIO_MUTE};
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -1898,7 +1906,7 @@ static void idd_update_display_size(VmDisplayIdd *d, BOOL follow)
         packet->handle = d->shared_refresh ? refresh : 0;
     }
     LeaveCriticalSection(&d->frame_cs);
-    if (resize_window) {
+    if (resize_window && !d->fullscreen) {
         rc.left = rc.top = 0;
         rc.right = (LONG)width;
         rc.bottom = (LONG)height;
@@ -3195,6 +3203,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHARE_CLIPBOARD, L"Share clipboard");
+            AppendMenuW(sysmenu, MF_STRING, IDM_FULLSCREEN, L"Borderless fullscreen");
             if (!_wcsicmp(d->os_type, L"Windows"))
                 AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_AUTO_DISPLAYS,
                             L"Automatically disable non AppSandbox displays");
@@ -3277,7 +3286,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         d->render_retry_at = GetTickCount64() + 1000;
     }
     if (SUCCEEDED(apartment))
-        d->agent_overlay = agent_overlay_create(d->render_hwnd, d->hwnd, WM_IDD_TAKE_CONTROL,d->vm_id);
+        d->agent_overlay = agent_overlay_create(d->render_hwnd,d->hwnd,WM_IDD_TAKE_CONTROL,WM_IDD_FULLSCREEN,WM_IDD_VIEWER_OPTIONS,d->vm_id);
 
     /* Start the recv thread now that the window and D3D11 are ready */
     d->shared_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
@@ -3337,6 +3346,60 @@ static void idd_join_thread(HANDLE thread)
     }
 }
 
+static BOOL idd_fit_fullscreen(VmDisplayIdd *d,HMONITOR target)
+{
+    MONITORINFO monitor={sizeof(monitor)};
+    if (!GetMonitorInfoW(target,&monitor)) return FALSE;
+    return SetWindowPos(d->hwnd,NULL,monitor.rcMonitor.left,monitor.rcMonitor.top,
+        monitor.rcMonitor.right-monitor.rcMonitor.left,monitor.rcMonitor.bottom-monitor.rcMonitor.top,
+        SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);
+}
+
+static BOOL idd_set_fullscreen(VmDisplayIdd *d,BOOL enabled)
+{
+    if (d->fullscreen==enabled) return TRUE;
+    if (enabled && !agent_overlay_is_ready(d->agent_overlay)) return FALSE;
+    if (enabled) {
+        d->windowed_placement.length=sizeof(d->windowed_placement);
+        if (!GetWindowPlacement(d->hwnd,&d->windowed_placement)) return FALSE;
+        d->windowed_style=GetWindowLongPtrW(d->hwnd,GWL_STYLE);
+    }
+    d->input_sizing=TRUE;
+    idd_update_relative_mouse(d);
+    agent_overlay_cancel_input(d->agent_overlay);
+    InterlockedExchange(&d->fullscreen,enabled);
+    if (enabled) {
+        SetWindowLongPtrW(d->hwnd,GWL_STYLE,(d->windowed_style & ~(WS_OVERLAPPEDWINDOW|WS_MAXIMIZE))|WS_POPUP);
+        if (!idd_fit_fullscreen(d,MonitorFromWindow(d->hwnd,MONITOR_DEFAULTTONEAREST))) {
+            InterlockedExchange(&d->fullscreen,FALSE);
+            SetWindowLongPtrW(d->hwnd,GWL_STYLE,d->windowed_style);
+            SetWindowPlacement(d->hwnd,&d->windowed_placement);
+        }
+    } else {
+        SetWindowLongPtrW(d->hwnd,GWL_STYLE,d->windowed_style);
+        SetWindowPlacement(d->hwnd,&d->windowed_placement);
+        SetWindowPos(d->hwnd,NULL,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);
+    }
+    d->input_sizing=FALSE;
+    agent_overlay_set_fullscreen(d->agent_overlay,d->fullscreen);
+    idd_update_display_size(d,FALSE);
+    idd_update_relative_mouse(d);
+    asb_events_changed();
+    return d->fullscreen==enabled;
+}
+
+static void idd_viewer_option_state(VmDisplayIdd *d,UINT *enabled,UINT *checked)
+{
+    *enabled=28;*checked=0;
+    if (asb_vm_sas_supported((AsbVm)asb_find_vm_by_id(d->vm_id))) *enabled|=1;
+    if (d->shared_ready && d->shared_resize && !d->shared_disabled &&
+        (d->shared_front>=0 || d->shared_pending>=0)) *enabled|=2;
+    if (d->size_mode==DISPLAY_SIZE_WINDOW) *checked|=2;
+    if (d->share_clipboard) *checked|=4;
+    if (d->transmit_hotkeys) *checked|=8;
+    if (d->audio_muted) *checked|=16;
+}
+
 static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     VmDisplayIdd *d;
@@ -3359,6 +3422,19 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         idd_resume_absolute_mouse(d, NULL);
 
     switch (msg) {
+    case WM_IDD_VIEWER_OPTIONS:
+        if (d && d->fullscreen) {
+            UINT enabled=0,checked=0;
+            idd_viewer_option_state(d,&enabled,&checked);
+            if (wp<ARRAYSIZE(g_viewer_commands) && (enabled&(1u<<wp))) {
+                SendMessageW(hwnd,WM_SYSCOMMAND,g_viewer_commands[wp],0);
+                idd_viewer_option_state(d,&enabled,&checked);
+            }
+            agent_overlay_viewer_options(d->agent_overlay,enabled,checked);
+        }
+        return 0;
+    case WM_IDD_FULLSCREEN:
+        return d && idd_set_fullscreen(d,!!wp);
     case WM_IDD_TAKE_CONTROL:
         if (d) {
             if (wp == ASB_INPUT_USER_GRANT || wp == ASB_INPUT_USER_REVOKE || wp == ASB_INPUT_USER_CANCEL) {
@@ -3369,23 +3445,28 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_INITMENU:
         if (d) {
-            BOOL enabled;
+            UINT enabled,checked;
             HMENU menu = GetSystemMenu(hwnd, FALSE);
-            enabled = d->shared_ready && d->shared_resize && !d->shared_disabled &&
-                (d->shared_front >= 0 || d->shared_pending >= 0);
-            EnableMenuItem(menu, IDM_MATCH_WINDOW, MF_BYCOMMAND | (enabled ? MF_ENABLED : MF_GRAYED));
-            CheckMenuItem(menu, IDM_MATCH_WINDOW, MF_BYCOMMAND |
-                (d->size_mode == DISPLAY_SIZE_WINDOW ? MF_CHECKED : MF_UNCHECKED));
+            idd_viewer_option_state(d,&enabled,&checked);
+            for (UINT i=0;i<ARRAYSIZE(g_viewer_commands);++i) {
+                EnableMenuItem(menu,g_viewer_commands[i],MF_BYCOMMAND | ((enabled&(1u<<i))?MF_ENABLED:MF_GRAYED));
+                CheckMenuItem(menu,g_viewer_commands[i],MF_BYCOMMAND | ((checked&(1u<<i))?MF_CHECKED:MF_UNCHECKED));
+            }
+            EnableMenuItem(menu,IDM_FULLSCREEN,MF_BYCOMMAND |
+                (agent_overlay_is_ready(d->agent_overlay)?MF_ENABLED:MF_GRAYED));
+            CheckMenuItem(menu,IDM_FULLSCREEN,MF_BYCOMMAND | (d->fullscreen?MF_CHECKED:MF_UNCHECKED));
             if (!_wcsicmp(d->os_type, L"Windows")) {
                 int state = asb_vm_display_monitor_state((AsbVm)asb_find_vm_by_id(d->vm_id));
                 EnableMenuItem(menu, IDM_AUTO_DISPLAYS, MF_BYCOMMAND | (state >= 0 ? MF_ENABLED : MF_GRAYED));
                 CheckMenuItem(menu, IDM_AUTO_DISPLAYS, MF_BYCOMMAND | (state > 0 ? MF_CHECKED : MF_UNCHECKED));
-                EnableMenuItem(menu, IDM_SEND_SAS, MF_BYCOMMAND |
-                    (asb_vm_sas_supported((AsbVm)asb_find_vm_by_id(d->vm_id)) ? MF_ENABLED : MF_GRAYED));
             }
         }
         break;
     case WM_SYSCOMMAND:
+        if (d && (wp & 0xFFF0)==IDM_FULLSCREEN) {
+            vm_display_idd_set_fullscreen(d,!d->fullscreen);
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_SEND_SAS) {
             if (FAILED(asb_vm_send_sas((AsbVm)asb_find_vm_by_id(d->vm_id))))
                 idd_log(d, L"Could not queue Ctrl+Alt+Del.");
@@ -3564,6 +3645,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_GETMINMAXINFO:
     {
         MINMAXINFO *mmi = (MINMAXINFO *)lp;
+        if (d && d->fullscreen) return 0;
         DWORD style   = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
         DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
         RECT wr;
@@ -3607,7 +3689,16 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
 
+    case WM_DPICHANGED:
+        if (d && d->fullscreen) {
+            idd_fit_fullscreen(d,MonitorFromRect((RECT *)lp,MONITOR_DEFAULTTONEAREST));
+            agent_overlay_resize(d->agent_overlay);
+            return 0;
+        }
+        break;
+
     case WM_DISPLAYCHANGE:
+        if (d && d->fullscreen) idd_fit_fullscreen(d,MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST));
     case WM_MOVE:
         if (d) agent_overlay_resize(d->agent_overlay);
         if (d && d->size_mode == DISPLAY_SIZE_WINDOW && !d->input_sizing)
@@ -4079,4 +4170,17 @@ void vm_display_idd_focus(VmDisplayIdd *display)
     /* Marshal to the window thread; that thread owns the window and runs
        the activation (restore-if-minimized + foreground) in WM_IDD_FOCUS. */
     PostMessageW(display->hwnd, WM_IDD_FOCUS, 0, 0);
+}
+
+BOOL vm_display_idd_is_fullscreen(VmDisplayIdd *display)
+{
+    return vm_display_idd_is_open(display) && InterlockedCompareExchange(&display->fullscreen,0,0);
+}
+
+BOOL vm_display_idd_set_fullscreen(VmDisplayIdd *display,BOOL enabled)
+{
+    DWORD_PTR result=FALSE;
+    if (!vm_display_idd_is_open(display)) return FALSE;
+    return SendMessageTimeoutW(display->hwnd,WM_IDD_FULLSCREEN,!!enabled,0,
+        SMTO_ABORTIFHUNG|SMTO_BLOCK,1000,&result) && result;
 }

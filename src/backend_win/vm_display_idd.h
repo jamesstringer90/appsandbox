@@ -16,6 +16,8 @@ void vm_display_idd_destroy(VmDisplayIdd *display);
 BOOL vm_display_idd_is_active(VmDisplayIdd *display);
 BOOL vm_display_idd_is_open(VmDisplayIdd *display);
 UINT_PTR vm_display_idd_token(VmDisplayIdd *display);
+BOOL vm_display_idd_is_fullscreen(VmDisplayIdd *display);
+BOOL vm_display_idd_set_fullscreen(VmDisplayIdd *display, BOOL enabled);
 
 /* Bring an already-open display window to the foreground/focus.
    Safe to call from any thread; the work is marshaled to the window thread. */

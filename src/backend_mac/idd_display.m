@@ -509,7 +509,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
     NSRect frame = NSMakeRect(0, 0, 1280, 720);
     NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                               NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
-    NSWindow *window = [[AsbViewerWindow alloc] initWithContentRect:frame
+    AsbViewerWindow *window = [[AsbViewerWindow alloc] initWithContentRect:frame
                                                   styleMask:style
                                                     backing:NSBackingStoreBuffered
                                                       defer:NO];
@@ -522,6 +522,9 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
     _name = [name copy];
     _vmId = vmId;
+    window.vmName = _name;
+    __weak IddDisplayWindow *weakSelf = self;
+    window.populateViewerOptions = ^(NSMenu *menu) { [weakSelf populateViewerOptions:menu]; };
     _transport = transport;
     _stop = 1;
     _displayFd = -1;
@@ -680,9 +683,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
     [self performSelector:@selector(flushDisplaySize) withObject:nil afterDelay:0.15];
 }
 
-- (void)showTitlebarMenuAtPoint:(NSPoint)point {
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
-    menu.autoenablesItems = NO;
+- (void)populateViewerOptions:(NSMenu *)menu {
     NSMenuItem *mute = [menu addItemWithTitle:@"Mute audio" action:@selector(toggleAudioMute:) keyEquivalent:@""];
     mute.target = self;
     mute.state = _audioMuted ? NSControlStateValueOn : NSControlStateValueOff;
@@ -707,6 +708,12 @@ static __weak IddDisplayWindow *g_mouseOwner;
     NSMenuItem *sas = [menu addItemWithTitle:@"Send Ctrl+Alt+Del" action:@selector(sendSas:) keyEquivalent:@""];
     sas.target = self;
     sas.enabled = asb_mac_vm_sas_supported(self.vmId);
+}
+
+- (void)showTitlebarMenuAtPoint:(NSPoint)point {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+    menu.autoenablesItems = NO;
+    [(AsbViewerWindow *)self.window populateViewerMenu:menu];
     _trackingMenus++;
     [self releaseKeyboardCapture];
     [self releaseMouseCapture];
@@ -2305,13 +2312,13 @@ static __weak IddDisplayWindow *g_mouseOwner;
 }
 
 - (void)windowDidFailToEnterFullScreen:(NSWindow *)window {
-    (void)window;
+    [(AsbViewerWindow *)window fullscreenTransitionFinished];
     _fullscreenSizing = NO;
     [self flushDisplaySize];
 }
 
 - (void)windowDidFailToExitFullScreen:(NSWindow *)window {
-    (void)window;
+    [(AsbViewerWindow *)window fullscreenTransitionFinished];
     _fullscreenSizing = NO;
     [self flushDisplaySize];
 }
