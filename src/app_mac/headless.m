@@ -1426,7 +1426,7 @@ static int handle_request(int fd, HttpReq *r) {
                 send_json(fd, 200, "OK",
                           json_str(@{ @"open": open ? @YES : @NO,
                                       @"ready": ready ? @YES : @NO,
-                                      @"automaticallyDisableExtraDisplays": monitor < 0 ? NSNull.null : @(monitor != 0),
+                                      @"automaticallyDisableExtraDisplays": monitor < 0 ? NSNull.null : (monitor ? @YES : @NO),
                                       @"sasSupported": @(sas) }));
                 return 0;
             }
