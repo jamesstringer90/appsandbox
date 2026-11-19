@@ -857,7 +857,7 @@ uint64_t ntfs_add_hardlink(ntfs_writer_t *w, uint64_t target_ref, uint64_t paren
  * `sub_vcn` is the down-pointer for internal nodes. The B-tree machinery
  * (pack_level/emit_indx/serialize_body) is shared between both index kinds. */
 typedef struct { uint64_t file_ref; const uint8_t *key; uint16_t key_len; uint64_t sub_vcn;
-                 const uint8_t *data; uint16_t data_len; } bentry_t;
+                 const uint8_t *data; uint16_t data_len, data_padding; } bentry_t;
 /* A built node awaiting emission once the index's base LCN is known. */
 typedef struct { uint64_t vcn; bentry_t *ent; int n; int internal; uint64_t end_vcn; } nodespec_t;
 
@@ -880,7 +880,7 @@ static uint32_t serialize_body(uint8_t *out, const bentry_t *ent, int n, int int
         uint8_t *e = out+p; memset(e,0,elen);
         if (ent[i].data){                       /* VIEW index entry ($SDH/$SII) */
             uint16_t doff=(uint16_t)(0x10+ent[i].key_len);   /* data right after key (0x14 for SII) */
-            w16(e+0x00, doff); w16(e+0x02, ent[i].data_len);
+            w16(e+0x00, doff); w16(e+0x02, ent[i].data_len - ent[i].data_padding);
             w16(e+0x08, (uint16_t)elen); w16(e+0x0A, ent[i].key_len);
             w16(e+0x0C, internal?0x01:0x00);
             memcpy(e+0x10, ent[i].key, ent[i].key_len);
@@ -1707,7 +1707,7 @@ int ntfs_writer_close(ntfs_writer_t *w){
 
         uint32_t n=w->nsec;
         uint8_t  *data20 = malloc((size_t)n*20 + 1);   /* $SII data: hash,id,sds_off,len (20B) */
-        uint8_t  *data24 = malloc((size_t)n*24 + 1);   /* $SDH data: same + reserved_II (24B) */
+        uint8_t  *data24 = malloc((size_t)n*24 + 1);
         uint8_t  *siikey = malloc((size_t)n*4 + 1);
         uint8_t  *sdhkey = malloc((size_t)n*8 + 1);
         bentry_t *sii = malloc((size_t)n*sizeof(bentry_t) + 1);
@@ -1715,17 +1715,12 @@ int ntfs_writer_close(ntfs_writer_t *w){
         for (uint32_t i=0;i<n;i++){
             uint8_t *d=data20+i*20;
             w32(d+0,w->sec[i].hash); w32(d+4,(uint32_t)w->sec[i].id); w64(d+8,w->sec[i].sds_offset); w32(d+16,20+w->sec[i].sd_len);
-            /* $SDH data is the $SII datum (20B) + a 4-byte reserved_II "II" trailer
-             * (0x00490049), making $SDH index entries 24B of data.
-             * Windows writes this on every $SDH entry; omitting it makes our $SDH
-             * entries the wrong size, breaking the dedup-by-hash lookup Windows uses
-             * when ADDING new security descriptors (e.g. during specialize). */
             uint8_t *d2=data24+i*24;
             memcpy(d2,d,20); w32(d2+20,0x00490049);
             w32(siikey+i*4,(uint32_t)w->sec[i].id);
             w32(sdhkey+i*8,w->sec[i].hash); w32(sdhkey+i*8+4,(uint32_t)w->sec[i].id);
             sii[i]=(bentry_t){.key=siikey+i*4,.key_len=4,.data=d,.data_len=20};
-            sdh[i]=(bentry_t){.key=sdhkey+i*8,.key_len=8,.data=d2,.data_len=24};
+            sdh[i]=(bentry_t){.key=sdhkey+i*8,.key_len=8,.data=d2,.data_len=24,.data_padding=4};
         }
         /* $SII keyed by security_id: w->sec is already id-ascending. $SDH keyed by
          * COLLATION_NTOFS_SECURITY_HASH: sort by (hash, id). */
