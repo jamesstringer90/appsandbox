@@ -693,11 +693,20 @@ static __weak IddDisplayWindow *g_mouseOwner;
     NSMenuItem *clipboard = [menu addItemWithTitle:@"Share clipboard" action:@selector(toggleClipboardSharing:) keyEquivalent:@""];
     clipboard.target = self;
     clipboard.state = self.clipboardSharingEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    int displayMonitor = asb_mac_vm_display_monitor_state(self.vmId);
+    NSMenuItem *displays = [menu addItemWithTitle:@"Automatically disable non AppSandbox displays"
+        action:@selector(toggleDisplayMonitor:) keyEquivalent:@""];
+    displays.target = self;
+    displays.enabled = displayMonitor >= 0;
+    displays.state = displayMonitor > 0 ? NSControlStateValueOn : NSControlStateValueOff;
     NSMenuItem *match = [menu addItemWithTitle:@"Match window size"
                                       action:@selector(toggleMatchWindowSize:) keyEquivalent:@""];
     match.target = self;
     match.state = _matchWindow ? NSControlStateValueOn : NSControlStateValueOff;
     match.enabled = [self canMatchWindowSize];
+    NSMenuItem *sas = [menu addItemWithTitle:@"Send Ctrl+Alt+Del" action:@selector(sendSas:) keyEquivalent:@""];
+    sas.target = self;
+    sas.enabled = asb_mac_vm_sas_supported(self.vmId);
     _trackingMenus++;
     [self releaseKeyboardCapture];
     [self releaseMouseCapture];
@@ -705,6 +714,19 @@ static __weak IddDisplayWindow *g_mouseOwner;
     if (_trackingMenus) _trackingMenus--;
     [self updateKeyboardCapture];
     [self updateMouseCapture];
+}
+
+- (void)sendSas:(id)sender {
+    (void)sender;
+    if (asb_mac_vm_send_sas(self.vmId) != ASB_OK)
+        NSLog(@"IDD [%@]: Could not queue Ctrl+Alt+Del.", self.name);
+}
+
+- (void)toggleDisplayMonitor:(id)sender {
+    (void)sender;
+    int state = asb_mac_vm_display_monitor_state(self.vmId);
+    if (state >= 0 && asb_mac_vm_set_display_monitor_enabled(self.vmId, !state) != ASB_OK)
+        NSLog(@"IDD [%@]: Could not queue the display watcher setting.", self.name);
 }
 
 - (NSEvent *)handleViewerEvent:(NSEvent *)event {

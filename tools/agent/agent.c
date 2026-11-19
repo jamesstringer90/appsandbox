@@ -28,6 +28,7 @@
 #include <stdarg.h>
 #include "p9copy.h"
 #include "gl_vk_provision.h"
+#include "display_settings.h"
 #include "../transport/asb_transport.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -77,6 +78,8 @@ static HANDLE                g_stop_event;
 static AsbConn *             g_client_sock = NULL; /* Active persistent connection */
 static volatile BOOL         g_os_shutting_down = FALSE;
 static CRITICAL_SECTION      g_send_cs;     /* Protects send_line from concurrent callers */
+static HMODULE              g_sas_module;
+static void (WINAPI *g_send_sas)(BOOL);
 
 /* ---- Logging ---- */
 
@@ -1543,21 +1546,50 @@ static BOOL run_devcon(const wchar_t *args, char *output, int output_size, DWORD
 
 /* ---- VDD device check: restart if not running ---- */
 
+static SRWLOCK g_display_lock = SRWLOCK_INIT;
+static BOOL g_display_monitor_enabled = TRUE;
+
+static void disable_hyperv_adapter(void)
+{
+    static const wchar_t prefix[] = L"VMBUS\\{DA0A7802-E377-4AAC-8E77-0558EB1073F8}\\";
+    HDEVINFO devices = SetupDiGetClassDevsW(&GUID_DISPLAY_CLASS, NULL, NULL, DIGCF_PRESENT);
+    if (devices == INVALID_HANDLE_VALUE) {
+        agent_log("Hyper-V Video: device enumeration failed (%lu).", GetLastError());
+        return;
+    }
+    SP_DEVINFO_DATA device = {0};
+    device.cbSize = sizeof(device);
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(devices, i, &device); ++i) {
+        wchar_t instance[MAX_DEVICE_ID_LEN] = {0};
+        if (CM_Get_Device_IDW(device.DevInst, instance, ARRAYSIZE(instance), 0) != CR_SUCCESS ||
+            _wcsnicmp(instance, prefix, ARRAYSIZE(prefix) - 1)) continue;
+        CONFIGRET enabled = CM_Enable_DevNode(device.DevInst, 0);
+        CONFIGRET disabled = CM_Disable_DevNode(device.DevInst, 0);
+        agent_log("Hyper-V Video: startup enable=%lu, disable=%lu.",
+                  CM_MapCrToWin32Err(enabled, ERROR_GEN_FAILURE),
+                  CM_MapCrToWin32Err(disabled, ERROR_GEN_FAILURE));
+    }
+    SetupDiDestroyDeviceInfoList(devices);
+}
+
 static void ensure_vdd_running(void)
 {
     char output[4096];
     DWORD exit_code = 0;
 
+    AcquireSRWLockShared(&g_display_lock);
+    if (!g_display_monitor_enabled) goto done;
+
     if (!run_devcon(L"status Root\\AppSandboxVDD", output, sizeof(output), &exit_code)) {
         agent_log("ensure_vdd_running: devcon failed to launch (%lu).", GetLastError());
-        return;
+        goto done;
     }
 
     if (strstr(output, "running"))
-        return;
+        goto done;
 
     if (strstr(output, "No matching"))
-        return; /* not installed yet */
+        goto done;
 
     /* A device in CM_PROB_DISABLED (explicitly disabled) has its CONFIGFLAG_DISABLED bit set;
        `devcon restart` (DICS_PROPCHANGE: stop->start) reports success but CANNOT clear that bit,
@@ -1567,10 +1599,10 @@ static void ensure_vdd_running(void)
         agent_log("VDD: disabled - enabling.");
         if (!run_devcon(L"enable Root\\AppSandboxVDD", output, sizeof(output), &exit_code)) {
             agent_log("VDD enable: devcon failed to launch (%lu).", GetLastError());
-            return;
+            goto done;
         }
         agent_log("VDD enable (exit=%lu): %.400s", exit_code, output);
-        return;
+        goto done;
     }
 
     if (strstr(output, "problem"))
@@ -1580,26 +1612,62 @@ static void ensure_vdd_running(void)
 
     if (!run_devcon(L"restart Root\\AppSandboxVDD", output, sizeof(output), &exit_code)) {
         agent_log("VDD restart: devcon failed to launch (%lu).", GetLastError());
-        return;
+        goto done;
     }
     agent_log("VDD restart (exit=%lu): %.400s", exit_code, output);
+done:
+    ReleaseSRWLockShared(&g_display_lock);
 }
 
-static SRWLOCK g_display_lock = SRWLOCK_INIT;
 static HANDLE g_display_process;
+static HANDLE g_display_stop;
 static DWORD g_display_session = 0xFFFFFFFF;
+
+static BOOL display_helper_path(wchar_t *path, DWORD capacity)
+{
+    DWORD length = GetModuleFileNameW(NULL, path, capacity);
+    if (!length || length >= capacity) return FALSE;
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if (!slash) return FALSE;
+    slash[1] = 0;
+    if (wcscat_s(path, capacity, L"appsandbox-displays.exe") != 0) return FALSE;
+    DWORD attributes = GetFileAttributesW(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static void report_display_monitor(AsbConn *client)
+{
+    wchar_t path[MAX_PATH];
+    AcquireSRWLockShared(&g_display_lock);
+    const char *state = !display_helper_path(path, ARRAYSIZE(path)) ? "unsupported" :
+        g_display_monitor_enabled ? "enabled" : "disabled";
+    char line[64];
+    sprintf_s(line, sizeof(line), "display_monitor:%s", state);
+    ReleaseSRWLockShared(&g_display_lock);
+    send_line(client, line);
+}
 
 static void close_display_helper(void)
 {
     if (g_display_process) {
         if (WaitForSingleObject(g_display_process, 0) != WAIT_OBJECT_0) {
-            TerminateProcess(g_display_process, 0);
-            WaitForSingleObject(g_display_process, 3000);
+            if (!g_display_stop || !SetEvent(g_display_stop) ||
+                WaitForSingleObject(g_display_process, 3000) != WAIT_OBJECT_0) {
+                agent_log("Display monitor: graceful stop failed, terminating.");
+                TerminateProcess(g_display_process, 0);
+                WaitForSingleObject(g_display_process, 3000);
+            } else {
+                agent_log("Display monitor: stopped gracefully.");
+            }
         }
         CloseHandle(g_display_process);
         g_display_process = NULL;
     }
     g_display_session = 0xFFFFFFFF;
+    if (g_display_stop) {
+        CloseHandle(g_display_stop);
+        g_display_stop = NULL;
+    }
 }
 
 static void stop_display_monitor(void)
@@ -1612,14 +1680,14 @@ static void stop_display_monitor(void)
 static void ensure_display_monitor(void)
 {
     HANDLE cur_token = NULL, dup_token = NULL;
+    HANDLE stop_event = NULL;
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
-    wchar_t exe_path[MAX_PATH], cmd[MAX_PATH + 32];
-    wchar_t *slash;
+    wchar_t exe_path[MAX_PATH], cmd[MAX_PATH + 80];
     DWORD session_id;
 
     AcquireSRWLockExclusive(&g_display_lock);
-    if (WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0) goto done;
+    if (!g_display_monitor_enabled || WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0) goto done;
     session_id = WTSGetActiveConsoleSessionId();
     if (g_display_process && g_display_session == session_id &&
         WaitForSingleObject(g_display_process, 0) != WAIT_OBJECT_0) goto done;
@@ -1631,16 +1699,14 @@ static void ensure_display_monitor(void)
     close_display_helper();
     if (session_id == 0xFFFFFFFF || session_id == 0) goto done;
 
-    GetModuleFileNameW(NULL, exe_path, MAX_PATH);
-    slash = wcsrchr(exe_path, L'\\');
-    if (slash) *(slash + 1) = L'\0';
-    wcscat_s(exe_path, MAX_PATH, L"appsandbox-displays.exe");
-    swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%s\"", exe_path);
-
-    if (GetFileAttributesW(exe_path) == INVALID_FILE_ATTRIBUTES) {
-        agent_log("Hyper-V display: %ls not found.", exe_path);
+    if (!display_helper_path(exe_path, ARRAYSIZE(exe_path))) {
+        agent_log("Hyper-V display helper not found.");
         goto done;
     }
+    stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!stop_event) goto done;
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%s\" --stop-event %lu:%llu", exe_path,
+               GetCurrentProcessId(), (unsigned long long)(ULONG_PTR)stop_event);
 
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &cur_token)) {
         agent_log("Hyper-V display: OpenProcessToken failed (%lu).", GetLastError());
@@ -1670,13 +1736,34 @@ static void ensure_display_monitor(void)
         goto done;
     }
     g_display_process = pi.hProcess;
+    g_display_stop = stop_event;
+    stop_event = NULL;
     g_display_session = session_id;
     CloseHandle(pi.hThread);
     agent_log("Display monitor: spawned PID %lu in session %lu.", pi.dwProcessId, session_id);
 done:
+    if (stop_event) CloseHandle(stop_event);
     if (dup_token) CloseHandle(dup_token);
     if (cur_token) CloseHandle(cur_token);
     ReleaseSRWLockExclusive(&g_display_lock);
+}
+
+static DWORD set_display_monitor_enabled(BOOL enabled)
+{
+    wchar_t path[MAX_PATH];
+    AcquireSRWLockExclusive(&g_display_lock);
+    DWORD result = display_helper_path(path, ARRAYSIZE(path)) ?
+        asb_display_settings_save(enabled) : ERROR_NOT_SUPPORTED;
+    if (result == ERROR_SUCCESS) {
+        g_display_monitor_enabled = enabled != FALSE;
+        if (!g_display_monitor_enabled) close_display_helper();
+    }
+    ReleaseSRWLockExclusive(&g_display_lock);
+    if (result == ERROR_SUCCESS && enabled) {
+        ensure_vdd_running();
+        ensure_display_monitor();
+    }
+    return (DWORD)result;
 }
 
 /* ---- IDD connect: respawn helpers in console session ---- */
@@ -1760,6 +1847,52 @@ static ULONG primary_nic_index(void)
     return index;
 }
 
+static DWORD send_sas(void)
+{
+    static const wchar_t policy[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System";
+    HKEY key = NULL;
+    BOOL restore = FALSE;
+    DWORD session = WTSGetActiveConsoleSessionId();
+    DWORD value = 0, type = 0, size = sizeof(value);
+    DWORD result;
+    if (!g_send_sas) return ERROR_NOT_SUPPORTED;
+    if (!session || session == 0xFFFFFFFF) return ERROR_NO_SUCH_LOGON_SESSION;
+    result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, policy, 0,
+        KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY, &key);
+    if (result != ERROR_SUCCESS) {
+        agent_log("SAS: opening the Windows software-SAS policy failed (%lu).", result);
+        return result;
+    }
+    result = RegQueryValueExW(key, L"SoftwareSASGeneration", NULL, &type, (BYTE *)&value, &size);
+    if (result == ERROR_FILE_NOT_FOUND) {
+        value = 1;
+        result = RegSetValueExW(key, L"SoftwareSASGeneration", 0, REG_DWORD,
+                                (const BYTE *)&value, sizeof(value));
+        restore = result == ERROR_SUCCESS;
+    } else if (result == ERROR_SUCCESS &&
+        (type != REG_DWORD || size != sizeof(value) || (value != 1 && value != 3))) {
+        result = ERROR_ACCESS_DISABLED_BY_POLICY;
+    }
+    if (result != ERROR_SUCCESS) goto done;
+    g_send_sas(FALSE);
+    agent_log("SAS: requested for console session %lu.", session);
+done:
+    if (restore) {
+        size = sizeof(value);
+        if (RegQueryValueExW(key, L"SoftwareSASGeneration", NULL, &type,
+                            (BYTE *)&value, &size) == ERROR_SUCCESS &&
+            type == REG_DWORD && size == sizeof(value) && value == 1) {
+            DWORD cleanup = RegDeleteValueW(key, L"SoftwareSASGeneration");
+            if (cleanup != ERROR_SUCCESS) {
+                agent_log("SAS: policy restoration failed (%lu).", cleanup);
+                if (result == ERROR_SUCCESS) result = cleanup;
+            }
+        }
+    }
+    RegCloseKey(key);
+    return result;
+}
+
 static void handle_client(AsbConn *client)
 {
     char buf[256];
@@ -1785,6 +1918,8 @@ static void handle_client(AsbConn *client)
 
     /* Report IDD driver status to host (force: always send on connect so a reconnect re-syncs) */
     report_idd_status(client, 1);
+    report_display_monitor(client);
+    send_line(client, g_send_sas ? "sas:supported" : "sas:unsupported");
 
     /* Initial device checks */
     ensure_vdd_running();
@@ -1994,6 +2129,28 @@ static void handle_client(AsbConn *client)
         }
         else if (strcmp(cmd, "idd_connect") == 0) {
             handle_idd_connect(client, tag);
+        }
+        else if (!strcmp(cmd, "sas")) {
+            DWORD result = send_sas();
+            if (result == ERROR_SUCCESS) REPLY("ok");
+            else {
+                char response[64];
+                agent_log("SAS: request failed (%lu).", result);
+                agent_log_to_host("Send Ctrl+Alt+Del failed (%lu).", result);
+                sprintf_s(response, sizeof(response), "error:sas:%lu", result);
+                REPLY(response);
+            }
+        }
+        else if (!strcmp(cmd, "display_monitor:0") || !strcmp(cmd, "display_monitor:1")) {
+            DWORD result = set_display_monitor_enabled(cmd[16] == '1');
+            if (result == ERROR_SUCCESS && cmd[16] == '1') report_idd_status(client, 0);
+            report_display_monitor(client);
+            if (result == ERROR_SUCCESS) REPLY("ok");
+            else {
+                char response[64];
+                sprintf_s(response, sizeof(response), "error:display_monitor:%lu", result);
+                REPLY(response);
+            }
         }
         else {
             REPLY("error:unknown");
@@ -2404,6 +2561,8 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
 static void WINAPI service_main(DWORD argc, LPSTR *argv)
 {
     HANDLE thread;
+    BOOL listener_stopped = TRUE;
+    g_display_monitor_enabled = asb_display_settings_enabled();
 
     (void)argc; (void)argv;
 
@@ -2423,6 +2582,10 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Wire p9copy logging into agent_log */
     p9_set_log(p9copy_log);
+
+    g_sas_module = LoadLibraryExW(L"sas.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (g_sas_module) g_send_sas = (void (WINAPI *)(BOOL))GetProcAddress(g_sas_module, "SendSAS");
+    disable_hyperv_adapter();
 
     /* Start listener on a worker thread */
     thread = CreateThread(NULL, 0, listener_thread, NULL, 0, NULL);
@@ -2473,7 +2636,7 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
        polls g_stop_event every 1s and exits on its own. Nothing socket-level to close here. */
     if (thread) {
         agent_log("Waiting for listener thread...");
-        WaitForSingleObject(thread, 5000);
+        listener_stopped = WaitForSingleObject(thread, 5000) == WAIT_OBJECT_0;
         CloseHandle(thread);
         agent_log("Listener thread exited.");
     }
@@ -2482,6 +2645,11 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     DeleteCriticalSection(&g_send_cs);
 
     agent_log("Service stopped.");
+    if (listener_stopped) {
+        g_send_sas = NULL;
+        if (g_sas_module) FreeLibrary(g_sas_module);
+        g_sas_module = NULL;
+    }
     set_service_status(SERVICE_STOPPED, 0);
 }
 
