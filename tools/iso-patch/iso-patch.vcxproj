@@ -164,6 +164,7 @@
     <ClCompile Include="prefetch_build_deps.c" />
     <ClCompile Include="prefetch_wsl_deps.c" />
     <ClCompile Include="prefetch_repo.c" />
+    <ClCompile Include="..\..\src\core\win_file_hash.c" />
     <ClCompile Include="engine\log.c" />
     <ClCompile Include="engine\ext4.c" />
     <ClCompile Include="engine\squashfs.c" />

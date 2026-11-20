@@ -285,6 +285,7 @@ $msBinaries = @('WebView2Loader.dll', 'devcon.exe')
 $toSign = @(Get-ChildItem $bin -Recurse -Include *.exe, *.dll, *.sys | Where-Object {
     ($_.Name -notin $msBinaries) -and
     ($_.FullName -notmatch '\\(drivers-signed|_attest|_package)\\') -and
+    (-not $_.FullName.StartsWith("$bin\cuda\", [StringComparison]::OrdinalIgnoreCase)) -and
     (-not (Test-OurEvSigned $_.FullName $ev.Thumbprint))
 }) | ForEach-Object { $_.FullName }
 
@@ -362,6 +363,7 @@ New-Item -ItemType Directory -Force -Path $stage | Out-Null
 # its direct deps; the guest binaries ship under resources\, the signed drivers under drivers\,
 # the web UI under web\.
 $rootBins = @('AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll')
+if ($Platform -eq 'x64') { $rootBins += 'appsandbox-cuda-updater.exe' }
 foreach ($b in $rootBins) {
     $src = Join-Path $bin $b
     if (-not (Test-Path $src)) { throw "Missing required root binary $b under $bin." }
@@ -407,6 +409,7 @@ $required = @(
     'headless-api\asb.py', 'headless-api\README.md', 'headless-api\examples', 'headless-api\tests'
 )
 if ($Platform -eq 'x64') {
+    $required += 'appsandbox-cuda-updater.exe'
     $required += 'resources\nvidia\appsandbox-nvidia-vk-gl-shim.dll', 'resources\nvidia\appsandbox-nvidia-vk-gl-shim32.dll'
     $required += 'resources\nvidia\appsandbox-nvidia-dlss-shim.dll'
     $required += 'resources\nvidia\appsandbox-nvidia-cuda-shim.dll', 'resources\nvidia\appsandbox-nvidia-opencl-shim.dll'

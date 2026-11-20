@@ -4,6 +4,7 @@
 #include "vm_ssh_proxy.h"
 #include "asb_core.h"
 #include "hcn_network.h"
+#include "gpu_delivery.h"
 #include "ui.h"
 #include <stdio.h>
 
@@ -55,6 +56,8 @@ typedef struct AgentConn {
     char           cmd[64];
     char           rsp[256];
     unsigned int   cmd_seq;      /* Monotonic sequence ID for tagged commands */
+    GpuShimDelivery shim_delivery;
+    wchar_t        disk[MAX_PATH];
 } AgentConn;
 
 #define MAX_AGENTS 16
@@ -79,6 +82,7 @@ static AgentConn *alloc_conn(VmInstance *vm)
         if (g_conns[i].vm_id == 0) {
             memset(&g_conns[i], 0, sizeof(AgentConn));
             g_conns[i].vm_id = vm->unique_id;
+            wcscpy_s(g_conns[i].disk, MAX_PATH, vm->vhdx_path);
             g_conns[i].sock = INVALID_SOCKET;
             g_conns[i].cmd_done = CreateEventW(NULL, FALSE, FALSE, NULL);
             return &g_conns[i];
@@ -112,12 +116,13 @@ static int recv_line(SOCKET s, char *buf, int buf_size)
     return pos;
 }
 
-static int send_line(SOCKET s, const char *msg)
+static int send_line(SOCKET s, const char *msg, BOOL require_complete)
 {
     int len = (int)strlen(msg);
     int n;
     n = send(s, msg, len, 0);
     if (n <= 0) return n;
+    if (require_complete && n != len) return SOCKET_ERROR;
     n = send(s, "\n", 1, 0);
     return n;
 }
@@ -217,8 +222,44 @@ static void vm_agent_send_deploy_key(SOCKET s, VmInstance *vm)
         return;
     WideCharToMultiByte(CP_UTF8, 0, vm->ssh_pubkey, -1, pubkey_a, sizeof(pubkey_a), NULL, NULL);
     sprintf_s(cmd, sizeof(cmd), "ssh_deploy_key %s", pubkey_a);
-    send_line(s, cmd);
+    send_line(s, cmd, FALSE);
     ui_log(L"Requested SSH key deploy for \"%s\".", vm->name);
+}
+
+static BOOL send_gpu_shares(AgentConn *conn, SOCKET s, const VmInstance *vm)
+{
+    char header[64];
+    int i, shim_index = -1;
+    if (conn->shim_delivery.requested) return TRUE;
+    if (vm->gpu_mode == 0 || vm->gpu_shares.count == 0) {
+        send_line(s, "gpu_none", FALSE);
+        return TRUE;
+    }
+
+    for (i = 0; i < vm->gpu_shares.count; i++) {
+        if (!_wcsicmp(vm->gpu_shares.shares[i].share_name, L"AppSandbox.Nvidia")) {
+            shim_index = i;
+            break;
+        }
+    }
+    sprintf_s(header, sizeof(header), "gpu_query_response:%d", vm->gpu_shares.count);
+    if (send_line(s, header, shim_index >= 0) <= 0 && shim_index >= 0) return FALSE;
+    for (i = 0; i < vm->gpu_shares.count; i++) {
+        wchar_t filter[4096];
+        char line[8192], share_a[128], dest_a[512], filter_a[4096];
+        const GpuDriverShare *share = &vm->gpu_shares.shares[i];
+        const wchar_t *files = share->file_filter;
+        if (i == shim_index)
+            files = gpu_shim_delivery_filter(vm->unique_id, conn->disk, share, filter, &conn->shim_delivery);
+        if (!WideCharToMultiByte(CP_UTF8, 0, share->share_name, -1, share_a, sizeof(share_a), NULL, NULL) ||
+            !WideCharToMultiByte(CP_UTF8, 0, share->guest_path, -1, dest_a, sizeof(dest_a), NULL, NULL) ||
+            !WideCharToMultiByte(CP_UTF8, 0, files, -1, filter_a, sizeof(filter_a), NULL, NULL) ||
+            sprintf_s(line, sizeof(line), "%s|%s|%s", share_a, dest_a, filter_a) < 0)
+            return FALSE;
+        if (send_line(s, line, i == shim_index) <= 0 && shim_index >= 0) return FALSE;
+    }
+    ui_log(L"Sent %d GPU share(s) to agent for \"%s\".", vm->gpu_shares.count, vm->name);
+    return TRUE;
 }
 
 /* Process an untagged (async) message from the agent.
@@ -226,7 +267,7 @@ static void vm_agent_send_deploy_key(SOCKET s, VmInstance *vm)
             2 = service_stopping (caller should break and let the reconnect
                 loop retry - SCM restarts the service on failure, so we must
                 keep trying to reconnect). */
-static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
+static int process_async_message(AgentConn *conn, VmInstance *vm, SOCKET s, const char *buf)
 {
     if (strcmp(buf, "heartbeat") == 0) {
         vm->last_heartbeat = GetTickCount64();
@@ -244,8 +285,15 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
     } else if (strncmp(buf, "gpu_copy_progress:", 18) == 0) {
         ui_log(L"GPU copy progress for \"%s\": %S", vm->name, buf + 18);
     } else if (strncmp(buf, "gpu_copy_done:", 14) == 0) {
+        if (conn->shim_delivery.requested) {
+            DWORD copied;
+            if (sscanf_s(buf + 14, "%lu", &copied) == 1)
+                gpu_confirm_shim_delivery(&conn->shim_delivery, copied);
+            conn->shim_delivery.requested = 0;
+        }
         ui_log(L"GPU copy complete for \"%s\" (%S files).", vm->name, buf + 14);
     } else if (strncmp(buf, "gpu_copy_error:", 15) == 0) {
+        conn->shim_delivery.requested = 0;
         ui_log(L"GPU copy error for \"%s\": %S", vm->name, buf + 15);
     } else if (strncmp(buf, "gpu_device_status:", 18) == 0) {
         ui_log(L"[%s] GPU: %S", vm->name, buf + 18);
@@ -283,28 +331,7 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
     } else if (strncmp(buf, "log:", 4) == 0) {
         ui_log(L"[%s] %S", vm->name, buf + 4);
     } else if (strcmp(buf, "gpu_query") == 0) {
-        if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {
-            char header[64];
-            int gi;
-            sprintf_s(header, sizeof(header), "gpu_query_response:%d",
-                      vm->gpu_shares.count);
-            send_line(s, header);
-            for (gi = 0; gi < vm->gpu_shares.count; gi++) {
-                const GpuDriverShare *ds = &vm->gpu_shares.shares[gi];
-                char line[8192];
-                char share_a[128], dest_a[512], filter_a[4096];
-                WideCharToMultiByte(CP_UTF8, 0, ds->share_name, -1,
-                                    share_a, sizeof(share_a), NULL, NULL);
-                WideCharToMultiByte(CP_UTF8, 0, ds->guest_path, -1,
-                                    dest_a, sizeof(dest_a), NULL, NULL);
-                WideCharToMultiByte(CP_UTF8, 0, ds->file_filter, -1,
-                                    filter_a, sizeof(filter_a), NULL, NULL);
-                sprintf_s(line, sizeof(line), "%s|%s|%s", share_a, dest_a, filter_a);
-                send_line(s, line);
-            }
-        } else {
-            send_line(s, "gpu_none");
-        }
+        if (!send_gpu_shares(conn, s, vm)) shutdown(s, SD_BOTH);
     } else if (strcmp(buf, "ssh_ready") == 0) {
         vm->ssh_state = 2;
         vm_ssh_proxy_start(vm);
@@ -333,19 +360,19 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
 /* Send a tagged command and wait for the tagged response.
    Processes any interleaved async messages while waiting.
    Returns: response length on success, 0 on close, -1 on error. */
-static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
+static int send_tagged_cmd(SOCKET s, AgentConn *conn, VmInstance *vm,
                            const char *cmd, char *rsp, int rsp_size)
 {
     char tagged[512];
     char prefix[32];
     int pfx_len, n;
 
-    (*seq)++;
-    sprintf_s(tagged, sizeof(tagged), "%u:%s", *seq, cmd);
-    sprintf_s(prefix, sizeof(prefix), "%u:", *seq);
+    conn->cmd_seq++;
+    sprintf_s(tagged, sizeof(tagged), "%u:%s", conn->cmd_seq, cmd);
+    sprintf_s(prefix, sizeof(prefix), "%u:", conn->cmd_seq);
     pfx_len = (int)strlen(prefix);
 
-    if (send_line(s, tagged) <= 0) return -1;
+    if (send_line(s, tagged, FALSE) <= 0) return -1;
 
     for (;;) {
         n = recv_line(s, rsp, rsp_size);
@@ -358,7 +385,7 @@ static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
         }
 
         /* Untagged = async message, process inline */
-        process_async_message(vm, s, rsp);
+        process_async_message(conn, vm, s, rsp);
     }
 }
 
@@ -398,6 +425,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             continue;
         }
 
+        conn->shim_delivery.requested = 0;
         vm->agent_online = TRUE;
         InterlockedExchange(&vm->display_monitor_state, 0);
         InterlockedExchange(&vm->sas_supported, 0);
@@ -419,44 +447,16 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             char ip_cmd[64];
             sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s.1",
                        vm->nat_ip, hcn_nat_subnet_base());
-            n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd, buf, sizeof(buf));
+            n = send_tagged_cmd(s, conn, vm, ip_cmd, buf, sizeof(buf));
             if (n <= 0) goto disconnected;
             ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);
         }
 
-        /* Send GPU share info to agent (if GPU-PV is assigned).
-           Fire-and-forget - no response expected, so no tagging needed. */
-        if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {
-            char header[64];
-            int gi;
-            sprintf_s(header, sizeof(header), "gpu_query_response:%d",
-                      vm->gpu_shares.count);
-            send_line(s, header);
-            for (gi = 0; gi < vm->gpu_shares.count; gi++) {
-                const GpuDriverShare *ds = &vm->gpu_shares.shares[gi];
-                char line[8192];
-                char share_a[128], dest_a[512], filter_a[4096];
-
-                WideCharToMultiByte(CP_UTF8, 0, ds->share_name, -1,
-                                    share_a, sizeof(share_a), NULL, NULL);
-                WideCharToMultiByte(CP_UTF8, 0, ds->guest_path, -1,
-                                    dest_a, sizeof(dest_a), NULL, NULL);
-                WideCharToMultiByte(CP_UTF8, 0, ds->file_filter, -1,
-                                    filter_a, sizeof(filter_a), NULL, NULL);
-
-                sprintf_s(line, sizeof(line), "%s|%s|%s",
-                          share_a, dest_a, filter_a);
-                send_line(s, line);
-            }
-            ui_log(L"Sent %d GPU share(s) to agent for \"%s\".",
-                   vm->gpu_shares.count, vm->name);
-        } else {
-            send_line(s, "gpu_none");
-        }
+        if (!send_gpu_shares(conn, s, vm)) goto disconnected;
 
         /* Request SSH install/enable if configured */
         if (vm->ssh_enabled) {
-            n = send_tagged_cmd(s, vm, &conn->cmd_seq, "ssh_enable", buf, sizeof(buf));
+            n = send_tagged_cmd(s, conn, vm, "ssh_enable", buf, sizeof(buf));
             if (n <= 0) goto disconnected;
             if (strcmp(buf, "ssh_ready") == 0) {
                 vm->ssh_state = 2;
@@ -486,7 +486,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                 char tagged[512];
                 conn->cmd_seq++;
                 sprintf_s(tagged, sizeof(tagged), "%u:%s", conn->cmd_seq, conn->cmd);
-                if (send_line(s, tagged) <= 0) break;
+                if (send_line(s, tagged, FALSE) <= 0) break;
                 /* Read lines until we get our tagged response */
                 for (;;) {
                     n = recv_line(s, conn->rsp, sizeof(conn->rsp));
@@ -509,7 +509,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                         }
                     }
                     /* Untagged = async message, process inline */
-                    process_async_message(vm, s, conn->rsp);
+                    process_async_message(conn, vm, s, conn->rsp);
                 }
                 conn->cmd_pending = FALSE;
                 SetEvent(conn->cmd_done);
@@ -529,7 +529,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             n = recv_line(s, buf, sizeof(buf));
             if (n <= 0) break; /* connection lost */
 
-            { int rc = process_async_message(vm, s, buf);
+            { int rc = process_async_message(conn, vm, s, buf);
               if (rc == 1 || rc == 2) break;   /* os_shutdown or service_stopping - reconnect loop will retry */
             }
         }

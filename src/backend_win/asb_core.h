@@ -297,6 +297,7 @@ ASB_API VmInstance   *asb_find_vm_by_id(UINT64 id);
 ASB_API SnapshotTree *asb_vm_snap_tree(AsbVm vm);
 ASB_API GpuList      *asb_gpu_list(void);
 ASB_API int           asb_vm_index(AsbVm vm);
+BOOL get_vm_disk_root(const wchar_t *disk_path, wchar_t *out);
 
 /* Tear down the VM's HCN endpoint, and the shared network too if no other
    running VM is still attached to a network of the same mode. Safe to call

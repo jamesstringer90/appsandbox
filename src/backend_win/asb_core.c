@@ -13,6 +13,8 @@
 #include "headless_vm.h"
 #include "hcs_vm.h"
 #include "gpu_enum.h"
+#include "cuda_update.h"
+#include "gpu_delivery.h"
 #include "hcn_network.h"
 #include "disk_util.h"
 #include "d3dlayers.h"
@@ -152,6 +154,45 @@ static void prepare_gl_layers_share(GpuDriverShareList *shares)
     }
 
     gpu_append_gl_layers_share(shares, dir);
+}
+
+static void asb_log(const wchar_t *fmt, ...);
+
+static void prepare_gpu_driver_shares(VmConfig *config, BOOL for_boot)
+{
+    GpuList *current = NULL, *gpus = &g_gpu_list;
+    BOOL windows;
+    config->gpu_shares.count = 0;
+    if (config->gpu_mode != GPU_DEFAULT || config->is_template) return;
+    windows = _wcsicmp(config->os_type, L"Windows") == 0;
+#if defined(_M_X64)
+    if (windows && for_boot) {
+        int i;
+        for (i = 0; i < g_gpu_list.count; i++) {
+            const GpuInfo *gpu = &g_gpu_list.gpus[i];
+            if (_wcsicmp(gpu->service, L"nvlddmkm") ||
+                (config->gpu_id[0] && _wcsicmp(gpu->interface_path, config->gpu_id)))
+                continue;
+            current = calloc(1, sizeof(*current));
+            if (current && gpu_enumerate(current)) gpus = current;
+            break;
+        }
+    }
+#endif
+    gpu_get_driver_shares(gpus, &config->gpu_shares);
+    if (_wcsicmp(config->os_type, L"Linux") == 0)
+        gpu_append_lxsslib_share(&config->gpu_shares);
+    else if (windows) {
+        gpu_append_amd_gl_vk_driver_shares(gpus, &config->gpu_shares);
+        if (for_boot) {
+            gpu_append_nvidia_drs_share(gpus, &config->gpu_shares);
+            gpu_append_nvidia_graphics_shim_share(gpus, &config->gpu_shares);
+            prepare_gl_layers_share(&config->gpu_shares);
+            if (gpus == current && !cuda_prepare_driver_share(gpus, config->gpu_id, &config->gpu_shares))
+                asb_log(L"CUDA preparation failed (error %lu). Using the standard NVIDIA share.", GetLastError());
+        }
+    }
+    free(current);
 }
 
 typedef struct {
@@ -750,7 +791,7 @@ static BOOL save_vm_list(void)
 
 /* A VM named "snapshots" is a normal VM folder. Only generated branch/frozen
    filenames identify a disk in the snapshots subfolder. */
-static BOOL get_vm_disk_root(const wchar_t *disk_path, wchar_t *out)
+BOOL get_vm_disk_root(const wchar_t *disk_path, wchar_t *out)
 {
     wchar_t *slash;
     BOOL branch;
@@ -1343,20 +1384,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         }
     }
 
-    if (args->config.gpu_mode == GPU_DEFAULT) {
-        gpu_get_driver_shares(&g_gpu_list, &args->config.gpu_shares);
-        /* For Linux guests, also expose the host's lxss\lib so the
-         * Linux agent mounts it at /usr/lib/wsl/lib alongside the
-         * per-GPU driver shares. Windows guests have no use for it. */
-        if (_wcsicmp(args->config.os_type, L"Linux") == 0)
-            gpu_append_lxsslib_share(&args->config.gpu_shares);
-        else if (_wcsicmp(args->config.os_type, L"Windows") == 0) {
-            gpu_append_amd_gl_vk_driver_shares(&g_gpu_list, &args->config.gpu_shares);
-            gpu_append_nvidia_drs_share(&g_gpu_list, &args->config.gpu_shares);
-            gpu_append_nvidia_graphics_shim_share(&g_gpu_list, &args->config.gpu_shares);
-            prepare_gl_layers_share(&args->config.gpu_shares);
-        }
-    }
+    prepare_gpu_driver_shares(&args->config, TRUE);
 
     asb_log(L"Re-creating HCS compute system for \"%s\"...", vm->name);
     hr = (endpoint_guid_str[0] != L'\0')
@@ -1721,6 +1749,10 @@ disk_ready:
         VmInstance temp_inst;
         ZeroMemory(&temp_inst, sizeof(temp_inst));
 
+        if (_wcsicmp(args->config.os_type, L"Windows") == 0) {
+            prepare_gpu_driver_shares(&args->config, TRUE);
+            if (template_copy_cancelled(args)) goto done;
+        }
         hr = (args->endpoint_guid[0] != L'\0')
             ? hcs_create_vm_with_endpoint(&args->config, args->endpoint_guid, &temp_inst)
             : hcs_create_vm(&args->config, &temp_inst);
@@ -1804,6 +1836,7 @@ done:
                     inst->running = TRUE;
                     inst->gpu_mode = heap_inst->gpu_mode;
                     wcscpy_s(inst->gpu_id, ARRAYSIZE(inst->gpu_id), heap_inst->gpu_id);
+                    memcpy(&inst->gpu_shares, &heap_inst->gpu_shares, sizeof(inst->gpu_shares));
                     update_vm_gpu_name(inst);
                     inst->network_mode = heap_inst->network_mode;
                     inst->network_id = args->network_id;
@@ -3646,21 +3679,7 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     }
     swprintf_s(cfg.vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
 
-    /* GPU driver shares */
-    if (cfg.gpu_mode == GPU_DEFAULT && !is_template_create) {
-        gpu_get_driver_shares(&g_gpu_list, &cfg.gpu_shares);
-        /* Linux guests additionally consume %SystemRoot%\System32\lxss\lib
-         * (NVIDIA's WSL-staged Linux userspace .so files), mounted at
-         * /usr/lib/wsl/lib by the agent on first connect. */
-        if (_wcsicmp(cfg.os_type, L"Linux") == 0)
-            gpu_append_lxsslib_share(&cfg.gpu_shares);
-        else if (_wcsicmp(cfg.os_type, L"Windows") == 0) {
-            gpu_append_amd_gl_vk_driver_shares(&g_gpu_list, &cfg.gpu_shares);
-            gpu_append_nvidia_drs_share(&g_gpu_list, &cfg.gpu_shares);
-            gpu_append_nvidia_graphics_shim_share(&g_gpu_list, &cfg.gpu_shares);
-            prepare_gl_layers_share(&cfg.gpu_shares);
-        }
-    }
+    prepare_gpu_driver_shares(&cfg, FALSE);
 
     /* ---- VHDX-first path (Windows, from ISO) ---- */
     {
@@ -3930,6 +3949,7 @@ build_failed:
 
     /* Create HCS VM */
     asb_log(L"Creating %sVM \"%s\"...", is_template_create ? L"template " : L"", cfg.name);
+    if (_wcsicmp(cfg.os_type, L"Windows") == 0) prepare_gpu_driver_shares(&cfg, TRUE);
     hr = (endpoint_guid_str[0] != L'\0')
         ? hcs_create_vm_with_endpoint(&cfg, endpoint_guid_str, inst)
         : hcs_create_vm(&cfg, inst);
@@ -4028,6 +4048,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
             notify_state(vm, FALSE, g_state_ud);
             return hr;
         }
+        gpu_forget_delivery(inst->vhdx_path);
         if (snap_idx == -2) asb_log(L"Switching to base branch...");
         else asb_log(L"Switching to \"%s\" branch...", tree->nodes[snap_idx].name);
         save_vm_list();
