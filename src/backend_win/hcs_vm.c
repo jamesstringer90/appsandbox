@@ -885,6 +885,30 @@ static BOOL hcs_nested_virt_supported(void)
     return g_nested_virt == 1;
 }
 
+static BOOL hcs_ensure_state_file(PCWSTR path, HRESULT (WINAPI *create_file)(PCWSTR))
+{
+    DWORD attributes = GetFileAttributesW(path);
+    HRESULT hr;
+
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        if (!(attributes & FILE_ATTRIBUTE_DIRECTORY))
+            return TRUE;
+        hr = HRESULT_FROM_WIN32(ERROR_DIRECTORY);
+    } else {
+        DWORD error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND)
+            hr = HRESULT_FROM_WIN32(error);
+        else if (create_file)
+            hr = create_file(path);
+        else
+            hr = HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+    }
+
+    if (FAILED(hr))
+        ui_log(L"Error: Could not prepare VM state file \"%s\" (0x%08X).", path, hr);
+    return SUCCEEDED(hr);
+}
+
 BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                        wchar_t *json_out, size_t json_out_chars)
 {
@@ -908,7 +932,6 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     wchar_t vmrs_path[MAX_PATH];
     wchar_t dir[MAX_PATH];
     BOOL is_windows;
-    HRESULT vmgs_hr, vmrs_hr;
     int written;
 
     if (!config || !json_out || json_out_chars < 8192)
@@ -961,8 +984,6 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L",\"ApplySecureBootTemplate\":\"Skip\"");
     }
 
-    /* VMGS + VMRS files — always created regardless of TPM/SecureBoot.
-       GuestState section is always included in the JSON. */
     wcscpy_s(dir, MAX_PATH, config->vhdx_path);
     {
         wchar_t *last_slash = wcsrchr(dir, L'\\');
@@ -971,42 +992,14 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     swprintf_s(vmgs_path, MAX_PATH, L"%s\\vm.vmgs", dir);
     swprintf_s(vmrs_path, MAX_PATH, L"%s\\vm.vmrs", dir);
 
-    /* Delete stale VMGS/VMRS and recreate — stale files from a previous VM
-       instance with different secure boot state cause 0x80370118 on create.
-       After reboot, HcsGrantVmAccess ACLs persist on old files and may prevent
-       deletion, so reset the DACL before deleting. */
-    vmgs_hr = S_OK;
-    vmrs_hr = S_OK;
-    if (pfnCreateVmgs) {
-        if (!DeleteFileW(vmgs_path) &&
-            GetLastError() == ERROR_ACCESS_DENIED) {
-            /* Reset DACL to allow delete — stale HcsGrantVmAccess ACLs */
-            SetNamedSecurityInfoW(vmgs_path, SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION, NULL, NULL, NULL, NULL);
-            DeleteFileW(vmgs_path);
-        }
-        vmgs_hr = pfnCreateVmgs(vmgs_path);
-        if (FAILED(vmgs_hr))
-            ui_log(L"Warning: HcsCreateEmptyGuestStateFile failed (0x%08X)", vmgs_hr);
-    }
-    if (pfnCreateVmrs) {
-        if (!DeleteFileW(vmrs_path) &&
-            GetLastError() == ERROR_ACCESS_DENIED) {
-            SetNamedSecurityInfoW(vmrs_path, SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION, NULL, NULL, NULL, NULL);
-            DeleteFileW(vmrs_path);
-        }
-        vmrs_hr = pfnCreateVmrs(vmrs_path);
-        if (FAILED(vmrs_hr))
-            ui_log(L"Warning: HcsCreateEmptyRuntimeStateFile failed (0x%08X)", vmrs_hr);
-    }
+    if (!hcs_ensure_state_file(vmgs_path, pfnCreateVmgs) ||
+        !hcs_ensure_state_file(vmrs_path, pfnCreateVmrs))
+        return FALSE;
 
     /* Grant VM access to VMGS/VMRS files */
     if (pfnGrantAccess) {
-        if (GetFileAttributesW(vmgs_path) != INVALID_FILE_ATTRIBUTES)
-            pfnGrantAccess(config->name, vmgs_path);
-        if (GetFileAttributesW(vmrs_path) != INVALID_FILE_ATTRIBUTES)
-            pfnGrantAccess(config->name, vmrs_path);
+        pfnGrantAccess(config->name, vmgs_path);
+        pfnGrantAccess(config->name, vmrs_path);
     }
 
     escape_json_path(vmgs_path, vmgs_esc, MAX_PATH * 2);
