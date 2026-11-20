@@ -2879,11 +2879,6 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     }
     args->vhdx_created = TRUE;
 
-    /* The Ubuntu ISO has its own bootable EFI files; if we leave image_path
-       set, hcs_vm.c attaches it at SCSI slot 1 alongside the installed
-       VHDX, and Hyper-V's UEFI firmware sometimes picks the ISO's
-       /EFI/BOOT/BOOTX64.EFI instead of ours. Detach the ISO from the
-       runtime VM — the installed VHDX is fully self-bootable. */
     args->config.image_path[0] = L'\0';
 
     /* ---- 2. NAT IP allocation. The chosen static /24 address is baked

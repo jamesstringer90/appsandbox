@@ -913,11 +913,9 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                        wchar_t *json_out, size_t json_out_chars)
 {
     wchar_t vhdx_esc[MAX_PATH * 2];
-    wchar_t iso_esc[MAX_PATH * 2];
     wchar_t res_esc[MAX_PATH * 2];
     wchar_t vmgs_esc[MAX_PATH * 2];
     wchar_t vmrs_esc[MAX_PATH * 2];
-    wchar_t iso_section[512];
     wchar_t res_section[512];
     wchar_t net_section[512];
     wchar_t secureboot_section[512];
@@ -940,14 +938,6 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     is_windows = (_wcsicmp(config->os_type, L"Windows") == 0);
 
     escape_json_path(config->vhdx_path, vhdx_esc, MAX_PATH * 2);
-
-    /* Optional ISO attachment at SCSI slot 1 */
-    iso_section[0] = L'\0';
-    if (config->image_path[0] != L'\0') {
-        escape_json_path(config->image_path, iso_esc, MAX_PATH * 2);
-        swprintf_s(iso_section, 512,
-            L",\"1\":{\"Type\":\"Iso\",\"Path\":\"%s\"}", iso_esc);
-    }
 
     /* Optional resources ISO at SCSI slot 2 (autounattend + agent + helpers) */
     res_section[0] = L'\0';
@@ -1166,7 +1156,6 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                         L"\"Attachments\":{"
                             L"\"0\":{\"Type\":\"VirtualDisk\",\"Path\":\"%s\"}"
                             L"%s"
-                            L"%s"
                         L"}"
                     L"}"
                 L"},"
@@ -1190,7 +1179,6 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         config->cpu_cores,
         nested_section,
         vhdx_esc,
-        iso_section,
         res_section,
         video_section,
         comports_section,
@@ -1233,8 +1221,6 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
             if (FAILED(grant_hr))
                 ui_log(L"Warning: GrantVmAccess retry on VHDX failed (0x%08X)", grant_hr);
         }
-        if (config->image_path[0] != L'\0')
-            pfnGrantAccess(config->name, config->image_path);
         if (config->resources_iso_path[0] != L'\0')
             pfnGrantAccess(config->name, config->resources_iso_path);
     }
@@ -1327,8 +1313,6 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
             if (FAILED(grant_hr))
                 ui_log(L"Warning: GrantVmAccess retry on VHDX failed (0x%08X)", grant_hr);
         }
-        if (config->image_path[0] != L'\0')
-            pfnGrantAccess(config->name, config->image_path);
         if (config->resources_iso_path[0] != L'\0')
             pfnGrantAccess(config->name, config->resources_iso_path);
     }
