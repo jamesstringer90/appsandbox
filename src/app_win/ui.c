@@ -12,7 +12,6 @@
 #include "headless.h"
 #include "resource.h"
 #include "hcs_vm.h"
-#include "hcn_network.h"
 #include "snapshot.h"
 #include "vm_display.h"
 #include "vm_display_idd.h"
@@ -489,56 +488,14 @@ static void send_host_info(void)
     webview2_post(buf);
 }
 
-/* IF_TYPE constants */
-#ifndef IF_TYPE_ETHERNET_CSMACD
-#define IF_TYPE_ETHERNET_CSMACD 6
-#endif
-#ifndef IF_TYPE_IEEE80211
-#define IF_TYPE_IEEE80211 71
-#endif
-
-typedef struct {
-    wchar_t names[32][256];
-    int count;
-    int first_eth;
-    int first_wifi;
-} AdapterList;
-
-static void adapter_enum_cb(const wchar_t *name, int if_type, void *ctx)
-{
-    AdapterList *al = (AdapterList *)ctx;
-    if (al->count >= 32) return;
-    wcscpy_s(al->names[al->count], 256, name);
-    if (if_type == IF_TYPE_ETHERNET_CSMACD && al->first_eth < 0)
-        al->first_eth = al->count + 1;
-    else if (if_type == IF_TYPE_IEEE80211 && al->first_wifi < 0)
-        al->first_wifi = al->count + 1;
-    al->count++;
-}
-
 static void send_adapters(void)
 {
-    wchar_t buf[8192];
+    wchar_t buf[32768];
     JsonBuilder jb;
-    AdapterList al;
-    int def_idx, i;
-
-    al.count = 0; al.first_eth = -1; al.first_wifi = -1;
-    hcn_enum_adapters(adapter_enum_cb, &al);
-    def_idx = (al.first_eth >= 0) ? al.first_eth : (al.first_wifi >= 0) ? al.first_wifi : 0;
-
-    jb_init(&jb, buf, 8192);
+    jb_init(&jb, buf, ARRAYSIZE(buf));
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"adapters");
-    jb_array_begin(&jb, L"adapters");
-    for (i = 0; i < al.count; i++) {
-        if (i > 0) jb_append(&jb, L",");
-        jb_append(&jb, L"\"");
-        jb_append_escaped(&jb, al.names[i]);
-        jb_append(&jb, L"\"");
-    }
-    jb_array_end(&jb);
-    jb_int(&jb, L"defaultIndex", def_idx);
+    asb_api_append_network_choices(&jb);
     jb_object_end(&jb);
     webview2_post(buf);
 }
@@ -610,25 +567,6 @@ static void send_full_state(void)
         jb.count++;
     }
 
-    /* Adapters */
-    {
-        AdapterList al;
-        int def_idx;
-        al.count = 0; al.first_eth = -1; al.first_wifi = -1;
-        hcn_enum_adapters(adapter_enum_cb, &al);
-        def_idx = (al.first_eth >= 0) ? al.first_eth : (al.first_wifi >= 0) ? al.first_wifi : 0;
-
-        jb_array_begin(&jb, L"adapters");
-        for (i = 0; i < al.count; i++) {
-            if (i > 0) jb_append(&jb, L",");
-            jb_append(&jb, L"\"");
-            jb_append_escaped(&jb, al.names[i]);
-            jb_append(&jb, L"\"");
-        }
-        jb_array_end(&jb);
-        jb_int(&jb, L"defaultAdapter", def_idx);
-    }
-
     /* Templates */
     {
         int tc = asb_template_count();
@@ -648,6 +586,7 @@ static void send_full_state(void)
         jb_array_end(&jb);
     }
 
+    asb_api_append_network_choices(&jb);
     jb_object_end(&jb);
     webview2_post(buf);
 }
@@ -1124,6 +1063,8 @@ static void handle_webview2_message(const wchar_t *json)
         if (!asb_api_start(g_hInstance, g_hwnd_main))
             ui_show_alert(L"The local API could not start. See headless.log for details.");
         send_full_state();
+    } else if (wcscmp(action, L"getAdapters") == 0) {
+        send_adapters();
     } else if (wcscmp(action, L"createVm") == 0) {
         if (!g_prereq_ok) {
             webview2_post(g_prereq_reboot_pending
@@ -1168,7 +1109,12 @@ static void handle_webview2_message(const wchar_t *json)
             ui_show_alert(error);
             return;
         }
-        json_get_string(json, L"netAdapter", adapter_buf, 256);
+        if (json_has_key(json, L"netAdapter") &&
+            !json_get_string(json, L"netAdapter", adapter_buf, ARRAYSIZE(adapter_buf))) {
+            SecureZeroMemory(pass_buf, sizeof(pass_buf));
+            ui_show_alert(L"Adapter selection is invalid or too long.");
+            return;
+        }
         if (!json_get_string(json, L"gpuId", gpu_id, ARRAYSIZE(gpu_id)) &&
             json_has_key(json, L"gpuId")) {
             SecureZeroMemory(pass_buf, sizeof(pass_buf));
@@ -1367,7 +1313,16 @@ static void handle_webview2_message(const wchar_t *json)
                         error = asb_validate_gpu_selection(mode, gpu_id);
                     if (!error) hr = asb_vm_set_gpu_selection(vm, mode, gpu_id);
                 }
-                else if (wcscmp(field, L"networkMode") == 0) hr = asb_vm_set_network(vm, _wtoi(value));
+                else if (wcscmp(field, L"networkMode") == 0) {
+                    wchar_t adapter[256];
+                    BOOL has_adapter = json_has_key(json, L"netAdapter");
+                    if (has_adapter && !json_get_string(json, L"netAdapter", adapter, ARRAYSIZE(adapter)))
+                        error = L"The selected network adapter or switch is invalid.";
+                    else {
+                        hr = asb_vm_set_network_selection(vm, _wtoi(value), has_adapter ? adapter : NULL);
+                        if (FAILED(hr)) error = L"Could not select the network adapter or switch.";
+                    }
+                }
                 if (FAILED(hr)) ui_show_alert(error ? error : L"VM configuration could not be updated.");
                 else asb_save();
             }

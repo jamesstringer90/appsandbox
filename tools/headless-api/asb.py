@@ -165,8 +165,8 @@ class Client:
         return self._req("POST", "/vms", cfg)
 
     def edit(self, name=None, *, vm_id=None, **fields):
-        """Change config on a STOPPED VM. Honors ramMb/cpuCores/gpuMode/networkMode
-        (same ranges as create); name is fixed at create and any other key is ignored.
+        """Change config on a STOPPED VM. Honors ramMb/cpuCores/gpuMode/networkMode.
+        On Windows External networking, netAdapter selects an adapter or switch, with "" for Auto.
         Returns (status, body) -- 409 if the VM is running."""
         return self._req("PUT", self._vm_path(name,vm_id=vm_id), fields)
 

@@ -14,3 +14,4 @@ int api_json_get_string(const wchar_t *text,const wchar_t *key,wchar_t *out,size
 int api_json_get_int(const wchar_t *text,const wchar_t *key,int *out);
 int api_json_get_bool(const wchar_t *text,const wchar_t *key,int *out);
 int api_json_has_key(const wchar_t *text,const wchar_t *key);
+size_t api_json_escape_string(const wchar_t *text,wchar_t *out,size_t capacity);

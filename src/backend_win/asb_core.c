@@ -1208,6 +1208,7 @@ static BOOL another_vm_uses_network_mode(const VmInstance *self, int mode)
         if (!v->running && !v->starting && !v->building_vhdx) continue;
         if (v->network_cleaned) continue;
         if (v->network_mode != mode) continue;
+        if (mode == NET_EXTERNAL && hcn_is_switch_target(v->net_adapter)) continue;
         return TRUE;
     }
     return FALSE;
@@ -1327,6 +1328,66 @@ static HRESULT try_endpoint_with_retry(const GUID *net_id, GUID *ep_id,
     return hr;
 }
 
+static BOOL clear_missing_switch(VmInstance *vm)
+{
+    if (!hcn_is_switch_target(vm->net_adapter)) return FALSE;
+    HRESULT hr = hcn_validate_external_switch(vm->net_adapter);
+    if (hr != HCN_E_NETWORK_NOT_FOUND && hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
+        return FALSE;
+
+    EnterCriticalSection(&g_cs);
+    if (vm->network_mode == NET_EXTERNAL) vm->network_mode = NET_NONE;
+    vm->net_adapter[0] = L'\0';
+    LeaveCriticalSection(&g_cs);
+    asb_log(L"Cleared the missing external switch for VM \"%s\".", vm->name);
+    return TRUE;
+}
+
+static HRESULT connect_vm_network(VmInstance *vm, VmConfig *config,
+                                  GUID *network_id, GUID *endpoint_id,
+                                  wchar_t endpoint_guid[64], BOOL creating)
+{
+    int mode = config->network_mode;
+    HRESULT hr;
+    if (mode == NET_NONE) return S_OK;
+    if (!vm) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+
+    BOOL selected_switch = mode == NET_EXTERNAL && hcn_is_switch_target(vm->net_adapter);
+    if (mode == NET_NAT && allocate_nat_ip(vm)) {
+        asb_log(L"Allocated NAT IP %S for \"%s\".", vm->nat_ip, config->name);
+        save_vm_list();
+    }
+
+    switch (mode) {
+    case NET_NAT:      hr = hcn_create_nat_network(network_id); break;
+    case NET_INTERNAL: hr = hcn_create_internal_network(network_id); break;
+    case NET_EXTERNAL: hr = hcn_prepare_external_network(network_id, vm->net_adapter); break;
+    default:           return E_INVALIDARG;
+    }
+    if (SUCCEEDED(hr)) {
+        hr = try_endpoint_with_retry(network_id, endpoint_id, endpoint_guid, 64,
+                                    vm->nat_ip, sizeof(vm->nat_ip), mode == NET_NAT,
+                                    config->mac_address);
+        if (SUCCEEDED(hr)) {
+            if (mode == NET_NAT) save_vm_list();
+            return hr;
+        }
+    }
+
+    if (selected_switch && clear_missing_switch(vm)) {
+        save_vm_list();
+    } else if (creating && !selected_switch) {
+        asb_log(L"Warning: Network failed (0x%08X). Continuing without.", hr);
+    } else {
+        return hr;
+    }
+    config->network_mode = NET_NONE;
+    ZeroMemory(network_id, sizeof(*network_id));
+    ZeroMemory(endpoint_id, sizeof(*endpoint_id));
+    endpoint_guid[0] = L'\0';
+    return S_OK;
+}
+
 /* ---- Background VM start thread ---- */
 
 typedef struct {
@@ -1334,7 +1395,6 @@ typedef struct {
     VmConfig   config;
     GUID       network_id;
     GUID       endpoint_id;
-    int        network_mode;
 } StartVmArgs;
 
 static DWORD WINAPI start_vm_thread(LPVOID param)
@@ -1344,45 +1404,17 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     HRESULT hr;
     wchar_t endpoint_guid_str[64] = { 0 };
 
-    /* Allocate NAT IP before endpoint creation (only for NAT mode) */
-    if (args->network_mode == NET_NAT) {
-        if (allocate_nat_ip(vm)) {
-            asb_log(L"Allocated NAT IP %S for \"%s\".", vm->nat_ip, vm->name);
-            save_vm_list();
-        } else {
-            asb_log(L"Warning: NAT IP pool exhausted.");
-        }
+    hr = connect_vm_network(vm, &args->config, &args->network_id, &args->endpoint_id,
+                            endpoint_guid_str, FALSE);
+    if (FAILED(hr)) {
+        asb_log(L"Error: Network unavailable (0x%08X).", hr);
+        vm->starting = FALSE;
+        notify_state(vm_handle(vm), FALSE, g_state_ud);
+        free(args);
+        return 1;
     }
-
-    if (args->network_mode != NET_NONE) {
-        switch (args->network_mode) {
-        case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
-        case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
-        case NET_EXTERNAL: hr = hcn_create_external_network(&args->network_id, args->vm->net_adapter); break;
-        default:           hr = E_INVALIDARG; break;
-        }
-        if (SUCCEEDED(hr)) {
-            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
-                                          endpoint_guid_str, 64,
-                                          vm->nat_ip, sizeof(vm->nat_ip),
-                                          args->network_mode == NET_NAT,
-                                          vm->mac_address);
-            if (SUCCEEDED(hr) && args->network_mode == NET_NAT) save_vm_list();
-            if (FAILED(hr)) {
-                asb_log(L"Error: Network endpoint failed (0x%08X).", hr);
-                vm->starting = FALSE;
-                notify_state(vm_handle(vm), FALSE, g_state_ud);
-                free(args); return 1;
-            }
-            vm->network_id = args->network_id;
-            vm->endpoint_id = args->endpoint_id;
-        } else {
-            asb_log(L"Error: Network unavailable (0x%08X).", hr);
-            vm->starting = FALSE;
-            notify_state(vm_handle(vm), FALSE, g_state_ud);
-            free(args); return 1;
-        }
-    }
+    vm->network_id = args->network_id;
+    vm->endpoint_id = args->endpoint_id;
 
     prepare_gpu_driver_shares(&args->config, TRUE);
 
@@ -1437,8 +1469,6 @@ typedef struct {
     wchar_t  endpoint_guid[64];
     GUID     network_id;
     GUID     endpoint_id;
-    BOOL     has_network;
-    wchar_t  net_adapter[256];
     HRESULT  result;
     wchar_t  error_msg[512];
     VmInstance *vm_inst;
@@ -1454,9 +1484,8 @@ static BOOL template_copy_cancelled(VhdxCreateArgs *args)
         WaitForSingleObject(args->template_copy->cancel_event, 0) != WAIT_OBJECT_0) return FALSE;
     args->result = HRESULT_FROM_WIN32(ERROR_CANCELLED);
     wcscpy_s(args->error_msg, 512, L"Template instance creation cancelled");
-    if (args->has_network) {
+    if (args->endpoint_guid[0]) {
         hcn_delete_endpoint(&args->endpoint_id);
-        args->has_network = FALSE;
         args->endpoint_guid[0] = L'\0';
     }
     return TRUE;
@@ -1701,43 +1730,12 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
 disk_ready:
     if (template_copy_cancelled(args)) goto done;
 
-    /* Allocate NAT IP before endpoint creation.
-       args->vm_inst isn't set yet (HCS VM not created), so allocate
-       into the g_vms[] entry directly via vm_index. */
-    VmInstance *network_vm = asb_find_vm_by_id(args->vm_unique_id);
-    if (args->config.network_mode == NET_NAT && network_vm) {
-        if (allocate_nat_ip(network_vm)) {
-            asb_log(L"Allocated NAT IP %S for new VM.", network_vm->nat_ip);
-            save_vm_list();
-        }
-    }
-
-    /* Network */
-    if (args->config.network_mode != NET_NONE) {
-        char *nat_ip = network_vm ? network_vm->nat_ip : NULL;
-        switch (args->config.network_mode) {
-        case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
-        case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
-        case NET_EXTERNAL: hr = hcn_create_external_network(&args->network_id, args->net_adapter); break;
-        default:           hr = E_INVALIDARG; break;
-        }
-        if (SUCCEEDED(hr)) {
-            BOOL is_nat = (args->config.network_mode == NET_NAT);
-            size_t ip_size = network_vm ? sizeof(network_vm->nat_ip) : 0;
-            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
-                                          args->endpoint_guid, 64,
-                                          nat_ip, ip_size, is_nat,
-                                          args->config.mac_address);
-            if (SUCCEEDED(hr)) {
-                args->has_network = TRUE;
-                if (is_nat) save_vm_list();
-            }
-            /* If endpoint create fails, leave the network alone - it may be
-               shared with other VMs. Orphan networks are cleaned up at next
-               launch by hcn_cleanup_stale_networks(). */
-        }
-        if (FAILED(hr))
-            args->config.network_mode = NET_NONE;
+    hr = connect_vm_network(asb_find_vm_by_id(args->vm_unique_id), &args->config,
+                            &args->network_id, &args->endpoint_id, args->endpoint_guid, TRUE);
+    if (FAILED(hr)) {
+        args->result = hr;
+        swprintf_s(args->error_msg, 512, L"Could not connect VM networking (0x%08X)", hr);
+        goto done;
     }
 
     args->config.image_path[0] = L'\0';
@@ -1762,9 +1760,8 @@ disk_ready:
             /* HCS rejected the VM after we already created the HCN endpoint.
                Free the endpoint so its IP reservation doesn't leak into the
                next attempt as a phantom HCN_E_ADDR_INVALID_OR_RESERVED. */
-            if (args->has_network) {
+            if (args->endpoint_guid[0]) {
                 hcn_delete_endpoint(&args->endpoint_id);
-                args->has_network = FALSE;
                 args->endpoint_guid[0] = L'\0';
             }
             goto done;
@@ -1781,9 +1778,8 @@ disk_ready:
             hcs_close_vm(&temp_inst);
             /* VM created but failed to start. Free the endpoint so its
                IP reservation doesn't leak into the next attempt. */
-            if (args->has_network) {
+            if (args->endpoint_guid[0]) {
                 hcn_delete_endpoint(&args->endpoint_id);
-                args->has_network = FALSE;
                 args->endpoint_guid[0] = L'\0';
             }
             goto done;
@@ -2723,8 +2719,6 @@ typedef struct {
     wchar_t     endpoint_guid[64];
     GUID        network_id;
     GUID        endpoint_id;
-    BOOL        has_network;
-    wchar_t     net_adapter[256];
     HRESULT     result;
     wchar_t     error_msg[512];
     VmInstance *vm_inst;
@@ -2879,48 +2873,14 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     }
     args->vhdx_created = TRUE;
 
-    /* The Ubuntu ISO has its own bootable EFI files; if we leave image_path
-       set, hcs_vm.c attaches it at SCSI slot 1 alongside the installed
-       VHDX, and Hyper-V's UEFI firmware sometimes picks the ISO's
-       /EFI/BOOT/BOOTX64.EFI instead of ours. Detach the ISO from the
-       runtime VM — the installed VHDX is fully self-bootable. */
     args->config.image_path[0] = L'\0';
 
-    /* ---- 2. NAT IP allocation. The chosen static /24 address is baked
-       into the HCN endpoint policy below and pushed to the guest at
-       runtime by the agent (set_ip -> static netplan); the guest never
-       DHCPs in NAT mode. ---- */
-    VmInstance *network_vm = asb_find_vm_by_id(args->vm_unique_id);
-    if (args->config.network_mode == NET_NAT && network_vm) {
-        if (allocate_nat_ip(network_vm)) {
-            asb_log(L"Allocated NAT IP %S for new VM.", network_vm->nat_ip);
-            save_vm_list();
-        }
-    }
-
-    /* ---- 5. Network + endpoint (same as vhdx_create_thread:1114). ---- */
-    if (args->config.network_mode != NET_NONE) {
-        char *nat_ip = network_vm ? network_vm->nat_ip : NULL;
-        switch (args->config.network_mode) {
-        case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
-        case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
-        case NET_EXTERNAL: hr = hcn_create_external_network(&args->network_id, args->net_adapter); break;
-        default:           hr = E_INVALIDARG; break;
-        }
-        if (SUCCEEDED(hr)) {
-            BOOL is_nat = (args->config.network_mode == NET_NAT);
-            size_t ip_size = network_vm ? sizeof(network_vm->nat_ip) : 0;
-            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
-                                          args->endpoint_guid, 64,
-                                          nat_ip, ip_size, is_nat,
-                                          args->config.mac_address);
-            if (SUCCEEDED(hr)) {
-                args->has_network = TRUE;
-                if (is_nat) save_vm_list();
-            }
-        }
-        if (FAILED(hr))
-            args->config.network_mode = NET_NONE;
+    hr = connect_vm_network(asb_find_vm_by_id(args->vm_unique_id), &args->config,
+                            &args->network_id, &args->endpoint_id, args->endpoint_guid, TRUE);
+    if (FAILED(hr)) {
+        args->result = hr;
+        swprintf_s(args->error_msg, 512, L"Could not connect VM networking (0x%08X)", hr);
+        goto done;
     }
 
     /* ---- 6. HCS create + start (same as vhdx_create_thread:1145). ---- */
@@ -2934,9 +2894,8 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         if (FAILED(hr)) {
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to create HCS VM (0x%08X)", hr);
-            if (args->has_network) {
+            if (args->endpoint_guid[0]) {
                 hcn_delete_endpoint(&args->endpoint_id);
-                args->has_network = FALSE;
                 args->endpoint_guid[0] = L'\0';
             }
             goto done;
@@ -2947,9 +2906,8 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to start VM (0x%08X)", hr);
             hcs_close_vm(&temp_inst);
-            if (args->has_network) {
+            if (args->endpoint_guid[0]) {
                 hcn_delete_endpoint(&args->endpoint_id);
-                args->has_network = FALSE;
                 args->endpoint_guid[0] = L'\0';
             }
             goto done;
@@ -3110,6 +3068,12 @@ ASB_API HRESULT asb_init(void)
 
     g_config_load_failed = FALSE;
     load_vm_list();
+    if (!g_config_load_failed) {
+        BOOL changed = FALSE;
+        for (int i = 0; i < g_vm_count; ++i)
+            if (clear_missing_switch(&VM_AT(i))) changed = TRUE;
+        if (changed) save_vm_list();
+    }
     scan_templates();
 
     if (g_vm_count > 0) asb_log(L"Loaded %d VM(s) from config.", g_vm_count);
@@ -3426,6 +3390,16 @@ ASB_API const wchar_t *asb_validate_password(const wchar_t *os_type,
     return NULL;
 }
 
+static HRESULT validate_network_selection(int mode, const wchar_t *adapter)
+{
+    if (!adapter) return S_OK;
+    if (wcslen(adapter) >= ARRAYSIZE(VM_AT(0).net_adapter) || wcspbrk(adapter, L"\r\n"))
+        return E_INVALIDARG;
+    if (mode == NET_EXTERNAL && hcn_is_switch_target(adapter))
+        return hcn_validate_external_switch(adapter);
+    return S_OK;
+}
+
 ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 {
     return asb_vm_create_with_id(config, NULL);
@@ -3468,6 +3442,13 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
         int index=asb_template_index_by_id(selected.template_id);
         if (index<0) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
         selected.template_name=g_templates[index].name;
+    }
+
+    hr = validate_network_selection(config->network_mode, config->net_adapter);
+    if (FAILED(hr)) {
+        asb_log(L"Could not select the network adapter or switch (0x%08X).", hr);
+        asb_alert(L"Could not select the network adapter or switch.");
+        return hr;
     }
 
     effective_os = config->os_type;
@@ -3732,7 +3713,6 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
             SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
             args->vm_unique_id = inst->unique_id;
             wcscpy_s(args->vhdx_dir, MAX_PATH, vhdx_dir);
-            wcscpy_s(args->net_adapter, 256, inst->net_adapter);
 
             get_host_keyboard_settings(args->input_locale, ARRAYSIZE(args->input_locale), NULL, NULL);
 
@@ -3844,7 +3824,6 @@ build_failed:
             memcpy(&args->config, &cfg, sizeof(VmConfig));
             args->vm_unique_id = inst->unique_id;
             wcscpy_s(args->vhdx_dir, MAX_PATH, vhdx_dir);
-            wcscpy_s(args->net_adapter, 256, inst->net_adapter);
 
             detect_host_locale_settings(args->host_locale, sizeof(args->host_locale),
                                         args->host_xkb, sizeof(args->host_xkb),
@@ -3911,40 +3890,14 @@ build_failed:
 
     inst->network_cleaned = FALSE;
 
-    /* Allocate NAT IP before endpoint creation */
-    if (cfg.network_mode == NET_NAT) {
-        if (allocate_nat_ip(inst)) {
-            asb_log(L"Allocated NAT IP %S for \"%s\".", inst->nat_ip, inst->name);
-            save_vm_list();
-        }
-    } else {
-        inst->nat_ip[0] = '\0';
-    }
-
-    /* Networking */
-    if (cfg.network_mode != NET_NONE) {
-        switch (cfg.network_mode) {
-        case NET_NAT:      hr = hcn_create_nat_network(&inst->network_id); break;
-        case NET_INTERNAL: hr = hcn_create_internal_network(&inst->network_id); break;
-        case NET_EXTERNAL: hr = hcn_create_external_network(&inst->network_id, inst->net_adapter); break;
-        default:           hr = E_INVALIDARG; break;
-        }
-        if (FAILED(hr)) {
-            asb_log(L"Warning: Network failed (0x%08X). Continuing without.", hr);
-            cfg.network_mode = NET_NONE;
-        } else {
-            hr = try_endpoint_with_retry(&inst->network_id, &inst->endpoint_id,
-                                          endpoint_guid_str, 64,
-                                          inst->nat_ip, sizeof(inst->nat_ip),
-                                          cfg.network_mode == NET_NAT,
-                                          inst->mac_address);
-            if (SUCCEEDED(hr) && cfg.network_mode == NET_NAT) save_vm_list();
-            if (FAILED(hr)) {
-                asb_log(L"Warning: Endpoint failed (0x%08X).", hr);
-                /* Leave the shared network alone - other VMs may be using it. */
-                cfg.network_mode = NET_NONE;
-            }
-        }
+    if (cfg.network_mode != NET_NAT) inst->nat_ip[0] = '\0';
+    hr = connect_vm_network(inst, &cfg, &inst->network_id, &inst->endpoint_id,
+                            endpoint_guid_str, TRUE);
+    if (FAILED(hr)) {
+        asb_log(L"Could not connect VM networking (0x%08X).", hr);
+        asb_alert(L"Could not connect VM networking.");
+        remove_dir_recursive(vhdx_dir);
+        return hr;
     }
 
     /* Create HCS VM */
@@ -4087,7 +4040,6 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
-        args->network_mode = inst->network_mode;
         inst->network_cleaned = FALSE;
         asb_log(L"Starting VM \"%s\" (background)...", inst->name);
         if (inst->start_thread) CloseHandle(inst->start_thread);
@@ -4488,13 +4440,25 @@ ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *
 
 ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
 {
+    return asb_vm_set_network_selection(vm, mode, NULL);
+}
+
+ASB_API HRESULT asb_vm_set_network_selection(AsbVm vm, int mode, const wchar_t *adapter)
+{
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (VM_AT(idx).running || VM_AT(idx).building_vhdx || VM_AT(idx).starting) return E_ACCESSDENIED;
-    if (mode < 0 || mode > 3) return E_INVALIDARG;
-    VM_AT(idx).network_mode = mode;
+    VmInstance *inst = &VM_AT(idx);
+    if (inst->running || inst->building_vhdx || inst->starting) return E_ACCESSDENIED;
+    if (mode < NET_NONE || mode > NET_INTERNAL || (adapter && mode != NET_EXTERNAL)) return E_INVALIDARG;
+    if (adapter) {
+        HRESULT hr = validate_network_selection(mode, adapter);
+        if (FAILED(hr)) return hr;
+        wcscpy_s(inst->net_adapter, ARRAYSIZE(inst->net_adapter),
+                 wcscmp(adapter, L"(Auto)") ? adapter : L"");
+    }
+    inst->network_mode = mode;
     save_vm_list();
-    notify_state(vm, VM_AT(idx).running, g_state_ud);
+    notify_state(vm, inst->running, g_state_ud);
     return S_OK;
 }
 
