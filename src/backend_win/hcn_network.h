@@ -71,6 +71,5 @@ ASB_API BOOL hcn_default_adapter_name(wchar_t *out, size_t out_len);
 typedef void (*HcnSwitchCallback)(const wchar_t *name, const wchar_t *target, void *ctx);
 ASB_API void hcn_enum_external_switches(HcnSwitchCallback cb, void *ctx);
 BOOL hcn_is_switch_target(const wchar_t *target);
-HRESULT hcn_validate_external_switch(const wchar_t *target);
 
 #endif /* HCN_NETWORK_H */

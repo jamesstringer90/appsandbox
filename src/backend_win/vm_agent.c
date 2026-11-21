@@ -304,6 +304,9 @@ static int process_async_message(AgentConn *conn, VmInstance *vm, SOCKET s, cons
     } else if (strncmp(buf, "sas:", 4) == 0) {
         InterlockedExchange(&vm->sas_supported, !strcmp(buf + 4, "supported"));
         asb_events_changed();
+    } else if (strcmp(buf, "disk_resize:supported") == 0) {
+        vm->disk_resize_supported = TRUE;
+        asb_events_changed();
     } else if (strncmp(buf, "display_monitor:", 16) == 0) {
         LONG state = !strcmp(buf + 16, "enabled") ? 1 : !strcmp(buf + 16, "disabled") ? 2 : 0;
         InterlockedExchange(&vm->display_monitor_state, state);
@@ -425,6 +428,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             continue;
         }
 
+        vm->disk_resize_supported = FALSE;
         conn->shim_delivery.requested = 0;
         vm->agent_online = TRUE;
         InterlockedExchange(&vm->display_monitor_state, 0);

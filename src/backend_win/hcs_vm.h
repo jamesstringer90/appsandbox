@@ -110,6 +110,7 @@ typedef struct {
     BOOL        ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key to the guest */
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
+    BOOL        disk_resize_supported;
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.

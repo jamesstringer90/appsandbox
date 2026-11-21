@@ -279,6 +279,12 @@ static BOOL s_workersStopping;
     return [self runWorkerArgs:args networkPort:nil progress:progressBlock completion:completion];
 }
 
++ (void)growDiskAtURL:(NSURL *)diskURL diskGb:(int)diskGb macGuest:(BOOL)macGuest
+           completion:(IsoPatchCompletion)completion {
+    [self runWorkerArgs:@[@"grow-disk", diskURL.path, @(diskGb).stringValue, macGuest ? @"macos" : @"windows"]
+                progress:nil completion:completion];
+}
+
 #pragma mark - Privileged workers
 
 + (void)runPrivilegedArgs:(NSArray<NSString *> *)args
@@ -427,7 +433,8 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName, BOOL fromMed
         @"--test-mode", (testMode ? @"1" : @"0"),   /* honor the create-time choice (mirrors Windows) */
     ] mutableCopy];
     if (templateMode == 1) [args addObject:@"--template"];
-    if (templateMode == 2) [args addObject:@"--resources-iso"];
+    if (templateMode == 2)
+        [args addObjectsFromArray:@[@"--resources-iso", @"--disk", [VmDir diskImageURLFor:vmName].path]];
 
     /* Pass --lang ONLY for an explicit override; without it build-windows auto-detects the ISO's
      * language and reports it via LANG: so we re-generate unattend.xml in-process below. */

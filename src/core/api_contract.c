@@ -420,10 +420,10 @@ int asb_api_snapshot_route(const char *method,const wchar_t *path,int *snapshot,
 const char *asb_api_capabilities_json(int windows_host)
 {
     return windows_host?
-        "{\"snapshots\":true,\"templates\":true,\"screenshots\":true,\"input\":true,\"sshSessions\":true,\"gpuSelection\":true,"
+        "{\"snapshots\":true,\"templates\":true,\"screenshots\":true,\"input\":true,\"sshSessions\":true,\"gpuSelection\":true,\"diskResize\":true,"
         "\"guestOs\":[\"windows11\",\"ubuntu2604lts\"],\"guestOsNames\":{\"windows11\":\"Windows 11\",\"ubuntu2604lts\":\"Ubuntu 26.04 LTS\"},"
         "\"templateGuestOs\":[\"windows11\"],\"networkModes\":[0,1,2,3]}":
-        "{\"snapshots\":false,\"templates\":true,\"screenshots\":true,\"input\":true,\"sshSessions\":true,\"gpuSelection\":false,"
+        "{\"snapshots\":false,\"templates\":true,\"screenshots\":true,\"input\":true,\"sshSessions\":true,\"gpuSelection\":false,\"diskResize\":true,"
         "\"guestOs\":[\"windows11\",\"macos27\"],\"guestOsNames\":{\"windows11\":\"Windows 11\",\"macos27\":\"macOS 27\"},"
         "\"templateGuestOs\":[\"windows11\",\"macos27\"],\"networkModes\":[1]}";
 }
@@ -443,5 +443,5 @@ const char *asb_api_vm_fields_json(void)
     return "[\"id\",\"name\",\"osType\",\"osName\",\"diskDirectory\",\"state\",\"running\","
         "\"agentOnline\",\"installComplete\",\"building\",\"progress\",\"sshState\","
         "\"sshPort\",\"ramMb\",\"hddGb\",\"cpuCores\",\"gpuMode\",\"networkMode\","
-        "\"displayOpen\",\"gpuId\",\"gpuName\"]";
+        "\"displayOpen\",\"gpuId\",\"gpuName\",\"diskResizeSupported\"]";
 }

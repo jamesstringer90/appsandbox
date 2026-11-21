@@ -37,6 +37,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <copyfile.h>
+#include <limits.h>
+#include <sys/stat.h>
 
 /* ---- Global state ---- */
 
@@ -258,11 +260,14 @@ static BOOL save_vm_list(void) {
         fprintf(f, "Id=%s\n", id);
         fprintf(f, "Name=%s\n", g_vms[i].name);
         fprintf(f, "OsType=%s\n", g_vms[i].os_type);
+        if (g_vms[i].disk_resize_supported)
+            fprintf(f, "DiskResizeSupported=1\n");
         if (g_vms[i].is_template) fprintf(f, "IsTemplate=1\nTemplateReady=%d\n", g_vms[i].template_ready);
         if (g_vms[i].disk_directory[0])
             fprintf(f, "DiskDirectory=%s\n", g_vms[i].disk_directory);
         fprintf(f, "RamMB=%d\n", g_vms[i].ram_mb);
-        fprintf(f, "HddGB=%d\n", g_vms[i].hdd_gb);
+        if (g_vms[i].is_template)
+            fprintf(f, "HddGB=%d\n", g_vms[i].hdd_gb);
         fprintf(f, "CpuCores=%d\n", g_vms[i].cpu_cores);
         if (vm_is_windows_idx(i))
             fprintf(f, "WindowsStorageController=%d\n", g_vms[i].windows_storage_controller);
@@ -299,6 +304,16 @@ static BOOL save_vm_list(void) {
     unlink(temporary);
     post_alert(0, "Cannot save VM configuration; the previous file was preserved.");
     return NO;
+}
+
+static BOOL refresh_vm_disk_size(AsbVmMac *vm) {
+    NSURL *url = [VmDir diskImageURLFor:@(vm->name)];
+    struct stat st;
+    if (stat(url.fileSystemRepresentation, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) return NO;
+    uint64_t gb = ((uint64_t)st.st_size + ((1ULL << 30) - 1)) >> 30;
+    if (gb > INT_MAX) return NO;
+    vm->hdd_gb = (int)gb;
+    return YES;
 }
 
 static void load_vm_list(void) {
@@ -366,6 +381,8 @@ static void load_vm_list(void) {
             vm->ram_mb = atoi(line + 6);
         else if (strncmp(line, "HddGB=", 6) == 0)
             vm->hdd_gb = atoi(line + 6);
+        else if (strcmp(line, "DiskResizeSupported=1") == 0)
+            vm->disk_resize_supported = YES;
         else if (strncmp(line, "CpuCores=", 9) == 0)
             vm->cpu_cores = atoi(line + 9);
         else if (strncmp(line, "WindowsStorageController=", 25) == 0) {
@@ -415,7 +432,10 @@ static void load_vm_list(void) {
         ids[i]=asb_resource_id_load(record_ids[i],g_vms[i].is_template,&identities_changed);
     int migrated = asb_vm_ids_ensure(ids, (size_t)g_vm_count);
     if (migrated<0) { g_config_load_failed=YES;g_vm_count=0;return; }
-    for (int i=0;i<g_vm_count;++i) g_vms[i].unique_id=ids[i];
+    for (int i=0;i<g_vm_count;++i) {
+        g_vms[i].unique_id=ids[i];
+        if (!g_vms[i].is_template && g_vms[i].disk_built) refresh_vm_disk_size(&g_vms[i]);
+    }
     if (migrated || identities_changed) {
         if (!save_vm_list()) {
             g_config_load_failed = YES;
@@ -703,11 +723,22 @@ static void start_agent_for(int idx) {
         agent = [[VmAgentMac alloc] initWithName:nsName socketDevice:vsock];
     }
     agent.sshEnabled = g_vms[idx].ssh_enabled;
+    agent.onDiskResizeSupported = ^{
+        int i = vm_index_of(vm_id);
+        if (i < 0 || g_vms[i].run_id != runId || !g_vms[i].running || g_vms[i].disk_resize_supported) return;
+        g_vms[i].disk_resize_supported = YES;
+        save_vm_list();
+        post_list_changed();
+    };
     agent.onOnlineChange = ^(BOOL online) {
         int i = vm_index_of(vm_id);
         if (i < 0 || g_vms[i].run_id != runId || !g_vms[i].running) return;
+        BOOL support_changed = online && g_vms[i].disk_resize_supported;
         g_vms[i].agent_online = online;
-        if (online) g_vms[i].agent_last_heartbeat_ms = 0;
+        if (online) {
+            g_vms[i].disk_resize_supported = NO;
+            g_vms[i].agent_last_heartbeat_ms = 0;
+        }
         post_event(CORE_VM_EVENT_AGENT_STATUS, g_vms[i].unique_id, online ? 1 : 0, NULL);
         post_list_changed();
 
@@ -722,7 +753,7 @@ static void start_agent_for(int idx) {
             post_event(CORE_VM_EVENT_INSTALL_STATUS, vm_id, 100, "Install complete");
             post_list_changed();
             post_log("[%s] Install complete (agent reached).", g_vms[i].name);
-        }
+        } else if (support_changed) save_vm_list();
 
         /* Clipboard is always-on — start when the agent comes up. */
         if (online) start_clipboard_for(i);
@@ -1193,7 +1224,6 @@ static void start_template_instance(int idx, const AsbVmMac *source) {
     NSString *name = @(g_vms[idx].name);
     NSString *sourceName = @(source->name);
     BOOL windows = vm_is_windows_idx(idx);
-    int diskGb = g_vms[idx].hdd_gb;
     NSURL *disk = [VmDir diskImageURLFor:name];
     NSURL *sourceDisk = [VmDir diskImageURLFor:sourceName];
     NSURL *sourceAux = [VmDir auxiliaryStorageURLFor:sourceName];
@@ -1207,12 +1237,6 @@ static void start_template_instance(int idx, const AsbVmMac *source) {
         if (copyfile(sourceDisk.fileSystemRepresentation, disk.fileSystemRepresentation,
                      NULL, COPYFILE_ALL | COPYFILE_CLONE | COPYFILE_EXCL) != 0)
             error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
-        if (!error && windows) {
-            int fd = open(disk.fileSystemRepresentation, O_RDWR);
-            if (fd < 0 || ftruncate(fd, (off_t)diskGb * 1024 * 1024 * 1024) != 0)
-                error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
-            if (fd >= 0) close(fd);
-        }
         if (!error && !windows) {
             for (NSArray<NSURL *> *pair in @[@[sourceAux, targetAux], @[sourceHardware, targetHardware]]) {
                 if (copyfile(pair[0].fileSystemRepresentation, pair[1].fileSystemRepresentation,
@@ -1626,6 +1650,7 @@ int asb_mac_vm_start(AsbVmId vm_id) {
     if (!vm_id) return BACKEND_ERR_INVALID_ARG;
     int idx = vm_index_of(vm_id);
     if (idx < 0) return BACKEND_ERR_NOT_FOUND;
+    if (g_vms[idx].resizing_disk) return BACKEND_ERR_NOT_READY;
     char name[sizeof(g_vms[idx].name)];
     strlcpy(name, g_vms[idx].name, sizeof(name));
     if (g_vms[idx].template_ready) return BACKEND_ERR_INVALID_ARG;
@@ -1634,6 +1659,8 @@ int asb_mac_vm_start(AsbVmId vm_id) {
         post_alert(vm_id, "Cannot start: disk is not built yet");
         return BACKEND_ERR_FAILED;
     }
+    if (!g_vms[idx].is_template && !g_vms[idx].running && !g_vms[idx].starting)
+        refresh_vm_disk_size(&g_vms[idx]);
     BOOL needsMac = !g_vms[idx].mac_address[0];
     VZMACAddress *macAddress = vm_mac_address(&g_vms[idx]);
     if (!macAddress) {
@@ -2060,7 +2087,7 @@ static int delete_instance(AsbVmId vm_id,BOOL template_resource) {
             return BACKEND_ERR_NOT_READY;
         }
     }
-    if (asb_mac_vm_is_building(&g_vms[idx])) return BACKEND_ERR_NOT_READY;
+    if (asb_mac_vm_is_building(&g_vms[idx]) || g_vms[idx].resizing_disk) return BACKEND_ERR_NOT_READY;
     g_vms[idx].template_cancelled = YES;
     char name[sizeof(g_vms[idx].name)];
     strlcpy(name, g_vms[idx].name, sizeof(name));
@@ -2147,12 +2174,19 @@ static int delete_instance(AsbVmId vm_id,BOOL template_resource) {
 
 /* ---- Public: config editing ---- */
 
+static int vm_config_edit_status(const AsbVmMac *vm) {
+    if (vm->running) return BACKEND_ERR_ALREADY_RUNNING;
+    if (!vm->install_complete || vm->starting || asb_mac_vm_is_building(vm))
+        return BACKEND_ERR_NOT_READY;
+    return BACKEND_OK;
+}
+
 int asb_mac_vm_edit(AsbVmId vm_id, const char *field, const char *value) {
     if (!vm_id || !field || !value) return BACKEND_ERR_INVALID_ARG;
     int idx = vm_index_of(vm_id);
     if (idx < 0) return BACKEND_ERR_NOT_FOUND;
-    if (g_vms[idx].running) return BACKEND_ERR_ALREADY_RUNNING;
-    if (g_vms[idx].starting || asb_mac_vm_is_building(&g_vms[idx])) return BACKEND_ERR_NOT_READY;
+    int status = vm_config_edit_status(&g_vms[idx]);
+    if (status != BACKEND_OK) return status;
 
     if (strcmp(field, "ramMb") == 0) {
         int ram = atoi(value);
@@ -2177,6 +2211,49 @@ int asb_mac_vm_edit(AsbVmId vm_id, const char *field, const char *value) {
     post_event(CORE_VM_EVENT_STATE_CHANGED, g_vms[idx].unique_id, 0, NULL);
     post_list_changed();
     return BACKEND_OK;
+}
+
+void asb_mac_vm_set_disk_size(AsbVmId vm_id, const char *value, void (^completion)(int result, NSString *error)) {
+    int idx = vm_index_of(vm_id);
+    if (idx < 0) { completion(BACKEND_ERR_NOT_FOUND, nil); return; }
+    AsbVmMac *vm = &g_vms[idx];
+    char *end;
+    long gb = strtol(value, &end, 10);
+    if (*value < '1' || *value > '9' || *end || gb > INT_MAX) {
+        completion(BACKEND_ERR_INVALID_ARG, nil);
+        return;
+    }
+    if (vm_config_edit_status(vm) != BACKEND_OK || vm->resizing_disk) {
+        completion(BACKEND_ERR_NOT_READY, nil);
+        return;
+    }
+    if (!refresh_vm_disk_size(vm)) {
+        completion(BACKEND_ERR_FAILED, @"Could not read the virtual disk size.");
+        return;
+    }
+    if (gb <= vm->hdd_gb) {
+        completion(gb == vm->hdd_gb ? BACKEND_OK : BACKEND_ERR_INVALID_ARG, nil);
+        return;
+    }
+    if (!vm->disk_resize_supported) {
+        completion(BACKEND_ERR_AGENT_UNSUPPORTED, @(ASB_DISK_GROW_AGENT_ERROR));
+        return;
+    }
+    NSURL *disk = [VmDir diskImageURLFor:@(vm->name)];
+
+    vm->resizing_disk = YES;
+    [IsoPatchMac growDiskAtURL:disk diskGb:(int)gb macGuest:!vm_is_windows_idx(idx)
+                   completion:^(NSError *error) {
+        AsbVmMac *current = asb_mac_vm_find_by_id(vm_id);
+        if (!current) { completion(BACKEND_ERR_NOT_FOUND, nil); return; }
+        current->resizing_disk = NO;
+        if (error) refresh_vm_disk_size(current);
+        else current->hdd_gb = (int)gb;
+        post_event(CORE_VM_EVENT_STATE_CHANGED, vm_id, 0, NULL);
+        post_list_changed();
+        completion(error ? BACKEND_ERR_FAILED : BACKEND_OK, error ?
+                   [@"Could not expand the virtual disk. " stringByAppendingString:error.localizedDescription] : nil);
+    }];
 }
 
 int asb_mac_vm_delete(AsbVmId vm_id)
@@ -2237,6 +2314,8 @@ NSDictionary *asb_mac_vm_snapshot(const AsbVmMac *vm) {
         @"starting":        @(vm->starting),
         @"shuttingDown":    @(vm->shutting_down),
         @"agentOnline":     @(vm->agent_online),
+        @"diskResizeSupported": @(vm->disk_resize_supported),
+        @"diskResizeAgentError": vm->disk_resize_supported ? @"" : @(ASB_DISK_GROW_AGENT_ERROR),
         @"ramMb":           @(vm->ram_mb),
         @"hddGb":           @(vm->hdd_gb),
         @"cpuCores":        @(vm->cpu_cores),

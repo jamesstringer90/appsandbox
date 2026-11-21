@@ -33,6 +33,12 @@ static void put_le16(uint8_t *p, uint16_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)(v
 static void put_le32(uint8_t *p, uint32_t v) { for (int i=0;i<4;i++) p[i]=(uint8_t)(v>>(8*i)); }
 static void put_le64(uint8_t *p, uint64_t v) { for (int i=0;i<8;i++) p[i]=(uint8_t)(v>>(8*i)); }
 
+static uint64_t get_le(const uint8_t *p, size_t len) {
+    uint64_t value = 0;
+    for (size_t i = 0; i < len; ++i) value |= (uint64_t)p[i] << (8 * i);
+    return value;
+}
+
 /* Fill one 128-byte partition entry. name is ASCII -> UTF-16LE. */
 static void fill_entry(uint8_t *e, const uint8_t type[16],
                        uint64_t first, uint64_t last, const char *name) {
@@ -131,4 +137,102 @@ int gpt_write_windows(blockio_t *io, uint32_t ss,
 done:
     free(arr);
     return rc;
+}
+
+int gpt_move_macos_recovery(blockio_t *io, uint64_t old_bytes) {
+    static const uint8_t type_apfs[16] = {
+        0xEF,0x57,0x34,0x7C,0x00,0x00,0xAA,0x11,0xAA,0x11,0x00,0x30,0x65,0x43,0xEC,0xAC };
+    static const uint8_t type_recovery[16] = {
+        0x72,0x76,0x63,0x52,0x00,0x79,0xAA,0x11,0xAA,0x11,0x00,0x30,0x65,0x43,0xEC,0xAC };
+    static const uint8_t empty_type[16];
+    uint64_t bytes = blockio_size(io);
+    if (bytes <= old_bytes || old_bytes < 4 * 1024 * 1024) return -1;
+
+    uint64_t ss = 512;
+    uint8_t header[2][4096];
+    if (blockio_read(io, ss, header[0], ss) != 0) return -1;
+    if (memcmp(header[0], "EFI PART", 8) != 0) {
+        ss = 4096;
+        if (blockio_read(io, ss, header[0], ss) != 0) return -1;
+    }
+    if (bytes % ss || old_bytes % ss) return -1;
+    uint64_t last_lba = bytes / ss - 1;
+    if (blockio_read(io, last_lba * ss, header[1], ss) != 0) return -1;
+
+    uint64_t first = get_le(header[0] + 40, 8), last = get_le(header[0] + 48, 8);
+    uint64_t tables[2];
+    uint8_t entries[2][128 * 128];
+    for (int i = 0; i < 2; ++i) {
+        uint8_t *h = header[i];
+        uint32_t expected = (uint32_t)get_le(h + 16, 4);
+        put_le32(h + 16, 0);
+        if (memcmp(h, "EFI PART", 8) != 0 || get_le(h + 8, 4) != 0x10000 ||
+            get_le(h + 12, 4) != 92 || crc32(h, 92) != expected ||
+            get_le(h + 24, 8) != (i ? last_lba : 1) ||
+            get_le(h + 32, 8) != (i ? 1 : last_lba) ||
+            get_le(h + 40, 8) != first || get_le(h + 48, 8) != last ||
+            memcmp(h + 56, header[0] + 56, 16) != 0 ||
+            get_le(h + 80, 4) != 128 || get_le(h + 84, 4) != 128) return -1;
+        tables[i] = get_le(h + 72, 8);
+        uint64_t sectors = sizeof entries[i] / ss;
+        if (first >= last || last >= last_lba || tables[i] < 2 ||
+            tables[i] > last_lba - sectors || (i ? tables[i] <= last : tables[i] + sectors > first) ||
+            blockio_read(io, tables[i] * ss, entries[i], sizeof entries[i]) != 0 ||
+            crc32(entries[i], sizeof entries[i]) != get_le(h + 88, 4)) return -1;
+    }
+    if (memcmp(entries[0], entries[1], sizeof entries[0]) != 0) return -1;
+
+    uint8_t *apfs = NULL, *recovery = NULL;
+    for (size_t i = 0; i < sizeof entries[0]; i += 128) {
+        uint8_t *entry = entries[0] + i;
+        if (memcmp(entry, empty_type, 16) == 0) continue;
+        uint64_t begin = get_le(entry + 32, 8), end = get_le(entry + 40, 8);
+        if (begin < first || end < begin || end > last || end >= old_bytes / ss) return -1;
+        if (memcmp(entry, type_apfs, 16) == 0) {
+            if (apfs) return -1;
+            apfs = entry;
+        } else if (memcmp(entry, type_recovery, 16) == 0) {
+            if (recovery) return -1;
+            recovery = entry;
+        }
+    }
+    if (!apfs) return -1;
+
+    uint64_t apfs_end = get_le(apfs + 40, 8);
+    uint64_t recovery_start = recovery ? get_le(recovery + 32, 8) : 0;
+    uint64_t recovery_end = recovery ? get_le(recovery + 40, 8) : 0;
+    if (recovery && recovery_start <= apfs_end) return -1;
+    for (size_t i = 0; i < sizeof entries[0]; i += 128) {
+        uint8_t *entry = entries[0] + i;
+        if (entry == apfs || entry == recovery || memcmp(entry, empty_type, 16) == 0) continue;
+        if (get_le(entry + 40, 8) >= get_le(apfs + 32, 8)) return -1;
+    }
+    if (!recovery) return 0;
+
+    uint64_t shift = ((bytes - old_bytes) / 4096 * 4096) / ss;
+    if (!shift || shift > last - recovery_end) return -1;
+    uint8_t *chunk = malloc(4 * 1024 * 1024);
+    if (!chunk) return -1;
+    for (uint64_t left = (recovery_end - recovery_start + 1) * ss; left > 0;) {
+        size_t n = left < 4 * 1024 * 1024 ? (size_t)left : 4 * 1024 * 1024;
+        left -= n;
+        uint64_t offset = recovery_start * ss + left;
+        if (blockio_read(io, offset, chunk, n) != 0 ||
+            blockio_pwrite(io, offset + shift * ss, chunk, n) != 0) {
+            free(chunk);
+            return -1;
+        }
+    }
+    free(chunk);
+
+    put_le64(recovery + 32, recovery_start + shift);
+    put_le64(recovery + 40, recovery_end + shift);
+    uint32_t table_crc = crc32(entries[0], sizeof entries[0]);
+    for (int i = 1; i >= 0; --i) {
+        put_le32(header[i] + 88, table_crc);
+        put_le32(header[i] + 16, crc32(header[i], 92));
+        if (blockio_write(io, tables[i] * ss, entries[0], sizeof entries[0]) != 0 ||
+            blockio_write(io, get_le(header[i] + 24, 8) * ss, header[i], ss) != 0) return -1;
+    }
+    return 0;
 }

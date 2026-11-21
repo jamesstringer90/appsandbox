@@ -19,6 +19,10 @@
 #include <crt_externs.h>
 #include <stdio.h>
 #include <string.h>
+#include <copyfile.h>
+#include <errno.h>
+#include <limits.h>
+#include "engine/gpt.h"
 #include "engine/win_disk.h"               /* from-scratch Windows-disk builder (apply WIM + stage) */
 #include "engine/wim.h"                    /* WIM XML reader -> install image's default UI language */
 #include "../provision/win_provision.h"    /* shared unattend/setup.cmd/SetupComplete.cmd generators */
@@ -512,6 +516,72 @@ static BOOL set_computer_name(NSString *mountPt, NSString *displayName,
 }
 
 static MountState g_mount = {0};
+static NSString *g_worker_tmp;
+
+static BOOL grow_disk_image(NSString *path, uint64_t bytes, BOOL macGuest, BOOL editing) {
+    const char *source = path.fileSystemRepresentation;
+    struct stat original;
+    if (lstat(source, &original) != 0 || !S_ISREG(original.st_mode) || original.st_size <= 0) {
+        emit_error(@"Cannot read the virtual disk image");
+        return NO;
+    }
+    if (bytes <= (uint64_t)original.st_size) {
+        if (!editing || bytes == (uint64_t)original.st_size) return YES;
+        emit_error(@"The virtual disk cannot be shrunk");
+        return NO;
+    }
+
+    emit_status(@"Expanding disk image");
+    BOOL replace = macGuest && editing;
+    NSString *target = path;
+    if (replace) {
+        char temp[PATH_MAX];
+        int len = snprintf(temp, sizeof temp, "%s/.disk-grow-XXXXXX",
+                           path.stringByDeletingLastPathComponent.fileSystemRepresentation);
+        if (len < 0 || (size_t)len >= sizeof temp || !mkdtemp(temp)) {
+            emit_error(@"Cannot create a temporary directory beside the virtual disk");
+            return NO;
+        }
+
+        g_worker_tmp = [[NSFileManager defaultManager] stringWithFileSystemRepresentation:temp length:strlen(temp)];
+        target = [g_worker_tmp stringByAppendingPathComponent:@"disk.img"];
+        if (copyfile(source, target.fileSystemRepresentation, NULL, COPYFILE_ALL | COPYFILE_CLONE | COPYFILE_EXCL) != 0) {
+            emit_error([NSString stringWithFormat:@"Cannot copy the virtual disk: %s", strerror(errno)]);
+            return NO;
+        }
+    }
+
+    NSString *error = nil;
+    if (run_tool(@"/usr/sbin/diskutil", @[@"image", @"resize", @"--image-only", @"--size",
+                 [NSString stringWithFormat:@"%lluB", (unsigned long long)bytes], target], NULL, &error) != 0) {
+        emit_error(error.length ? [error stringByReplacingOccurrencesOfString:@"\n" withString:@" "] : @"Disk resize failed");
+        return NO;
+    }
+    blockio_t *io = blockio_open(target.fileSystemRepresentation);
+    BOOL ok = io && blockio_size(io) == bytes &&
+        (!macGuest || gpt_move_macos_recovery(io, (uint64_t)original.st_size) == 0);
+    if (blockio_close(io) != 0) ok = NO;
+    if (!ok) {
+        emit_error(@"Cannot prepare the enlarged partition map");
+        return NO;
+    }
+    if (!replace) return YES;
+
+    check_cancelled();
+    struct stat current;
+    if (lstat(source, &current) != 0 || current.st_dev != original.st_dev ||
+        current.st_ino != original.st_ino || current.st_size != original.st_size ||
+        current.st_mtimespec.tv_sec != original.st_mtimespec.tv_sec ||
+        current.st_mtimespec.tv_nsec != original.st_mtimespec.tv_nsec) {
+        emit_error(@"The virtual disk changed during the resize");
+        return NO;
+    }
+    if (rename(target.fileSystemRepresentation, source) != 0) {
+        emit_error([NSString stringWithFormat:@"Cannot replace the virtual disk: %s", strerror(errno)]);
+        return NO;
+    }
+    return YES;
+}
 
 /* ---- "stage" subcommand ---- */
 
@@ -551,22 +621,7 @@ static int cmd_stage(int argc, char **argv) {
 
     emit_progress(5, @"Loaded manifest");
 
-    struct stat diskStat;
-    if (stat(diskPath.fileSystemRepresentation, &diskStat) != 0) {
-        emit_error([NSString stringWithFormat:@"Cannot read virtual disk size: %s", strerror(errno)]);
-        return 4;
-    }
-    if (diskBytes > (uint64_t)diskStat.st_size) {
-        emit_status(@"Expanding macOS disk");
-        NSString *resizeError = nil;
-        if (run_tool(@"/usr/sbin/diskutil", @[@"image", @"resize", @"--size",
-            [NSString stringWithFormat:@"%llu", (unsigned long long)diskBytes], diskPath], NULL, &resizeError) != 0) {
-            NSString *detail = resizeError ?: @"diskutil failed";
-            emit_error([@"Failed to expand macOS disk: " stringByAppendingString:
-                [detail stringByReplacingOccurrencesOfString:@"\n" withString:@" "]]);
-            return 4;
-        }
-    }
+    if (!grow_disk_image(diskPath, diskBytes, YES, NO)) return 4;
 
     if (!mount_disk(diskPath, &g_mount, &err)) {
         emit_error(err);
@@ -1119,7 +1174,6 @@ static int bw_manifest_add(FILE *mf, NSString *src, const char *dest) {
 /* ---- ISO mount lifecycle ---- */
 typedef struct { NSString *diskDev; NSString *mountPt; NSString *shadowPath; } IsoMount;
 static IsoMount g_iso_mount;
-static NSString *g_build_tmp;
 
 /* Attach the ISO and locate the mount point that actually contains sources/install.wim (a Windows ISO
  * exposes both ISO9660 and UDF volumes).
@@ -1180,7 +1234,7 @@ static void cleanup_worker(void) {
     g_cleaning_up = YES;
     unmount_and_detach(&g_mount);
     bw_unmount_iso(&g_iso_mount);
-    if (g_build_tmp) [[NSFileManager defaultManager] removeItemAtPath:g_build_tmp error:nil];
+    if (g_worker_tmp) [[NSFileManager defaultManager] removeItemAtPath:g_worker_tmp error:nil];
 }
 
 /* win_disk_build progress -> PROGRESS/STATUS lines. */
@@ -1190,6 +1244,7 @@ static void bw_progress(int pct, const char *msg) {
 
 static int cmd_build_windows(int argc, char **argv) {
     NSString *iso = nil, *out = nil, *sshMsi = nil, *signedZip = nil, *netkvmZip = nil, *vioscsiZip = nil;
+    NSString *diskPath = nil;
     NSString *vmName = @"WIN11-VM", *user = @"user", *pass = @"test123";
     NSString *provDir = nil;   /* host-generated unattend.xml/setup.cmd/SetupComplete.cmd (password encoded host-side) */
     NSString *lang = @"";   /* empty => auto-detect from the install.wim XML (else en-US) */
@@ -1200,6 +1255,7 @@ static int cmd_build_windows(int argc, char **argv) {
         else if (strcmp(argv[i], "--resources-iso") == 0) resourcesOnly = YES;
         else if (strcmp(argv[i], "--iso") == 0 && i+1 < argc) iso = @(argv[++i]);
         else if (strcmp(argv[i], "--out") == 0 && i+1 < argc) out = @(argv[++i]);
+        else if (strcmp(argv[i], "--disk") == 0 && i+1 < argc) diskPath = @(argv[++i]);
         else if (strcmp(argv[i], "--signed-payload-zip") == 0 && i+1 < argc) signedZip = @(argv[++i]);
         else if (strcmp(argv[i], "--netkvm-zip") == 0 && i+1 < argc) netkvmZip = @(argv[++i]);
         else if (strcmp(argv[i], "--vioscsi-zip") == 0 && i+1 < argc) vioscsiZip = @(argv[++i]);
@@ -1217,12 +1273,19 @@ static int cmd_build_windows(int argc, char **argv) {
         emit_error(@"build-windows: --iso, --out and --signed-payload-zip are required");
         return 2;
     }
+    if (resourcesOnly && diskPath) {
+        if (diskGb < 1) {
+            emit_error(@"The disk size must be positive");
+            return 2;
+        }
+        if (!grow_disk_image(diskPath, (uint64_t)diskGb << 30, NO, NO)) return 4;
+    }
     NSFileManager *fm = [NSFileManager defaultManager];
 
     /* 1) temp staging dir for the generated answer file + scripts */
     NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
                      [NSString stringWithFormat:@"asb-winbuild-%d", getpid()]];
-    g_build_tmp = tmp;
+    g_worker_tmp = tmp;
     [fm removeItemAtPath:tmp error:nil];
     NSError *mkErr = nil;
     if (![fm createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:&mkErr]) {
@@ -1534,7 +1597,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         const char *cmd = argv[1];
-        if (strcmp(cmd, "stage") == 0 || strcmp(cmd, "build-windows") == 0) {
+        if (strcmp(cmd, "stage") == 0 || strcmp(cmd, "build-windows") == 0 || strcmp(cmd, "grow-disk") == 0) {
             atexit(cleanup_worker);
             struct sigaction action = {0};
             action.sa_handler = cancel_on_signal;
@@ -1546,6 +1609,16 @@ int main(int argc, char *argv[]) {
         }
         if (strcmp(cmd, "stage") == 0) {
             return cmd_stage(argc - 2, argv + 2);
+        }
+        if (strcmp(cmd, "grow-disk") == 0 && argc == 5) {
+            char *end;
+            unsigned long gb = strtoul(argv[3], &end, 10);
+            if (*argv[3] < '1' || *argv[3] > '9' || *end || gb > INT_MAX ||
+                (strcmp(argv[4], "windows") != 0 && strcmp(argv[4], "macos") != 0)) return 64;
+            if (!grow_disk_image(@(argv[2]), (uint64_t)gb << 30, strcmp(argv[4], "macos") == 0, YES))
+                return 1;
+            emit_done(@(argv[2]));
+            return 0;
         }
         if (strcmp(cmd, "fetch-ipsw") == 0) {
             return cmd_fetch_ipsw(argc - 2, argv + 2);

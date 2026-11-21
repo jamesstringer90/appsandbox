@@ -19,6 +19,7 @@
 #include <ImageIO/ImageIO.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <limits.h>
 
 #include <sys/socket.h>
 #include <sys/file.h>
@@ -911,6 +912,52 @@ static void service_error(int fd,uint32_t error,int input_operation)
     send_err(fd,response.status,"Operation Failed",@(response.code),@(response.message));
 }
 
+static int apply_vm_settings(AsbVmId vm_id, NSDictionary *body)
+{
+    int rc = BACKEND_OK;
+    for (NSString *field in @[@"ramMb", @"cpuCores", @"gpuMode", @"networkMode"]) {
+        if (!body[field]) continue;
+        NSString *value = [NSString stringWithFormat:@"%d", [body[field] intValue]];
+        int result = asb_mac_vm_edit(vm_id, field.UTF8String, value.UTF8String);
+        if (result != BACKEND_OK) rc = result;
+    }
+    if (!body[@"hddGb"]) asb_mac_save();
+    return rc;
+}
+
+static void serve_disk_edit(ServiceCall *call, NSDictionary *body)
+{
+    AsbVmId vm_id = call->target.id;
+    NSString *size = [NSString stringWithFormat:@"%d", [body[@"hddGb"] intValue]];
+    __block int rc = BACKEND_ERR_FAILED;
+    __block NSString *detail = nil;
+    __block NSDictionary *snapshot = nil;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    on_main(^{
+        asb_mac_vm_set_disk_size(vm_id, size.UTF8String, ^(int result, NSString *error) {
+            rc = result;
+            detail = error;
+            if (rc == BACKEND_OK && !g_stop_all) {
+                rc = apply_vm_settings(vm_id, body);
+                AsbVmMac *vm = asb_mac_vm_find_by_id(vm_id);
+                if (vm) snapshot = api_vm_snapshot(vm);
+            }
+            dispatch_semaphore_signal(done);
+        });
+    });
+    while (!g_stop_all) {
+        if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC)) != 0) continue;
+        int fd = call->client->fd;
+        if (rc == BACKEND_OK && snapshot) send_json(fd, 200, "OK", json_str(snapshot));
+        else if (rc == BACKEND_ERR_AGENT_UNSUPPORTED)
+            send_err(fd, 409, "Conflict", @"disk_resize_agent_unsupported", detail);
+        else if (rc == BACKEND_ERR_FAILED && detail)
+            send_err(fd, 500, "Operation Failed", @"operation_failed", detail);
+        else send_rc(fd, "editVm", @(call->target.name), vm_id, rc);
+        break;
+    }
+}
+
 static void *service_thread(void *context)
 {
     ServiceCall *call=context;pthread_detach(pthread_self());
@@ -918,9 +965,12 @@ static void *service_thread(void *context)
         if (!strcmp(call->operation,"screenshot")) pthread_set_qos_class_self_np(QOS_CLASS_UTILITY,0);
         NSData *data=[NSData dataWithBytes:call->body length:strlen(call->body)];
         NSDictionary *body=data.length?[NSJSONSerialization JSONObjectWithData:data options:0 error:nil]:@{};
-        id result=nil;uint32_t error=service_execute(call,body,&result);
-        if (error) service_error(call->client->fd,error,strcmp(call->operation,"screenshot") && strncmp(call->operation,"ssh_",4));
-        else send_json(call->client->fd,200,"OK",json_str(result ?: @{}));
+        if (!strcmp(call->operation,"edit_disk")) serve_disk_edit(call,body);
+        else {
+            id result=nil;uint32_t error=service_execute(call,body,&result);
+            if (error) service_error(call->client->fd,error,strcmp(call->operation,"screenshot") && strncmp(call->operation,"ssh_",4));
+            else send_json(call->client->fd,200,"OK",json_str(result ?: @{}));
+        }
         asb_mac_channel_release(call->target.channel);client_close(call->client);free(call);--g_service_count;
     }
     return NULL;
@@ -941,7 +991,7 @@ static int defer_service(int fd,const HttpReq *request,uint64_t identity,const w
             strlcpy(target.name,vm->name,sizeof(target.name));strlcpy(target.os_type,vm->os_type,sizeof(target.os_type));
         }
     });
-    if (!exists || (!running && wcscmp(operation,L"input_status"))) {
+    if (!exists || (!running && wcscmp(operation,L"input_status") && wcscmp(operation,L"edit_disk"))) {
         --g_service_count;free(call);send_err(fd,exists?409:404,exists?"Conflict":"Not Found",exists?@"not_running":@"not_found",exists?@"VM is not running.":@"no such VM");return 0;
     }
     call->target=target;call->target.ssh_session=session_id;call->client=g_serving_client;
@@ -1212,6 +1262,7 @@ static int handle_request(int fd, HttpReq *r) {
                     AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
                     if (v && asb_mac_vm_is_building(v)) conflict = 2;
                     else if (v && v->running)  conflict = 1;
+                    else if (v && !v->install_complete) conflict = 3;
                 });
                 if (conflict == 2) {
                     send_err(fd, 409, "Conflict", @"vm_building",
@@ -1221,6 +1272,11 @@ static int handle_request(int fd, HttpReq *r) {
                 if (conflict == 1) {
                     send_err(fd, 409, "Conflict", @"vm_running",
                              @"cannot edit a running VM; stop it first");
+                    return 0;
+                }
+                if (conflict == 3) {
+                    send_err(fd, 409, "Conflict", @"vm_install_incomplete",
+                             @"Finish installing the VM before editing its configuration.");
                     return 0;
                 }
                 if (b[@"ramMb"]) {
@@ -1236,6 +1292,13 @@ static int handle_request(int fd, HttpReq *r) {
                     send_err(fd, 400, "Bad Request", @"invalid_arg",
                              @"CPU cores must be at least 1");
                     return 0;
+                }
+                if (b[@"hddGb"]) {
+                    long long gb = [b[@"hddGb"] longLongValue];
+                    if (gb < 1 || gb > INT_MAX || [b[@"hddGb"] doubleValue] != (double)gb) {
+                        send_err(fd, 400, "Bad Request", @"invalid_arg", @"hddGb must be a positive whole number.");
+                        return 0;
+                    }
                 }
                 if (b[@"gpuMode"]) {
                     int iv = [b[@"gpuMode"] intValue];
@@ -1253,21 +1316,16 @@ static int handle_request(int fd, HttpReq *r) {
                         return 0;
                     }
                 }
+                if (b[@"hddGb"]) return defer_service(fd, r, vm_id, L"edit_disk", 0);
                 __block int rc = BACKEND_OK;
                 __block NSDictionary *st = nil;
                 on_main(^{
-                    for (NSString *field in @[@"ramMb", @"cpuCores", @"gpuMode", @"networkMode"]) {
-                        if (!b[field]) continue;
-                        NSString *val = [NSString stringWithFormat:@"%d", [b[field] intValue]];
-                        int frc = asb_mac_vm_edit(vm_id, field.UTF8String, val.UTF8String);
-                        if (frc != BACKEND_OK) rc = frc;
-                    }
-                    asb_mac_save();
+                    rc = apply_vm_settings(vm_id, b);
                     AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);
                     if (v) st = api_vm_snapshot(v);
                 });
                 if (rc == BACKEND_OK && st) send_json(fd, 200, "OK", json_str(st));
-                else                        send_rc(fd, "editVm", name, vm_id, rc);
+                else send_rc(fd, "editVm", name, vm_id, rc);
                 return 0;
             }
             send_err(fd, 405, "Method Not Allowed", @"method", @"unsupported method");

@@ -67,6 +67,8 @@ typedef struct {
     VzDisplayWindow *__unsafe_unretained display;
     VmAgentMac      *__unsafe_unretained agent;
     VmSshProxyMac   *__unsafe_unretained ssh_proxy;
+    BOOL    disk_resize_supported;
+    BOOL    resizing_disk;
 } AsbVmMac;
 
 void asb_mac_init(void);
@@ -103,6 +105,7 @@ int  asb_mac_vm_stop(AsbVmId vm_id, int force);
 int  asb_mac_vm_delete(AsbVmId vm_id);
 int asb_mac_template_delete(AsbTemplateId template_id);
 int  asb_mac_vm_edit(AsbVmId vm_id, const char *field, const char *value);
+void asb_mac_vm_set_disk_size(AsbVmId vm_id, const char *value, void (^completion)(int result, NSString *error));
 
 void asb_mac_save(void);
 int asb_mac_get_api_port(void);

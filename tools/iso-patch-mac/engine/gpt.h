@@ -31,5 +31,6 @@ typedef struct {
  * Returns 0 on success, -1 on error. */
 int gpt_write_windows(blockio_t *io, uint32_t sector_size,
                       uint64_t esp_mb, uint64_t msr_mb, gpt_layout_t *out);
+int gpt_move_macos_recovery(blockio_t *io, uint64_t old_bytes);
 
 #endif /* ASB_GPT_H */

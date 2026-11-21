@@ -304,6 +304,11 @@
 }
 
 - (void)processAsyncMessage:(const char *)line {
+    if (strcmp(line, "disk_resize:supported") == 0) {
+        dispatch_block_t cb = self.onDiskResizeSupported;
+        if (cb) dispatch_async(dispatch_get_main_queue(), cb);
+        return;
+    }
     if (!strncmp(line, "sas:", 4)) {
         self.sasSupported = !strcmp(line + 4, "supported");
         return;

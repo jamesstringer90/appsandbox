@@ -395,30 +395,48 @@ static BOOL logoff_session(DWORD session_id)
     return result;
 }
 
+static DWORD start_quiet(wchar_t *cmd, HANDLE *process)
+{
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) return GetLastError();
+    CloseHandle(pi.hThread);
+    *process = pi.hProcess;
+    return ERROR_SUCCESS;
+}
+
 /* Run a command hidden and wait for it (used for takeown/icacls). The cmd buffer
    must be writable (CreateProcessW may modify it). */
 static DWORD run_quiet(wchar_t *cmd)
 {
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = { 0 };
-    DWORD result;
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
-                       NULL, NULL, &si, &pi)) {
-        DWORD wait = WaitForSingleObject(pi.hProcess, 30000);
+    HANDLE process;
+    DWORD result = start_quiet(cmd, &process);
+    if (result == ERROR_SUCCESS) {
+        DWORD wait = WaitForSingleObject(process, 30000);
         if (wait == WAIT_OBJECT_0) {
-            if (!GetExitCodeProcess(pi.hProcess, &result))
+            if (!GetExitCodeProcess(process, &result))
                 result = GetLastError();
         } else {
             result = wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
         }
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-    } else {
-        result = GetLastError();
+        CloseHandle(process);
     }
     return result;
+}
+
+static void grow_system_volume(void)
+{
+    wchar_t cmd[] = L"powershell.exe -NoProfile -NonInteractive -Command \"$ErrorActionPreference='Stop'; "
+        L"$letter=[char]$env:SystemDrive[0]; $part=Get-Partition -DriveLetter $letter; "
+        L"$max=(Get-PartitionSupportedSize -DriveLetter $letter).SizeMax; "
+        L"if ($max -gt ($part.Size + 1MB)) { Resize-Partition -DriveLetter $letter -Size $max -Confirm:$false }\"";
+    HANDLE process;
+    DWORD result = start_quiet(cmd, &process);
+    if (result == ERROR_SUCCESS) CloseHandle(process);
+    else agent_log("Could not start system volume expansion (%lu).", result);
 }
 
 /* Deploy the AppSandbox public key into administrators_authorized_keys -- the file
@@ -1909,8 +1927,8 @@ static void handle_client(AsbConn *client)
     asb_set_timeout(client, 10000, 10000);
 
     /* Send hello */
-    if (send_line(client, "hello") <= 0) {
-        agent_log("Failed to send hello.");
+    if (send_line(client, "hello") <= 0 || send_line(client, "disk_resize:supported") <= 0) {
+        agent_log("Failed to send handshake.");
         asb_close(client);
         g_client_sock = NULL;
         return;
@@ -2609,6 +2627,7 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     ensure_vdd_running();
 
     ensure_display_monitor();
+    grow_system_volume();
 
     /* Wait until stop is signaled */
     WaitForSingleObject(g_stop_event, INFINITE);
