@@ -644,11 +644,25 @@ static DWORD WINAPI clip_writer_thread_proc(LPVOID param)
 
 /* ---- Reader channel: file data receive ---- */
 
+/* A guest->host file transfer is tied to the sharing generation captured when
+ * it started. Toggling a direction off bumps that generation, so the receive
+ * loop must abort even if the guest is still streaming a 10 GB file. */
+static BOOL clip_reader_transfer_active(VmClipboard clip, LONG generation)
+{
+    return clip->sharing_enabled && clip->share_guest_to_host &&
+           generation == (LONG)InterlockedCompareExchange(&clip->sharing_generation, 0, 0);
+}
+
 static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHeader *hdr)
 {
     ClipFileInfo fi;
     wchar_t rel_path[MAX_PATH], full_path[MAX_PATH];
+    LONG generation = (LONG)InterlockedCompareExchange(&clip->sharing_generation, 0, 0);
 
+    if (!clip_reader_transfer_active(clip, generation)) {
+        clip_log(clip, L"CLIP-R: File receive cancelled (guest->host sharing disabled).");
+        return FALSE;
+    }
     if (hdr->data_size < sizeof(fi)) return FALSE;
     if (!clip_recv_exact(s, &fi, sizeof(fi))) return FALSE;
 
@@ -679,7 +693,18 @@ static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHea
             UINT64 remaining = fi.file_size;
             while (remaining > 0) {
                 DWORD to_read = remaining > CLIP_FILE_BUFFER_SIZE ? CLIP_FILE_BUFFER_SIZE : (DWORD)remaining;
+
+                if (!clip_reader_transfer_active(clip, generation)) {
+                    clip_log(clip, L"CLIP-R: File receive cancelled (guest->host sharing disabled).");
+                    clip_file_writer_abort(&file);
+                    return FALSE;
+                }
                 if (!clip_recv_exact(s, file.buffer, (int)to_read)) {
+                    clip_file_writer_abort(&file);
+                    return FALSE;
+                }
+                if (!clip_reader_transfer_active(clip, generation)) {
+                    clip_log(clip, L"CLIP-R: File receive cancelled (guest->host sharing disabled).");
                     clip_file_writer_abort(&file);
                     return FALSE;
                 }
@@ -689,6 +714,11 @@ static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHea
                     return FALSE;
                 }
                 remaining -= to_read;
+            }
+            if (!clip_reader_transfer_active(clip, generation)) {
+                clip_log(clip, L"CLIP-R: File receive cancelled (guest->host sharing disabled).");
+                clip_file_writer_abort(&file);
+                return FALSE;
             }
             if (!clip_file_writer_finish(&file)) {
                 clip_log(clip, L"CLIP-R: File completion failed (%lu).", GetLastError());
