@@ -107,7 +107,7 @@ When your VM is running and open, right clicking its title bar will show several
 
 [Windows] You can check if the GPU-PV driver setup is working by running gpu-test.exe inside your App Sandbox Windows VM, gpu-test.exe will show a box with 6 rotating cubes, each using a different rendering engine (D3D9, D3D10, D3D11, D3D12, OpenGL and Vulkan).  If one or more fail, they will not correctly show a rotating cube for that rendering API.  [gpu-test.zip](https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.2/gpu-test.zip). Note: The rendering API succeeding means that the GPU-PV worked, but sometimes games or apps are coded in such a way that they will not detect the GPU-PV system correctly and still show an error.
 
-### How to support the project
+## How to support the project
 
 Show people on Reddit, Twitter, Youtube, Tiktok or your favorite forum how you use App Sandbox to do something cool.  Even if you just mention it's one of the tools in your workflow that would be super helpful, and will bring a lot of awareness to the project!  
 
