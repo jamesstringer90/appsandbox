@@ -210,7 +210,8 @@ window.addEventListener('resize',()=>{cancelDwell();showExit(false);});
 window.chrome.webview.addEventListener('message', e => {
   const s=e.data;
   if(s.type==='viewer_options') {
-    for(const [i,item] of viewerItems.entries()) {
+    for(const item of viewerItems) {
+      const i=Number(item.dataset.option);
       item.disabled=!(s.enabled&(1<<i)); item.classList.toggle('checked',!!(s.checked&(1<<i)));
     }
     return;
