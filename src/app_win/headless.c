@@ -14,6 +14,7 @@
 #include <stdarg.h>
 
 #include "headless.h"
+#include "hcn_network.h"
 #include "ui.h"
 #include "asb_events.h"
 #include "asb_core.h"          /* full API incl. internal VmInstance */
@@ -298,6 +299,8 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->gpu_id);
     pos += sprintf_s(out + pos, cap - pos, ",\"gpuName\":");
     pos = append_wstr(out, cap, pos, v->gpu_name);
+    pos += sprintf_s(out + pos, cap - pos, ",\"netAdapter\":");
+    pos = append_wstr(out, cap, pos, v->net_adapter);
     pos += sprintf_s(out + pos, cap - pos, "}");
     return pos;
 }
@@ -318,6 +321,52 @@ static int append_template_json(char *out,int cap,int pos,AsbTemplateId id)
         index>=0?asb_template_hdd_gb(index):builder->hdd_gb,index>=0?"true":"false",
         index>=0?"ready":"building",index>=0?"false":"true",index>=0?100:builder->vhdx_progress);
     return pos;
+}
+
+typedef struct {
+    JsonBuilder *json;
+    wchar_t preferred[256];
+    int default_index;
+} NetworkAdapterJson;
+
+static void append_network_adapter(const wchar_t *name, int if_type, void *ctx)
+{
+    NetworkAdapterJson *adapters = ctx;
+    JsonBuilder *json = adapters->json;
+    (void)if_type;
+    if (json->cap - json->len <= wcslen(name) * 6 + 128) return;
+    if (json->count) jb_append(json, L",");
+    jb_append(json, L"\"");
+    jb_append_escaped(json, name);
+    jb_append(json, L"\"");
+    ++json->count;
+    if (CompareStringOrdinal(name, -1, adapters->preferred, -1, TRUE) == CSTR_EQUAL)
+        adapters->default_index = json->count;
+}
+
+static void append_external_switch(const wchar_t *name, const wchar_t *target, void *ctx)
+{
+    JsonBuilder *json = ctx;
+    if (json->cap - json->len <= wcslen(name) * 6 + wcslen(target) + 32) return;
+    if (json->count) jb_append(json, L",");
+    jb_object_begin(json);
+    jb_string(json, L"name", name);
+    jb_string(json, L"netAdapter", target);
+    jb_object_end(json);
+}
+
+void asb_api_append_network_choices(JsonBuilder *json)
+{
+    NetworkAdapterJson adapters = {0};
+    adapters.json = json;
+    hcn_default_adapter_name(adapters.preferred, ARRAYSIZE(adapters.preferred));
+    jb_array_begin(json, L"adapters");
+    hcn_enum_adapters(append_network_adapter, &adapters);
+    jb_array_end(json);
+    jb_int(json, L"defaultAdapter", adapters.default_index);
+    jb_array_begin(json, L"externalSwitches");
+    hcn_enum_external_switches(append_external_switch, json);
+    jb_array_end(json);
 }
 
 static int build_host_info(char *buf, int cap)
@@ -356,8 +405,15 @@ static int build_host_info(char *buf, int cap)
         pos = append_wstr(buf, cap, pos, gpus->gpus[i].location);
         pos += sprintf_s(buf + pos, cap - pos, "}");
     }
-    pos += sprintf_s(buf + pos, cap - pos, "]}");
-    return pos;
+    pos += sprintf_s(buf + pos, cap - pos, "]");
+    wchar_t choices[32768];
+    JsonBuilder json;
+    jb_init(&json, choices, ARRAYSIZE(choices));
+    json.count = 1;
+    asb_api_append_network_choices(&json);
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, choices, -1, buf + pos, cap - pos - 1, NULL, NULL);
+    if (bytes) pos += bytes - 1;
+    return pos + sprintf_s(buf + pos, cap - pos, "}");
 }
 
 /* ---- HTTP helpers ---- */
@@ -1381,7 +1437,13 @@ static int handle_request(PHTTP_REQUEST req)
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg", error);
                 return 0;
             }
-            api_json_get_string(body, L"netAdapter", adapter, 256);
+            if (api_json_has_key(body, L"netAdapter") &&
+                !api_json_get_string(body, L"netAdapter", adapter, ARRAYSIZE(adapter))) {
+                SecureZeroMemory(pass, sizeof(pass));
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                         "netAdapter must be a valid string of at most 255 UTF-16 code units.");
+                return 0;
+            }
             if (!api_json_get_string(body, L"diskDirectory", disk_directory, MAX_PATH + 1) &&
                 api_json_has_key(body, L"diskDirectory")) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
@@ -1533,7 +1595,9 @@ static int handle_request(PHTTP_REQUEST req)
             if (verb == HttpVerbPUT) {   /* edit (PUT instead of PATCH: PATCH isn't in the http.sys verb enum) */
                 const wchar_t *body=request_body();
                 wchar_t gpu_id[512] = {0};
-                int iv, gpu_mode = GPU_DEFAULT; BOOL has_gpu;
+                wchar_t adapter[256];
+                int iv, gpu_mode = GPU_DEFAULT, network_mode = inst->network_mode;
+                BOOL has_gpu, has_adapter, has_network_mode;
                 HRESULT hr = S_OK;
                 /* config is locked while building or running -- return a clean 409,
                    not the generic 500 that asb_vm_set_*'s E_ACCESSDENIED would
@@ -1544,7 +1608,7 @@ static int handle_request(PHTTP_REQUEST req)
                              "cannot edit a VM while it is building/staging; wait for the build to finish");
                     return 0;
                 }
-                if (inst->running) {
+                if (inst->running || inst->starting) {
                     send_err(req->RequestId, 409, "Conflict", "vm_running", "cannot edit a running VM; stop it first");
                     return 0;
                 }
@@ -1564,23 +1628,31 @@ static int handle_request(PHTTP_REQUEST req)
                         return 0;
                     }
                 }
-                /* name is the guest hostname -- fixed at create, NOT editable. */
-                if (!validate_body(body)) {
-                    send_err(req->RequestId,400,"Bad Request","invalid_arg","Invalid field types or JSON body.");return 0;
-                }
                 if (api_json_get_int(body,L"ramMb",&iv)) {
                     const char *error=asb_api_validate_ram_mb(iv);
                     if (error) { send_err(req->RequestId,400,"Bad Request","invalid_arg",error);return 0; }
                 }
+                has_adapter = api_json_has_key(body, L"netAdapter");
+                has_network_mode = api_json_get_int(body, L"networkMode", &network_mode);
                 if ((api_json_get_int(body,L"cpuCores",&iv) && iv<1) ||
-                    (api_json_get_int(body,L"networkMode",&iv) && (iv<0 || iv>3))) {
+                    (has_network_mode && (network_mode < NET_NONE || network_mode > NET_INTERNAL))) {
                     send_err(req->RequestId,400,"Bad Request","invalid_arg","Invalid RAM, CPU, or network setting.");return 0;
+                }
+                if (has_adapter && (network_mode != NET_EXTERNAL ||
+                    !api_json_get_string(body, L"netAdapter", adapter, ARRAYSIZE(adapter)))) {
+                    send_err(req->RequestId,400,"Bad Request","invalid_arg","netAdapter requires External networking and a valid adapter or switch selection.");return 0;
+                }
+                if (has_network_mode || has_adapter) {
+                    hr = asb_vm_set_network_selection(vm, network_mode, has_adapter ? adapter : NULL);
+                    if (FAILED(hr)) {
+                        send_hr(req->RequestId, "editVm", nu, vm_id, hr);
+                        return 0;
+                    }
                 }
                 if (api_json_get_int(body, L"ramMb", &iv)) {
                     hr = asb_vm_set_ram(vm, (DWORD)iv);
                 }
                 if (api_json_get_int(body, L"cpuCores", &iv)) {
-                    if (iv < 1) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "CPU cores must be at least 1"); return 0; }
                     hr = asb_vm_set_cpu(vm, (DWORD)iv);
                 }
                 if (has_gpu) {
@@ -1589,10 +1661,6 @@ static int handle_request(PHTTP_REQUEST req)
                         send_hr(req->RequestId, "editVm", nu, vm_id, hr);
                         return 0;
                     }
-                }
-                if (api_json_get_int(body, L"networkMode", &iv)) {
-                    if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal)"); return 0; }
-                    hr = asb_vm_set_network(vm, iv);
                 }
                 asb_save();
                 if (SUCCEEDED(hr)) {

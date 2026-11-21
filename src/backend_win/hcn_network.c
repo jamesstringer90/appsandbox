@@ -1,13 +1,21 @@
+#define COBJMACROS
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include "hcn_network.h"
+#include "api_json.h"
 #include "ui.h"
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <objbase.h>
 #include <iphlpapi.h>
+#include <devguid.h>
+#include <netcfgx.h>
 
 #pragma comment(lib, "iphlpapi.lib")
 
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
 
 /* ---- HCN function pointer types ---- */
 
@@ -52,8 +60,11 @@ static void guid_to_string(const GUID *g, wchar_t *out, size_t out_len)
 
 typedef HRESULT (WINAPI *PFN_HcnEnumerateNetworks)(
     PCWSTR query, PWSTR *networks, PWSTR *errorRecord);
+typedef HRESULT (WINAPI *PFN_HcnQueryNetworkProperties)(
+    void *network, PCWSTR query, PWSTR *properties, PWSTR *errorRecord);
 
 static PFN_HcnEnumerateNetworks pfnEnumNet;
+static PFN_HcnQueryNetworkProperties pfnQueryNet;
 
 BOOL hcn_init(void)
 {
@@ -69,6 +80,7 @@ BOOL hcn_init(void)
     pfnCloseEp    = (PFN_HcnCloseEndpoint)GetProcAddress(g_hcn_dll, "HcnCloseEndpoint");
     pfnOpenNet    = (PFN_HcnOpenNetwork)GetProcAddress(g_hcn_dll, "HcnOpenNetwork");
     pfnEnumNet    = (PFN_HcnEnumerateNetworks)GetProcAddress(g_hcn_dll, "HcnEnumerateNetworks");
+    pfnQueryNet   = (PFN_HcnQueryNetworkProperties)GetProcAddress(g_hcn_dll, "HcnQueryNetworkProperties");
 
     if (!pfnCreateNet || !pfnCreateEp || !pfnCloseNet || !pfnCloseEp) {
         FreeLibrary(g_hcn_dll);
@@ -95,10 +107,112 @@ static const GUID APPSANDBOX_EXTERNAL_GUID = {
     { 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x88 }
 };
 
+static const wchar_t switch_prefix[] = L"switch:";
+static const wchar_t network_query[] = L"{\"SchemaVersion\":{\"Major\":2,\"Minor\":0}}";
+
+static BOOL hcn_manages_network(const GUID *id)
+{
+    return IsEqualGUID(id, &APPSANDBOX_NAT_GUID) ||
+           IsEqualGUID(id, &APPSANDBOX_INTERNAL_GUID) ||
+           IsEqualGUID(id, &APPSANDBOX_EXTERNAL_GUID);
+}
+
+BOOL hcn_is_switch_target(const wchar_t *target)
+{
+    return target && !_wcsnicmp(target, switch_prefix, ARRAYSIZE(switch_prefix) - 1);
+}
+
+static BOOL parse_network_id(const wchar_t *text, GUID *id)
+{
+    wchar_t braced[39];
+    size_t length = wcslen(text);
+    if (length == 38 && text[0] == L'{')
+        return SUCCEEDED(CLSIDFromString(text, id));
+    if (length != 36) return FALSE;
+    swprintf_s(braced, ARRAYSIZE(braced), L"{%s}", text);
+    return SUCCEEDED(CLSIDFromString(braced, id));
+}
+
+static BOOL parse_external_switch_target(const wchar_t *target, GUID *id)
+{
+    return parse_network_id(target + ARRAYSIZE(switch_prefix) - 1, id) &&
+           !hcn_manages_network(id);
+}
+
+static HRESULT hcn_read_external_switch(void *network, wchar_t *name, size_t capacity)
+{
+    PWSTR properties = NULL;
+    wchar_t type[32];
+    if (!pfnQueryNet)
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+
+    HRESULT hr = pfnQueryNet(network, network_query, &properties, NULL);
+    if (SUCCEEDED(hr) &&
+        (!properties || !api_json_get_string(properties, L"Type", type, ARRAYSIZE(type)) ||
+         wcscmp(type, L"Transparent") ||
+         (name && (!api_json_get_string(properties, L"Name", name, capacity) || !name[0]))))
+        hr = E_INVALIDARG;
+    CoTaskMemFree(properties);
+    return hr;
+}
+
+static HRESULT hcn_query_external_switch(const GUID *id, wchar_t *name, size_t capacity)
+{
+    void *network = NULL;
+    if (hcn_manages_network(id)) return E_INVALIDARG;
+    if (!g_hcn_dll || !pfnOpenNet)
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+
+    HRESULT hr = pfnOpenNet(id, &network, NULL);
+    if (FAILED(hr)) return hr;
+    hr = hcn_read_external_switch(network, name, capacity);
+    pfnCloseNet(network);
+    return hr;
+}
+
+HRESULT hcn_validate_external_switch(const wchar_t *target)
+{
+    GUID id;
+    if (!hcn_is_switch_target(target) || !parse_external_switch_target(target, &id))
+        return E_INVALIDARG;
+    return hcn_query_external_switch(&id, NULL, 0);
+}
+
+void hcn_enum_external_switches(HcnSwitchCallback cb, void *ctx)
+{
+    PWSTR ids = NULL;
+    ApiJsonToken *tokens;
+    ApiJson json;
+
+    if (!g_hcn_dll || !pfnEnumNet || !cb) return;
+    if (FAILED(pfnEnumNet(network_query, &ids, NULL)) || !ids) {
+        CoTaskMemFree(ids);
+        return;
+    }
+    size_t capacity = wcslen(ids) / 36 + 1;
+    tokens = calloc(capacity, sizeof(*tokens));
+    if (tokens && capacity <= INT_MAX && api_json_parse(&json, ids, tokens, (int)capacity) &&
+        tokens[0].type == API_JSON_ARRAY) {
+        for (int i = 1; i < tokens[0].next; i = tokens[i].next) {
+            GUID id;
+            wchar_t id_text[39], name[256], target[ARRAYSIZE(switch_prefix) + 36];
+            if (!api_json_string(&json, i, id_text, ARRAYSIZE(id_text)) ||
+                !parse_network_id(id_text, &id) ||
+                FAILED(hcn_query_external_switch(&id, name, ARRAYSIZE(name))))
+                continue;
+            wcscpy_s(target, ARRAYSIZE(target), switch_prefix);
+            guid_to_string(&id, target + ARRAYSIZE(switch_prefix) - 1, 37);
+            cb(name, target, ctx);
+        }
+    }
+    free(tokens);
+    CoTaskMemFree(ids);
+}
+
 /* Find the adapter that carries the default route (0.0.0.0/0). */
 /* Find a physical adapter that is UP, has a default gateway, and isn't virtual.
    Prefers Ethernet (IF_TYPE_ETHERNET_CSMACD) over Wi-Fi (IF_TYPE_IEEE80211). */
-static BOOL get_default_adapter_name(wchar_t *out, size_t out_len)
+BOOL hcn_default_adapter_name(wchar_t *out, size_t out_len)
 {
     ULONG buf_len;
     PIP_ADAPTER_ADDRESSES addrs;
@@ -157,16 +271,10 @@ static BOOL get_default_adapter_name(wchar_t *out, size_t out_len)
     }
 
     pick = best_eth ? best_eth : best_wifi;
-    if (pick) {
-        wcscpy_s(out, out_len, pick->FriendlyName);
-        ui_log(L"Selected adapter: %s (type %lu, index %lu)",
-               out, pick->IfType, pick->IfIndex);
-        HeapFree(GetProcessHeap(), 0, addrs);
-        return TRUE;
-    }
-
+    BOOL found = pick && wcslen(pick->FriendlyName) < out_len &&
+        wcscpy_s(out, out_len, pick->FriendlyName) == 0;
     HeapFree(GetProcessHeap(), 0, addrs);
-    return FALSE;
+    return found;
 }
 
 /* Check if a network already exists by GUID. Returns TRUE if it does. */
@@ -400,16 +508,22 @@ HRESULT hcn_create_internal_network(GUID *network_id)
     return hr;
 }
 
-HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_name)
+HRESULT hcn_prepare_external_network(GUID *network_id, const wchar_t *adapter_name)
 {
     wchar_t settings[2048];
     wchar_t adapter[256];
+    wchar_t escaped_adapter[ARRAYSIZE(adapter) * 6];
     void *network = NULL;
     PWSTR error_record = NULL;
     HRESULT hr;
 
+    if (hcn_is_switch_target(adapter_name))
+        return parse_external_switch_target(adapter_name, network_id) ? S_OK : E_INVALIDARG;
+
     if (!g_hcn_dll || !pfnCreateNet)
         return E_NOT_VALID_STATE;
+    if (adapter_name && wcslen(adapter_name) >= ARRAYSIZE(adapter))
+        return E_INVALIDARG;
 
     *network_id = APPSANDBOX_EXTERNAL_GUID;
 
@@ -421,23 +535,28 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
 
     /* Use specified adapter, or auto-detect */
     if (adapter_name && adapter_name[0] != L'\0') {
-        wcscpy_s(adapter, 256, adapter_name);
+        wcscpy_s(adapter, ARRAYSIZE(adapter), adapter_name);
         ui_log(L"Using adapter: %s", adapter);
     } else {
-        if (!get_default_adapter_name(adapter, 256)) {
+        if (!hcn_default_adapter_name(adapter, ARRAYSIZE(adapter))) {
             ui_log(L"Error: No connected network adapter found for External network.");
             ReleaseSRWLockExclusive(&g_network_lock);
             return E_FAIL;
         }
+        ui_log(L"Selected adapter: %s", adapter);
     }
 
-    swprintf_s(settings, 2048,
+    if (!api_json_escape_string(adapter, escaped_adapter, ARRAYSIZE(escaped_adapter))) {
+        ReleaseSRWLockExclusive(&g_network_lock);
+        return E_INVALIDARG;
+    }
+    swprintf_s(settings, ARRAYSIZE(settings),
         L"{"
         L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
         L"\"Name\":\"AppSandboxExternal\","
         L"\"Type\":\"Transparent\","
         L"\"Policies\":[{\"Type\":\"NetAdapterName\",\"Settings\":{\"NetworkAdapterName\":\"%s\"}}]"
-        L"}", adapter);
+        L"}", escaped_adapter);
 
     hr = pfnCreateNet(network_id, settings, &network, &error_record);
 
@@ -489,7 +608,25 @@ HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
     if (error_record) { LocalFree(error_record); error_record = NULL; }
     if (FAILED(hr)) return hr;
 
-    CoCreateGuid(endpoint_id);
+    if (hcn_manages_network(network_id)) {
+        CoCreateGuid(endpoint_id);
+    } else {
+        hr = hcn_read_external_switch(network, NULL, 0);
+        if (FAILED(hr)) {
+            pfnCloseNet(network);
+            return hr;
+        }
+        GUID id = {0xd3251a8f, 0x1d9c, 0x80ea, {0x93, 0x46}};
+        for (int i = 0; i < 6; ++i)
+            id.Data4[i + 2] = (BYTE)wcstoul(mac_address + i * 3, NULL, 16);
+        *endpoint_id = id;
+        hr = pfnDeleteEp ? pfnDeleteEp(endpoint_id, NULL) : E_NOTIMPL;
+        if (FAILED(hr) && hr != HCN_E_ENDPOINT_NOT_FOUND &&
+            hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
+            pfnCloseNet(network);
+            return hr;
+        }
+    }
     guid_to_string(network_id, net_guid_str, 64);
     guid_to_string(endpoint_id, ep_guid_str, 64);
 
@@ -540,6 +677,7 @@ HRESULT hcn_delete_network(const GUID *network_id)
     HRESULT hr;
     wchar_t guid_str[64];
 
+    if (!hcn_manages_network(network_id)) return S_FALSE;
     if (!g_hcn_dll || !pfnDeleteNet)
         return E_NOT_VALID_STATE;
 
@@ -584,40 +722,90 @@ HRESULT hcn_delete_endpoint(const GUID *endpoint_id)
     return hr;
 }
 
+static INetCfgComponentBindings *network_component_bindings(INetCfg *cfg, const wchar_t *id)
+{
+    INetCfgComponent *component = NULL;
+    INetCfgComponentBindings *bindings = NULL;
+
+    if (INetCfg_FindComponent(cfg, id, &component) == S_OK) {
+        INetCfgComponent_QueryInterface(component, &IID_INetCfgComponentBindings,
+                                        (void **)&bindings);
+        INetCfgComponent_Release(component);
+    }
+    return bindings;
+}
+
+static const MIB_IF_ROW2 *find_uplink_interface(const MIB_IF_TABLE2 *table, const GUID *id)
+{
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+        const MIB_IF_ROW2 *row = &table->Table[i];
+        if (IsEqualGUID(id, &row->InterfaceGuid) &&
+            row->AdminStatus == NET_IF_ADMIN_STATUS_UP &&
+            row->OperStatus != IfOperStatusNotPresent &&
+            (row->Type == IF_TYPE_ETHERNET_CSMACD || row->Type == IF_TYPE_IEEE80211) &&
+            !row->InterfaceAndOperStatusFlags.FilterInterface &&
+            !row->InterfaceAndOperStatusFlags.EndPointInterface &&
+            row->Alias[0] && wcslen(row->Alias) < 256)
+            return row;
+    }
+    return NULL;
+}
+
 int hcn_enum_adapters(HcnAdapterCallback cb, void *ctx)
 {
-    ULONG buf_len = 15000;
-    PIP_ADAPTER_ADDRESSES addrs, cur;
-    DWORD ret;
+    MIB_IF_TABLE2 *table = NULL;
+    INetCfg *cfg = NULL;
+    INetCfgComponentBindings *switch_bindings = NULL;
+    INetCfgComponentBindings *bridge_bindings = NULL;
+    IEnumNetCfgComponent *components = NULL;
+    INetCfgComponent *adapter;
+    BOOL initialized = FALSE;
+    HRESULT com;
     int count = 0;
 
-    addrs = (PIP_ADAPTER_ADDRESSES)HeapAlloc(GetProcessHeap(), 0, buf_len);
-    if (!addrs) return 0;
+    if (!cb || GetIfTable2(&table) != NO_ERROR) return 0;
+    com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(com) && com != RPC_E_CHANGED_MODE) goto done;
+    if (FAILED(CoCreateInstance(&CLSID_CNetCfg, NULL, CLSCTX_INPROC_SERVER,
+                                &IID_INetCfg, (void **)&cfg)) ||
+        FAILED(INetCfg_Initialize(cfg, NULL)))
+        goto done;
+    initialized = TRUE;
+    switch_bindings = network_component_bindings(cfg, L"vms_pp");
+    if (!switch_bindings ||
+        FAILED(INetCfg_EnumComponents(cfg, &GUID_DEVCLASS_NET, &components)))
+        goto done;
+    bridge_bindings = network_component_bindings(cfg, L"ms_implat");
 
-    ret = GetAdaptersAddresses(AF_INET,
-        GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
-        NULL, addrs, &buf_len);
-    if (ret == ERROR_BUFFER_OVERFLOW) {
-        HeapFree(GetProcessHeap(), 0, addrs);
-        addrs = (PIP_ADAPTER_ADDRESSES)HeapAlloc(GetProcessHeap(), 0, buf_len);
-        if (!addrs) return 0;
-        ret = GetAdaptersAddresses(AF_INET,
-            GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
-            NULL, addrs, &buf_len);
-    }
-
-    if (ret == ERROR_SUCCESS) {
-        for (cur = addrs; cur != NULL; cur = cur->Next) {
-            if (cur->OperStatus != IfOperStatusUp) continue;
-            if (cur->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-            if (cur->IfType == IF_TYPE_TUNNEL) continue;
-            if (wcsstr(cur->FriendlyName, L"vEthernet") != NULL) continue;
-
-            cb(cur->FriendlyName, (int)cur->IfType, ctx);
+    while (IEnumNetCfgComponent_Next(components, 1, &adapter, NULL) == S_OK) {
+        GUID id;
+        DWORD characteristics;
+        LPWSTR component_id = NULL;
+        const MIB_IF_ROW2 *row = NULL;
+        if (SUCCEEDED(INetCfgComponent_GetCharacteristics(adapter, &characteristics)) &&
+            !(characteristics & NCF_HIDDEN) &&
+            SUCCEEDED(INetCfgComponent_GetInstanceGuid(adapter, &id)) &&
+            SUCCEEDED(INetCfgComponent_GetId(adapter, &component_id)) && component_id &&
+            _wcsicmp(component_id, L"vms_mp"))
+            row = find_uplink_interface(table, &id);
+        if (row &&
+            INetCfgComponentBindings_IsBindableTo(switch_bindings, adapter) == S_OK &&
+            INetCfgComponentBindings_IsBoundTo(switch_bindings, adapter) == S_FALSE &&
+            (!bridge_bindings || INetCfgComponentBindings_IsBoundTo(bridge_bindings, adapter) == S_FALSE)) {
+            cb(row->Alias, (int)row->Type, ctx);
             count++;
         }
+        CoTaskMemFree(component_id);
+        INetCfgComponent_Release(adapter);
     }
 
-    HeapFree(GetProcessHeap(), 0, addrs);
+done:
+    if (components) IEnumNetCfgComponent_Release(components);
+    if (bridge_bindings) INetCfgComponentBindings_Release(bridge_bindings);
+    if (switch_bindings) INetCfgComponentBindings_Release(switch_bindings);
+    if (initialized) INetCfg_Uninitialize(cfg);
+    if (cfg) INetCfg_Release(cfg);
+    if (SUCCEEDED(com)) CoUninitialize();
+    FreeMibTable(table);
     return count;
 }

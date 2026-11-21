@@ -117,9 +117,10 @@ int api_json_string(const ApiJson *j,int token,wchar_t *out,size_t capacity)
                 for (int i=0;i<4;++i) unit=(unit<<4)|(unsigned)hex(j->text[p++]);
                 c=(wchar_t)unit;
             } else {
-                const wchar_t *esc=wcschr(L"\"\\/bfnrt",c);
+                static const wchar_t escapes[]=L"\"\\/bfnrt";
+                const wchar_t *esc=wcschr(escapes,c);
                 if (!esc) return FALSE;
-                c=L"\"\\/\b\f\n\r\t"[esc-L"\"\\/bfnrt"];
+                c=L"\"\\/\b\f\n\r\t"[esc-escapes];
             }
         }
         if (!c || n+1>=capacity) return FALSE;
@@ -197,4 +198,33 @@ int api_json_get_bool(const wchar_t *text,const wchar_t *key,int *out)
 int api_json_has_key(const wchar_t *text,const wchar_t *key)
 {
     return get_field(text,key,0,NULL,0);
+}
+
+size_t api_json_escape_string(const wchar_t *text, wchar_t *out, size_t capacity)
+{
+    static const wchar_t digits[] = L"0123456789abcdef";
+    size_t length = 0;
+    if (!capacity) return 0;
+
+    for (; *text; ++text) {
+        wchar_t c = *text;
+        size_t width = (unsigned)c < L' ' ? 6 : (c == L'"' || c == L'\\') ? 2 : 1;
+        if (width >= capacity - length) {
+            out[0] = L'\0';
+            return 0;
+        }
+        if (width == 6) {
+            out[length++] = L'\\';
+            out[length++] = L'u';
+            out[length++] = L'0';
+            out[length++] = L'0';
+            out[length++] = digits[c >> 4];
+            out[length++] = digits[c & 15];
+        } else {
+            if (width == 2) out[length++] = L'\\';
+            out[length++] = c;
+        }
+    }
+    out[length] = L'\0';
+    return length;
 }

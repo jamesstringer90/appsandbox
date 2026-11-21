@@ -1206,6 +1206,7 @@ static int handle_request(int fd, HttpReq *r) {
             if (isPUT) {   /* edit -- VM must be stopped (and not installing) */
                 NSDictionary *b = requestBody;
                 if ([b[@"gpuId"] length]) { send_501(fd,@"GPU selection");return 0; }
+                if (b[@"netAdapter"]) { send_501(fd,@"Network adapter selection");return 0; }
                 __block int conflict = 0;
                 on_main(^{
                     AsbVmMac *v = asb_mac_vm_find_by_id(vm_id);

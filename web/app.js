@@ -158,7 +158,7 @@ window.onHostMessage = function(msg) {
         case 'diskDirectoryBrowseResult': onDiskDirectoryBrowseResult(msg.path); break;
         case 'diskSpace':     onDiskSpace(msg); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
-        case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
+        case 'adapters':      populateAdapters(msg); break;
         case 'templates':     populateTemplates(msg.templates); break;
         case 'alert':         showModal('Error', msg.message, 'OK'); break;
         case 'prereqRequired': onPrereqRequired(); break;
@@ -183,7 +183,7 @@ function onFullState(msg) {
     renderVmTable();
     revalidateVmName();
     if (msg.hostInfo) updateHostInfo(msg.hostInfo);
-    if (msg.adapters) populateAdapters(msg.adapters, msg.defaultAdapter);
+    if (msg.adapters) populateAdapters(msg);
     if (msg.templates) populateTemplates(msg.templates);
     if (!minSizeReported) {
         minSizeReported = true;
@@ -331,23 +331,31 @@ function onDiskSpace(msg) {
 
 /* ---- Adapters ---- */
 
-var currentAdapters = [];
-
-function populateAdapters(adapters, defaultIdx) {
+function populateAdapters(msg) {
     var sel = document.getElementById('net-adapter');
-    sel.innerHTML = '<option value="">(Auto)</option>';
-    currentAdapters = adapters || [];
-    if (adapters) {
-        adapters.forEach(function(a) {
-            var opt = document.createElement('option');
-            opt.value = a;
-            opt.textContent = a;
-            sel.appendChild(opt);
-        });
-    }
-    if (typeof defaultIdx === 'number' && defaultIdx >= 0 && defaultIdx < sel.options.length) {
-        sel.selectedIndex = defaultIdx;
-    }
+    var selected = sel.value;
+    var hadOptions = sel.options.length > 0;
+    var options = [new Option('(Auto)', '')];
+    (msg.adapters || []).forEach(function(name) {
+        options.push(new Option(name, name));
+    });
+    var defaultIndex = options[msg.defaultAdapter] ? msg.defaultAdapter : 0;
+    (msg.externalSwitches || []).forEach(function(sw) {
+        options.push(new Option(sw.name, sw.netAdapter));
+    });
+    sel.replaceChildren(...options);
+    sel.selectedIndex = defaultIndex;
+    if (hadOptions && options.some(function(opt) { return opt.value === selected; })) sel.value = selected;
+    if (editVmState) setEditAdapter(editVmValues().netAdapter);
+}
+
+function setEditAdapter(target) {
+    var sel = document.getElementById('edit-net-adapter');
+    var options = Array.from(document.getElementById('net-adapter').options, function(opt) {
+        return opt.cloneNode(true);
+    });
+    sel.replaceChildren(...options);
+    sel.value = target || '';
 }
 
 /* ---- Templates ---- */
@@ -655,12 +663,17 @@ function hidePassword() {
     document.getElementById('admin-confirm').type = 'password';
 }
 
-function onNetModeChange() {
-    /* Adapter dropdown only relevant for External */
-    var mode = parseInt(document.getElementById('net-mode').value);
+function updateNetworkSelector(prefix) {
+    var mode = Number(document.getElementById(prefix + 'net-mode').value);
     var show = (!hostBridge.isMac && mode === 2) ? '' : 'none';
-    document.getElementById('net-adapter').style.display = show;
-    document.getElementById('net-adapter-label').style.display = show;
+    document.getElementById(prefix + 'net-adapter').style.display = show;
+    var label = document.getElementById(prefix + 'net-adapter-label');
+    if (label) label.style.display = show;
+    return show === '';
+}
+
+function onNetModeChange(prefix = '') {
+    if (updateNetworkSelector(prefix)) sendCmd('getAdapters');
 }
 onNetModeChange();
 
@@ -1248,6 +1261,8 @@ function openEditVmModal(idx) {
     document.getElementById('edit-cpu-cores').value = vm.cpuCores;
     setGpuSelection('edit-gpu-mode', vm);
     document.getElementById('edit-net-mode').value = String(vm.networkMode);
+    setEditAdapter(vm.netAdapter);
+    onNetModeChange('edit-');
     updateEditVmModal();
     document.getElementById('edit-vm-overlay').classList.add('active');
     document.getElementById('edit-ram-size').focus();
@@ -1278,6 +1293,8 @@ function editVmValues() {
     if (!hostBridge.isMac) {
         Object.assign(values, selectedGpu('edit-gpu-mode'));
         values.networkMode = Number(document.getElementById('edit-net-mode').value);
+        var adapter = document.getElementById('edit-net-adapter');
+        values.netAdapter = adapter.selectedIndex < 0 ? (editVmState.initial.netAdapter || '') : adapter.value;
     }
     return values;
 }
@@ -1300,7 +1317,10 @@ function updateEditVmModal() {
     var values = editVmValues();
     var conflict = false;
     var fields = { ramMb: 'edit-ram-size', cpuCores: 'edit-cpu-cores' };
-    if (!hostBridge.isMac) fields.networkMode = 'edit-net-mode';
+    if (!hostBridge.isMac) {
+        fields.networkMode = 'edit-net-mode';
+        fields.netAdapter = 'edit-net-adapter';
+    }
     Object.keys(fields).forEach(function(field) {
         if (vm[field] === editVmState.initial[field]) return;
         if (values[field] !== editVmState.initial[field] && values[field] !== vm[field]) {
@@ -1310,6 +1330,7 @@ function updateEditVmModal() {
         document.getElementById(fields[field]).value = vm[field];
         editVmState.initial[field] = vm[field];
     });
+    updateNetworkSelector('edit-');
     if (!hostBridge.isMac && gpuSelectionValue(vm) !== gpuSelectionValue(editVmState.initial)) {
         if (gpuSelectionValue(values) !== gpuSelectionValue(editVmState.initial) &&
             gpuSelectionValue(values) !== gpuSelectionValue(vm)) conflict = true;
@@ -1340,11 +1361,19 @@ function saveEditVm() {
     var gpuChanged = !hostBridge.isMac &&
         gpuSelectionValue(values) !== gpuSelectionValue(editVmState.initial) &&
         gpuSelectionValue(values) !== gpuSelectionValue(vms[idx]);
+    var networkChanged = !hostBridge.isMac &&
+        (values.networkMode !== editVmState.initial.networkMode ||
+            (values.networkMode === 2 && values.netAdapter !== editVmState.initial.netAdapter));
     var fields = Object.keys(values).filter(function(field) {
-        return field !== 'gpuMode' && field !== 'gpuId' &&
+        return (field === 'ramMb' || field === 'cpuCores') &&
             values[field] !== editVmState.initial[field] && values[field] !== vms[idx][field];
     });
     closeEditVmModal();
+    if (networkChanged)
+        sendCmd('editVm', {
+            vmId: vms[idx].id, field: 'networkMode', value: String(values.networkMode),
+            netAdapter: values.networkMode === 2 ? values.netAdapter : undefined
+        });
     fields.forEach(function(field) {
         sendCmd('editVm', { vmId: vms[idx].id, field: field, value: String(values[field]) });
     });

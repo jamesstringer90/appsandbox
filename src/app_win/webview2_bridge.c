@@ -6,6 +6,7 @@
  */
 
 #include "webview2_bridge.h"
+#include "api_json.h"
 #include "ui.h"
 #include <shlwapi.h>
 #include <stdio.h>
@@ -461,19 +462,7 @@ void jb_append(JsonBuilder *jb, const wchar_t *s)
 
 void jb_append_escaped(JsonBuilder *jb, const wchar_t *s)
 {
-    const wchar_t *p;
-    for (p = s; *p; p++) {
-        if (jb->len + 6 >= jb->cap) break;
-        switch (*p) {
-        case L'\\': jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L'\\'; break;
-        case L'"':  jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L'"'; break;
-        case L'\n': jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L'n'; break;
-        case L'\r': jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L'r'; break;
-        case L'\t': jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L't'; break;
-        default:    jb->buf[jb->len++] = *p; break;
-        }
-    }
-    jb->buf[jb->len] = L'\0';
+    jb->len += api_json_escape_string(s, jb->buf + jb->len, jb->cap - jb->len);
 }
 
 void jb_object_begin(JsonBuilder *jb)

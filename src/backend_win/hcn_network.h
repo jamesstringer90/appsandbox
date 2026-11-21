@@ -43,10 +43,7 @@ const char *hcn_nat_subnet_base(void);
 /* Create an internal (host-only) network. Returns S_OK on success. */
 HRESULT hcn_create_internal_network(GUID *network_id);
 
-/* Create a network bridged to an external adapter.
-   adapter_name: friendly name (e.g. L"Ethernet"). If NULL/empty, auto-detects.
-   Returns S_OK on success. */
-HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_name);
+HRESULT hcn_prepare_external_network(GUID *network_id, const wchar_t *adapter_name);
 
 /* Create an endpoint on a network.
    network_id: the network to attach to.
@@ -69,5 +66,11 @@ ASB_API HRESULT hcn_delete_endpoint(const GUID *endpoint_id);
    Calls the callback for each adapter found. Returns count. */
 typedef void (*HcnAdapterCallback)(const wchar_t *friendly_name, int if_type, void *ctx);
 ASB_API int hcn_enum_adapters(HcnAdapterCallback cb, void *ctx);
+ASB_API BOOL hcn_default_adapter_name(wchar_t *out, size_t out_len);
+
+typedef void (*HcnSwitchCallback)(const wchar_t *name, const wchar_t *target, void *ctx);
+ASB_API void hcn_enum_external_switches(HcnSwitchCallback cb, void *ctx);
+BOOL hcn_is_switch_target(const wchar_t *target);
+HRESULT hcn_validate_external_switch(const wchar_t *target);
 
 #endif /* HCN_NETWORK_H */
