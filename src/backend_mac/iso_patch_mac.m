@@ -279,6 +279,12 @@ static BOOL s_workersStopping;
     return [self runWorkerArgs:args networkPort:nil progress:progressBlock completion:completion];
 }
 
++ (void)growDiskAtURL:(NSURL *)diskURL diskGb:(int)diskGb macGuest:(BOOL)macGuest
+           completion:(IsoPatchCompletion)completion {
+    [self runWorkerArgs:@[@"grow-disk", diskURL.path, @(diskGb).stringValue, macGuest ? @"macos" : @"windows"]
+                progress:nil completion:completion];
+}
+
 #pragma mark - Privileged workers
 
 + (void)runPrivilegedArgs:(NSArray<NSString *> *)args

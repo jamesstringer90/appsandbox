@@ -294,28 +294,36 @@ static void handleConnectDisplay(NSDictionary *msg) {
     if (rc != BACKEND_OK) sendAlert(@"The VM display is not ready yet. Wait for the guest to finish starting.");
 }
 
+static void sendVmEditResult(NSNumber *requestId, NSString *error) {
+    sendVmListChanged();
+    postToJs(@{@"type": @"vmEditResult", @"requestId": requestId, @"error": error ?: @""});
+}
+
 static void handleEditVm(NSDictionary *msg) {
-    AsbVmId vm_id = vmIdForMessage(msg);
+    AsbVmId vm_id = msg[@"templateId"] ? 0 : vmIdForMessage(msg);
     NSString *field = msg[@"field"];
     id rawValue = msg[@"value"];
+    NSNumber *requestId = [msg[@"requestId"] isKindOfClass:[NSNumber class]] ? msg[@"requestId"] : @0;
+    NSString *updateError = @"VM configuration could not be updated.";
     if (!vm_id || ![field isKindOfClass:[NSString class]] ||
         (![rawValue isKindOfClass:[NSString class]] && ![rawValue isKindOfClass:[NSNumber class]])) {
-        sendAlert(@"VM configuration could not be updated.");
-        sendVmListChanged();
+        sendVmEditResult(requestId, updateError);
         return;
     }
     NSString *value = [rawValue isKindOfClass:[NSString class]]
         ? rawValue : [NSString stringWithFormat:@"%@", rawValue];
-    AsbVmMac *vm = asb_mac_vm_find_by_id(vm_id);
-    if (!vm) {
-        sendAlert(@"VM configuration could not be updated.");
-    } else if (vm->running || (!vm->disk_built && vm->install_progress >= 0)) {
-        sendAlert(@"VM settings can only be changed when the VM is stopped and its disk build has finished.");
-    } else {
-        int rc = asb_mac_vm_edit(vm_id, [field UTF8String], [value UTF8String]);
-        if (rc != BACKEND_OK) sendAlert(@"VM configuration could not be updated.");
+    if ([field isEqualToString:@"hddGb"]) {
+        asb_mac_vm_set_disk_size(vm_id, value.UTF8String, ^(int rc, NSString *detail) {
+            sendVmEditResult(requestId, rc == BACKEND_OK ? nil : (detail ?: updateError));
+        });
+        return;
     }
-    sendVmListChanged();
+    AsbVmMac *vm = asb_mac_vm_find_by_id(vm_id);
+    if (vm && (vm->running || (!vm->disk_built && vm->install_progress >= 0)))
+        updateError = @"VM settings can only be changed when the VM is stopped and its disk build has finished.";
+    else if (vm && asb_mac_vm_edit(vm_id, field.UTF8String, value.UTF8String) == BACKEND_OK)
+        updateError = nil;
+    sendVmEditResult(requestId, updateError);
 }
 
 static void handleBrowseImage(NSDictionary *msg) {

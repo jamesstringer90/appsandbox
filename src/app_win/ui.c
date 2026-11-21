@@ -9,6 +9,7 @@
 #include "asb_core.h"
 #include "asb_events.h"
 #include "api_contract.h"
+#include "api_json.h"
 #include "headless.h"
 #include "resource.h"
 #include "hcs_vm.h"
@@ -333,6 +334,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"starting", v->starting);
     jb_bool(jb, L"shuttingDown", v->shutdown_requested);
     jb_bool(jb, L"agentOnline", v->agent_online);
+    jb_string(jb, L"diskResizeAgentError", v->disk_resize_supported ? L"" : L"" ASB_DISK_GROW_AGENT_ERROR);
     jb_int(jb, L"ramMb", (int)v->ram_mb);
     jb_int(jb, L"hddGb", (int)v->hdd_gb);
     jb_int(jb, L"cpuCores", (int)v->cpu_cores);
@@ -619,6 +621,21 @@ static void ui_show_alert(const wchar_t *message)
             PostMessageW(g_hwnd_main, WM_SHOW_ALERT, 0, (LPARAM)copy);
         }
     }
+}
+
+static void send_vm_edit_result(const wchar_t *json, const wchar_t *error)
+{
+    int request_id = 0;
+    wchar_t reply[1024];
+    JsonBuilder jb;
+    json_get_int(json, L"requestId", &request_id);
+    jb_init(&jb, reply, ARRAYSIZE(reply));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"vmEditResult");
+    jb_int(&jb, L"requestId", request_id);
+    jb_string(&jb, L"error", error ? error : L"");
+    jb_object_end(&jb);
+    webview2_post(reply);
 }
 
 /* ---- Display connections ---- */
@@ -1291,16 +1308,31 @@ static void handle_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"editVm") == 0) {
         int idx;
         wchar_t field[64], value[256];
-        if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count() &&
-            json_get_string(json, L"field", field, 64) &&
-            json_get_string(json, L"value", value, 256)) {
+        const wchar_t *error = L"VM configuration could not be updated.";
+        if (!json_has_key(json, L"templateId") &&
+            json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count() &&
+            json_get_string(json, L"field", field, ARRAYSIZE(field))) {
+            BOOL disk_edit = wcscmp(field, L"hddGb") == 0;
             AsbVm vm = asb_vm_get(idx);
             if (asb_vm_is_running(vm) || asb_vm_is_building(vm)) {
-                ui_show_alert(L"VM settings can only be changed when the VM is stopped and its disk build has finished.");
-            } else {
+                error = L"VM settings can only be changed when the VM is stopped and its disk build has finished.";
+            } else if (disk_edit || json_get_string(json, L"value", value, ARRAYSIZE(value))) {
                 HRESULT hr = E_INVALIDARG;
-                const wchar_t *error = NULL;
-                if (wcscmp(field, L"name") == 0) hr = asb_vm_set_name(vm, value);
+                error = NULL;
+                if (disk_edit) {
+                    int hdd_gb;
+                    if (api_json_get_int(json, L"value", &hdd_gb))
+                        hr = asb_vm_set_disk_size(vm, (DWORD)hdd_gb);
+                    if (hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED))
+                        error = L"Disk growth requires a completed VM without snapshots or branches.";
+                    else if (hr == HRESULT_FROM_WIN32(ERROR_NOT_CAPABLE))
+                        error = L"" ASB_DISK_GROW_AGENT_ERROR;
+                    else if (hr == E_INVALIDARG)
+                        error = L"Enter a whole number no smaller than the current disk size.";
+                    else if (hr == E_ACCESSDENIED)
+                        error = L"Stop the VM before changing its disk size.";
+                }
+                else if (wcscmp(field, L"name") == 0) hr = asb_vm_set_name(vm, value);
                 else if (wcscmp(field, L"ramMb") == 0) hr = asb_vm_set_ram(vm, (DWORD)_wtoi(value));
                 else if (wcscmp(field, L"cpuCores") == 0) hr = asb_vm_set_cpu(vm, (DWORD)_wtoi(value));
                 else if (wcscmp(field, L"gpuMode") == 0) {
@@ -1323,13 +1355,12 @@ static void handle_webview2_message(const wchar_t *json)
                         if (FAILED(hr)) error = L"Could not select the network adapter or switch.";
                     }
                 }
-                if (FAILED(hr)) ui_show_alert(error ? error : L"VM configuration could not be updated.");
-                else asb_save();
+                if (FAILED(hr) && !error) error = L"VM configuration could not be updated.";
+                if (SUCCEEDED(hr) && !disk_edit) asb_save();
             }
-        } else {
-            ui_show_alert(L"VM configuration could not be updated.");
         }
         send_vm_list();
+        send_vm_edit_result(json, error);
     } else if (wcscmp(action, L"selectVm") == 0) {
     } else if (wcscmp(action, L"getDiskSpace") == 0) {
         wchar_t *copy = _wcsdup(json);
@@ -1480,7 +1511,12 @@ static void ui_core_event(const CoreVmEvent *event, void *context)
 static void on_webview2_message(const wchar_t *json)
 {
     if (g_command_depth || asb_api_busy()) {
-        ui_show_alert(L"Another VM operation is in progress. Please try again when it finishes.");
+        const wchar_t *error = L"Another VM operation is in progress. Please try again when it finishes.";
+        wchar_t action[64];
+        if (json_get_string(json, L"action", action, ARRAYSIZE(action)) && wcscmp(action, L"editVm") == 0)
+            send_vm_edit_result(json, error);
+        else
+            ui_show_alert(error);
         return;
     }
     ++g_command_depth;

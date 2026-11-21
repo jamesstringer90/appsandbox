@@ -1070,8 +1070,8 @@ static void handle_client(int fd)
     g_client_fd = fd;
     agent_log("client connected (fd=%d)", fd);
 
-    if (send_line(fd, "hello") < 0) {
-        agent_log("hello: send failed");
+    if (send_line(fd, "hello") < 0 || send_line(fd, "disk_resize:supported") < 0) {
+        agent_log("handshake: send failed");
         goto out;
     }
 
@@ -1169,7 +1169,7 @@ out:
 
 static int listen_vsock(void)
 {
-    int s = socket(AF_VSOCK, SOCK_STREAM, 0);
+    int s = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_vm addr;
 
     if (s < 0) {
@@ -1236,6 +1236,12 @@ int main(int argc, char **argv)
      * clients. It'll spawn the helper as soon as the user session is
      * ready, independent of host-driven idd_connect. */
     start_clipboard_monitor();
+    spawn_detached("set -eu; root=$(findmnt -enro SOURCE /); "
+                   "[ -b \"$root\" ] && [ \"$(findmnt -nro FSTYPE /)\" = ext4 ] || exit 0; "
+                   "part=$(cat \"/sys/class/block/${root##*/}/partition\"); "
+                   "disk=/dev/$(lsblk -dnro PKNAME \"$root\"); "
+                   "growpart --fudge 2048 \"$disk\" \"$part\" || [ $? -eq 1 ]; "
+                   "resize2fs \"$root\"");
 
     while (!g_stop) {
         int c = accept(ls, NULL, NULL);

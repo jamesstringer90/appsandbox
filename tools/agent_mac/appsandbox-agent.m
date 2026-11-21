@@ -31,6 +31,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <spawn.h>
+#include <crt_externs.h>
 
 #if __has_include(<sys/vsock.h>)
 #include <sys/vsock.h>
@@ -536,8 +538,8 @@ static void handle_client(int client) {
     setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    if (send_line(client, "hello") <= 0) {
-        agent_log("Failed to send hello.");
+    if (send_line(client, "hello") <= 0 || send_line(client, "disk_resize:supported") <= 0) {
+        agent_log("Failed to send handshake.");
         goto done;
     }
 
@@ -740,6 +742,31 @@ int main(int argc, char *argv[]) {
      * pasteboard protocol directly on them. */
     start_clip_xpc_listener();
     start_clip_accept();
+
+    char *grow[] = {"sh", "-c",
+        "set -eu; info=$(/usr/sbin/diskutil info -plist /System/Volumes/Data); "
+        "container=$(printf '%s' \"$info\" | /usr/bin/plutil -extract APFSContainerReference raw -o - -); "
+        "limits=$(/usr/sbin/diskutil apfs resizeContainer \"$container\" limits -plist); "
+        "current=$(printf '%s' \"$limits\" | /usr/bin/plutil -extract CurrentSize raw -o - -); "
+        "maximum=$(printf '%s' \"$limits\" | /usr/bin/plutil -extract MaximumSize raw -o - -); "
+        "if [ \"$((maximum - current))\" -gt 1048576 ]; then "
+        "/usr/sbin/diskutil apfs resizeContainer \"$container\" 0; fi", NULL};
+    posix_spawnattr_t attr;
+    int rc = posix_spawnattr_init(&attr);
+    if (rc == 0) {
+        posix_spawn_file_actions_t actions;
+        rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+        if (rc == 0) rc = posix_spawn_file_actions_init(&actions);
+        if (rc == 0) {
+            pid_t pid;
+            rc = posix_spawn_file_actions_addinherit_np(&actions, STDOUT_FILENO);
+            if (rc == 0) rc = posix_spawn_file_actions_addinherit_np(&actions, STDERR_FILENO);
+            if (rc == 0) rc = posix_spawn(&pid, "/bin/sh", &actions, &attr, grow, *_NSGetEnviron());
+            posix_spawn_file_actions_destroy(&actions);
+        }
+        posix_spawnattr_destroy(&attr);
+    }
+    if (rc != 0) agent_log("Could not start system volume expansion: %s", strerror(rc));
 
     while (!g_stop) {
         g_listen_sock = open_listener();

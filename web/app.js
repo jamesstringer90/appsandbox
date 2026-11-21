@@ -6,6 +6,8 @@ let vms = [];
 let selectedVm = -1;
 let selectedSnap = new Map();
 let editVmState = null;
+let vmEditRequestId = 0;
+let pendingVmEdit = null;
 let snapshotModal = null;
 let pendingConfirm = null; /* {resolve} */
 let minSizeReported = false;
@@ -157,10 +159,22 @@ window.onHostMessage = function(msg) {
         case 'browseResult':  onBrowseResult(msg.path); break;
         case 'diskDirectoryBrowseResult': onDiskDirectoryBrowseResult(msg.path); break;
         case 'diskSpace':     onDiskSpace(msg); break;
+        case 'vmEditResult':
+            if (pendingVmEdit && pendingVmEdit.requestId === msg.requestId) {
+                pendingVmEdit.resolve(msg.error || true);
+                pendingVmEdit = null;
+            } else if (msg.error) {
+                if (pendingConfirm) appendLog(msg.error);
+                else showModal('Error', msg.error, 'OK');
+            }
+            break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg); break;
         case 'templates':     populateTemplates(msg.templates); break;
-        case 'alert':         showModal('Error', msg.message, 'OK'); break;
+        case 'alert':
+            if (pendingConfirm && pendingConfirm.working) appendLog(msg.message);
+            else showModal('Error', msg.message, 'OK');
+            break;
         case 'prereqRequired': onPrereqRequired(); break;
         case 'prereqReboot':   onPrereqReboot(); break;
         case 'prereqProgress': onPrereqProgress(msg); break;
@@ -346,7 +360,7 @@ function populateAdapters(msg) {
     sel.replaceChildren(...options);
     sel.selectedIndex = defaultIndex;
     if (hadOptions && options.some(function(opt) { return opt.value === selected; })) sel.value = selected;
-    if (editVmState) setEditAdapter(editVmValues().netAdapter);
+    if (editVmState) setEditAdapter(editVmState.netAdapter);
 }
 
 function setEditAdapter(target) {
@@ -356,6 +370,7 @@ function setEditAdapter(target) {
     });
     sel.replaceChildren(...options);
     sel.value = target || '';
+    if (sel.selectedIndex < 0) sel.value = '';
 }
 
 /* ---- Templates ---- */
@@ -937,6 +952,7 @@ document.addEventListener('keydown', function(e) {
     var confirmOverlay = document.getElementById('modal-overlay');
     if (confirmOverlay.classList.contains('active')) {
         if (e.key === 'Escape') { e.preventDefault(); modalResolve(false); }
+        else if (e.key === 'Tab' && pendingConfirm && pendingConfirm.working) e.preventDefault();
         else trapModalFocus(e, confirmOverlay);
         return;
     }
@@ -1096,7 +1112,7 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmId: vm.id}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(vmIndexById(vm.id)); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(vmIndexById(vm.id)); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
-        makeIconCell('edit', '\u270F\uFE0F', !vm.running && !bld, function() { openEditVmModal(vmIndexById(vm.id)); }, '', 'Edit VM configuration — VM must be stopped'),
+        makeIconCell('edit', '\u270F\uFE0F', canEditVm(vm), function() { openEditVmModal(vmIndexById(vm.id)); }, '', 'Edit VM configuration — VM must be stopped and fully installed'),
     );
     return cells;
 }
@@ -1251,14 +1267,23 @@ function vmIndexById(id) {
     return vms.findIndex(function(vm) { return vm.id === id; });
 }
 
+function canEditVm(vm) {
+    return vm.installComplete && !vm.isTemplate && !vm.running && !vm.starting && !vm.buildingVhdx;
+}
+
 function openEditVmModal(idx) {
     var vm = vms[idx];
-    if (!vm || vm.running || vm.buildingVhdx) return;
-    editVmState = { id: vm.id, name: vm.name, initial: Object.assign({}, vm), previousFocus: rowCache[vm.id].querySelector('.edit') };
+    if (!vm || !canEditVm(vm)) return;
+    editVmState = {
+        id: vm.id, name: vm.name, initial: Object.assign({}, vm), netAdapter: vm.netAdapter || '',
+        previousFocus: rowCache[vm.id].querySelector('.edit')
+    };
     document.getElementById('edit-vm-title').textContent = 'Edit ' + vm.name;
     document.getElementById('edit-ram-size').value = vm.ramMb;
     document.getElementById('edit-ram-size').min = 4096;
     document.getElementById('edit-cpu-cores').value = vm.cpuCores;
+    document.getElementById('edit-hdd-size').value = vm.hddGb;
+    document.getElementById('edit-hdd-size').min = vm.hddGb;
     setGpuSelection('edit-gpu-mode', vm);
     document.getElementById('edit-net-mode').value = String(vm.networkMode);
     setEditAdapter(vm.netAdapter);
@@ -1288,13 +1313,13 @@ function restoreVmModalFocus(state, selector) {
 function editVmValues() {
     var values = {
         ramMb: document.getElementById('edit-ram-size').valueAsNumber,
-        cpuCores: document.getElementById('edit-cpu-cores').valueAsNumber
+        cpuCores: document.getElementById('edit-cpu-cores').valueAsNumber,
+        hddGb: document.getElementById('edit-hdd-size').valueAsNumber
     };
     if (!hostBridge.isMac) {
         Object.assign(values, selectedGpu('edit-gpu-mode'));
         values.networkMode = Number(document.getElementById('edit-net-mode').value);
-        var adapter = document.getElementById('edit-net-adapter');
-        values.netAdapter = adapter.selectedIndex < 0 ? (editVmState.initial.netAdapter || '') : adapter.value;
+        values.netAdapter = editVmState.netAdapter;
     }
     return values;
 }
@@ -1306,6 +1331,8 @@ function editVmValidationError(values) {
     if (values.ramMb !== editVmState.initial.ramMb &&
         (!Number.isInteger(values.ramMb) || values.ramMb < minRam || values.ramMb > 2147483647))
         return 'RAM must be a whole number of at least ' + minRam + ' MB.';
+    if (!Number.isInteger(values.hddGb) || values.hddGb < editVmState.initial.hddGb || values.hddGb > 2147483647)
+        return 'Disk size must be a whole number of at least ' + editVmState.initial.hddGb + ' GB.';
     return '';
 }
 
@@ -1316,10 +1343,18 @@ function updateEditVmModal() {
     document.getElementById("edit-vm-title").textContent = "Edit " + vm.name;
     var values = editVmValues();
     var conflict = false;
-    var fields = { ramMb: 'edit-ram-size', cpuCores: 'edit-cpu-cores' };
+    var fields = { ramMb: 'edit-ram-size', cpuCores: 'edit-cpu-cores', hddGb: 'edit-hdd-size' };
+    var disk = document.getElementById('edit-hdd-size');
+    disk.min = vm.hddGb;
     if (!hostBridge.isMac) {
         fields.networkMode = 'edit-net-mode';
-        fields.netAdapter = 'edit-net-adapter';
+        if (vm.netAdapter !== editVmState.initial.netAdapter) {
+            if (values.netAdapter === (editVmState.initial.netAdapter || '')) {
+                editVmState.netAdapter = vm.netAdapter || '';
+                setEditAdapter(vm.netAdapter);
+            }
+            editVmState.initial.netAdapter = vm.netAdapter;
+        }
     }
     Object.keys(fields).forEach(function(field) {
         if (vm[field] === editVmState.initial[field]) return;
@@ -1340,49 +1375,91 @@ function updateEditVmModal() {
             editVmState.initial.gpuId = vm.gpuId;
         }
     }
-    var disabled = vm.running || vm.buildingVhdx || vm.starting;
+    var disabled = !canEditVm(vm);
     document.querySelectorAll('#edit-vm-overlay input, #edit-vm-overlay select').forEach(function(el) {
         el.disabled = !!disabled;
     });
+    var diskError = vm.hasSnapshots ? 'Disk growth requires a VM without snapshots or branches.' : vm.diskResizeAgentError;
+    disk.disabled = disabled || !!diskError;
+    disk.parentElement.title = diskError || '';
     var values = editVmValues();
-    var error = disabled ? 'Stop the VM before editing its configuration.' :
+    var error = disabled ? 'Only fully installed, stopped VMs can be edited.' :
         conflict ? 'These settings changed in another interface. Reopen this editor to review the latest values.' : editVmValidationError(values);
     document.getElementById('edit-vm-warn').textContent = error;
     document.getElementById('btn-save-edit-vm').disabled = !!error;
 }
 
-function saveEditVm() {
-    if (!editVmState) return;
+function submitVmEdit(vmId, edit) {
+    if (edit.field !== 'hddGb') {
+        sendCmd('editVm', Object.assign({ vmId: vmId }, edit));
+        return;
+    }
+    if (vmIndexById(vmId) < 0) return Promise.resolve('The VM is no longer available.');
+    return new Promise(function(resolve) {
+        var requestId = ++vmEditRequestId;
+        pendingVmEdit = { requestId: requestId, resolve: resolve };
+        sendCmd('editVm', Object.assign({ vmId: vmId, requestId: requestId }, edit));
+    });
+}
+
+async function saveEditVm() {
+    if (!editVmState || pendingConfirm || pendingVmEdit) return;
     updateEditVmModal();
     if (!editVmState || document.getElementById('btn-save-edit-vm').disabled) return;
-    var idx = vmIndexById(editVmState.id);
+    var draft = editVmState;
+    var vm = vms[vmIndexById(draft.id)];
     var values = editVmValues();
-    if (values.ramMb !== editVmState.initial.ramMb) values.ramMb = alignRamMb(values.ramMb);
-    var gpuChanged = !hostBridge.isMac &&
-        gpuSelectionValue(values) !== gpuSelectionValue(editVmState.initial) &&
-        gpuSelectionValue(values) !== gpuSelectionValue(vms[idx]);
-    var networkChanged = !hostBridge.isMac &&
-        (values.networkMode !== editVmState.initial.networkMode ||
-            (values.networkMode === 2 && values.netAdapter !== editVmState.initial.netAdapter));
-    var fields = Object.keys(values).filter(function(field) {
-        return (field === 'ramMb' || field === 'cpuCores') &&
-            values[field] !== editVmState.initial[field] && values[field] !== vms[idx][field];
-    });
-    closeEditVmModal();
-    if (networkChanged)
-        sendCmd('editVm', {
-            vmId: vms[idx].id, field: 'networkMode', value: String(values.networkMode),
-            netAdapter: values.networkMode === 2 ? values.netAdapter : undefined
+    var edits = [];
+    var adapterChanged = values.netAdapter !== (draft.initial.netAdapter || '');
+    if (values.ramMb !== draft.initial.ramMb) values.ramMb = alignRamMb(values.ramMb);
+    if (!hostBridge.isMac && (values.networkMode !== draft.initial.networkMode ||
+        (values.networkMode === 2 && adapterChanged))) {
+        var netAdapter = adapterChanged ? values.netAdapter : document.getElementById('edit-net-adapter').value;
+        edits.push({
+            field: 'networkMode', value: String(values.networkMode),
+            netAdapter: values.networkMode === 2 ? netAdapter : undefined
         });
-    fields.forEach(function(field) {
-        sendCmd('editVm', { vmId: vms[idx].id, field: field, value: String(values[field]) });
+    }
+    ['ramMb', 'cpuCores'].forEach(function(field) {
+        if (values[field] !== draft.initial[field] && values[field] !== vm[field])
+            edits.push({ field: field, value: String(values[field]) });
     });
-    if (gpuChanged)
-        sendCmd('editVm', { vmId: vms[idx].id, field: 'gpuMode', value: String(values.gpuMode), gpuId: values.gpuId });
+    if (!hostBridge.isMac && gpuSelectionValue(values) !== gpuSelectionValue(draft.initial) &&
+        gpuSelectionValue(values) !== gpuSelectionValue(vm)) {
+        edits.push({ field: 'gpuMode', value: String(values.gpuMode), gpuId: values.gpuId });
+    }
+
+    if (values.hddGb > vm.hddGb) {
+        var result = await showModal(
+            'Increase Disk Size?',
+            'Increasing the disk to ' + values.hddGb + ' GB is permanent. You cannot reduce its size afterward.',
+            'Increase Disk Size',
+            {
+                cancelText: 'Cancel Disk Size Increase', confirmClass: 'primary',
+                progressText: 'Increasing disk size…',
+                action: function() { return submitVmEdit(draft.id, { field: 'hddGb', value: values.hddGb }); }
+            }
+        );
+        if (typeof result === 'string') {
+            showModal('Error', result, 'OK');
+            return;
+        }
+        if (editVmState !== draft) return;
+        if (result === false) {
+            document.getElementById('edit-hdd-size').value = draft.initial.hddGb;
+            updateEditVmModal();
+            return;
+        }
+    }
+    closeEditVmModal();
+    for (const edit of edits) submitVmEdit(draft.id, edit);
 }
 
 document.getElementById('edit-vm-overlay').addEventListener('input', updateEditVmModal);
 document.getElementById('edit-vm-overlay').addEventListener('change', updateEditVmModal);
+document.getElementById('edit-net-adapter').addEventListener('change', function() {
+    if (editVmState) editVmState.netAdapter = this.value;
+});
 document.getElementById('edit-ram-size').addEventListener('change', function() {
     if (Number.isInteger(this.valueAsNumber)) this.value = alignRamMb(this.valueAsNumber);
     updateEditVmModal();
@@ -1812,6 +1889,7 @@ function showModal(title, message, confirmText, opts) {
     var previousFocus = document.activeElement;
     document.getElementById('modal-title').textContent = title;
     document.getElementById('modal-message').textContent = message;
+    document.getElementById('modal-cancel-btn').textContent = (opts && opts.cancelText) || 'Cancel';
     var confirmBtn = document.getElementById('modal-confirm-btn');
     confirmBtn.textContent = confirmText || 'Confirm';
     confirmBtn.className = (opts && opts.confirmClass) || 'danger';
@@ -1838,12 +1916,32 @@ function showModal(title, message, confirmText, opts) {
     if (!(opts && opts.input)) confirmBtn.focus();
 
     return new Promise(function(resolve) {
-        pendingConfirm = { resolve: resolve, hasInput: !!(opts && opts.input), previousFocus: previousFocus };
+        pendingConfirm = {
+            resolve: resolve, hasInput: !!(opts && opts.input), previousFocus: previousFocus,
+            action: opts && opts.action, progressText: opts && opts.progressText
+        };
     });
 }
 
-function modalResolve(result) {
+async function modalResolve(result) {
+    if (pendingConfirm && pendingConfirm.working) return;
+    var progress = document.getElementById('modal-progress');
+    var cancelBtn = document.getElementById('modal-cancel-btn');
+    var confirmBtn = document.getElementById('modal-confirm-btn');
+    if (result === true && pendingConfirm && pendingConfirm.action) {
+        pendingConfirm.working = true;
+        cancelBtn.disabled = true;
+        confirmBtn.disabled = true;
+        document.getElementById('modal-progress-text').textContent = pendingConfirm.progressText;
+        progress.hidden = false;
+        progress.focus();
+        result = await pendingConfirm.action();
+    }
     document.getElementById('modal-overlay').classList.remove('active');
+    progress.hidden = true;
+    cancelBtn.disabled = false;
+    cancelBtn.textContent = 'Cancel';
+    confirmBtn.disabled = false;
     if (pendingConfirm) {
         if (pendingConfirm.previousFocus && pendingConfirm.previousFocus.isConnected) {
             pendingConfirm.previousFocus.focus();

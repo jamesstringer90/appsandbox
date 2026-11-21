@@ -301,7 +301,7 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->gpu_name);
     pos += sprintf_s(out + pos, cap - pos, ",\"netAdapter\":");
     pos = append_wstr(out, cap, pos, v->net_adapter);
-    pos += sprintf_s(out + pos, cap - pos, "}");
+    pos += sprintf_s(out + pos, cap - pos, ",\"diskResizeSupported\":%s}", v->disk_resize_supported ? "true" : "false");
     return pos;
 }
 
@@ -1596,7 +1596,7 @@ static int handle_request(PHTTP_REQUEST req)
                 const wchar_t *body=request_body();
                 wchar_t gpu_id[512] = {0};
                 wchar_t adapter[256];
-                int iv, gpu_mode = GPU_DEFAULT, network_mode = inst->network_mode;
+                int iv, hdd_gb = 0, gpu_mode = GPU_DEFAULT, network_mode = inst->network_mode;
                 BOOL has_gpu, has_adapter, has_network_mode;
                 HRESULT hr = S_OK;
                 /* config is locked while building or running -- return a clean 409,
@@ -1608,8 +1608,13 @@ static int handle_request(PHTTP_REQUEST req)
                              "cannot edit a VM while it is building/staging; wait for the build to finish");
                     return 0;
                 }
-                if (inst->running || inst->starting) {
+                if (inst->running) {
                     send_err(req->RequestId, 409, "Conflict", "vm_running", "cannot edit a running VM; stop it first");
+                    return 0;
+                }
+                if (!inst->install_complete) {
+                    send_err(req->RequestId, 409, "Conflict", "vm_install_incomplete",
+                             "Finish installing the VM before editing its configuration.");
                     return 0;
                 }
                 if (!validate_body(body)) {
@@ -1632,6 +1637,10 @@ static int handle_request(PHTTP_REQUEST req)
                     const char *error=asb_api_validate_ram_mb(iv);
                     if (error) { send_err(req->RequestId,400,"Bad Request","invalid_arg",error);return 0; }
                 }
+                if (api_json_has_key(body, L"hddGb") &&
+                    (!api_json_get_int(body, L"hddGb", &hdd_gb) || hdd_gb < 1)) {
+                    send_err(req->RequestId,400,"Bad Request","invalid_arg","hddGb must be a positive whole number.");return 0;
+                }
                 has_adapter = api_json_has_key(body, L"netAdapter");
                 has_network_mode = api_json_get_int(body, L"networkMode", &network_mode);
                 if ((api_json_get_int(body,L"cpuCores",&iv) && iv<1) ||
@@ -1640,7 +1649,23 @@ static int handle_request(PHTTP_REQUEST req)
                 }
                 if (has_adapter && (network_mode != NET_EXTERNAL ||
                     !api_json_get_string(body, L"netAdapter", adapter, ARRAYSIZE(adapter)))) {
-                    send_err(req->RequestId,400,"Bad Request","invalid_arg","netAdapter requires External networking and a valid adapter or switch selection.");return 0;
+                    send_err(req->RequestId,400,"Bad Request","invalid_arg","netAdapter requires External networking and a string of at most 255 UTF-16 code units.");return 0;
+                }
+                if (hdd_gb) {
+                    hr = asb_vm_set_disk_size(vm, (DWORD)hdd_gb);
+                    if (hr == E_INVALIDARG) {
+                        send_err(req->RequestId,400,"Bad Request","invalid_arg","hddGb must be no smaller than the current disk size.");return 0;
+                    }
+                    if (hr == HRESULT_FROM_WIN32(ERROR_NOT_CAPABLE)) {
+                        send_err(req->RequestId,409,"Conflict","disk_resize_agent_unsupported",ASB_DISK_GROW_AGENT_ERROR);return 0;
+                    }
+                    if (hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) {
+                        send_err(req->RequestId,409,"Conflict","disk_resize_unavailable","Disk growth requires a completed VM without snapshots or branches.");return 0;
+                    }
+                    if (FAILED(hr)) {
+                        send_hr(req->RequestId, "editVm", nu, vm_id, hr);
+                        return 0;
+                    }
                 }
                 if (has_network_mode || has_adapter) {
                     hr = asb_vm_set_network_selection(vm, network_mode, has_adapter ? adapter : NULL);
@@ -1662,7 +1687,7 @@ static int handle_request(PHTTP_REQUEST req)
                         return 0;
                     }
                 }
-                asb_save();
+                if (!hdd_gb) asb_save();
                 if (SUCCEEDED(hr)) {
                     append_vm_json(buf, sizeof(buf), 0, inst);
                     send_json(req->RequestId, 200, "OK", buf);

@@ -13,7 +13,7 @@
 #define OP(name,description,method,path,properties,required) \
     "{\"name\":\"" name "\",\"description\":\"" description "\",\"method\":\"" method "\",\"path\":\"" path "\",\"inputSchema\":{\"type\":\"object\",\"properties\":{" properties "},\"required\":[" required "],\"additionalProperties\":false}}"
 #define CONFIG "\"name\":" STR ",\"osType\":" OS_TYPE ",\"imagePath\":" IMAGE ",\"diskDirectory\":" STR ",\"templateName\":" STR ",\"templateId\":" STR ",\"ramMb\":" RAM ",\"hddGb\":" DISK ",\"cpuCores\":" INT ",\"gpuMode\":" INT ",\"gpuId\":" STR ",\"networkMode\":" INT ",\"netAdapter\":" NET_ADAPTER ",\"adminUser\":" STR ",\"adminPass\":" STR ",\"testMode\":" BOOL ",\"sshEnabled\":" BOOL ",\"sshDeployKey\":" BOOL ",\"isTemplate\":" BOOL
-#define EDIT "\"ramMb\":{\"type\":\"integer\",\"minimum\":4096,\"description\":\"Even MB, at least 4096.\"},\"cpuCores\":" INT ",\"gpuMode\":" INT ",\"gpuId\":" STR ",\"networkMode\":" INT ",\"netAdapter\":" NET_ADAPTER
+#define EDIT "\"ramMb\":{\"type\":\"integer\",\"minimum\":4096,\"description\":\"Even MB, at least 4096.\"},\"cpuCores\":" INT ",\"hddGb\":{\"type\":\"integer\",\"minimum\":1,\"description\":\"Grow the virtual disk of a stopped VM.\"},\"gpuMode\":" INT ",\"gpuId\":" STR ",\"networkMode\":" INT ",\"netAdapter\":" NET_ADAPTER
 #define INPUT_ACTIONS "\"actions\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":128,\"items\":{\"type\":\"object\",\"properties\":{\"type\":{\"enum\":[\"move\",\"click\",\"button\",\"text\",\"unicode\",\"key\",\"scroll\"]},\"x\":" INT ",\"y\":" INT ",\"width\":" INT ",\"height\":" INT ",\"button\":" INT ",\"text\":" STR ",\"scan\":" INT ",\"down\":" BOOL ",\"extended\":" BOOL ",\"delta\":" INT "},\"required\":[\"type\"],\"additionalProperties\":false}}"
 
 const char *asb_api_operations_json(void)
@@ -24,7 +24,7 @@ const char *asb_api_operations_json(void)
         OP("vm_list","List VMs and their persistent VM IDs.","GET","/vms","","") ","
         OP("vm_status","Read a VM by its persistent VM ID.","GET","/vm-ids/{vm_id}",VM,"\"vm_id\"") ","
         OP("vm_create","Create a VM; validation and asynchronous provisioning are owned by the API.","POST","/vms",CONFIG,"\"name\",\"osType\"") ","
-        OP("vm_edit","Edit a stopped VM configuration.","PUT","/vm-ids/{vm_id}",VM "," EDIT,"\"vm_id\"") ","
+        OP("vm_edit","Edit a stopped, fully installed VM.","PUT","/vm-ids/{vm_id}",VM "," EDIT,"\"vm_id\"") ","
         OP("vm_start","Start a VM. Set openDisplay to false for windowless use. Snapshot and branch options require the host capability.","POST","/vm-ids/{vm_id}/start",VM ",\"snapIndex\":" INT ",\"branchIndex\":" INT ",\"branchName\":" STR ",\"openDisplay\":" BOOL,"\"vm_id\"") ","
         OP("vm_shutdown","Request graceful VM shutdown.","POST","/vm-ids/{vm_id}/shutdown",VM,"\"vm_id\"") ","
         OP("vm_stop","Force-stop a VM.","POST","/vm-ids/{vm_id}/stop",VM,"\"vm_id\"") ","

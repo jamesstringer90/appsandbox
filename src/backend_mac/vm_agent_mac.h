@@ -63,6 +63,7 @@ typedef void (^VmAgentIddStatus)(BOOL ready);
 
 /* Fires on main queue from the guest's idd_status: line (Windows guest / ivshmem path). */
 @property (nonatomic, copy, nullable)     VmAgentIddStatus onIddStatusChange;
+@property (nonatomic, copy, nullable)     dispatch_block_t onDiskResizeSupported;
 
 /* VZ path (macOS guest): reach the agent over a VZVirtioSocketDevice. */
 - (instancetype)initWithName:(NSString *)vmName

@@ -170,14 +170,6 @@ static HRESULT hcn_query_external_switch(const GUID *id, wchar_t *name, size_t c
     return hr;
 }
 
-HRESULT hcn_validate_external_switch(const wchar_t *target)
-{
-    GUID id;
-    if (!hcn_is_switch_target(target) || !parse_external_switch_target(target, &id))
-        return E_INVALIDARG;
-    return hcn_query_external_switch(&id, NULL, 0);
-}
-
 void hcn_enum_external_switches(HcnSwitchCallback cb, void *ctx)
 {
     PWSTR ids = NULL;

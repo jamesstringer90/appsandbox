@@ -28,6 +28,7 @@
 #include "../../tools/transport/asb_clipboard_temp.h"
 
 #include <stdio.h>
+#include <limits.h>
 #include <io.h>
 #include <stdlib.h>
 #include <shlobj.h>
@@ -736,8 +737,9 @@ static BOOL save_vm_list(void)
         fwprintf(f, L"OsType=%s\n", VM_AT(i).os_type);
         fwprintf(f, L"ImagePath=%s\n", VM_AT(i).image_path);
         fwprintf(f, L"VhdxPath=%s\n", VM_AT(i).vhdx_path);
+        if (VM_AT(i).disk_resize_supported)
+            fwprintf(f, L"DiskResizeSupported=1\n");
         fwprintf(f, L"RamMB=%lu\n", VM_AT(i).ram_mb);
-        fwprintf(f, L"HddGB=%lu\n", VM_AT(i).hdd_gb);
         fwprintf(f, L"CpuCores=%lu\n", VM_AT(i).cpu_cores);
         fwprintf(f, L"GpuMode=%d\n", VM_AT(i).gpu_mode);
         fwprintf(f, L"GpuName=%s\n", VM_AT(i).gpu_name);
@@ -808,6 +810,13 @@ BOOL get_vm_disk_root(const wchar_t *disk_path, wchar_t *out)
         out[len - 10] = 0;
     /* Never treat a drive root as an owned VM directory. */
     return wcslen(out) > 3;
+}
+
+static void refresh_disk_size(const wchar_t *path, DWORD *hdd_gb)
+{
+    ULONGLONG bytes;
+    if (SUCCEEDED(vhdx_get_virtual_size(path, &bytes)))
+        *hdd_gb = (DWORD)((bytes + ((1ULL << 30) - 1)) >> 30);
 }
 
 static void load_vm_list(void)
@@ -913,6 +922,8 @@ static void load_vm_list(void)
             vm->ram_mb = (DWORD)_wtoi(line + 6);
         else if (wcsncmp(line, L"HddGB=", 6) == 0)
             vm->hdd_gb = (DWORD)_wtoi(line + 6);
+        else if (wcscmp(line, L"DiskResizeSupported=1") == 0)
+            vm->disk_resize_supported = TRUE;
         else if (wcsncmp(line, L"CpuCores=", 9) == 0)
             vm->cpu_cores = (DWORD)_wtoi(line + 9);
         else if (wcsncmp(line, L"GpuMode=", 8) == 0)
@@ -966,6 +977,7 @@ static void load_vm_list(void)
             wchar_t snap_dir[MAX_PATH];
             VM_AT(i).handle = NULL;
             VM_AT(i).running = FALSE;
+            refresh_disk_size(VM_AT(i).vhdx_path, &VM_AT(i).hdd_gb);
             if (resolve_vm_gpu_selection(&VM_AT(i))) gpu_changed = TRUE;
             if (vm_load_state_json(VM_AT(i).vhdx_path))
                 VM_AT(i).install_complete = TRUE;
@@ -1328,21 +1340,6 @@ static HRESULT try_endpoint_with_retry(const GUID *net_id, GUID *ep_id,
     return hr;
 }
 
-static BOOL clear_missing_switch(VmInstance *vm)
-{
-    if (!hcn_is_switch_target(vm->net_adapter)) return FALSE;
-    HRESULT hr = hcn_validate_external_switch(vm->net_adapter);
-    if (hr != HCN_E_NETWORK_NOT_FOUND && hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
-        return FALSE;
-
-    EnterCriticalSection(&g_cs);
-    if (vm->network_mode == NET_EXTERNAL) vm->network_mode = NET_NONE;
-    vm->net_adapter[0] = L'\0';
-    LeaveCriticalSection(&g_cs);
-    asb_log(L"Cleared the missing external switch for VM \"%s\".", vm->name);
-    return TRUE;
-}
-
 static HRESULT connect_vm_network(VmInstance *vm, VmConfig *config,
                                   GUID *network_id, GUID *endpoint_id,
                                   wchar_t endpoint_guid[64], BOOL creating)
@@ -1352,7 +1349,6 @@ static HRESULT connect_vm_network(VmInstance *vm, VmConfig *config,
     if (mode == NET_NONE) return S_OK;
     if (!vm) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
 
-    BOOL selected_switch = mode == NET_EXTERNAL && hcn_is_switch_target(vm->net_adapter);
     if (mode == NET_NAT && allocate_nat_ip(vm)) {
         asb_log(L"Allocated NAT IP %S for \"%s\".", vm->nat_ip, config->name);
         save_vm_list();
@@ -1374,13 +1370,16 @@ static HRESULT connect_vm_network(VmInstance *vm, VmConfig *config,
         }
     }
 
-    if (selected_switch && clear_missing_switch(vm)) {
+    if (mode == NET_EXTERNAL) {
+        EnterCriticalSection(&g_cs);
+        vm->network_mode = NET_NONE;
+        vm->net_adapter[0] = L'\0';
+        LeaveCriticalSection(&g_cs);
         save_vm_list();
-    } else if (creating && !selected_switch) {
-        asb_log(L"Warning: Network failed (0x%08X). Continuing without.", hr);
-    } else {
+    } else if (!creating) {
         return hr;
     }
+    asb_log(L"Warning: Network failed (0x%08X). Continuing without.", hr);
     config->network_mode = NET_NONE;
     ZeroMemory(network_id, sizeof(*network_id));
     ZeroMemory(endpoint_id, sizeof(*endpoint_id));
@@ -3068,12 +3067,6 @@ ASB_API HRESULT asb_init(void)
 
     g_config_load_failed = FALSE;
     load_vm_list();
-    if (!g_config_load_failed) {
-        BOOL changed = FALSE;
-        for (int i = 0; i < g_vm_count; ++i)
-            if (clear_missing_switch(&VM_AT(i))) changed = TRUE;
-        if (changed) save_vm_list();
-    }
     scan_templates();
 
     if (g_vm_count > 0) asb_log(L"Loaded %d VM(s) from config.", g_vm_count);
@@ -3086,6 +3079,7 @@ ASB_API HRESULT asb_init(void)
 ASB_API void asb_cleanup(void)
 {
     int i;
+    BOOL stopped_running_vm = FALSE;
     if (!g_initialized) return;
 
     asb_headless_shutdown();
@@ -3100,9 +3094,13 @@ ASB_API void asb_cleanup(void)
         vm_ssh_proxy_stop(&VM_AT(i));
         vm_agent_stop(&VM_AT(i));
         idd_probe_stop(&VM_AT(i));
-        if (VM_AT(i).running) hcs_terminate_vm(&VM_AT(i));
+        if (VM_AT(i).running) {
+            hcs_terminate_vm(&VM_AT(i));
+            stopped_running_vm = TRUE;
+        }
         hcs_close_vm(&VM_AT(i));
     }
+    if (stopped_running_vm) save_vm_list();
 
     hcs_cleanup();
     hcn_cleanup();
@@ -3390,13 +3388,11 @@ ASB_API const wchar_t *asb_validate_password(const wchar_t *os_type,
     return NULL;
 }
 
-static HRESULT validate_network_selection(int mode, const wchar_t *adapter)
+static HRESULT validate_network_selection(const wchar_t *adapter)
 {
     if (!adapter) return S_OK;
     if (wcslen(adapter) >= ARRAYSIZE(VM_AT(0).net_adapter) || wcspbrk(adapter, L"\r\n"))
         return E_INVALIDARG;
-    if (mode == NET_EXTERNAL && hcn_is_switch_target(adapter))
-        return hcn_validate_external_switch(adapter);
     return S_OK;
 }
 
@@ -3444,7 +3440,7 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
         selected.template_name=g_templates[index].name;
     }
 
-    hr = validate_network_selection(config->network_mode, config->net_adapter);
+    hr = validate_network_selection(config->net_adapter);
     if (FAILED(hr)) {
         asb_log(L"Could not select the network adapter or switch (0x%08X).", hr);
         asb_alert(L"Could not select the network adapter or switch.");
@@ -4020,6 +4016,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         }
     }
 
+    refresh_disk_size(inst->vhdx_path, &inst->hdd_gb);
     if (!inst->handle) {
         /* Need to re-create HCS system - do it in a background thread */
         StartVmArgs *args = (StartVmArgs *)calloc(1, sizeof(StartVmArgs));
@@ -4386,11 +4383,16 @@ ASB_API DWORD asb_vm_ssh_port(AsbVm vm)
 
 /* ---- VM Config Editing ---- */
 
+static BOOL vm_config_editable(const VmInstance *vm)
+{
+    return vm->install_complete && !vm->running && !vm->starting && !vm->building_vhdx;
+}
+
 ASB_API HRESULT asb_vm_set_name(AsbVm vm, const wchar_t *name)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (VM_AT(idx).running || VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
+    if (!vm_config_editable(&VM_AT(idx))) return E_ACCESSDENIED;
     return name && !wcscmp(VM_AT(idx).name,name)?S_FALSE:E_INVALIDARG;
 }
 
@@ -4398,7 +4400,7 @@ ASB_API HRESULT asb_vm_set_ram(AsbVm vm, DWORD ram_mb)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (VM_AT(idx).running || VM_AT(idx).building_vhdx || VM_AT(idx).starting) return E_ACCESSDENIED;
+    if (!vm_config_editable(&VM_AT(idx))) return E_ACCESSDENIED;
     if (asb_api_validate_ram_mb((int)ram_mb)) return E_INVALIDARG;
     VM_AT(idx).ram_mb = ram_mb;
     save_vm_list();
@@ -4410,11 +4412,33 @@ ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores)
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (VM_AT(idx).running || VM_AT(idx).building_vhdx || VM_AT(idx).starting) return E_ACCESSDENIED;
+    if (!vm_config_editable(&VM_AT(idx))) return E_ACCESSDENIED;
     if (cores < 1) return E_INVALIDARG;
     VM_AT(idx).cpu_cores = cores;
     save_vm_list();
     notify_state(vm, VM_AT(idx).running, g_state_ud);
+    return S_OK;
+}
+
+ASB_API HRESULT asb_vm_set_disk_size(AsbVm vm, DWORD hdd_gb)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    VmInstance *inst = &VM_AT(idx);
+    if (!vm_config_editable(inst)) return E_ACCESSDENIED;
+    refresh_disk_size(inst->vhdx_path, &inst->hdd_gb);
+    if (!hdd_gb || hdd_gb > INT_MAX || hdd_gb < inst->hdd_gb) return E_INVALIDARG;
+    if (hdd_gb == inst->hdd_gb) return S_FALSE;
+    if (SNAP_AT(idx).count || SNAP_AT(idx).base_branch_count)
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    if (!inst->disk_resize_supported)
+        return HRESULT_FROM_WIN32(ERROR_NOT_CAPABLE);
+
+    HRESULT hr = vhdx_grow(inst->vhdx_path, hdd_gb);
+    if (FAILED(hr)) return hr;
+    inst->hdd_gb = hdd_gb;
+    asb_events_changed();
+    notify_state(vm, FALSE, g_state_ud);
     return S_OK;
 }
 
@@ -4427,7 +4451,7 @@ ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *
 {
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (VM_AT(idx).running || VM_AT(idx).building_vhdx || VM_AT(idx).starting) return E_ACCESSDENIED;
+    if (!vm_config_editable(&VM_AT(idx))) return E_ACCESSDENIED;
     if (asb_validate_gpu_selection(gpu_mode, gpu_id)) return E_INVALIDARG;
     VM_AT(idx).gpu_mode = gpu_mode;
     wcscpy_s(VM_AT(idx).gpu_id, ARRAYSIZE(VM_AT(idx).gpu_id),
@@ -4448,10 +4472,10 @@ ASB_API HRESULT asb_vm_set_network_selection(AsbVm vm, int mode, const wchar_t *
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     VmInstance *inst = &VM_AT(idx);
-    if (inst->running || inst->building_vhdx || inst->starting) return E_ACCESSDENIED;
+    if (!vm_config_editable(inst)) return E_ACCESSDENIED;
     if (mode < NET_NONE || mode > NET_INTERNAL || (adapter && mode != NET_EXTERNAL)) return E_INVALIDARG;
     if (adapter) {
-        HRESULT hr = validate_network_selection(mode, adapter);
+        HRESULT hr = validate_network_selection(adapter);
         if (FAILED(hr)) return hr;
         wcscpy_s(inst->net_adapter, ARRAYSIZE(inst->net_adapter),
                  wcscmp(adapter, L"(Auto)") ? adapter : L"");

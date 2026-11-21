@@ -201,6 +201,7 @@ ASB_API DWORD   asb_vm_ssh_port(AsbVm vm);
 
 ASB_API HRESULT asb_vm_set_name(AsbVm vm, const wchar_t *name);
 ASB_API HRESULT asb_vm_set_ram(AsbVm vm, DWORD ram_mb);
+ASB_API HRESULT asb_vm_set_disk_size(AsbVm vm, DWORD hdd_gb);
 ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores);
 ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode);
 ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *gpu_id);

@@ -25,6 +25,8 @@ extern "C" {
 #define BACKEND_ERR_NOT_RUNNING     -6
 #define BACKEND_ERR_NO_DISPLAY      -7   /* no console GUI session to show a window in */
 #define BACKEND_ERR_NOT_READY       -8   /* VM running but the guest agent isn't online yet */
+#define BACKEND_ERR_AGENT_UNSUPPORTED -9
+#define ASB_DISK_GROW_AGENT_ERROR "Disk growth requires a compatible guest agent."
 
 #define CORE_VM_NAME_MAX       128
 #define CORE_VM_OS_TYPE_MAX     32

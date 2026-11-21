@@ -24,6 +24,8 @@ typedef void (^IsoPatchCompletion)(NSError * _Nullable error);
                    completion:(IsoPatchCompletion)completion;
 
 + (void)stopWorkers;
++ (void)growDiskAtURL:(NSURL *)diskURL diskGb:(int)diskGb macGuest:(BOOL)macGuest
+           completion:(IsoPatchCompletion)completion;
 
 + (void)installMacOSWithName:(NSString *)name
                        vmDir:(NSURL *)vmDir
