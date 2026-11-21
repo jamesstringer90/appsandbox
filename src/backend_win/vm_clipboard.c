@@ -98,6 +98,8 @@ struct VmClipboardData {
     volatile BOOL    sync_enabled;
     volatile LONG    sharing_enabled;
     volatile LONG    sharing_generation;
+    volatile LONG    share_host_to_guest;
+    volatile LONG    share_guest_to_host;
 
     VmClipboardLogFn log_fn;
     void            *log_ud;
@@ -273,7 +275,8 @@ static BOOL clip_send_file_entry(VmClipboard clip, SOCKET s, const wchar_t *full
     DWORD attrs;
     UINT32 path_bytes;
 
-    if (!clip->sharing_enabled || generation != clip->sharing_generation) return FALSE;
+    if (!clip->sharing_enabled || !clip->share_host_to_guest ||
+        generation != clip->sharing_generation) return FALSE;
     attrs = GetFileAttributesW(full_path);
     if (attrs == INVALID_FILE_ATTRIBUTES) return TRUE;
 
@@ -349,13 +352,15 @@ static BOOL clip_send_file_entry(VmClipboard clip, SOCKET s, const wchar_t *full
         while (remaining > 0) {
             DWORD to_read = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : (DWORD)remaining;
             DWORD bytes_read;
-            if (!clip->sharing_enabled || generation != clip->sharing_generation ||
+            if (!clip->sharing_enabled || !clip->share_host_to_guest ||
+                generation != clip->sharing_generation ||
                 !ReadFile(hFile, chunk, to_read, &bytes_read, NULL) || bytes_read == 0) {
                 HeapFree(GetProcessHeap(), 0, chunk);
                 CloseHandle(hFile);
                 return FALSE;
             }
-            if (!clip->sharing_enabled || generation != clip->sharing_generation ||
+            if (!clip->sharing_enabled || !clip->share_host_to_guest ||
+                generation != clip->sharing_generation ||
                 !clip_send_all(s, chunk, (int)bytes_read)) {
                 HeapFree(GetProcessHeap(), 0, chunk);
                 CloseHandle(hFile);
@@ -406,7 +411,10 @@ static BOOL clip_send_format_list(VmClipboard clip)
 
     s = clip->writer_socket;
     if (s == INVALID_SOCKET) return FALSE;
-    if (!clip->sync_enabled || !clip->sharing_enabled) return TRUE;
+    if (!clip->sync_enabled || !clip->sharing_enabled || !clip->share_host_to_guest) {
+        InterlockedExchange(&clip->pushed_sequence, 0);
+        return TRUE;
+    }
 
     sequence = GetClipboardSequenceNumber();
     if (sequence && (LONG)sequence == InterlockedCompareExchange(&clip->pushed_sequence, 0, 0))
@@ -416,7 +424,8 @@ static BOOL clip_send_format_list(VmClipboard clip)
         InterlockedExchange(&clip->pending_push, 1);
         return TRUE;
     }
-    if (!clip->sharing_enabled || generation != clip->sharing_generation) {
+    if (!clip->sharing_enabled || !clip->share_host_to_guest ||
+        generation != clip->sharing_generation) {
         CloseClipboard();
         return TRUE;
     }
@@ -449,7 +458,8 @@ static BOOL clip_send_format_list(VmClipboard clip)
     if (count) InterlockedExchange(&clip->pushed_sequence, (LONG)sequence);
     CloseClipboard();
 
-    if (!clip->sharing_enabled || generation != clip->sharing_generation) return TRUE;
+    if (!clip->sharing_enabled || !clip->share_host_to_guest ||
+        generation != clip->sharing_generation) return TRUE;
     if (count == 0) return TRUE;
 
     *(UINT32 *)buf = count;
@@ -486,10 +496,12 @@ static BOOL clip_handle_data_request(VmClipboard clip, UINT fmt)
 
     clip_log(clip, L"CLIP: Data request from guest for format %u.", fmt);
 
-    if (!clip->sync_enabled) InterlockedExchange(&clip->pushed_sequence, 0);
-    if (clip->sync_enabled && clip->sharing_enabled && OpenClipboard(NULL)) {
+    if (!clip->sync_enabled || !clip->share_host_to_guest)
+        InterlockedExchange(&clip->pushed_sequence, 0);
+    if (clip->sync_enabled && clip->sharing_enabled && clip->share_host_to_guest && OpenClipboard(NULL)) {
         DWORD sequence = GetClipboardSequenceNumber();
-        HANDLE hData = clip->sharing_enabled && generation == clip->sharing_generation ? GetClipboardData(fmt) : NULL;
+        HANDLE hData = clip->sharing_enabled && clip->share_host_to_guest &&
+            generation == clip->sharing_generation ? GetClipboardData(fmt) : NULL;
         if (fmt == CF_HDROP && hData) {
             UINT count = DragQueryFileW((HDROP)hData, 0xFFFFFFFF, NULL, 0);
             if (count && count <= CLIP_MAX_PAYLOAD / sizeof(*paths))
@@ -518,7 +530,7 @@ static BOOL clip_handle_data_request(VmClipboard clip, UINT fmt)
         if (sequence)
             InterlockedCompareExchange(&clip->pushed_sequence, (LONG)GetClipboardSequenceNumber(), (LONG)sequence);
         CloseClipboard();
-    } else if (clip->sync_enabled) {
+    } else if (clip->sync_enabled || !clip->share_host_to_guest) {
         InterlockedExchange(&clip->pushed_sequence, 0);
     }
 
@@ -527,7 +539,7 @@ static BOOL clip_handle_data_request(VmClipboard clip, UINT fmt)
         const wchar_t *name = wcsrchr(paths[i], L'\\');
         sent = clip_send_file_entry(clip, s, paths[i], name ? name + 1 : paths[i], generation);
     }
-    if (!clip->sharing_enabled && (path_count || data)) sent = FALSE;
+    if ((!clip->sharing_enabled || !clip->share_host_to_guest) && (path_count || data)) sent = FALSE;
     if (sent) sent = clip_send_all(s, &hdr, sizeof(hdr));
     if (sent && data) sent = clip_send_all(s, data, (int)hdr.data_size);
     if (paths) HeapFree(GetProcessHeap(), 0, paths);
@@ -577,7 +589,8 @@ static DWORD WINAPI clip_writer_thread_proc(LPVOID param)
             sync = InterlockedExchange(&clip->pending_sync, -1);
             push = InterlockedExchange(&clip->pending_push, 0);
             if (sync >= 0 && !clip_send_sync_enable(clip, sync != 0 && clip->sharing_enabled)) break;
-            if (push && clip->sync_enabled && clip->sharing_enabled && !clip_send_format_list(clip)) break;
+            if (push && clip->sync_enabled && clip->sharing_enabled &&
+                clip->share_host_to_guest && !clip_send_format_list(clip)) break;
             FD_ZERO(&reads);
             FD_SET(s, &reads);
             ready = select(0, &reads, NULL, NULL, &timeout);
@@ -711,7 +724,8 @@ static void clip_reader_request_next(VmClipboard clip, SOCKET s)
 {
     ClipHeader hdr;
 
-    if (!clip->sharing_enabled || clip->reader_generation != clip->sharing_generation) return;
+    if (!clip->sharing_enabled || !clip->share_guest_to_host ||
+        clip->reader_generation != clip->sharing_generation) return;
     if (clip->reader_fetch_idx >= clip->reader_fmt_count) {
         if (clip->temp && (!asb_clipboard_temp_prepare(clip->temp) ||
             !(clip->reader_hdrop = clip_file_build_hdrop(clip->temp_dir)))) {
@@ -765,8 +779,8 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         }
 
         /* Focus gate: discard if sync is off */
-        if (!clip->sync_enabled || !clip->sharing_enabled) {
-            clip_log(clip, L"CLIP-R: FORMAT_LIST discarded (sync disabled).");
+        if (!clip->sync_enabled || !clip->sharing_enabled || !clip->share_guest_to_host) {
+            clip_log(clip, L"CLIP-R: FORMAT_LIST discarded (guest->host sharing disabled).");
             HeapFree(GetProcessHeap(), 0, buf);
             return TRUE;
         }
@@ -855,7 +869,7 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
     case CLIP_MSG_FILE_DATA: {
         EnterCriticalSection(&clip->reader_cs);
         int idx = clip->reader_fetch_idx;
-        BOOL active = !clip->reader_ready && clip->sharing_enabled &&
+        BOOL active = !clip->reader_ready && clip->sharing_enabled && clip->share_guest_to_host &&
             clip->reader_generation == clip->sharing_generation && idx >= 0 && idx < clip->reader_fmt_count &&
             clip->reader_fmts[idx].remote_id == CF_HDROP;
         LeaveCriticalSection(&clip->reader_cs);
@@ -959,6 +973,8 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
     clip->stop = FALSE;
     clip->sync_enabled = FALSE;
     clip->sharing_enabled = TRUE;
+    clip->share_host_to_guest = TRUE;
+    clip->share_guest_to_host = TRUE;
     clip->writer_socket = INVALID_SOCKET;
     clip->reader_socket = INVALID_SOCKET;
     clip->writer_suppress = 0;
@@ -1055,7 +1071,8 @@ ASB_API void vm_clipboard_set_sync_enabled(VmClipboard clip, BOOL enabled)
              enabled ? L"focused" : L"unfocused",
              enabled ? L"ON" : L"OFF");
     InterlockedExchange(&clip->pending_sync, enabled && clip->sharing_enabled ? 1 : 0);
-    if (enabled) InterlockedExchange(&clip->pending_push, 1);
+    if (enabled && clip->share_host_to_guest)
+        InterlockedExchange(&clip->pending_push, 1);
 }
 
 ASB_API void vm_clipboard_set_sharing_enabled(VmClipboard clip, BOOL enabled)
@@ -1064,7 +1081,37 @@ ASB_API void vm_clipboard_set_sharing_enabled(VmClipboard clip, BOOL enabled)
     InterlockedIncrement(&clip->sharing_generation);
     InterlockedExchange(&clip->pushed_sequence, 0);
     InterlockedExchange(&clip->pending_sync, enabled && clip->sync_enabled ? 1 : 0);
-    InterlockedExchange(&clip->pending_push, enabled ? 1 : 0);
+    InterlockedExchange(&clip->pending_push, enabled && clip->share_host_to_guest ? 1 : 0);
+}
+
+ASB_API void vm_clipboard_set_share_directions(VmClipboard clip,
+                                               BOOL share_host_to_guest,
+                                               BOOL share_guest_to_host)
+{
+    BOOL h2g = share_host_to_guest ? TRUE : FALSE;
+    BOOL g2h = share_guest_to_host ? TRUE : FALSE;
+
+    if (!clip) return;
+    if ((BOOL)clip->share_host_to_guest == h2g && (BOOL)clip->share_guest_to_host == g2h) return;
+
+    clip->share_host_to_guest = h2g;
+    clip->share_guest_to_host = g2h;
+
+    /* Cancel any in-progress transfer whose direction was just disabled. */
+    InterlockedIncrement(&clip->sharing_generation);
+    InterlockedExchange(&clip->pushed_sequence, 0);
+    InterlockedExchange(&clip->pending_sync, clip->sharing_enabled && clip->sync_enabled ? 1 : 0);
+    InterlockedExchange(&clip->pending_push,
+                        clip->sharing_enabled && clip->sync_enabled && h2g ? 1 : 0);
+}
+
+ASB_API void vm_clipboard_get_share_directions(VmClipboard clip,
+                                               BOOL *share_host_to_guest,
+                                               BOOL *share_guest_to_host)
+{
+    if (!clip) return;
+    if (share_host_to_guest) *share_host_to_guest = (BOOL)clip->share_host_to_guest;
+    if (share_guest_to_host) *share_guest_to_host = (BOOL)clip->share_guest_to_host;
 }
 
 ASB_API void vm_clipboard_on_clipboard_update(VmClipboard clip)
@@ -1078,8 +1125,8 @@ ASB_API void vm_clipboard_on_clipboard_update(VmClipboard clip)
         return;
     }
 
-    /* Focus gate */
-    if (!clip->sync_enabled || !clip->sharing_enabled) return;
+    /* Focus/host->guest gates */
+    if (!clip->sync_enabled || !clip->sharing_enabled || !clip->share_host_to_guest) return;
 
     InterlockedExchange(&clip->pending_push, 1);
 }
@@ -1095,7 +1142,8 @@ ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)
         return;
     }
     clip->reader_ready = FALSE;
-    if (!clip->sharing_enabled || clip->reader_generation != clip->sharing_generation) {
+    if (!clip->sharing_enabled || !clip->share_guest_to_host ||
+        clip->reader_generation != clip->sharing_generation) {
         clip_reader_free_pending(clip);
         LeaveCriticalSection(&clip->reader_cs);
         return;
