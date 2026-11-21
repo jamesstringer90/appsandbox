@@ -55,6 +55,20 @@ ASB_API void vm_clipboard_destroy(VmClipboard clip);
 ASB_API void vm_clipboard_set_sync_enabled(VmClipboard clip, BOOL enabled);
 ASB_API void vm_clipboard_set_sharing_enabled(VmClipboard clip, BOOL enabled);
 
+/* Set independent per-direction sharing gates. These apply on top of the
+ * master sharing/sync gates: host->guest blocks host clipboard pushes and
+ * guest DATA_REQ replies; guest->host discards guest FORMAT_LIST data and
+ * stops applying it to the host clipboard. Changing either gate cancels any
+ * in-flight transfer by bumping the sharing generation. */
+ASB_API void vm_clipboard_set_share_directions(VmClipboard clip,
+                                               BOOL share_host_to_guest,
+                                               BOOL share_guest_to_host);
+
+/* Read the current per-direction gates. */
+ASB_API void vm_clipboard_get_share_directions(VmClipboard clip,
+                                               BOOL *share_host_to_guest,
+                                               BOOL *share_guest_to_host);
+
 /* Call from WM_CLIPBOARDUPDATE in the display window's wndproc.
  * Forwards host clipboard to guest if sync is enabled. */
 ASB_API void vm_clipboard_on_clipboard_update(VmClipboard clip);
