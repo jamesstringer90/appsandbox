@@ -15,7 +15,7 @@ Windows features:
 - GPU Hardware Video Decoder/Encoder support
 - SSH via Hyper-V socket proxy (no network required)
 - Snapshots
-- Multiple resolution options as well as optional dynamic resolution
+- Multiple resolution options as well as optional dynamic resolution, and fullscreen mode
 - Host to client hot-key support
 - Provision and boot with / without internet
 - Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support
@@ -28,7 +28,7 @@ Mac features:
 - 2 Channel Audio
 - macOS: GPU Acceleration via Paravirtualization with support for Metal, Windows: No GPU Acceleration
 - SSH via virtio-vsock (no network required)
-- Dynamic display sizing (optional on Windows)
+- Dynamic display sizing (optional on Windows) and fullscreen mode
 - Provision and boot with / without internet
 - Local API, MCP server, and Python SDK
 
@@ -99,11 +99,17 @@ The default username is `user` and the default password is `test123`
 
 Want to give your old VM the new App Sandbox features? Download and run the new App Sandbox version and give your AI agent this [prompt](https://github.com/jamesstringer90/appsandbox/blob/main/VM-UPGRADE.md) to help with the upgrade
 
+[Windows] Enter fullscreen mode my right clicking the title bar and selecting borderless fullscreen mode.  To exit this mode hold your mouse up on the top of the screen for about 1 second, then you'll see an option to exit.
+
 When your VM is running and open, right clicking its title bar will show several options like transmit hotkeys, mute audio and match window size where your VM display dynamically resizes to your viewers size.
 
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well  
 
 [Windows] You can check if the GPU-PV driver setup is working by running gpu-test.exe inside your App Sandbox Windows VM, gpu-test.exe will show a box with 6 rotating cubes, each using a different rendering engine (D3D9, D3D10, D3D11, D3D12, OpenGL and Vulkan).  If one or more fail, they will not correctly show a rotating cube for that rendering API.  [gpu-test.zip](https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.2/gpu-test.zip). Note: The rendering API succeeding means that the GPU-PV worked, but sometimes games or apps are coded in such a way that they will not detect the GPU-PV system correctly and still show an error.
+
+### How to support the project
+
+Show people on Reddit, Twitter, Youtube, Tiktok or your favorite forum how you use App Sandbox to do something cool.  Even if you just mention it's one of the tools in your workflow that would be super helpful, and will bring a lot of awareness to the project!  
 
 ## Sharing fixes and features
 
