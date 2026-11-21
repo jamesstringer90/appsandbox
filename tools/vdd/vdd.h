@@ -240,6 +240,7 @@ typedef struct _VDD_SWAP_PROC {
     UINT64              frameSeq;
 
     VDD_GPU_SLOT        gpuSlots[DISPLAY_GPU_SLOTS];
+    AsbGpuWaiter        gpuHandoffWaiter;
     ID3D11Texture2D*     pGpuPendingTex;
     BOOL                bGpuPendingFrame;
     ULONGLONG           gpuBlockedSince;

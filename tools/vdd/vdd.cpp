@@ -838,6 +838,17 @@ static BOOL VddPublishGpuFrame(VDD_SWAP_PROC* proc, ID3D11Texture2D* source)
             if (hr != S_OK) break;
             proc->pDeviceContext->CopyResource(slot->pTexture, source);
             proc->pDeviceContext->Flush();
+            hr = asb_gpu_waiter_wait(&proc->gpuHandoffWaiter, proc->pDevice,
+                proc->pDeviceContext, proc->hTerminateEvent, ASB_GPU_HANDOFF_WAIT_MS);
+            if (hr != S_OK) {
+                HRESULT released = slot->pMutex->ReleaseSync(0);
+                if (hr == S_FALSE) return TRUE;
+                if (hr == (HRESULT)WAIT_TIMEOUT && !proc->gpuBlockedSince)
+                    VddLog("GPU: copy into slot %u unfinished after %u ms; holding frame",
+                           index, (UINT)ASB_GPU_HANDOFF_WAIT_MS);
+                if (released != S_OK) hr = released;
+                break;
+            }
             hr = slot->pMutex->ReleaseSync(1);
             if (hr != S_OK) break;
             proc->gpuLastSlot = index;
@@ -1138,7 +1149,8 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             InterlockedCompareExchange(&proc->screenshot.handoffState, 0, 0) == ASB_SCREENSHOT_HANDOFF_READY &&
             proc->screenshot.handoff.slot < DISPLAY_GPU_SLOTS) {
             VDD_GPU_SLOT* slot = &proc->gpuSlots[proc->screenshot.handoff.slot];
-            asb_vdd_screenshot_handoff(&proc->screenshot, slot->pMutex, slot->pTexture, slot->sequence);
+            asb_vdd_screenshot_handoff(&proc->screenshot, slot->pMutex, slot->pTexture, slot->sequence,
+                &proc->gpuHandoffWaiter);
         }
         if (proc->bGpuPoolReady && proc->bGpuPendingFrame) {
             ID3D11Texture2D* pending = proc->pGpuPendingTex;
@@ -1504,6 +1516,7 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
     }
 
     asb_vdd_screenshot_destroy(&proc->screenshot);
+    asb_gpu_waiter_destroy(&proc->gpuHandoffWaiter);
 
     /* Close any remaining client connection */
     VddLog("DestroySwapProc: closing client connection (%p)", (void*)proc->hClientConn);
