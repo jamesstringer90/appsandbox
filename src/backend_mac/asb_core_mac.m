@@ -1224,6 +1224,7 @@ static void start_template_instance(int idx, const AsbVmMac *source) {
     NSString *name = @(g_vms[idx].name);
     NSString *sourceName = @(source->name);
     BOOL windows = vm_is_windows_idx(idx);
+    int diskGb = g_vms[idx].hdd_gb;
     NSURL *disk = [VmDir diskImageURLFor:name];
     NSURL *sourceDisk = [VmDir diskImageURLFor:sourceName];
     NSURL *sourceAux = [VmDir auxiliaryStorageURLFor:sourceName];
@@ -1237,6 +1238,12 @@ static void start_template_instance(int idx, const AsbVmMac *source) {
         if (copyfile(sourceDisk.fileSystemRepresentation, disk.fileSystemRepresentation,
                      NULL, COPYFILE_ALL | COPYFILE_CLONE | COPYFILE_EXCL) != 0)
             error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+        if (!error && windows) {
+            int fd = open(disk.fileSystemRepresentation, O_RDWR);
+            if (fd < 0 || ftruncate(fd, (off_t)diskGb * 1024 * 1024 * 1024) != 0)
+                error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+            if (fd >= 0) close(fd);
+        }
         if (!error && !windows) {
             for (NSArray<NSURL *> *pair in @[@[sourceAux, targetAux], @[sourceHardware, targetHardware]]) {
                 if (copyfile(pair[0].fileSystemRepresentation, pair[1].fileSystemRepresentation,

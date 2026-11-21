@@ -532,41 +532,29 @@ static BOOL grow_disk_image(NSString *path, uint64_t bytes, BOOL macGuest, BOOL 
     }
 
     emit_status(@"Expanding disk image");
-    BOOL replace = macGuest && editing;
-    NSString *target = path;
-    if (replace) {
-        char temp[PATH_MAX];
-        int len = snprintf(temp, sizeof temp, "%s/.disk-grow-XXXXXX",
-                           path.stringByDeletingLastPathComponent.fileSystemRepresentation);
-        if (len < 0 || (size_t)len >= sizeof temp || !mkdtemp(temp)) {
-            emit_error(@"Cannot create a temporary directory beside the virtual disk");
-            return NO;
-        }
-
-        g_worker_tmp = [[NSFileManager defaultManager] stringWithFileSystemRepresentation:temp length:strlen(temp)];
-        target = [g_worker_tmp stringByAppendingPathComponent:@"disk.img"];
-        if (copyfile(source, target.fileSystemRepresentation, NULL, COPYFILE_ALL | COPYFILE_CLONE | COPYFILE_EXCL) != 0) {
-            emit_error([NSString stringWithFormat:@"Cannot copy the virtual disk: %s", strerror(errno)]);
-            return NO;
-        }
-    }
-
-    NSString *error = nil;
-    if (run_tool(@"/usr/sbin/diskutil", @[@"image", @"resize", @"--image-only", @"--size",
-                 [NSString stringWithFormat:@"%lluB", (unsigned long long)bytes], target], NULL, &error) != 0) {
-        emit_error(error.length ? [error stringByReplacingOccurrencesOfString:@"\n" withString:@" "] : @"Disk resize failed");
+    char temp[PATH_MAX];
+    int len = snprintf(temp, sizeof temp, "%s/.disk-grow-XXXXXX",
+                       path.stringByDeletingLastPathComponent.fileSystemRepresentation);
+    if (len < 0 || (size_t)len >= sizeof temp || !mkdtemp(temp)) {
+        emit_error(@"Cannot create a temporary directory beside the virtual disk");
         return NO;
     }
+
+    g_worker_tmp = [[NSFileManager defaultManager] stringWithFileSystemRepresentation:temp length:strlen(temp)];
+    NSString *target = [g_worker_tmp stringByAppendingPathComponent:@"disk.img"];
+    if (copyfile(source, target.fileSystemRepresentation, NULL, COPYFILE_ALL | COPYFILE_CLONE | COPYFILE_EXCL) != 0) {
+        emit_error([NSString stringWithFormat:@"Cannot copy the virtual disk: %s", strerror(errno)]);
+        return NO;
+    }
+
     blockio_t *io = blockio_open(target.fileSystemRepresentation);
-    BOOL ok = io && blockio_size(io) == bytes &&
-        (!macGuest || gpt_move_macos_recovery(io, (uint64_t)original.st_size) == 0);
+    BOOL ok = io && blockio_size(io) == (uint64_t)original.st_size &&
+        gpt_grow_disk(io, bytes, macGuest) == 0;
     if (blockio_close(io) != 0) ok = NO;
     if (!ok) {
         emit_error(@"Cannot prepare the enlarged partition map");
         return NO;
     }
-    if (!replace) return YES;
-
     check_cancelled();
     struct stat current;
     if (lstat(source, &current) != 0 || current.st_dev != original.st_dev ||
@@ -1244,7 +1232,6 @@ static void bw_progress(int pct, const char *msg) {
 
 static int cmd_build_windows(int argc, char **argv) {
     NSString *iso = nil, *out = nil, *sshMsi = nil, *signedZip = nil, *netkvmZip = nil, *vioscsiZip = nil;
-    NSString *diskPath = nil;
     NSString *vmName = @"WIN11-VM", *user = @"user", *pass = @"test123";
     NSString *provDir = nil;   /* host-generated unattend.xml/setup.cmd/SetupComplete.cmd (password encoded host-side) */
     NSString *lang = @"";   /* empty => auto-detect from the install.wim XML (else en-US) */
@@ -1255,7 +1242,6 @@ static int cmd_build_windows(int argc, char **argv) {
         else if (strcmp(argv[i], "--resources-iso") == 0) resourcesOnly = YES;
         else if (strcmp(argv[i], "--iso") == 0 && i+1 < argc) iso = @(argv[++i]);
         else if (strcmp(argv[i], "--out") == 0 && i+1 < argc) out = @(argv[++i]);
-        else if (strcmp(argv[i], "--disk") == 0 && i+1 < argc) diskPath = @(argv[++i]);
         else if (strcmp(argv[i], "--signed-payload-zip") == 0 && i+1 < argc) signedZip = @(argv[++i]);
         else if (strcmp(argv[i], "--netkvm-zip") == 0 && i+1 < argc) netkvmZip = @(argv[++i]);
         else if (strcmp(argv[i], "--vioscsi-zip") == 0 && i+1 < argc) vioscsiZip = @(argv[++i]);
@@ -1272,13 +1258,6 @@ static int cmd_build_windows(int argc, char **argv) {
     if ((!resourcesOnly && !iso) || !out || !signedZip || (resourcesOnly && !provDir)) {
         emit_error(@"build-windows: --iso, --out and --signed-payload-zip are required");
         return 2;
-    }
-    if (resourcesOnly && diskPath) {
-        if (diskGb < 1) {
-            emit_error(@"The disk size must be positive");
-            return 2;
-        }
-        if (!grow_disk_image(diskPath, (uint64_t)diskGb << 30, NO, NO)) return 4;
     }
     NSFileManager *fm = [NSFileManager defaultManager];
 

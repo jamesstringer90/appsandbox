@@ -433,8 +433,7 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName, BOOL fromMed
         @"--test-mode", (testMode ? @"1" : @"0"),   /* honor the create-time choice (mirrors Windows) */
     ] mutableCopy];
     if (templateMode == 1) [args addObject:@"--template"];
-    if (templateMode == 2)
-        [args addObjectsFromArray:@[@"--resources-iso", @"--disk", [VmDir diskImageURLFor:vmName].path]];
+    if (templateMode == 2) [args addObject:@"--resources-iso"];
 
     /* Pass --lang ONLY for an explicit override; without it build-windows auto-detects the ISO's
      * language and reports it via LANG: so we re-generate unattend.xml in-process below. */
