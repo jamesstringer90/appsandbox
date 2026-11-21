@@ -508,8 +508,8 @@ static BOOL write_prov_scripts(NSString *dir, NSString *sshMsiName, BOOL fromMed
     /* Signed ARM64 release: EV-signed agent EXEs + MS-attestation-signed drivers (VDD/VAD/AppSandboxSHM/
      * devcon). The release version is pinned in the cached filename, so a newer release auto-invalidates
      * the cache. The URL must stay publicly fetchable by an unauthenticated client. */
-    NSString *name   = @"AppSandbox-0.1.13-win-arm64.zip";
-    NSString *urlStr = @"https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.13/AppSandbox-0.1.13-win-arm64.zip";
+    NSString *name   = @"AppSandbox-0.1.14-win-arm64.zip";
+    NSString *urlStr = @"https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.14/AppSandbox-0.1.14-win-arm64.zip";
     NSString *cacheDir = [[VmDir vmsRootDirectory] URLByDeletingLastPathComponent].path;
     [[NSFileManager defaultManager] createDirectoryAtPath:cacheDir
                               withIntermediateDirectories:YES attributes:nil error:nil];
