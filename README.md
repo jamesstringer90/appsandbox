@@ -5,6 +5,8 @@
 
 App Sandbox is a virtual machine app for Windows and macOS that's focused on performance and ease of use.
 
+[![All-time downloads](https://img.shields.io/github/downloads/jamesstringer90/appsandbox/total?style=for-the-badge&label=All-time%20downloads)](https://github.com/jamesstringer90/appsandbox/releases)
+
 Windows features:
 - Works on Windows 11 Home or Pro, without Hyper-V
 - Windows 11 or Ubuntu 26.04 LTS VM Support
