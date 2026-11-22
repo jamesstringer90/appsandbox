@@ -13,7 +13,8 @@ Windows features:
 - Zero touch install
 - Copy and Paste
 - 2 Channel Audio
-- GPU Acceleration via Paravirtualization (GPU-PV) with support for DirectX 12 (Windows only), OpenGL, Vulkan, CUDA, OpenCL
+- GPU Acceleration via Paravirtualization (GPU-PV) with support for DirectX 12, 11, 10, 9 (Windows only), OpenGL, Vulkan, CUDA, OpenCL
+- When an NVIDIA GPU is shared, DLSS and CUDA is supported
 - GPU Hardware Video Decoder/Encoder support
 - SSH via Hyper-V socket proxy (no network required)
 - Snapshots
@@ -57,7 +58,7 @@ Virtual Machine Platform is the same Windows feature WSL2 uses.
 
 **What you can use it for:**
 - A full Windows or Ubuntu **desktop** VM — a complete graphical OS with GPU acceleration
-  (OpenGL, Vulkan, CUDA) — for building and testing your own software on a clean install.
+  (OpenGL, Vulkan, CUDA, DLSS, D3D) — for building and testing your own software on a clean install.
 - Running a program in a VM, kept separate from your main OS and files.
 - Developing and testing Windows drivers: a built-in **Test Mode** enables test-signing
   inside the guest, so the host's Secure Boot and boot configuration are left unchanged.
@@ -79,7 +80,7 @@ Windows, App Sandbox submits a hand-built HCS machine document to `computecore.d
 `computenetwork.dll` — the HCS/HCN layer that also underlies WSL2 and Windows Sandbox —
 rather than going through Hyper-V Manager. GPU acceleration uses GPU paravirtualization
 (GPU-PV) to share the host's installed GPU with the guest — the same WSL2 path, not a
-dedicated passthrough (no VFIO/IOMMU, no second GPU). Windows guests get DirectX 12, OpenGL,
+dedicated passthrough (no VFIO/IOMMU, no second GPU). Windows guests get DirectX 12, 11, 10, 9, OpenGL,
 Vulkan, CUDA, and OpenCL; Ubuntu guests the same minus DirectX; macOS guests Metal. A custom
 **IddCx** indirect display driver and a virtual audio device carry the screen and sound, and
 guest↔host clipboard, audio, input, and SSH run over **Hyper-V sockets**. Guest disks are
