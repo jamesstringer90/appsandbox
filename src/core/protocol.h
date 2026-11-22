@@ -68,6 +68,14 @@ typedef struct {
 #define DISPLAY_GPU_CAP_FENCE 4u
 #define DISPLAY_GPU_CAP_REFRESH 8u
 #define DISPLAY_GPU_CAP_SNAPSHOT 16u
+/* A QUERY with this bit accepts pixel RLE on the frame stream, independently
+ * of GPU sharing. Legacy peers continue to exchange raw pixel payloads. */
+#define DISPLAY_GPU_CAP_FRAME_RLE 32u
+#define ASB_FRAME_RLE_FLAG 0x80000000u /* high bit of the wire payload length */
+/* The sequence high bit advertises that a stream-only guest accepts a QUERY
+ * carrying just FRAME_RLE. Older viewers ignore the frame sequence. This
+ * lets software-only viewers avoid sending control traffic to older guests. */
+#define ASB_FRAME_SEQ_RLE_CAPABLE (UINT64_C(1) << 63)
 #define DISPLAY_GPU_FENCE_SLOTS (DISPLAY_GPU_SLOTS * 2)
 #define DISPLAY_SIZE_GUEST    0u
 #define DISPLAY_SIZE_WINDOW   1u

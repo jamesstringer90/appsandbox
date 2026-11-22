@@ -14,7 +14,8 @@
  *
  * Wire protocol reference: src/backend_win/vm_display_idd.c (FRAME_MAGIC
  * 'ASFR', packed FrameHeader { magic, w, h, stride, frame_seq, rect_cnt },
- * then rect_cnt RECT(int32 ltrb), then u32 data_size, then BGRA bytes).
+ * then rect_cnt RECT(int32 ltrb), then u32 wire size and pixel data).
+ * ASB_FRAME_RLE_FLAG in the size selects negotiated pixel RLE.
  */
 
 #include <stdio.h>
@@ -41,6 +42,7 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 #include "display-gpu.h"
+#include "frame_rle.h"
 #include "asb_capture_socket.h"
 #include "asb_drm_uapi.h"
 
@@ -564,25 +566,33 @@ static int cursor_tick(int client_fd, int drm_fd, struct cursor_state *cur)
 
 /* ---- Main capture loop ---- */
 
-static int send_frame(int client_fd, struct capture_ctx *c, uint64_t seq)
+static int send_frame(int client_fd, struct capture_ctx *c, uint64_t seq, AsbFrameBuffer *encoded)
 {
     struct frame_header h;
     h.magic            = FRAME_MAGIC;
     h.width            = c->width;
     h.height           = c->height;
     h.stride           = c->stride;
-    h.frame_seq        = seq;
+    h.frame_seq        = ASB_FRAME_SEQ_RLE_CAPABLE | seq;
     h.dirty_rect_count = 0;
 
-    if (send_all(client_fd, &h, sizeof(h)) < 0) return -1;
-
-    uint32_t data_size = c->stride * c->height;
-    if (send_all(client_fd, &data_size, sizeof(data_size)) < 0) return -1;
-
-    if (data_size > 0) {
-        if (send_all(client_fd, c->mem, data_size) < 0) return -1;
+    uint64_t raw_size = (uint64_t)c->stride * c->height;
+    if (!raw_size || raw_size > DISPLAY_MAX_WIDTH * DISPLAY_MAX_HEIGHT * ASB_FRAME_PIXEL_BYTES) return -1;
+    uint32_t wire_size = (uint32_t)raw_size;
+    const uint8_t *pixels = c->mem;
+    size_t bytes = (size_t)raw_size;
+    if (encoded && asb_frame_reserve(encoded, bytes - 1)) {
+        size_t packed = asb_frame_encode(c->mem, c->stride, c->stride, c->height,
+                                         encoded->data, bytes - 1);
+        if (packed) {
+            pixels = encoded->data;
+            bytes = packed;
+            wire_size = ASB_FRAME_RLE_FLAG | (uint32_t)packed;
+        }
     }
-    return 0;
+    if (send_all(client_fd, &h, sizeof(h)) < 0 ||
+        send_all(client_fd, &wire_size, sizeof(wire_size)) < 0) return -1;
+    return send_all(client_fd, pixels, bytes) < 0 ? -1 : 0;
 }
 
 static int capture_open(void)
@@ -867,6 +877,8 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu,
     DisplayGpuPacket query = {0};
     size_t query_bytes = 0;
     int shared = 0, queried = 0, resize = 0;
+    int frame_rle = 0;
+    AsbFrameBuffer encoded = {0};
     uint64_t session = 0, connected = display_time_ms();
     uint32_t width = 0, height = 0;
     struct timespec next;
@@ -890,6 +902,8 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu,
         }
         if (query_bytes == sizeof(query)) {
             if (query.magic != DISPLAY_GPU_MAGIC || query.version != DISPLAY_GPU_VERSION) break;
+            if (!queried && query.type == DISPLAY_GPU_QUERY)
+                frame_rle = (query.reserved & DISPLAY_GPU_CAP_FRAME_RLE) != 0;
             if (queried) {
                 if (query.type != DISPLAY_GPU_RESIZE ||
                     display_resize(drm_fd, client_fd, config, &query, session, shared && resize,
@@ -897,6 +911,10 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu,
                 query_bytes = 0;
             } else if (query.type != DISPLAY_GPU_QUERY) {
                 break;
+            } else if (query.reserved == DISPLAY_GPU_CAP_FRAME_RLE) {
+                queried = 1;
+                session = query.session;
+                query_bytes = 0;
             } else if (!*gpu || display_gpu_active(*gpu)) {
                 capture_size(ctx.fd, &width, &height);
                 if (*gpu && (!width || !height)) {
@@ -963,9 +981,9 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu,
                 display_config_fallback(drm_fd, config);
             } else if (result > 0) {
                 fallback.mem = (uint8_t *)pixels;
-                if (send_frame(client_fd, &fallback, ++seq) < 0) break;
+                if (send_frame(client_fd, &fallback, ++seq, frame_rle ? &encoded : NULL) < 0) break;
             } else if (drm_acquire_fb(&ctx) == 0) {
-                if (send_frame(client_fd, &ctx, ++seq) < 0) break;
+                if (send_frame(client_fd, &ctx, ++seq, frame_rle ? &encoded : NULL) < 0) break;
             }
         }
         display_gpu_capture_offer(*gpu,capture->gpu,shared);
@@ -991,6 +1009,7 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu,
     if (shared && *gpu && !config->reconnect_until)
         config->reconnect_until = display_time_ms() + 10000;
     display_gpu_disconnect(*gpu);
+    free(encoded.data);
     drm_release_fb(&ctx);
 }
 

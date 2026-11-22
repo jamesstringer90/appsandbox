@@ -27,6 +27,7 @@ Environment:
 --*/
 
 #include "vdd.h"
+#include "../../src/core/frame_rle.h"
 #include "../agent/display_settings.h"
 
 #include <stdlib.h>  /* malloc, free */
@@ -250,6 +251,80 @@ static void VddNotifyGpuMode(VDD_SWAP_PROC* proc, BOOL available)
 static int VddSendAll(AsbConn* c, const char* data, int len)
 {
     return asb_send(c, data, len) == len ? 0 : -1;
+}
+
+/* A zero rectangle count selects the whole frame, including cached resends. */
+static BOOL VddSendFrame(VDD_SWAP_PROC* proc, const D3D11_MAPPED_SUBRESOURCE& mapped,
+                         const RECT* dirty, UINT count, AsbFrameBuffer* encoded)
+{
+    UINT32 fullSize = proc->stride * proc->height;
+    AsbFrameRect regions[VDD_MAX_DIRTY_RECTS];
+    UINT regionCount = 0;
+    UINT64 total = 0;
+    for (UINT i = 0; i < count; ++i) {
+        AsbFrameRect r = { dirty[i].left, dirty[i].top, dirty[i].right, dirty[i].bottom };
+        UINT64 bytes = asb_frame_rect_bytes(&r, proc->width, proc->height);
+        if (bytes) {
+            regions[regionCount++] = r;
+            total += bytes;
+        }
+    }
+    if (count && !regionCount) return TRUE;
+
+    VDD_WIRE_FRAME_HEADER header = {};
+    header.magic = VDD_FRAME_MAGIC;
+    header.width = proc->width;
+    header.height = proc->height;
+    header.stride = proc->stride;
+    header.frame_seq = ASB_FRAME_SEQ_RLE_CAPABLE | ++proc->frameSeq;
+    if (!count || total >= fullSize) {
+        regions[0] = { 0, 0, (LONG)proc->width, (LONG)proc->height };
+        regionCount = 1;
+        total = fullSize;
+    } else {
+        header.dirty_rect_count = regionCount;
+    }
+
+    UINT32 wireSize = (UINT32)total;
+    size_t packed = 0;
+    if (proc->frameRleSupported && asb_frame_reserve(encoded, wireSize - 1)) {
+        for (UINT i = 0; i < regionCount; ++i) {
+            const AsbFrameRect& r = regions[i];
+            const BYTE* start = (const BYTE*)mapped.pData + (size_t)r.top * mapped.RowPitch + r.left * VDD_BPP;
+            size_t bytes = asb_frame_encode(start, mapped.RowPitch, (r.right - r.left) * VDD_BPP,
+                r.bottom - r.top, encoded->data + packed, wireSize - 1 - packed);
+            if (!bytes) { packed = 0; break; }
+            packed += bytes;
+        }
+        if (packed) wireSize = ASB_FRAME_RLE_FLAG | (UINT32)packed;
+    }
+
+    AsbConn* connection = proc->hClientConn;
+    if (VddSendAll(connection, (const char*)&header, sizeof(header)) != 0 ||
+        (header.dirty_rect_count && VddSendAll(connection, (const char*)regions,
+             (int)(regionCount * sizeof(regions[0]))) != 0) ||
+        VddSendAll(connection, (const char*)&wireSize, sizeof(wireSize)) != 0)
+        return FALSE;
+    if (packed) {
+        /* The socket send timeout applies per call. Keep it a stall timeout
+         * even when a large frame takes longer to transfer. */
+        for (size_t offset = 0; offset < packed; ) {
+            int chunk = (int)min(packed - offset, (size_t)(256 * 1024));
+            if (VddSendAll(connection, (const char*)encoded->data + offset, chunk) != 0) return FALSE;
+            offset += chunk;
+        }
+        return TRUE;
+    }
+
+    for (UINT i = 0; i < regionCount; ++i) {
+        const AsbFrameRect& r = regions[i];
+        UINT rowBytes = (r.right - r.left) * VDD_BPP;
+        for (LONG y = r.top; y < r.bottom; ++y) {
+            const BYTE* row = (const BYTE*)mapped.pData + (size_t)y * mapped.RowPitch + r.left * VDD_BPP;
+            if (VddSendAll(connection, (const char*)row, rowBytes) != 0) return FALSE;
+        }
+    }
+    return TRUE;
 }
 
 /* Close a client connection and clear *pc. PC: graceful shutdown(SD_BOTH) then closesocket; ivshmem:
@@ -756,6 +831,8 @@ static void VddPollGpuControl(VDD_SWAP_PROC* proc)
         }
         if (packet.version != DISPLAY_GPU_VERSION) continue;
         if (packet.type == DISPLAY_GPU_QUERY && packet.session && !proc->gpuSession) {
+            proc->frameRleSupported = (packet.reserved & DISPLAY_GPU_CAP_FRAME_RLE) != 0;
+            if (packet.reserved == DISPLAY_GPU_CAP_FRAME_RLE) continue;
             proc->gpuSession = packet.session;
             proc->gpuScreenshotSupported = (packet.reserved & DISPLAY_GPU_CAP_SNAPSHOT) != 0;
             proc->gpuResizeSupported = (packet.reserved & DISPLAY_GPU_CAP_RESIZE) != 0 &&
@@ -1074,6 +1151,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
 
     BOOL bHasFrame = FALSE;
     BOOL bSentFullFrame = FALSE;   /* TRUE after first full frame sent to current client */
+    AsbFrameBuffer encoded = {};
 
 
     /* Main frame acquisition loop */
@@ -1124,6 +1202,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 proc->gpuSession = 0;
                 proc->gpuResizeSupported = FALSE;
                 proc->gpuScreenshotSupported = FALSE;
+                proc->frameRleSupported = FALSE;
                 proc->bGpuCapsSent = FALSE;
                 proc->bGpuPoolFailed = FALSE;
                 ZeroMemory(proc->gpuSlots, sizeof(proc->gpuSlots));
@@ -1207,32 +1286,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 hr = proc->pDeviceContext->Map(proc->pStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
                 if (SUCCEEDED(hr))
                 {
-                    VDD_WIRE_FRAME_HEADER whdr;
-                    UINT32 data_size = proc->stride * proc->height;
-                    BOOL send_ok = TRUE;
-                    AsbConn* s = proc->hClientConn;
-
-                    proc->frameSeq++;
-                    whdr.magic            = VDD_FRAME_MAGIC;
-                    whdr.width            = proc->width;
-                    whdr.height           = proc->height;
-                    whdr.stride           = proc->stride;
-                    whdr.frame_seq        = proc->frameSeq;
-                    whdr.dirty_rect_count = 0;
-
-                    if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
-                        VddSendAll(s, (const char*)&data_size, sizeof(data_size)) != 0) {
-                        send_ok = FALSE;
-                    }
-                    if (send_ok) {
-                        for (UINT row = 0; row < proc->height; row++) {
-                            if (VddSendAll(s, (const char*)((const BYTE*)mapped.pData + row * mapped.RowPitch),
-                                           proc->stride) != 0) {
-                                send_ok = FALSE;
-                                break;
-                            }
-                        }
-                    }
+                    BOOL send_ok = VddSendFrame(proc, mapped, NULL, 0, &encoded);
 
                     proc->pDeviceContext->Unmap(proc->pStagingTex, 0);
 
@@ -1311,7 +1365,6 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                         {
                             RECT dirtyRects[VDD_MAX_DIRTY_RECTS];
                             UINT32 rectCount = 0;
-                            BOOL sendFull = !bSentFullFrame;  /* first frame must be full */
 
                             /* Query dirty rects from IddCx.  If GetDirtyRects returns
                                0 rects OR fails, fall back to sending a full frame.
@@ -1319,98 +1372,20 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                boot the presenter may not supply dirty rect metadata,
                                and skipping would stall updates until the E_PENDING
                                timeout resend path fires ~100ms later. */
-                            if (!sendFull) {
+                            if (bSentFullFrame) {
                                 IDARG_IN_GETDIRTYRECTS drIn = {};
                                 IDARG_OUT_GETDIRTYRECTS drOut = {};
                                 drIn.DirtyRectInCount = VDD_MAX_DIRTY_RECTS;
                                 drIn.pDirtyRects = dirtyRects;
                                 HRESULT drHr = IddCxSwapChainGetDirtyRects(proc->hSwapChain, &drIn, &drOut);
-                                if (SUCCEEDED(drHr) && drOut.DirtyRectOutCount > 0) {
+                                if (SUCCEEDED(drHr) && drOut.DirtyRectOutCount > 0 &&
+                                    drOut.DirtyRectOutCount <= VDD_MAX_DIRTY_RECTS) {
                                     rectCount = drOut.DirtyRectOutCount;
-                                } else {
-                                    sendFull = TRUE;
                                 }
                             }
 
-                            VDD_WIRE_FRAME_HEADER whdr;
-                            BOOL send_ok = TRUE;
-                            AsbConn* s = proc->hClientConn;
-
-                            proc->frameSeq++;
-                            whdr.magic            = VDD_FRAME_MAGIC;
-                            whdr.width            = proc->width;
-                            whdr.height           = proc->height;
-                            whdr.stride           = proc->stride;
-                            whdr.frame_seq        = proc->frameSeq;
-
-                            if (sendFull) {
-                                /* Full frame */
-                                UINT32 data_size = proc->stride * proc->height;
-                                whdr.dirty_rect_count = 0;
-
-                                if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
-                                    VddSendAll(s, (const char*)&data_size, sizeof(data_size)) != 0)
-                                    send_ok = FALSE;
-
-                                if (send_ok) {
-                                    for (UINT row = 0; row < proc->height; row++) {
-                                        if (VddSendAll(s, (const char*)((const BYTE*)mapped.pData + row * mapped.RowPitch),
-                                                       proc->stride) != 0) {
-                                            send_ok = FALSE;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if (send_ok) bSentFullFrame = TRUE;
-                            } else {
-                                /* Dirty rects only */
-                                UINT32 data_size = 0;
-                                UINT32 i;
-
-                                /* Clamp rects to frame bounds and calculate total data size */
-                                for (i = 0; i < rectCount; i++) {
-                                    if (dirtyRects[i].left < 0) dirtyRects[i].left = 0;
-                                    if (dirtyRects[i].top  < 0) dirtyRects[i].top  = 0;
-                                    if (dirtyRects[i].right  > (LONG)proc->width)  dirtyRects[i].right  = proc->width;
-                                    if (dirtyRects[i].bottom > (LONG)proc->height) dirtyRects[i].bottom = proc->height;
-                                    if (dirtyRects[i].left < dirtyRects[i].right &&
-                                        dirtyRects[i].top < dirtyRects[i].bottom) {
-                                        UINT rw = (UINT)(dirtyRects[i].right - dirtyRects[i].left);
-                                        UINT rh = (UINT)(dirtyRects[i].bottom - dirtyRects[i].top);
-                                        data_size += rw * 4 * rh;
-                                    }
-                                }
-
-                                /* All rects zero area after clamping — skip send */
-                                if (data_size == 0) goto skip_send;
-
-                                whdr.dirty_rect_count = rectCount;
-
-                                if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
-                                    VddSendAll(s, (const char*)dirtyRects, rectCount * sizeof(RECT)) != 0 ||
-                                    VddSendAll(s, (const char*)&data_size, sizeof(data_size)) != 0)
-                                    send_ok = FALSE;
-
-                                /* Send per-rect pixel rows */
-                                if (send_ok) {
-                                    for (i = 0; i < rectCount && send_ok; i++) {
-                                        LONG left = dirtyRects[i].left;
-                                        LONG top  = dirtyRects[i].top;
-                                        UINT rw   = (UINT)(dirtyRects[i].right - left);
-                                        UINT rh   = (UINT)(dirtyRects[i].bottom - top);
-                                        if (rw == 0 || rh == 0) continue;
-                                        for (UINT row = 0; row < rh; row++) {
-                                            const BYTE *src = (const BYTE*)mapped.pData
-                                                              + ((UINT)top + row) * mapped.RowPitch
-                                                              + (UINT)left * 4;
-                                            if (VddSendAll(s, (const char*)src, rw * 4) != 0) {
-                                                send_ok = FALSE;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            BOOL send_ok = VddSendFrame(proc, mapped, dirtyRects, rectCount, &encoded);
+                            if (send_ok && !rectCount) bSentFullFrame = TRUE;
 
                             if (!send_ok) {
                                 VddLog("Frame: send failed, disconnecting (seq=%llu)", proc->frameSeq);
@@ -1420,7 +1395,6 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                 VddLog("Frame: first frame sent (%ux%u, %u bytes)",
                                        proc->width, proc->height, proc->stride * proc->height);
                             }
-                        skip_send:;
                         }
 
                         proc->pDeviceContext->Unmap(proc->pStagingTex, 0);
@@ -1467,6 +1441,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             break;
         }
     }
+    free(encoded.data);
     VddStopGpuIo(proc, FALSE);
     VddReleaseGpuTexture(proc, FALSE);
 }

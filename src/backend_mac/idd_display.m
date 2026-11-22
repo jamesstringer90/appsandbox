@@ -48,6 +48,7 @@
 #include <sys/stat.h>
 #include "../../tools/transport/asb_transport.h"   /* ASB_CH_DISPLAY/INPUT/AUDIO/CLIPBOARD[_READER], AsbCursor, ASB_CURSOR_MAGIC */
 #include "../core/protocol.h"
+#include "../core/frame_rle.h"
 
 /* ---- VDD wire protocol (mirror of tools/vdd/vdd.h + src/backend_win/vm_display_idd.c).
  * The VDD pushes the same stream it sends over HvSocket on a
@@ -59,7 +60,6 @@
 #define VDD_MAX_CURSOR_SIZE (4u * 1024u * 1024u)
 #pragma pack(push, 1)
 typedef struct { uint32_t magic, width, height, stride; uint64_t frame_seq; uint32_t dirty_rect_count; } WireFrameHeader;
-typedef struct { int32_t left, top, right, bottom; } WireRect;   /* Windows RECT */
 typedef struct {
     uint32_t magic; int32_t x, y; uint32_t visible, shape_updated, shape_id,
              width, height, pitch, xhot, yhot, cursor_type, shape_data_size;
@@ -325,6 +325,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
 @interface IddDisplayWindow () <NSWindowDelegate>
 @property (nonatomic, copy)   NSString *name;
+@property (nonatomic) BOOL compressionToggleEnabled;  /* AppKit menu binding, updated on the main thread */
 @property (nonatomic, strong) AsbIvshmemTransport *transport;
 @property (nonatomic, strong) IddDisplayView *view;
 @property (nonatomic, strong) NSTimer *timer;
@@ -393,8 +394,10 @@ static __weak IddDisplayWindow *g_mouseOwner;
     pthread_mutex_t   _fbLock;
     BOOL              _matchWindow, _followDisplaySize, _adjustingDisplaySize, _fullscreenSizing;
     BOOL              _resizeSupported, _hasDisplayFrame, _displaySizing;
+    BOOL              _streamSupportsCompression;  /* protected by _inputLock */
     uint32_t          _guestSizeMode, _displayGeneration;
     uint64_t          _displaySession;
+    _Atomic BOOL      _losslessCompression;
     DisplayGpuPacket  _sizeRequest, _lastSizeRequest;
     NSSize            _normalMinSize, _normalMaxSize;
 
@@ -528,6 +531,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
     _transport = transport;
     _stop = 1;
     _displayFd = -1;
+    atomic_init(&_losslessCompression, NO);
     _audioFd = -1;
     _clipWriterFd = -1;
     _clipReaderFd = -1;
@@ -559,7 +563,9 @@ static __weak IddDisplayWindow *g_mouseOwner;
 
 - (void)saveDisplaySettings {
     NSError *error = nil;
-    if (![VmDir saveDisplaySettings:@{@"transmitKeyboardHotkeys": @(_transmitHotkeys ? 1 : 0)} forVm:self.name error:&error])
+    NSDictionary *settings = @{@"transmitKeyboardHotkeys": @(_transmitHotkeys ? 1 : 0),
+                               @"losslessCompression": @(atomic_load(&_losslessCompression) ? 1 : 0)};
+    if (![VmDir saveDisplaySettings:settings forVm:self.name error:&error])
         NSLog(@"IDD [%@]: Could not save display settings: %@", self.name, error);
 }
 
@@ -570,6 +576,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
     if ([value isKindOfClass:NSNumber.class]) _transmitHotkeys = [value boolValue];
     value = settings[@"shareClipboard"];
     if ([value isKindOfClass:NSNumber.class]) atomic_store(&_shareClipboard, [value boolValue]);
+    value = settings[@"losslessCompression"];
+    if ([value isKindOfClass:NSNumber.class]) atomic_store(&_losslessCompression, [value boolValue]);
 }
 
 - (BOOL)clipboardSharingEnabled { return atomic_load(&_shareClipboard); }
@@ -683,6 +691,15 @@ static __weak IddDisplayWindow *g_mouseOwner;
     [self performSelector:@selector(flushDisplaySize) withObject:nil afterDelay:0.15];
 }
 
+- (void)toggleLosslessCompression:(id)sender {
+    (void)sender;
+    pthread_mutex_lock(&_inputLock);
+    BOOL available = !_stop && _displayFd >= 0 && _streamSupportsCompression;
+    if (available) atomic_store(&_losslessCompression, !atomic_load(&_losslessCompression));
+    pthread_mutex_unlock(&_inputLock);
+    if (available) [self saveDisplaySettings];
+}
+
 - (void)populateViewerOptions:(NSMenu *)menu {
     NSMenuItem *mute = [menu addItemWithTitle:@"Mute audio" action:@selector(toggleAudioMute:) keyEquivalent:@""];
     mute.target = self;
@@ -705,6 +722,11 @@ static __weak IddDisplayWindow *g_mouseOwner;
     match.target = self;
     match.state = _matchWindow ? NSControlStateValueOn : NSControlStateValueOff;
     match.enabled = [self canMatchWindowSize];
+    NSMenuItem *compression = [menu addItemWithTitle:@"Lossless compression"
+        action:@selector(toggleLosslessCompression:) keyEquivalent:@""];
+    compression.target = self;
+    compression.state = atomic_load(&_losslessCompression) ? NSControlStateValueOn : NSControlStateValueOff;
+    [compression bind:NSEnabledBinding toObject:self withKeyPath:@"compressionToggleEnabled" options:nil];
     NSMenuItem *sas = [menu addItemWithTitle:@"Send Ctrl+Alt+Del" action:@selector(sendSas:) keyEquivalent:@""];
     sas.target = self;
     sas.enabled = asb_mac_vm_sas_supported(self.vmId);
@@ -1447,8 +1469,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
    accept => a fresh full frame, exactly like reopening the IDD window. Mirrors display_recv_thread. */
 - (void)displayLoop {
     __weak IddDisplayWindow *weakSelf = self;
-    uint8_t *scratch = NULL;
-    size_t   scratchSz = 0;
+    AsbFrameBuffer pixels = {0}, encoded = {0};
     while (!_stop) {
         int fd = [_transport connectChannel:ASB_CH_DISPLAY timeoutMs:2000];
         if (fd < 0) { if (_stop) break; usleep(200000); continue; }
@@ -1462,6 +1483,8 @@ static __weak IddDisplayWindow *g_mouseOwner;
         memset(&_sizeRequest, 0, sizeof(_sizeRequest));
         memset(&_lastSizeRequest, 0, sizeof(_lastSizeRequest));
         pthread_mutex_unlock(&_inputLock);
+        BOOL loggedRle = NO;
+        BOOL compressionEnabled = atomic_load(&_losslessCompression);
         struct timeval sendTimeout = {1, 0};
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout));
         DisplayGpuPacket query = {0};
@@ -1470,6 +1493,7 @@ static __weak IddDisplayWindow *g_mouseOwner;
         query.version = DISPLAY_GPU_VERSION;
         query.session = session;
         query.reserved = DISPLAY_GPU_CAP_RESIZE | DISPLAY_GPU_CAP_IVSHMEM;
+        if (compressionEnabled) query.reserved |= DISPLAY_GPU_CAP_FRAME_RLE;
         if (!idd_wr_full(fd, &query, sizeof(query))) shutdown(fd, SHUT_RDWR);
 
         for (;;) {
@@ -1555,78 +1579,66 @@ static __weak IddDisplayWindow *g_mouseOwner;
             WireFrameHeader fh;
             fh.magic = magic;
             if (![self readDisplay:fd bytes:(uint8_t *)&fh + 4 length:sizeof(fh) - 4 session:session idle:NO]) break;
-            if (fh.width == 0 || fh.height == 0 || fh.stride < fh.width * 4 ||
-                fh.width > 8192 || fh.height > 8192) break;
-
-            /* (Re)allocate the working framebuffer if geometry changed. */
-            BOOL geometryChanged = _fbW != fh.width || _fbH != fh.height;
-            if (geometryChanged || _fbStride != fh.stride || !_fb) {
-                uint8_t *nb = malloc((size_t)fh.stride * fh.height);
-                if (!nb) break;
-                pthread_mutex_lock(&_fbLock);
-                free(_fb); _fb = nb;
-                _fbW = fh.width; _fbH = fh.height; _fbStride = fh.stride;
-                memset(_fb, 0, (size_t)_fbStride * _fbH);
-                pthread_mutex_unlock(&_fbLock);
-            }
-
-            if (fh.dirty_rect_count == 0) {
-                /* Full frame: data_size then height*stride bytes. Read into scratch FIRST (unlocked)
-                   so a multi-MB blocking recv never holds _fbLock: renderTick (main thread) also takes
-                   _fbLock, so holding it across the recv would stall the whole UI for the transfer.
-                   _fbLock is taken only for the memcpy into _fb (as in the dirty-rect path below). */
-                uint32_t data_size = 0;
-                if (![self readDisplay:fd bytes:&data_size length:4 session:session idle:NO]) break;
-                uint32_t want = _fbStride * _fbH;
-                if (data_size != want) break;
-                if (data_size > scratchSz) { free(scratch); scratch = malloc(data_size); scratchSz = data_size; if (!scratch) break; }
-                if (![self readDisplay:fd bytes:scratch length:(int)data_size session:session idle:NO]) break;
-                pthread_mutex_lock(&_fbLock);
-                memcpy(_fb, scratch, data_size);
-                _fbSeq++;
-                pthread_mutex_unlock(&_fbLock);
-            } else {
-                /* Dirty rects: rects[], data_size, then per-rect packed rows. */
-                if (fh.dirty_rect_count > VDD_MAX_DIRTY) break;
-                WireRect rects[VDD_MAX_DIRTY];
-                if (![self readDisplay:fd bytes:rects length:(int)(fh.dirty_rect_count * sizeof(WireRect)) session:session idle:NO]) break;
-                uint32_t data_size = 0;
-                if (![self readDisplay:fd bytes:&data_size length:4 session:session idle:NO]) break;
-                if (data_size > scratchSz) { free(scratch); scratch = malloc(data_size); scratchSz = data_size; if (!scratch) break; }
-                if (![self readDisplay:fd bytes:scratch length:(int)data_size session:session idle:NO]) break;
-                pthread_mutex_lock(&_fbLock);
-                size_t off = 0;
-                for (uint32_t i = 0; i < fh.dirty_rect_count; i++) {
-                    int left = rects[i].left, top = rects[i].top, right = rects[i].right, bot = rects[i].bottom;
-                    if (left < 0) left = 0; if (top < 0) top = 0;
-                    if (right > (int)_fbW) right = (int)_fbW;
-                    if (bot > (int)_fbH) bot = (int)_fbH;
-                    if (left >= right || top >= bot) continue;
-                    uint32_t rw = (uint32_t)(right - left), rh = (uint32_t)(bot - top);
-                    for (uint32_t row = 0; row < rh; row++) {
-                        if (off + rw * 4 > data_size) { i = fh.dirty_rect_count; break; }
-                        memcpy(_fb + (size_t)(top + row) * _fbStride + (size_t)left * 4,
-                               scratch + off, rw * 4);
-                        off += rw * 4;
-                    }
+            /* A fresh connection negotiates the new setting and starts with a full frame. */
+            BOOL supportsCompression = (fh.frame_seq & ASB_FRAME_SEQ_RLE_CAPABLE) != 0;
+            if (supportsCompression && compressionEnabled != atomic_load(&_losslessCompression)) break;
+            if (fh.width > 8192 || fh.height > 8192 || fh.dirty_rect_count > VDD_MAX_DIRTY) break;
+            AsbFrameRect rects[VDD_MAX_DIRTY];
+            if (fh.dirty_rect_count && ![self readDisplay:fd bytes:rects
+                length:(int)(fh.dirty_rect_count * sizeof(rects[0])) session:session idle:NO]) break;
+            uint32_t wireSize;
+            if (![self readDisplay:fd bytes:&wireSize length:4 session:session idle:NO]) break;
+            uint32_t dataSize = asb_frame_payload_bytes(wireSize, fh.width, fh.height, fh.stride,
+                rects, fh.dirty_rect_count, 8192u * 8192u * ASB_FRAME_PIXEL_BYTES);
+            if (!dataSize || !asb_frame_reserve(&pixels, dataSize)) break;
+            if (wireSize & ASB_FRAME_RLE_FLAG) {
+                uint32_t packed = wireSize & ~ASB_FRAME_RLE_FLAG;
+                if (!compressionEnabled || !asb_frame_reserve(&encoded, packed) ||
+                    ![self readDisplay:fd bytes:encoded.data length:(int)packed session:session idle:NO] ||
+                    !asb_frame_decode(encoded.data, packed, pixels.data, dataSize)) break;
+                if (!loggedRle) {
+                    NSLog(@"IDD [%@]: Lossless frame compression active (%u bytes to %u)", self.name, dataSize, packed);
+                    loggedRle = YES;
                 }
-                _fbSeq++;
-                pthread_mutex_unlock(&_fbLock);
+            } else if (![self readDisplay:fd bytes:pixels.data length:(int)dataSize session:session idle:NO]) {
+                break;
             }
+
+            /* Receive and decode off the render lock. Publish only a complete frame. */
+            BOOL geometryChanged = _fbW != fh.width || _fbH != fh.height;
+            uint8_t *replacement = NULL;
+            if (geometryChanged || _fbStride != fh.stride || !_fb) {
+                replacement = calloc(fh.height, fh.stride);
+                if (!replacement) break;
+            }
+            pthread_mutex_lock(&_fbLock);
+            if (replacement) {
+                free(_fb); _fb = replacement;
+                _fbW = fh.width; _fbH = fh.height; _fbStride = fh.stride;
+            }
+            asb_frame_apply(_fb, _fbStride, pixels.data, fh.stride, fh.width, fh.height,
+                            rects, fh.dirty_rect_count);
+            _fbSeq++;
+            pthread_mutex_unlock(&_fbLock);
             pthread_mutex_lock(&_curLock);
             _displayReady = YES;
             pthread_mutex_unlock(&_curLock);
             pthread_mutex_lock(&_inputLock);
             BOOL firstFrame = !_hasDisplayFrame;
             _hasDisplayFrame = YES;
+            BOOL compressionChanged = _streamSupportsCompression != supportsCompression;
+            _streamSupportsCompression = supportsCompression;
             pthread_mutex_unlock(&_inputLock);
-            if (firstFrame || geometryChanged) dispatch_async(dispatch_get_main_queue(), ^{
+            if (firstFrame || geometryChanged || compressionChanged) dispatch_async(dispatch_get_main_queue(), ^{
                 IddDisplayWindow *owner = weakSelf;
                 if (!owner) return;
                 pthread_mutex_lock(&owner->_inputLock);
                 BOOL current = owner->_displaySession == session && owner->_displayFd == fd;
                 pthread_mutex_unlock(&owner->_inputLock);
-                if (current) [owner updateDisplaySize:geometryChanged];
+                if (current) {
+                    if (compressionChanged) owner.compressionToggleEnabled = supportsCompression;
+                    if (firstFrame || geometryChanged) [owner updateDisplaySize:geometryChanged];
+                }
             });
         }
 
@@ -1639,13 +1651,18 @@ static __weak IddDisplayWindow *g_mouseOwner;
         if (_displayFd == fd) _displayFd = -1;   /* unpublish before close so teardown won't shutdown a reused fd */
         _resizeSupported = NO;
         _hasDisplayFrame = NO;
+        _streamSupportsCompression = NO;
         memset(&_sizeRequest, 0, sizeof(_sizeRequest));
         pthread_mutex_unlock(&_inputLock);
-        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf updateDisplaySize:NO]; });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            weakSelf.compressionToggleEnabled = NO;
+            [weakSelf updateDisplaySize:NO];
+        });
         close(fd);   /* tears the pump down + releases the slot; reconnect = a fresh VDD full frame */
         if (!_stop) usleep(100000);
     }
-    free(scratch);
+    free(encoded.data);
+    free(pixels.data);
 }
 
 /* Own ch3 on the worker: drain the main thread's input queue, reconnect on failure,

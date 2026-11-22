@@ -432,6 +432,12 @@ int do_prefetch_repo(const wchar_t *tag, const wchar_t *mesa_tag,
         swprintf_s(protocol_src, MAX_PATH, L"%s\\src\\core\\protocol.h", extracted_root);
         swprintf_s(dst, MAX_PATH, L"%s\\protocol.h", out_agent);
         if (u_cp_file(protocol_src, dst) != 0) goto failed;
+        /* Older guest source archives predate negotiated frame compression. */
+        swprintf_s(protocol_src, MAX_PATH, L"%s\\src\\core\\frame_rle.h", extracted_root);
+        if (GetFileAttributesW(protocol_src) != INVALID_FILE_ATTRIBUTES) {
+            swprintf_s(dst, MAX_PATH, L"%s\\frame_rle.h", out_agent);
+            if (u_cp_file(protocol_src, dst) != 0) goto failed;
+        }
         wchar_t gnome_src[MAX_PATH];
         swprintf_s(gnome_src, MAX_PATH,
                    L"%s\\gnome\\appsandbox-pointer@appsandbox", agent_src);

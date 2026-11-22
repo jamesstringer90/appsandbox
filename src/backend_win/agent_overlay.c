@@ -259,9 +259,9 @@ static HRESULT STDMETHODCALLTYPE message_invoke(ICoreWebView2WebMessageReceivedE
     else if (!wcscmp(text,L"exit_fullscreen") && s->fullscreen && !IsRectEmpty(&s->exit_bounds))
         PostMessageW(s->notify,s->fullscreen_message,FALSE,0);
     else if (s->fullscreen && !IsRectEmpty(&s->exit_bounds) && !wcscmp(text,L"viewer_options"))
-        PostMessageW(s->notify,s->options_message,5,0);
+        PostMessageW(s->notify,s->options_message,(WPARAM)-1,0);
     else if (s->fullscreen && !IsRectEmpty(&s->options_bounds) && !wcsncmp(text,L"viewer_option:",14) &&
-        text[14]>=L'0' && text[14]<=L'4' && !text[15])
+        text[14]>=L'0' && text[14]<=L'5' && !text[15])
         PostMessageW(s->notify,s->options_message,text[14]-L'0',0);
     else if (!wcscmp(text,L"take_control") && active(s)) {
         s->state=ASB_CONTROL_USER;

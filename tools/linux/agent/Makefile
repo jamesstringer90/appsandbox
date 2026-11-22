@@ -35,6 +35,7 @@ appsandbox-agent: appsandbox-agent.c
 
 # Display daemon needs libdrm for drmModeGetFB2 + drmPrimeHandleToFD.
 appsandbox-display: appsandbox-display.c display-gpu.c display-gpu.h $(CAPTURE_DIR)/asb_capture_socket.c $(CAPTURE_DIR)/asb_capture_socket.h $(CAPTURE_DIR)/asb_capture_service.c $(CAPTURE_DIR)/asb_capture_service.h $(CAPTURE_DIR)/asb_automation.h $(wildcard protocol.h ../../../src/core/protocol.h) \
+                    $(wildcard frame_rle.h ../../../src/core/frame_rle.h) \
                     $(wildcard ../asb_drm/asb_drm_uapi.h ../asb_drm-src/asb_drm_uapi.h) \
                     $(wildcard ../dxgkrnl/.source/src/include/uapi/misc/d3dkmthk.h ../dxgkrnl-src/include/uapi/misc/d3dkmthk.h)
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags libdrm DirectX-Headers) \
