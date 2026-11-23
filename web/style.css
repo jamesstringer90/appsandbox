@@ -120,7 +120,7 @@ input[type="text"] { width: 100%; }
 input[type="number"] { width: 80px; }
 input[type="password"] { width: 100%; }
 select { min-width: 80px; }
-#gpu-mode, #edit-gpu-mode { max-width: 100%; text-overflow: ellipsis; }
+#gpu-mode, #edit-gpu-mode, #edid-source { max-width: 100%; text-overflow: ellipsis; }
 
 .input-sm { width: 80px !important; }
 .input-md { width: 140px !important; }

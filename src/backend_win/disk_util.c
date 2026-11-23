@@ -974,6 +974,15 @@ BOOL ensure_ssh_msi_cached(wchar_t *msi_path_out, int max_chars)
     return FALSE;
 }
 
+static BOOL stage_monitor_edid(const wchar_t *staging, const AsbEdid *edid, wchar_t path[MAX_PATH])
+{
+    FILE *file;
+    if (swprintf_s(path, MAX_PATH, L"%s\\monitor.edid", staging) < 0 ||
+        _wfopen_s(&file, path, L"wb")) return FALSE;
+    BOOL ok = fwrite(edid->bytes, 1, edid->size, file) == edid->size;
+    return fclose(file) == 0 && ok;
+}
+
 HRESULT iso_create_resources(const wchar_t *iso_path,
                               const wchar_t *vm_name,
                               const wchar_t *admin_user,
@@ -983,7 +992,7 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
                               BOOL test_mode,
                               BOOL ssh_enabled,
                               BOOL nat_network,
-                              const wchar_t *lang)
+                              const wchar_t *lang, const AsbEdid *edid)
 {
     wchar_t dir[MAX_PATH];
     wchar_t staging[MAX_PATH];
@@ -1025,6 +1034,11 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
     stage_agent_and_setup(staging, res_dir, ssh_enabled, nat_network);
 
     /* Build ISO from staging directory */
+    if (!stage_monitor_edid(staging, edid, file_path)) {
+        SecureZeroMemory(b64_pass, sizeof(b64_pass));
+        remove_staging_dir(staging);
+        return E_FAIL;
+    }
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     hr = create_iso_from_dir(iso_path, staging, L"APPSETUP");
     CoUninitialize();
@@ -1338,7 +1352,7 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        const wchar_t *res_dir,
                                        BOOL ssh_enabled,
                                        BOOL nat_network,
-                                       const wchar_t *lang)
+                                       const wchar_t *lang, const AsbEdid *edid)
 {
     wchar_t dir[MAX_PATH];
     wchar_t staging[MAX_PATH];
@@ -1377,6 +1391,11 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
 
     /* Agent exe + setup.cmd + SSH MSI */
     stage_agent_and_setup(staging, res_dir, ssh_enabled, nat_network);
+    /* An empty file explicitly selects Built-in when cloning a template. */
+    if (!stage_monitor_edid(staging, edid, file_path)) {
+        remove_staging_dir(staging);
+        return E_FAIL;
+    }
 
     /* Build ISO */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -1566,7 +1585,7 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
                             const wchar_t *staging_dir,
                             const wchar_t *res_dir,
                             const void *gpu_shares_ptr,
-                            BOOL ssh_enabled)
+                            BOOL ssh_enabled, const AsbEdid *edid)
 {
     const GpuDriverShareList *gpu_shares = (const GpuDriverShareList *)gpu_shares_ptr;
     FILE *mf;
@@ -1577,6 +1596,15 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
         return -1;
 
     get_exe_dir(exe_dir, MAX_PATH);
+
+    if (edid->size) {
+        if (!stage_monitor_edid(staging_dir, edid, src) ||
+            fwprintf(mf, L"%s\t\\Windows\\AppSandbox\\monitor.edid\n", src) < 0) {
+            fclose(mf);
+            return -1;
+        }
+        count++;
+    }
 
     /* 1. Staging files: unattend.xml, setup.cmd, SetupComplete.cmd */
     swprintf_s(src, MAX_PATH, L"%s\\unattend.xml", staging_dir);
@@ -1821,8 +1849,8 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
         }
     }
 
-    fclose(mf);
-    return count;
+    BOOL written = !ferror(mf);
+    return fclose(mf) == 0 && written ? count : -1;
 }
 
 /* ---- Language JSON helpers ---- */

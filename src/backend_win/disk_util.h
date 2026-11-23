@@ -2,6 +2,7 @@
 #define DISK_UTIL_H
 
 #include <windows.h>
+#include "edid.h"
 
 /* Compile-time target architecture. Build arch == host arch == guest arch
    (x64->x64->x64, ARM64->ARM->ARM; no cross-arch), so one compile-time flag
@@ -51,7 +52,7 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
                               BOOL test_mode,
                               BOOL ssh_enabled,
                               BOOL nat_network,
-                              const wchar_t *lang);
+                              const wchar_t *lang, const AsbEdid *edid);
 
 /* Create a resources ISO for an instance created from a template.
    Contains unattend.xml (not autounattend.xml) for post-sysprep mini-setup
@@ -63,7 +64,7 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        const wchar_t *res_dir,
                                        BOOL ssh_enabled,
                                        BOOL nat_network,
-                                       const wchar_t *lang);
+                                       const wchar_t *lang, const AsbEdid *edid);
 
 /* ---- VHDX-First VM Creation (no resources ISO) ---- */
 
@@ -101,7 +102,7 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
                             const wchar_t *staging_dir,
                             const wchar_t *res_dir,
                             const void *gpu_shares,
-                            BOOL ssh_enabled);
+                            BOOL ssh_enabled, const AsbEdid *edid);
 
 /* Ensure OpenSSH MSI is cached locally (downloads if needed).
    Returns TRUE if the MSI is available at the returned path. */

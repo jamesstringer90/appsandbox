@@ -201,6 +201,7 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
   <ItemGroup>
     <ClCompile Include="src\app_win\main.c" />
     <ClCompile Include="src\app_win\ui.c" />
+    <ClCompile Include="src\app_win\monitor_edid.c" />
     <ClCompile Include="src\backend_win\vm_display.c" />
     <ClCompile Include="src\backend_win\vm_display_idd.c" />
     <ClCompile Include="src\backend_win\agent_overlay.c" />
@@ -216,6 +217,7 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
   <ItemGroup>
     <ClInclude Include="src\app_win\resource.h" />
     <ClInclude Include="src\app_win\ui.h" />
+    <ClInclude Include="src\app_win\monitor_edid.h" />
     <ClInclude Include="src\backend_win\asb_core.h" />
     <ClInclude Include="src\backend_win\asb_display.h" />
     <ClInclude Include="src\app_win\webview2_bridge.h" />

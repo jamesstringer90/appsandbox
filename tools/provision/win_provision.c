@@ -398,6 +398,10 @@ int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name, int from_medi
             "set ISODRV=\r\n"
             "for %%d in (D E F G H I J) do @if exist %%d:\\drivers\\AppSandboxVDD.inf set ISODRV=%%d:\r\n"
             "if \"%ISODRV%\"==\"\" goto :done\r\n"
+            "if exist \"%ISODRV%\\monitor.edid\" (\r\n"
+            "    copy /B /Y \"%ISODRV%\\monitor.edid\" \"%SystemRoot%\\AppSandbox\\monitor.edid\" >> \"%LOG%\" 2>&1\r\n"
+            "    if errorlevel 1 exit /b 1\r\n"
+            ")\r\n"
             "set DRVDIR=%ISODRV%\\drivers\r\n", f);
     } else {
         fputs("set DRVDIR=%SystemRoot%\\AppSandbox\\drivers\r\n", f);

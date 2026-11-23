@@ -156,6 +156,7 @@ window.onHostMessage = function(msg) {
         case 'snapListChanged': break;
         case 'log':           appendLog(msg.message); break;
         case 'hostInfo':      updateHostInfo(msg); break;
+        case 'edidSources':   populateEdidSources(msg.monitors); break;
         case 'browseResult':  onBrowseResult(msg.path); break;
         case 'diskDirectoryBrowseResult': onDiskDirectoryBrowseResult(msg.path); break;
         case 'diskSpace':     onDiskSpace(msg); break;
@@ -275,6 +276,14 @@ function setGpuSelection(id, selection) {
     select.value = gpuSelectionValue(selection);
     if (select.selectedIndex < 0) select.value = '1';
     updateGpuTitle(select);
+}
+
+function populateEdidSources(monitors) {
+    var select = document.getElementById('edid-source');
+    select.options.length = 1;
+    monitors.forEach(function(monitor) {
+        select.add(new Option(monitor.name, monitor.id));
+    });
 }
 
 function populateGpus(gpus) {
@@ -714,6 +723,7 @@ function gatherConfig() {
         cpuCores:    document.getElementById('cpu-cores').valueAsNumber,
         gpuMode:     gpu.gpuMode,
         gpuId:       gpu.gpuId,
+        edidSource:  hostBridge.isMac ? undefined : document.getElementById('edid-source').value,
         networkMode: hostBridge.isMac ? 1 : parseInt(document.getElementById('net-mode').value),
         netAdapter:  hostBridge.isMac ? '' : document.getElementById('net-adapter').value,
         adminUser:   document.getElementById('admin-user').value.trim(),
@@ -882,6 +892,8 @@ function openCreateModal() {
     selectTemplate('', templateDefaultLabel());
     document.getElementById('hdd-size').value = 64;
     setGpuSelection('gpu-mode', { gpuMode: 1 });
+    populateEdidSources([]);
+    if (!hostBridge.isMac) sendCmd('getEdidSources');
     document.getElementById('net-mode').value = '1';
     document.getElementById('admin-user').value = 'user';
     document.getElementById('admin-pass').value = 'test123';

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: (GPL-2.0 OR MIT)
 /*
- * AppSandbox virtual DRM driver — VIRTUAL connector + synthesized EDID.
+ * AppSandbox virtual DRM driver — VIRTUAL connector with a provisioned or built-in EDID.
  *
- * Reports a single "monitor" with manufacturer code "ASB", monitor name
+ * The built-in descriptor uses manufacturer code "ASB", monitor name
  * "AppSandbox" and a preferred mode determined by module params. The mode
  * list returned by get_modes() comes from drm_cvt_mode() so userspace can
  * pick smaller resolutions if it wants.
@@ -12,6 +12,7 @@
  */
 
 #include <linux/capability.h>
+#include <linux/firmware.h>
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
@@ -19,6 +20,7 @@
 #include <drm/drm_edid.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 
 #include "asb_drm.h"
@@ -181,9 +183,6 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 	refresh = asb->display_refresh;
 	mutex_unlock(&asb->display_lock);
 
-	drm_connector_update_edid_property(connector,
-	                                   (const struct edid *)asb->edid);
-
 	m = drm_cvt_mode(connector->dev, roundup(width, 8), height, refresh,
 	                 false, false, false);
 	if (m) {
@@ -324,12 +323,29 @@ static const struct drm_connector_funcs asb_connector_funcs = {
  * Init
  * -------------------------------------------------------------------------- */
 
+static int asb_set_monitor_edid(struct asb_device *asb)
+{
+	const struct firmware *fw;
+
+	if (!firmware_request_nowarn(&fw, "appsandbox/monitor.edid", asb->drm.dev)) {
+		const struct drm_edid *edid = drm_edid_alloc(fw->data, fw->size);
+		release_firmware(fw);
+		if (edid && drm_edid_valid(edid)) {
+			int ret = drm_edid_connector_update(&asb->connector, edid);
+			drm_edid_free(edid);
+			return ret;
+		}
+		drm_edid_free(edid);
+		drm_warn(&asb->drm, "Invalid provisioned monitor EDID, using built-in EDID\n");
+	}
+	asb_build_edid(asb);
+	return drm_connector_update_edid_property(&asb->connector, (const struct edid *)asb->edid);
+}
+
 int asb_connector_init(struct asb_device *asb)
 {
 	struct drm_device *drm = &asb->drm;
 	int ret;
-
-	asb_build_edid(asb);
 
 	ret = drm_connector_init(drm, &asb->connector,
 	                         &asb_connector_funcs,
@@ -337,6 +353,11 @@ int asb_connector_init(struct asb_device *asb)
 	if (ret)
 		return ret;
 	drm_connector_helper_add(&asb->connector, &asb_connector_helper_funcs);
+
+	/* Both descriptors are fixed for this VM. Window resizing changes modes only. */
+	ret = asb_set_monitor_edid(asb);
+	if (ret)
+		return ret;
 
 	asb->connector.status = connector_status_connected;
 	asb->connector.interlace_allowed = false;

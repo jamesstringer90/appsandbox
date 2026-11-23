@@ -36,6 +36,7 @@ Environment:
 #include "Trace.h"
 #include "../transport/asb_transport.h"   /* AsbConn — host connection (AF_HYPERV on PC, ivshmem on Mac) */
 #include "../../src/core/protocol.h"
+#include "../../src/core/edid.h"
 #include "../transport/asb_automation.h"
 
 /* ============================================================================
@@ -304,6 +305,7 @@ typedef struct _VDD_DEVICE_CONTEXT {
     volatile LONG       stopping;
     volatile LONG       reconfiguring;
     BOOL                hdrSupported;
+    AsbEdid             monitorEdid;
     BOOL                swapChanging;
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,
