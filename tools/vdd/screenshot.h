@@ -18,11 +18,12 @@ enum {
 typedef struct {
     HANDLE hTerminateEvent,hScreenshotThread,sharedHandle;
     SRWLOCK screenshotLock;
-    volatile LONG screenshotRequested,offered,width,height,screenshotError;
+    volatile LONG screenshotRequested,offered,width,height,format,screenshotError;
     volatile LONG handoffState;
     DisplayGpuPacket handoff;
     ULONGLONG handoffDeadline;
     UINT mirrorWidth,mirrorHeight;
+    DXGI_FORMAT mirrorFormat;
     UINT64 screenshotGeneration,screenshotCopyGeneration;
     ID3D11Device *pDevice;
     ID3D11DeviceContext *pDeviceContext;

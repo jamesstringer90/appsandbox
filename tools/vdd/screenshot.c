@@ -6,6 +6,7 @@
 #include "../transport/asb_capture_service.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #pragma comment(lib,"d3d11.lib")
 #pragma comment(lib,"dxguid.lib")
@@ -14,6 +15,39 @@ typedef struct {
     AsbVddScreenshot *screenshot;
     ULONGLONG deadline;
 } ScreenshotClient;
+
+static INIT_ONCE scrgb_lut_once = INIT_ONCE_STATIC_INIT;
+static BYTE scrgb_lut[65536];
+
+static BOOL CALLBACK init_scrgb_lut(PINIT_ONCE once,PVOID argument,PVOID *context)
+{
+    (void)once;
+    (void)argument;
+    (void)context;
+    for (UINT i = 1; i <= 0x7c00; ++i) {
+        UINT exponent = i >> 10, fraction = i & 1023;
+        if (i >= 0x3c00) scrgb_lut[i] = 255;
+        else {
+            float linear = ldexpf((float)(exponent ? 1024 + fraction : fraction),
+                                  exponent ? (int)exponent - 25 : -24);
+            float srgb = linear <= 0.0031308f ? 12.92f * linear :
+                         1.055f * powf(linear, 1.0f / 2.4f) - 0.055f;
+            scrgb_lut[i] = (BYTE)(255 * srgb + 0.5f);
+        }
+    }
+    return TRUE;
+}
+
+static void scrgb_to_bgra(BYTE *target,const void *pixels,UINT width)
+{
+    const UINT16 *source = pixels;
+    for (UINT x = 0; x < width; ++x, source += 4, target += 4) {
+        target[0] = scrgb_lut[source[2]];
+        target[1] = scrgb_lut[source[1]];
+        target[2] = scrgb_lut[source[0]];
+        target[3] = 255;
+    }
+}
 
 static int receive_bytes(void *context,void *connection,void *buffer,size_t size)
 {
@@ -54,7 +88,7 @@ static void release_images(AsbVddScreenshot *s)
     s->sharedHandle=NULL;s->mirrorWidth=s->mirrorHeight=0;
 }
 
-static HRESULT prepare(AsbVddScreenshot *s,UINT width,UINT height)
+static HRESULT prepare(AsbVddScreenshot *s,UINT width,UINT height,DXGI_FORMAT format)
 {
     HRESULT hr=S_OK;
     if (!s->readerDevice) {
@@ -73,12 +107,13 @@ static HRESULT prepare(AsbVddScreenshot *s,UINT width,UINT height)
             IDXGIDevice_Release(dxgi);
         }
     }
-    if (s->mirror && s->mirrorWidth==width && s->mirrorHeight==height) return S_OK;
+    if (s->mirror && s->mirrorWidth==width && s->mirrorHeight==height &&
+        s->mirrorFormat==format) return S_OK;
     AcquireSRWLockExclusive(&s->screenshotLock);
     release_images(s);
     D3D11_TEXTURE2D_DESC desc={0};
     desc.Width=width;desc.Height=height;desc.MipLevels=desc.ArraySize=1;
-    desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;desc.SampleDesc.Count=1;
+    desc.Format=format;desc.SampleDesc.Count=1;
     desc.Usage=D3D11_USAGE_DEFAULT;
     desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;
     desc.MiscFlags=D3D11_RESOURCE_MISC_SHARED_NTHANDLE|D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
@@ -97,7 +132,7 @@ static HRESULT prepare(AsbVddScreenshot *s,UINT width,UINT height)
     if (SUCCEEDED(hr)) hr=ID3D11Device_CreateTexture2D(s->readerDevice,&desc,NULL,&s->readback);
     if (device) ID3D11Device1_Release(device);
     if (resource) IDXGIResource1_Release(resource);
-    if (SUCCEEDED(hr)) { s->mirrorWidth=width;s->mirrorHeight=height; }
+    if (SUCCEEDED(hr)) { s->mirrorWidth=width;s->mirrorHeight=height;s->mirrorFormat=format; }
     else release_images(s);
     InterlockedExchange(&s->offered,0);
     ReleaseSRWLockExclusive(&s->screenshotLock);
@@ -112,14 +147,15 @@ void asb_vdd_screenshot_frame(AsbVddScreenshot *s,ID3D11Texture2D *source,
     D3D11_TEXTURE2D_DESC desc={0};
     if (!s->width || wanted) {
         ID3D11Texture2D_GetDesc(source,&desc);
-        InterlockedExchange(&s->width,(LONG)desc.Width);
+        InterlockedExchange(&s->format,(LONG)desc.Format);
         InterlockedExchange(&s->height,(LONG)desc.Height);
+        InterlockedExchange(&s->width,(LONG)desc.Width);
     }
     if (!wanted || InterlockedCompareExchange(&s->offered,0,0) ||
         !TryAcquireSRWLockExclusive(&s->screenshotLock)) return;
     if (s->screenshotRequested && !s->screenshotError && !s->offered && s->mirror &&
         (!generation || generation==s->screenshotGeneration) &&
-        s->mirrorWidth==desc.Width && s->mirrorHeight==desc.Height &&
+        s->mirrorWidth==desc.Width && s->mirrorHeight==desc.Height && s->mirrorFormat==desc.Format &&
         IDXGIKeyedMutex_AcquireSync(s->writerMutex,0,0)==S_OK) {
         ID3D11DeviceContext_CopyResource(s->pDeviceContext,
             (ID3D11Resource *)s->mirror,(ID3D11Resource *)source);
@@ -142,7 +178,7 @@ void asb_vdd_screenshot_poll(AsbVddScreenshot *s,ID3D11Texture2D *cached,
     ID3D11Texture2D *pending,IDXGIKeyedMutex *mutex,ID3D11Texture2D *latest,
     UINT64 sequence,BOOL shared,UINT64 session,UINT slot)
 {
-    if (!sequence || !cached || InterlockedCompareExchange(&s->screenshotError,0,0) ||
+    if (!sequence || (!shared && !cached) || InterlockedCompareExchange(&s->screenshotError,0,0) ||
         !InterlockedCompareExchange(&s->screenshotRequested,0,0) ||
         InterlockedCompareExchange(&s->offered,0,0)) return;
     if (!shared) asb_vdd_screenshot_frame(s,cached,sequence,FALSE,0);
@@ -226,9 +262,10 @@ static DWORD capture(AsbVddScreenshot *s,DWORD timeout,AsbScreenshotReply *reply
         if (failure) { error=failure;break; }
         UINT width=(UINT)InterlockedCompareExchange(&s->width,0,0);
         UINT height=(UINT)InterlockedCompareExchange(&s->height,0,0);
-        if (!width || !height) { WaitForSingleObject(s->hTerminateEvent,2);continue; }
+        DXGI_FORMAT format=(DXGI_FORMAT)InterlockedCompareExchange(&s->format,0,0);
+        if (!width || !height || !format) { WaitForSingleObject(s->hTerminateEvent,2);continue; }
         if (width>7680 || height>4320) { error=ERROR_INVALID_DATA;break; }
-        HRESULT hr=prepare(s,width,height);
+        HRESULT hr=prepare(s,width,height,format);
         if (FAILED(hr)) { error=(DWORD)hr;break; }
         InterlockedExchange(&s->screenshotRequested,1);
         hr=IDXGIKeyedMutex_AcquireSync(s->readerMutex,1,0);
@@ -256,12 +293,22 @@ static DWORD capture(AsbVddScreenshot *s,DWORD timeout,AsbScreenshotReply *reply
             if (hr!=DXGI_ERROR_WAS_STILL_DRAWING) break;
         } while (GetTickCount64()<deadline && WaitForSingleObject(s->hTerminateEvent,2)!=WAIT_OBJECT_0);
         if (FAILED(hr)) { error=hr==DXGI_ERROR_WAS_STILL_DRAWING?ERROR_TIMEOUT:(DWORD)hr;break; }
-        if (!mapped.pData || mapped.RowPitch<frame.stride) {
+        BOOL hdr = format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (!mapped.pData || mapped.RowPitch < frame.stride * (hdr ? 2 : 1)) {
             ID3D11DeviceContext_Unmap(s->readerContext,(ID3D11Resource *)s->readback,0);
             error=ERROR_INVALID_DATA;
             break;
         }
-        error=asb_capture_pack(mapped.pData,mapped.RowPitch,&frame,pixels);
+        if (hdr) {
+            *pixels = malloc(frame.data_size);
+            error = *pixels ? ERROR_SUCCESS : ERROR_OUTOFMEMORY;
+            if (*pixels) {
+                InitOnceExecuteOnce(&scrgb_lut_once,init_scrgb_lut,NULL,NULL);
+                for (UINT row = 0; row < frame.height; ++row)
+                    scrgb_to_bgra(*pixels + row * frame.stride,
+                        (const BYTE*)mapped.pData + row * mapped.RowPitch,frame.width);
+            }
+        } else error=asb_capture_pack(mapped.pData,mapped.RowPitch,&frame,pixels);
         ID3D11DeviceContext_Unmap(s->readerContext,(ID3D11Resource *)s->readback,0);
         if (!error) *reply=frame;
         break;
