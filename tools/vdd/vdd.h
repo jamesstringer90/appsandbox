@@ -116,7 +116,7 @@ static const ResolutionEntry g_SupportedResolutions[] = {
 
 static const UINT g_NumResolutions = ARRAYSIZE(g_SupportedResolutions);
 static const UINT VDD_MAX_MODES = g_NumResolutions + 1;
-static const UINT VDD_EDID_BYTES = 128 * (1 + (VDD_MAX_MODES + 4) / 5);
+static const UINT VDD_EDID_BYTES = 128 * (2 + (VDD_MAX_MODES + 4) / 5);
 
 struct RefreshRateEntry {
     UINT numerator;
@@ -214,6 +214,7 @@ typedef struct _VDD_SWAP_PROC {
     UINT                width;
     UINT                height;
     UINT                stride;
+    DXGI_FORMAT         format;
     IDDCX_SWAPCHAIN     hSwapChain;
     HANDLE              hAvailableEvent;    /* from pInArgs->hNextSurfaceAvailable */
     HANDLE              hTerminateEvent;
@@ -303,6 +304,7 @@ typedef struct _VDD_DEVICE_CONTEXT {
     volatile LONG       fullModes;
     volatile LONG       stopping;
     volatile LONG       reconfiguring;
+    BOOL                hdrSupported;
     BOOL                swapChanging;
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,
@@ -329,6 +331,7 @@ struct MonitorContextWrapper
     ResolutionEntry modes[VDD_MAX_MODES];
     UINT modeCount;
     BOOL matchWindow;
+    BOOL hdr;
 };
 
 WDF_DECLARE_CONTEXT_TYPE(MonitorContextWrapper);

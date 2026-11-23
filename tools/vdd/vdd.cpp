@@ -98,7 +98,7 @@ static void VddWrite16(BYTE* data, UINT value)
     data[1] = (BYTE)(value >> 8);
 }
 
-static UINT VddBuildEdid(BYTE* edid, const ResolutionEntry* modes, UINT count)
+static UINT VddBuildEdid(BYTE* edid, const ResolutionEntry* modes, UINT count, BOOL hdr)
 {
     UINT blocks = (count + 4) / 5;
     UINT width = modes[0].width, height = modes[0].height;
@@ -123,7 +123,22 @@ static UINT VddBuildEdid(BYTE* edid, const ResolutionEntry* modes, UINT count)
         dtd[3] = 0x10;
         edid[24] &= ~2;
     }
-    edid[126] = (BYTE)blocks;
+    if (hdr) {
+        static const BYTE chromaticity[] = { 0x78, 0xb1, 181, 74, 43, 204, 33, 11, 80, 84 };
+        static const BYTE cta[] = {
+            0x02, 0x03, 18, 0,
+            0xe2, 0x00, 0x40,
+            0xe3, 0x05, 0x80, 0,
+            0xe6, 0x06, 0x05, 0x01, 138, 96, 5
+        };
+        edid[20] = (edid[20] & 0x8f) | 0x30;
+        edid[24] &= ~4;
+        memcpy(edid + 25, chromaticity, sizeof(chromaticity));
+        BYTE* ext = edid + (blocks + 1) * 128;
+        memcpy(ext, cta, sizeof(cta));
+        VddChecksum(ext, 128);
+    }
+    edid[126] = (BYTE)(blocks + (hdr ? 1 : 0));
     VddChecksum(edid, 128);
     for (UINT block = 0, index = 0; block < blocks; ++block) {
         BYTE* ext = edid + (block + 1) * 128;
@@ -155,17 +170,23 @@ static UINT VddBuildEdid(BYTE* edid, const ResolutionEntry* modes, UINT count)
         VddChecksum(ext + 1, 5 + ext[2]);
         VddChecksum(ext, 128);
     }
-    return (blocks + 1) * 128;
+    return (edid[126] + 1) * 128;
 }
 
-static UINT VddReadModes(const IDDCX_MONITOR_DESCRIPTION* description, ResolutionEntry* modes)
+static UINT VddReadModes(const IDDCX_MONITOR_DESCRIPTION* description, ResolutionEntry* modes,
+    BOOL* hdr = NULL)
 {
+    if (hdr) *hdr = FALSE;
     if (!description->pData || description->DataSize < 256) return 0;
     const BYTE* edid = (const BYTE*)description->pData;
     if ((UINT)(edid[126] + 1) * 128 > description->DataSize) return 0;
     UINT count = 0;
     for (UINT block = 0; block < edid[126]; ++block) {
         const BYTE* ext = edid + (block + 1) * 128;
+        if (ext[0] == 0x02 && block + 1 == edid[126]) {
+            if (hdr) *hdr = TRUE;
+            continue;
+        }
         if (ext[0] != 0x70 || ext[5] != 3 || ext[7] > 100 || ext[7] % 20) return 0;
         for (UINT offset = 8; offset < 8u + ext[7]; offset += 20) {
             if (count == VDD_MAX_MODES) return 0;
@@ -553,7 +574,7 @@ static BOOL VddGpuTextureCompatible(VDD_SWAP_PROC* proc, ID3D11Texture2D* textur
     D3D11_TEXTURE2D_DESC desc = {};
     texture->GetDesc(&desc);
     return desc.Width == proc->width && desc.Height == proc->height &&
-        desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM && desc.SampleDesc.Count == 1 &&
+        desc.Format == proc->format && desc.SampleDesc.Count == 1 &&
         desc.SampleDesc.Quality == 0 && desc.ArraySize == 1 && desc.MipLevels == 1;
 }
 
@@ -713,7 +734,7 @@ static BOOL VddSendGpuPacket(VDD_SWAP_PROC* proc, UINT type, HRESULT status, UIN
     packet.process_id = GetCurrentProcessId();
     packet.width = proc->width;
     packet.height = proc->height;
-    packet.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    packet.format = proc->format;
     packet.status = (UINT32)status;
     packet.version = DISPLAY_GPU_VERSION;
     packet.slot = slot;
@@ -859,7 +880,7 @@ static void VddPollGpuControl(VDD_SWAP_PROC* proc)
             if (validTarget) slot->hTexture = handle;
             if (validTarget && packet.status == S_OK && !proc->bGpuPoolFailed &&
                 packet.width == proc->width && packet.height == proc->height &&
-                packet.format == DXGI_FORMAT_B8G8R8A8_UNORM &&
+                packet.format == (UINT32)proc->format &&
                 proc->bGpuSourceCompatible) {
                 hr = proc->pDevice->QueryInterface(IID_PPV_ARGS(&device));
                 if (hr == S_OK)
@@ -1158,6 +1179,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
     for (;;)
     {
         IDXGIResource* pSurface = NULL;
+        DXGI_COLOR_SPACE_TYPE colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         if (proc->bStopNetwork || WaitForSingleObject(proc->hTerminateEvent, 0) == WAIT_OBJECT_0)
             break;
         if (FAILED(proc->pDevice->GetDeviceRemovedReason())) break;
@@ -1223,9 +1245,11 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             ID3D11Texture2D* pending = proc->pGpuPendingTex;
             pending->AddRef();
             if (!VddPublishGpuFrame(proc, pending)) {
-                proc->pDeviceContext->CopyResource(proc->pStagingTex, pending);
-                proc->pDeviceContext->Flush();
-                bHasFrame = proc->pDevice->GetDeviceRemovedReason() == S_OK;
+                if (proc->pStagingTex) {
+                    proc->pDeviceContext->CopyResource(proc->pStagingTex, pending);
+                    proc->pDeviceContext->Flush();
+                    bHasFrame = proc->pDevice->GetDeviceRemovedReason() == S_OK;
+                }
                 VddReleaseGpuTexture(proc, FALSE);
                 bSentFullFrame = FALSE;
             }
@@ -1246,6 +1270,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             bufferInArgs.Size = sizeof(bufferInArgs);
             hr = IddCxSwapChainReleaseAndAcquireBuffer2(proc->hSwapChain, &bufferInArgs, &buffer);
             pSurface = buffer.MetaData.pSurface;
+            colorSpace = buffer.MetaData.SurfaceColorSpace;
         } else {
             IDARG_OUT_RELEASEANDACQUIREBUFFER buffer = { 0 };
             hr = IddCxSwapChainReleaseAndAcquireBuffer(proc->hSwapChain, &buffer);
@@ -1313,22 +1338,37 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 {
                     D3D11_TEXTURE2D_DESC desc = {};
                     pTexture->GetDesc(&desc);
+                    BOOL scrgb = WdfObjectGet_MonitorContextWrapper(proc->hMonitor)->hdr &&
+                        desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+                        colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
                     if (!desc.Width || !desc.Height || desc.Width > DISPLAY_MAX_WIDTH ||
-                        desc.Height > DISPLAY_MAX_HEIGHT || desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
+                        desc.Height > DISPLAY_MAX_HEIGHT || (!scrgb && desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) ||
                         (proc->width && (desc.Width != proc->width || desc.Height != proc->height))) {
                         pTexture->Release();
                         pSurface->Release();
                         break;
                     }
-                    if (!proc->pStagingTex) {
+                    if (proc->format != desc.Format) {
+                        if (proc->bGpuSourceKnown) {
+                            VddStopGpuIo(proc, FALSE);
+                            VddCloseConn(&proc->hClientConn);
+                            VddReleaseGpuTexture(proc, FALSE);
+                            if (proc->pStagingTex) proc->pStagingTex->Release();
+                            proc->pStagingTex = NULL;
+                            InterlockedExchange(&proc->screenshot.width, 0);
+                            bHasFrame = bSentFullFrame = FALSE;
+                        }
                         proc->width = desc.Width;
                         proc->height = desc.Height;
                         proc->stride = desc.Width * 4;
-                        hr = VddCreateStagingTexture(proc, desc.Width, desc.Height);
-                        if (FAILED(hr)) {
-                            pTexture->Release();
-                            pSurface->Release();
-                            break;
+                        proc->format = desc.Format;
+                        if (!scrgb) {
+                            hr = VddCreateStagingTexture(proc, desc.Width, desc.Height);
+                            if (FAILED(hr)) {
+                                pTexture->Release();
+                                pSurface->Release();
+                                break;
+                            }
                         }
                     }
                     proc->bGpuSourceKnown = TRUE;
@@ -1344,6 +1384,10 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                     } else if (hadGpuTexture) {
                         VddReleaseGpuTexture(proc, FALSE);
                         bSentFullFrame = FALSE;
+                    }
+                    if (pTexture && scrgb) {
+                        pTexture->Release();
+                        pTexture = nullptr;
                     }
                 }
                 if (pTexture)
@@ -1576,6 +1620,12 @@ static void VddInitAdapter(VDD_DEVICE_CONTEXT* ctx)
 
     adapterCaps.MaxMonitorsSupported = 1;
     adapterCaps.Flags = IDDCX_ADAPTER_FLAGS_USE_SMALLEST_MODE;
+    ctx->hdrSupported = IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxMonitorSetGammaRamp) &&
+        IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2) &&
+        IDD_IS_FUNCTION_AVAILABLE(IddCxMonitorQueryHardwareCursor3) &&
+        IDD_IS_FUNCTION_AVAILABLE(IddCxMonitorUpdateModes2);
+    if (ctx->hdrSupported)
+        adapterCaps.Flags = (IDDCX_ADAPTER_FLAGS)(adapterCaps.Flags | IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16);
 
     adapterCaps.EndPointDiagnostics.Size = sizeof(adapterCaps.EndPointDiagnostics);
     adapterCaps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
@@ -1638,7 +1688,8 @@ static void VddFinishInit(VDD_DEVICE_CONTEXT* ctx)
 /* ========================================================================= */
 
 static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx,
-    UINT width = VDD_WIDTH, UINT height = VDD_HEIGHT, BOOL matchWindow = FALSE, UINT refresh = 60)
+    UINT width = VDD_WIDTH, UINT height = VDD_HEIGHT, BOOL matchWindow = FALSE, UINT refresh = 60,
+    BOOL hdr = FALSE)
 {
     VddLog("CreateMonitor: entered (ctx=%p, adapter=%p)", (void*)ctx, (void*)ctx->hAdapter);
 
@@ -1659,7 +1710,7 @@ static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx,
 
     monitorInfo.MonitorDescription.Size     = sizeof(monitorInfo.MonitorDescription);
     monitorInfo.MonitorDescription.Type     = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    monitorInfo.MonitorDescription.DataSize = VddBuildEdid(edid, modes, modeCount);
+    monitorInfo.MonitorDescription.DataSize = VddBuildEdid(edid, modes, modeCount, hdr);
     monitorInfo.MonitorDescription.pData    = edid;
 
     VddLog("CreateMonitor: EDID checksum byte=0x%02X, IDDCX_MONITOR_INFO.Size=%u",
@@ -1691,6 +1742,7 @@ static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx,
     pMonCtx->pContext = ctx;
     pMonCtx->modeCount = modeCount;
     pMonCtx->matchWindow = matchWindow;
+    pMonCtx->hdr = hdr;
     memcpy(pMonCtx->modes, modes, modeCount * sizeof(*modes));
     AcquireSRWLockExclusive(&ctx->swapLock);
     ctx->hMonitor = createOut.MonitorObject;
@@ -1748,6 +1800,7 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
     if (request.type && (!proc || request.session != proc->gpuSession)) request.type = 0;
     InterlockedExchange(&ctx->gpuModes, gpu);
     BOOL fullModes = gpu || memory;
+    BOOL hdr = gpu && !memory && ctx->hdrSupported;
     BOOL modesChanged = InterlockedExchange(&ctx->fullModes, fullModes) != fullModes;
     if (!monitor) {
         ReleaseSRWLockExclusive(&ctx->swapLock);
@@ -1779,6 +1832,7 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
     }
     ResolutionEntry previous = mon->modes[0];
     BOOL previousMatch = mon->matchWindow;
+    recreate |= hdr != mon->hdr;
     if (recreate) {
         InterlockedExchange(&ctx->reconfiguring, 1);
         ctx->hMonitor = NULL;
@@ -1798,7 +1852,7 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
             if (ctx->hRecoveryTimer) WdfTimerStart(ctx->hRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(2));
             return;
         }
-        status = VddCreateMonitor(ctx, width, height, matchWindow, refresh);
+        status = VddCreateMonitor(ctx, width, height, matchWindow, refresh, hdr);
         if (!NT_SUCCESS(status)) {
             VddLog("Display: resize failed 0x%08X; restoring monitor", status);
             status = VddCreateMonitor(ctx, available ? previous.width : VDD_WIDTH,
@@ -1817,7 +1871,9 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
             IDDCX_TARGET_MODE2 modes[VDD_MAX_MODES] = {};
             for (UINT i = 0; i < count; ++i) {
                 modes[i].Size = sizeof(modes[i]);
-                modes[i].BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
+                modes[i].BitsPerComponent.Rgb = hdr
+                    ? (IDDCX_BITS_PER_COMPONENT)(IDDCX_BITS_PER_COMPONENT_8 | IDDCX_BITS_PER_COMPONENT_10)
+                    : IDDCX_BITS_PER_COMPONENT_8;
                 VddCreateMonitorMode(&modes[i].TargetVideoSignalInfo.targetVideoSignalInfo, 1,
                     resolutions[i].width, resolutions[i].height, resolutions[i].refresh);
             }
@@ -2233,7 +2289,8 @@ NTSTATUS VddParseMonitorDescription2(
     IDARG_OUT_PARSEMONITORDESCRIPTION* pOutArgs)
 {
     ResolutionEntry modes[VDD_MAX_MODES];
-    UINT count = VddReadModes(&pInArgs->MonitorDescription, modes);
+    BOOL hdr;
+    UINT count = VddReadModes(&pInArgs->MonitorDescription, modes, &hdr);
     if (!count) return STATUS_INVALID_PARAMETER;
     pOutArgs->MonitorModeBufferOutputCount = count;
     pOutArgs->PreferredMonitorModeIdx = 0;
@@ -2244,7 +2301,9 @@ NTSTATUS VddParseMonitorDescription2(
         ZeroMemory(mode, sizeof(*mode));
         mode->Size = sizeof(*mode);
         mode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-        mode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
+        mode->BitsPerComponent.Rgb = hdr
+            ? (IDDCX_BITS_PER_COMPONENT)(IDDCX_BITS_PER_COMPONENT_8 | IDDCX_BITS_PER_COMPONENT_10)
+            : IDDCX_BITS_PER_COMPONENT_8;
         VddCreateMonitorMode(&mode->MonitorVideoSignalInfo, 0, modes[i].width, modes[i].height, modes[i].refresh);
     }
     return STATUS_SUCCESS;
@@ -2262,6 +2321,7 @@ NTSTATUS VddMonitorQueryTargetModes2(
 {
     ResolutionEntry modes[VDD_MAX_MODES];
     UINT count = VddTargetResolutions(MonitorObject, modes);
+    BOOL hdr = WdfObjectGet_MonitorContextWrapper(MonitorObject)->hdr;
     pOutArgs->TargetModeBufferOutputCount = count;
     if (!pInArgs->TargetModeBufferInputCount) return STATUS_SUCCESS;
     if (pInArgs->TargetModeBufferInputCount < count) return STATUS_BUFFER_TOO_SMALL;
@@ -2269,7 +2329,9 @@ NTSTATUS VddMonitorQueryTargetModes2(
         IDDCX_TARGET_MODE2* mode = &pInArgs->pTargetModes[i];
         ZeroMemory(mode, sizeof(*mode));
         mode->Size = sizeof(*mode);
-        mode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
+        mode->BitsPerComponent.Rgb = hdr
+            ? (IDDCX_BITS_PER_COMPONENT)(IDDCX_BITS_PER_COMPONENT_8 | IDDCX_BITS_PER_COMPONENT_10)
+            : IDDCX_BITS_PER_COMPONENT_8;
         VddCreateMonitorMode(&mode->TargetVideoSignalInfo.targetVideoSignalInfo, 1, modes[i].width, modes[i].height, modes[i].refresh);
     }
     return STATUS_SUCCESS;
@@ -2285,20 +2347,20 @@ NTSTATUS VddAdapterQueryTargetInfo(
     IDARG_IN_QUERYTARGET_INFO* pInArgs,
     IDARG_OUT_QUERYTARGET_INFO* pOutArgs)
 {
-    UNREFERENCED_PARAMETER(AdapterObject);
-    UNREFERENCED_PARAMETER(pInArgs);
-
     VddLog("QueryTargetInfo: called (ConnectorIndex=%u)", pInArgs->ConnectorIndex);
 
-    pOutArgs->TargetCaps = (IDDCX_TARGET_CAPS)0;
+    const VDD_DEVICE_CONTEXT* ctx = WdfObjectGet_IndirectDeviceContextWrapper(AdapterObject)->pContext;
+    pOutArgs->TargetCaps = ctx && ctx->hdrSupported
+        ? (IDDCX_TARGET_CAPS)(IDDCX_TARGET_CAPS_WIDE_COLOR_SPACE | IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE)
+        : IDDCX_TARGET_CAPS_NONE;
     pOutArgs->DitheringSupport.Rgb = IDDCX_BITS_PER_COMPONENT_8;
 
-    VddLog("QueryTargetInfo: returning caps=0, dithering=8bpc");
+    VddLog("QueryTargetInfo: returning caps=%u, dithering=8bpc", (UINT)pOutArgs->TargetCaps);
     return STATUS_SUCCESS;
 }
 
 /* ========================================================================= */
-/*  IddCx v2: Set Default HDR Metadata (no-op, SDR only)                    */
+/*  IddCx v2: Set Default HDR Metadata (no-op)                              */
 /* ========================================================================= */
 
 _Use_decl_annotations_
@@ -2308,7 +2370,6 @@ NTSTATUS VddMonitorSetDefaultHdrMetadata(
 {
     UNREFERENCED_PARAMETER(MonitorObject);
     UNREFERENCED_PARAMETER(pInArgs);
-    VddLog("SetDefaultHdrMetadata: called (no-op, SDR only)");
     return STATUS_SUCCESS;
 }
 
