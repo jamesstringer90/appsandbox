@@ -337,7 +337,9 @@ struct VmDisplayIdd {
 
     /* Clipboard (extracted to vm_clipboard.c) */
     VmClipboard      clipboard;
-    BOOL             share_clipboard;
+    volatile BOOL    share_clipboard;          /* both directions (legacy switch) */
+    volatile BOOL    clip_share_host_to_guest; /* independent direction override */
+    volatile BOOL    clip_share_guest_to_host; /* independent direction override */
 
     /* Audio playback channel (:0004 — guest→host render) */
     volatile SOCKET  audio_socket;
@@ -380,7 +382,9 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUTO_DISPLAYS  0x1050
 #define IDM_SEND_SAS       0x1060
 #define IDM_FULLSCREEN     0x1070
-static const UINT g_viewer_commands[]={IDM_SEND_SAS,IDM_MATCH_WINDOW,IDM_SHARE_CLIPBOARD,IDM_XMIT_HOTKEYS,IDM_AUDIO_MUTE};
+#define IDM_CLIP_H2G       0x1080
+#define IDM_CLIP_G2H       0x1090
+static const UINT g_viewer_commands[]={IDM_SEND_SAS,IDM_MATCH_WINDOW,IDM_SHARE_CLIPBOARD,IDM_XMIT_HOTKEYS,IDM_AUDIO_MUTE,IDM_CLIP_H2G,IDM_CLIP_G2H};
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -716,8 +720,18 @@ static BOOL idd_display_settings_save(VmDisplayIdd *d)
     idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
     if (swprintf_s(temporary, MAX_PATH, L"%s.tmp", path) < 0) return FALSE;
     if (_wfopen_s(&f, temporary, L"w") != 0 || !f) return FALSE;
-    ok = fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"shareClipboard\":%d}\n",
-                 d->transmit_hotkeys ? 1 : 0, d->share_clipboard ? 1 : 0) > 0;
+
+    /* Keep the old "shareClipboard" key as "any direction enabled" so older
+       AppSandbox versions still behave sensibly after this VM is opened with
+       a newer build. */
+    ok = fprintf(f,
+        "{\"transmitKeyboardHotkeys\":%d,\"shareClipboard\":%d,"
+        "\"shareClipboardBoth\":%d,\"shareHostToGuest\":%d,\"shareGuestToHost\":%d}\n",
+        d->transmit_hotkeys ? 1 : 0,
+        (d->share_clipboard || d->clip_share_host_to_guest || d->clip_share_guest_to_host) ? 1 : 0,
+        d->share_clipboard ? 1 : 0,
+        d->clip_share_host_to_guest ? 1 : 0,
+        d->clip_share_guest_to_host ? 1 : 0) > 0;
     if (fclose(f) != 0) ok = FALSE;
     if (ok && MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         return TRUE;
@@ -732,9 +746,12 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
     wchar_t buf[512];
     size_t length;
     int value;
+    BOOL has_clip = FALSE, has_h2g = FALSE, has_g2h = FALSE;
 
     d->transmit_hotkeys = FALSE;
     d->share_clipboard = TRUE;
+    d->clip_share_host_to_guest = FALSE;
+    d->clip_share_guest_to_host = FALSE;
     if (!d->vhdx_path[0]) return;
     idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
 
@@ -748,11 +765,90 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
         if (api_json_get_bool(buf, L"transmitKeyboardHotkeys", &value) ||
             api_json_get_int(buf, L"transmitKeyboardHotkeys", &value))
             d->transmit_hotkeys = value != 0;
-        if (api_json_get_bool(buf, L"shareClipboard", &value) ||
-            api_json_get_int(buf, L"shareClipboard", &value))
+
+        if (api_json_get_bool(buf, L"shareClipboardBoth", &value) ||
+            api_json_get_int(buf, L"shareClipboardBoth", &value)) {
             d->share_clipboard = value != 0;
+            has_clip = TRUE;
+        }
+        if (api_json_get_bool(buf, L"shareHostToGuest", &value) ||
+            api_json_get_int(buf, L"shareHostToGuest", &value)) {
+            d->clip_share_host_to_guest = value != 0;
+            has_h2g = TRUE;
+        }
+        if (api_json_get_bool(buf, L"shareGuestToHost", &value) ||
+            api_json_get_int(buf, L"shareGuestToHost", &value)) {
+            d->clip_share_guest_to_host = value != 0;
+            has_g2h = TRUE;
+        }
+
+        /* Older v0.1.13 settings only have "shareClipboard". */
+        if (!has_clip && !has_h2g && !has_g2h &&
+            (api_json_get_bool(buf, L"shareClipboard", &value) ||
+             api_json_get_int(buf, L"shareClipboard", &value))) {
+            if (value) {
+                d->share_clipboard = TRUE;
+            } else {
+                d->share_clipboard = FALSE;
+                d->clip_share_host_to_guest = FALSE;
+                d->clip_share_guest_to_host = FALSE;
+            }
+        }
+
+        /* "Both" owns the directions; keep the menu state unambiguous. */
+        if (d->share_clipboard) {
+            d->clip_share_host_to_guest = FALSE;
+            d->clip_share_guest_to_host = FALSE;
+        }
     }
     fclose(f);
+}
+
+static BOOL idd_clip_effective_h2g(VmDisplayIdd *d)
+{
+    return d->share_clipboard || d->clip_share_host_to_guest;
+}
+
+static BOOL idd_clip_effective_g2h(VmDisplayIdd *d)
+{
+    return d->share_clipboard || d->clip_share_guest_to_host;
+}
+
+/* Push the current three-toggle state into the clipboard module. */
+static void idd_clipboard_apply(VmDisplayIdd *d, BOOL update_sync)
+{
+    BOOL h2g, g2h, any;
+    if (!d || !d->clipboard) return;
+
+    h2g = idd_clip_effective_h2g(d);
+    g2h = idd_clip_effective_g2h(d);
+    any = h2g || g2h;
+
+    vm_clipboard_set_share_directions(d->clipboard, h2g, g2h);
+    vm_clipboard_set_sharing_enabled(d->clipboard, any);
+    if (update_sync && d->hwnd)
+        vm_clipboard_set_sync_enabled(d->clipboard, any && d->input_focused && !IsIconic(d->hwnd));
+}
+
+/* Keep all three system-menu items consistent. Direction items are greyed out
+   while "Both" is active, because "Both" is their effective state. */
+static void idd_clipboard_menu_update(HWND hwnd, VmDisplayIdd *d)
+{
+    HMENU sysmenu;
+    if (!d || !hwnd) return;
+    sysmenu = GetSystemMenu(hwnd, FALSE);
+    if (!sysmenu) return;
+
+    CheckMenuItem(sysmenu, IDM_SHARE_CLIPBOARD,
+                  MF_BYCOMMAND | (d->share_clipboard ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(sysmenu, IDM_CLIP_H2G,
+                  MF_BYCOMMAND | (!d->share_clipboard && d->clip_share_host_to_guest ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(sysmenu, IDM_CLIP_G2H,
+                  MF_BYCOMMAND | (!d->share_clipboard && d->clip_share_guest_to_host ? MF_CHECKED : MF_UNCHECKED));
+    EnableMenuItem(sysmenu, IDM_CLIP_H2G,
+                   MF_BYCOMMAND | (d->share_clipboard ? MF_GRAYED : MF_ENABLED));
+    EnableMenuItem(sysmenu, IDM_CLIP_G2H,
+                   MF_BYCOMMAND | (d->share_clipboard ? MF_GRAYED : MF_ENABLED));
 }
 
 /* ==================================================================
@@ -2777,6 +2873,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                                                d->hwnd, clip_log_callback, d);
             if (d->clipboard) {
                 idd_log(d, L"Clipboard module created.");
+                idd_clipboard_apply(d, FALSE);
                 PostMessageW(d->hwnd, WM_IDD_CLIPBOARD_READY, 0, 0);
             }
         }
@@ -3232,7 +3329,9 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
-            AppendMenuW(sysmenu, MF_STRING, IDM_SHARE_CLIPBOARD, L"Share clipboard");
+            AppendMenuW(sysmenu, MF_STRING, IDM_SHARE_CLIPBOARD, L"Share clipboard (both directions)");
+            AppendMenuW(sysmenu, MF_STRING, IDM_CLIP_H2G, L"Share Host -> Guest");
+            AppendMenuW(sysmenu, MF_STRING, IDM_CLIP_G2H, L"Share Guest -> Host");
             AppendMenuW(sysmenu, MF_STRING, IDM_FULLSCREEN, L"Borderless fullscreen");
             if (!_wcsicmp(d->os_type, L"Windows"))
                 AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_AUTO_DISPLAYS,
@@ -3243,8 +3342,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
-            CheckMenuItem(sysmenu, IDM_SHARE_CLIPBOARD,
-                          MF_BYCOMMAND | (d->share_clipboard ? MF_CHECKED : MF_UNCHECKED));
+            idd_clipboard_menu_update(d->hwnd, d);
         }
     }
 
@@ -3425,7 +3523,14 @@ static void idd_viewer_option_state(VmDisplayIdd *d,UINT *enabled,UINT *checked)
     if (d->shared_ready && d->shared_resize && !d->shared_disabled &&
         (d->shared_front>=0 || d->shared_pending>=0)) *enabled|=2;
     if (d->size_mode==DISPLAY_SIZE_WINDOW) *checked|=2;
-    if (d->share_clipboard) *checked|=4;
+    if (d->share_clipboard) {
+        *checked|=4;
+    } else {
+        if (d->clip_share_host_to_guest) *checked|=(1u<<5);
+        if (d->clip_share_guest_to_host) *checked|=(1u<<6);
+        /* Direction items are greyed out while "Both" is active. */
+        *enabled|=(1u<<5)|(1u<<6);
+    }
     if (d->transmit_hotkeys) *checked|=8;
     if (d->audio_muted) *checked|=16;
 }
@@ -3510,14 +3615,42 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_SHARE_CLIPBOARD) {
-            HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
             d->share_clipboard = !d->share_clipboard;
-            CheckMenuItem(sysmenu, IDM_SHARE_CLIPBOARD,
-                          MF_BYCOMMAND | (d->share_clipboard ? MF_CHECKED : MF_UNCHECKED));
-            SendMessageW(hwnd, WM_IDD_CLIPBOARD_READY, 0, 0);
+            /* "Both" owns the two direction toggles. Turning it on takes over
+               both directions; turning it off turns clipboard sharing off. */
+            d->clip_share_host_to_guest = FALSE;
+            d->clip_share_guest_to_host = FALSE;
+            idd_clipboard_menu_update(hwnd, d);
+            idd_clipboard_apply(d, TRUE);
             if (!idd_display_settings_save(d))
                 idd_log(d, L"Could not save viewer settings.");
-            idd_log(d, d->share_clipboard ? L"Clipboard sharing: ON." : L"Clipboard sharing: OFF.");
+            idd_log(d, d->share_clipboard
+                        ? L"Clipboard sharing (both directions): ON."
+                        : L"Clipboard sharing: OFF.");
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_CLIP_H2G) {
+            if (d->share_clipboard) return 0; /* greyed out while "Both" is active */
+            d->clip_share_host_to_guest = !d->clip_share_host_to_guest;
+            idd_clipboard_menu_update(hwnd, d);
+            idd_clipboard_apply(d, TRUE);
+            if (!idd_display_settings_save(d))
+                idd_log(d, L"Could not save viewer settings.");
+            idd_log(d, d->clip_share_host_to_guest
+                        ? L"Share host clipboard with guest: ON."
+                        : L"Share host clipboard with guest: OFF.");
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_CLIP_G2H) {
+            if (d->share_clipboard) return 0; /* greyed out while "Both" is active */
+            d->clip_share_guest_to_host = !d->clip_share_guest_to_host;
+            idd_clipboard_menu_update(hwnd, d);
+            idd_clipboard_apply(d, TRUE);
+            if (!idd_display_settings_save(d))
+                idd_log(d, L"Could not save viewer settings.");
+            idd_log(d, d->clip_share_guest_to_host
+                        ? L"Share guest clipboard with host: ON."
+                        : L"Share guest clipboard with host: OFF.");
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_MATCH_WINDOW) {
@@ -3864,10 +3997,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_IDD_CLIPBOARD_READY:
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
-        if (d && d->clipboard) {
-            vm_clipboard_set_sharing_enabled(d->clipboard, d->share_clipboard);
-            vm_clipboard_set_sync_enabled(d->clipboard, d->share_clipboard && d->input_focused && !IsIconic(hwnd));
-        }
+        idd_clipboard_apply(d, TRUE);
         break;
 
     /* Top-level activation gates keyboard forwarding. Tracking activation
@@ -3878,8 +4008,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ACTIVATE:
         if (d) {
             d->input_focused = (LOWORD(wp) != WA_INACTIVE);
-            if (d->clipboard)
-                vm_clipboard_set_sync_enabled(d->clipboard, d->share_clipboard && d->input_focused && !IsIconic(hwnd));
+            idd_clipboard_apply(d, TRUE);
             if (!d->input_focused) {
                 agent_overlay_cancel_input(d->agent_overlay);
                 idd_flush_held_keys(d);
