@@ -1,5 +1,6 @@
 #include <winsock2.h>
 #include "vm_agent.h"
+#include "agent_version.h"
 #include "asb_events.h"
 #include "vm_ssh_proxy.h"
 #include "asb_core.h"
@@ -305,8 +306,9 @@ static int process_async_message(AgentConn *conn, VmInstance *vm, SOCKET s, cons
         InterlockedExchange(&vm->sas_supported, !strcmp(buf + 4, "supported"));
         asb_events_changed();
     } else if (strcmp(buf, "disk_resize:supported") == 0) {
-        vm->disk_resize_supported = TRUE;
-        asb_events_changed();
+        BOOL changed = !InterlockedExchange(&vm->disk_resize_supported, TRUE);
+        if (changed || vm->state_save_pending) vm_save_state_json(vm);
+        if (changed) asb_events_changed();
     } else if (strncmp(buf, "display_monitor:", 16) == 0) {
         LONG state = !strcmp(buf + 16, "enabled") ? 1 : !strcmp(buf + 16, "disabled") ? 2 : 0;
         InterlockedExchange(&vm->display_monitor_state, state);
@@ -422,13 +424,15 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
 
         /* Wait for hello from agent */
         n = recv_line(s, buf, sizeof(buf));
-        if (n <= 0 || strcmp(buf, "hello") != 0) {
+        uint32_t version;
+        if (n <= 0 || !asb_agent_version_read_hello(buf, &version)) {
             closesocket(s);
             conn->sock = INVALID_SOCKET;
             continue;
         }
 
-        vm->disk_resize_supported = FALSE;
+        BOOL state_changed = InterlockedExchange(&vm->agent_version, (LONG)version) != (LONG)version;
+        if (InterlockedExchange(&vm->disk_resize_supported, FALSE)) state_changed = TRUE;
         conn->shim_delivery.requested = 0;
         vm->agent_online = TRUE;
         InterlockedExchange(&vm->display_monitor_state, 0);
@@ -441,9 +445,10 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         /* Mark install complete on first agent connection */
         if (!vm->install_complete && !vm->is_template) {
             vm->install_complete = TRUE;
-            vm_save_state_json(vm->vhdx_path, TRUE);
+            state_changed = TRUE;
             ui_log(L"Install complete for \"%s\".", vm->name);
         }
+        if (state_changed || vm->state_save_pending) vm_save_state_json(vm);
 
         /* Send NAT IP to agent (only for NAT mode). Gateway is the chosen
            subnet's .1; prefix length is always /24 for our NAT. */

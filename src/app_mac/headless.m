@@ -709,6 +709,7 @@ static NSDictionary *api_vm_snapshot(const AsbVmMac *vm)
     NSArray *fields=[NSJSONSerialization JSONObjectWithData:[@(asb_api_vm_fields_json()) dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
     NSMutableDictionary *result=[NSMutableDictionary dictionary];
     for (NSString *field in fields) result[field]=snapshot[field] ?: @"";
+    if (![result[@"agentVersion"] length]) result[@"agentVersion"] = @"unknown";
     return result;
 }
 
@@ -914,15 +915,13 @@ static void service_error(int fd,uint32_t error,int input_operation)
 
 static int apply_vm_settings(AsbVmId vm_id, NSDictionary *body)
 {
-    int rc = BACKEND_OK;
     for (NSString *field in @[@"ramMb", @"cpuCores", @"gpuMode", @"networkMode"]) {
         if (!body[field]) continue;
         NSString *value = [NSString stringWithFormat:@"%d", [body[field] intValue]];
         int result = asb_mac_vm_edit(vm_id, field.UTF8String, value.UTF8String);
-        if (result != BACKEND_OK) rc = result;
+        if (result != BACKEND_OK) return result;
     }
-    if (!body[@"hddGb"]) asb_mac_save();
-    return rc;
+    return BACKEND_OK;
 }
 
 static void serve_disk_edit(ServiceCall *call, NSDictionary *body)

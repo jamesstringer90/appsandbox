@@ -50,6 +50,10 @@ typedef struct {
                                       build/stage end for BOTH OSes, distinct from install_complete so a
                                       Windows VM can boot while its first boot is still "installing". */
     BOOL    agent_online;
+    uint32_t agent_version;
+    BOOL    disk_resize_supported;
+    BOOL    legacy_disk_resize_supported;
+    BOOL    state_save_pending;
     BOOL    idd_ready;              /* Windows guest: VDD driver up (from the agent's idd_status);
                                        gates display_ready. macOS guests leave this NO. */
     uint64_t agent_last_heartbeat_ms;
@@ -67,7 +71,6 @@ typedef struct {
     VzDisplayWindow *__unsafe_unretained display;
     VmAgentMac      *__unsafe_unretained agent;
     VmSshProxyMac   *__unsafe_unretained ssh_proxy;
-    BOOL    disk_resize_supported;
     BOOL    resizing_disk;
 } AsbVmMac;
 
@@ -107,7 +110,6 @@ int asb_mac_template_delete(AsbTemplateId template_id);
 int  asb_mac_vm_edit(AsbVmId vm_id, const char *field, const char *value);
 void asb_mac_vm_set_disk_size(AsbVmId vm_id, const char *value, void (^completion)(int result, NSString *error));
 
-void asb_mac_save(void);
 int asb_mac_get_api_port(void);
 
 /* Send a mute/unmute command to the VM's guest agent. Called from the

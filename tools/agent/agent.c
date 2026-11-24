@@ -31,6 +31,9 @@
 #include "display_settings.h"
 #include "../transport/asb_transport.h"
 
+#define ASB_AGENT_STRINGIZE_VALUE(value) #value
+#define ASB_AGENT_STRINGIZE(value) ASB_AGENT_STRINGIZE_VALUE(value)
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -1927,7 +1930,8 @@ static void handle_client(AsbConn *client)
     asb_set_timeout(client, 10000, 10000);
 
     /* Send hello */
-    if (send_line(client, "hello") <= 0 || send_line(client, "disk_resize:supported") <= 0) {
+    if (send_line(client, "hello v" ASB_AGENT_STRINGIZE(ASB_VERSION_SHORT)) <= 0 ||
+        send_line(client, "disk_resize:supported") <= 0) {
         agent_log("Failed to send handshake.");
         asb_close(client);
         g_client_sock = NULL;

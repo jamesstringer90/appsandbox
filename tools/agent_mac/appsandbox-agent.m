@@ -12,6 +12,7 @@
 
 #import <Foundation/Foundation.h>
 #import "clipboard_xpc.h"
+#include "asb_agent_build_version.h"
 
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -538,7 +539,8 @@ static void handle_client(int client) {
     setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    if (send_line(client, "hello") <= 0 || send_line(client, "disk_resize:supported") <= 0) {
+    if (send_line(client, "hello v" ASB_VERSION_STRING) <= 0 ||
+        send_line(client, "disk_resize:supported") <= 0) {
         agent_log("Failed to send handshake.");
         goto done;
     }
