@@ -443,5 +443,6 @@ const char *asb_api_vm_fields_json(void)
     return "[\"id\",\"name\",\"osType\",\"osName\",\"diskDirectory\",\"state\",\"running\","
         "\"agentOnline\",\"installComplete\",\"building\",\"progress\",\"sshState\","
         "\"sshPort\",\"ramMb\",\"hddGb\",\"cpuCores\",\"gpuMode\",\"networkMode\","
-        "\"displayOpen\",\"gpuId\",\"gpuName\",\"diskResizeSupported\"]";
+        "\"displayOpen\",\"gpuId\",\"gpuName\",\"diskResizeSupported\","
+        "\"agentVersion\"]";
 }

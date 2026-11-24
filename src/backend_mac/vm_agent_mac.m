@@ -1,4 +1,5 @@
 #import "vm_agent_mac.h"
+#include "agent_version.h"
 #import "asb_ivshmem_transport.h"
 
 #include <sys/socket.h>
@@ -82,7 +83,7 @@
     [_cmdCond broadcast];
     [_cmdCond unlock];
     if (self.online) {
-        [self setOnlineOnMain:NO];
+        [self setOnlineOnMain:NO version:0];
     }
     self.running = NO;
 }
@@ -119,7 +120,8 @@
 
         char buf[512];
         int n = [self recvLine:fd into:buf size:sizeof(buf)];
-        if (n <= 0 || strcmp(buf, "hello") != 0) {
+        uint32_t version;
+        if (n <= 0 || !asb_agent_version_read_hello(buf, &version)) {
             [self closeSocket];
             continue;
         }
@@ -127,7 +129,7 @@
         [self logFmt:@"Agent online for \"%@\".", self.vmName];
         self.lastHeartbeatMs = [self nowMs];
         self.keyDeploySent = NO;   /* re-attempt deploy on each (re)connection until it lands */
-        [self setOnlineOnMain:YES];
+        [self setOnlineOnMain:YES version:version];
 
         /* Request SSH bring-up if configured. Matches Windows vm_agent.c. */
         if (self.sshEnabled) {
@@ -141,7 +143,7 @@
                     /* Connection dropped while waiting. Let the outer read loop
                      * handle reconnect. */
                     [self closeSocket];
-                    [self setOnlineOnMain:NO];
+                    [self setOnlineOnMain:NO version:0];
                     continue;
                 }
             }
@@ -200,7 +202,7 @@
 
         [self logFmt:@"Agent offline for \"%@\".", self.vmName];
         [self closeSocket];
-        [self setOnlineOnMain:NO];
+        [self setOnlineOnMain:NO version:0];
         [self deliverResponse:nil];
     }
 }
@@ -430,14 +432,14 @@
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-- (void)setOnlineOnMain:(BOOL)online {
+- (void)setOnlineOnMain:(BOOL)online version:(uint32_t)version {
     if (!online) self.displayMonitorState = -1;
     if (!online) self.sasSupported = NO;
     if (self.online == online) return;
     self.online = online;
     VmAgentOnlineChange block = self.onOnlineChange;
     if (block) {
-        dispatch_async(dispatch_get_main_queue(), ^{ block(online); });
+        dispatch_async(dispatch_get_main_queue(), ^{ block(online, version); });
     }
 }
 

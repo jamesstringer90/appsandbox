@@ -21,6 +21,7 @@
 #include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
 #include "vm_display_idd.h"    /* IDD display window, opened on demand via the API */
+#include "agent_version.h"
 #include "headless_vm.h"
 #include "headless_ssh.h"
 #include <wincodec.h>
@@ -272,6 +273,8 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
 {
     wchar_t disk_directory[MAX_PATH];
     char id[ASB_VM_ID_TEXT_SIZE];
+    char version[ASB_AGENT_VERSION_TEXT_SIZE];
+    asb_agent_version_format((uint32_t)v->agent_version, version);
     asb_vm_id_format(v->unique_id, id);
     pos += sprintf_s(out + pos, cap - pos, "{\"id\":\"%s\",\"name\":", id);
     pos  = append_wstr(out, cap, pos, v->name);
@@ -301,7 +304,8 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->gpu_name);
     pos += sprintf_s(out + pos, cap - pos, ",\"netAdapter\":");
     pos = append_wstr(out, cap, pos, v->net_adapter);
-    pos += sprintf_s(out + pos, cap - pos, ",\"diskResizeSupported\":%s}", v->disk_resize_supported ? "true" : "false");
+    pos += sprintf_s(out + pos, cap - pos, ",\"diskResizeSupported\":%s,\"agentVersion\":\"%s\"}",
+        v->disk_resize_supported ? "true" : "false", version[0] ? version : "unknown");
     return pos;
 }
 
@@ -1674,20 +1678,12 @@ static int handle_request(PHTTP_REQUEST req)
                         return 0;
                     }
                 }
-                if (api_json_get_int(body, L"ramMb", &iv)) {
+                if (api_json_get_int(body, L"ramMb", &iv))
                     hr = asb_vm_set_ram(vm, (DWORD)iv);
-                }
-                if (api_json_get_int(body, L"cpuCores", &iv)) {
+                if (SUCCEEDED(hr) && api_json_get_int(body, L"cpuCores", &iv))
                     hr = asb_vm_set_cpu(vm, (DWORD)iv);
-                }
-                if (has_gpu) {
+                if (SUCCEEDED(hr) && has_gpu)
                     hr = asb_vm_set_gpu_selection(vm, gpu_mode, gpu_id);
-                    if (FAILED(hr)) {
-                        send_hr(req->RequestId, "editVm", nu, vm_id, hr);
-                        return 0;
-                    }
-                }
-                if (!hdd_gb) asb_save();
                 if (SUCCEEDED(hr)) {
                     append_vm_json(buf, sizeof(buf), 0, inst);
                     send_json(req->RequestId, 200, "OK", buf);

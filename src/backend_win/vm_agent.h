@@ -21,6 +21,8 @@
 /* Service GUID: {A5B0CAFE-0001-4000-8000-000000000001} */
 #define VM_AGENT_SERVICE_GUID_STR L"a5b0cafe-0001-4000-8000-000000000001"
 
+void vm_save_state_json(VmInstance *vm);
+
 /* Start persistent agent connection for a VM (call after VM starts).
    Spawns a background thread that connects, receives heartbeats,
    and updates instance->agent_online. */

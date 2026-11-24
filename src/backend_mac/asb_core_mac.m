@@ -8,6 +8,7 @@
  */
 
 #import "asb_core_mac.h"
+#include "agent_version.h"
 #import <CoreGraphics/CoreGraphics.h>   /* CGSessionCopyCurrentDictionary (A-gate) */
 #import <Security/AuthSession.h>
 #import "vm_dir.h"
@@ -45,6 +46,7 @@
 static AsbVmMac g_vms[ASB_MAX_VMS];
 static int g_vm_count = 0;
 static BOOL g_config_load_failed;
+static dispatch_queue_t g_vm_state_queue;
 static uint64_t g_next_run_id;
 static char g_last_ipsw_path[1024] = {0};
 static int g_api_port = ASB_API_DEFAULT_PORT;
@@ -232,6 +234,81 @@ static BOOL ensure_appsandbox_ssh_key(char *pubkey_out, size_t cap) {
     return pubkey_out[0] != '\0';
 }
 
+static NSURL *vm_state_url(const AsbVmMac *vm) {
+    NSString *name = @(vm->name);
+    if (!name.length || [name containsString:@"/"] || [name isEqualToString:@"."] || [name isEqualToString:@".."]) return nil;
+    return [[VmDir directoryForVm:name] URLByAppendingPathComponent:@"vm_state.json"];
+}
+
+static NSData *vm_state_data(const AsbVmMac *vm) {
+    char version[ASB_AGENT_VERSION_TEXT_SIZE];
+    asb_agent_version_format(vm->agent_version, version);
+    NSDictionary *state = @{
+        @"agentVersion": @(version),
+        @"diskResizeSupported": @(vm->disk_resize_supported),
+        @"installComplete": @(vm->install_complete),
+        @"diskBuilt": @(vm->disk_built),
+        @"macProvisioningPending": @(vm->mac_provisioning_pending),
+        @"templateReady": @(vm->template_ready),
+    };
+    return [NSJSONSerialization dataWithJSONObject:state options:0 error:nil];
+}
+
+static BOOL write_vm_state(NSURL *url, NSData *data) {
+    return url && data && [data writeToURL:url options:NSDataWritingAtomic error:nil];
+}
+
+static void finish_vm_state_save(AsbVmMac *vm, BOOL ok) {
+    vm->state_migrating = NO;
+    vm->state_save_pending = !ok;
+    if (ok) vm->legacy_state_pending = NO;
+    else post_log("Could not save VM state for \"%s\".", vm->name);
+}
+
+static BOOL save_vm_state_json(AsbVmMac *vm) {
+    NSURL *url = vm_state_url(vm);
+    NSData *data = vm_state_data(vm);
+    __block BOOL ok;
+    dispatch_block_t write_state = ^{ ok = write_vm_state(url, data); };
+    if (vm->state_migrating) dispatch_sync(g_vm_state_queue, write_state);
+    else write_state();
+    finish_vm_state_save(vm, ok);
+    return ok;
+}
+
+static void load_vm_state_json(AsbVmMac *vm) {
+    NSURL *url = vm_state_url(vm);
+    NSError *error = nil;
+    NSData *data = url ? [NSData dataWithContentsOfURL:url options:0 error:&error] : nil;
+    id state = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    if (![state isKindOfClass:NSDictionary.class]) {
+        BOOL missing = [error.domain isEqualToString:NSCocoaErrorDomain] && error.code == NSFileReadNoSuchFileError;
+        vm->state_save_pending = vm->legacy_state_pending || (missing && [VmDir vmExists:@(vm->name)]);
+        return;
+    }
+
+    id version = state[@"agentVersion"];
+    BOOL complete = [version isKindOfClass:NSString.class];
+    if (complete) vm->agent_version = asb_agent_version_parse([version UTF8String]);
+    struct {
+        NSString *__unsafe_unretained key;
+        BOOL *field;
+    } fields[] = {
+        {@"diskResizeSupported", &vm->disk_resize_supported},
+        {@"installComplete", &vm->install_complete},
+        {@"diskBuilt", &vm->disk_built},
+        {@"macProvisioningPending", &vm->mac_provisioning_pending},
+        {@"templateReady", &vm->template_ready},
+    };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+        id value = state[fields[i].key];
+        if ([value isKindOfClass:NSNumber.class]) *fields[i].field = [value boolValue];
+        else complete = NO;
+    }
+    if (complete) vm->legacy_state_pending = NO;
+    vm->state_save_pending = !complete;
+}
+
 static BOOL save_vm_list(void) {
     if (g_config_load_failed) return NO;
     asb_events_changed();
@@ -260,9 +337,7 @@ static BOOL save_vm_list(void) {
         fprintf(f, "Id=%s\n", id);
         fprintf(f, "Name=%s\n", g_vms[i].name);
         fprintf(f, "OsType=%s\n", g_vms[i].os_type);
-        if (g_vms[i].disk_resize_supported)
-            fprintf(f, "DiskResizeSupported=1\n");
-        if (g_vms[i].is_template) fprintf(f, "IsTemplate=1\nTemplateReady=%d\n", g_vms[i].template_ready);
+        if (g_vms[i].is_template) fprintf(f, "IsTemplate=1\n");
         if (g_vms[i].disk_directory[0])
             fprintf(f, "DiskDirectory=%s\n", g_vms[i].disk_directory);
         fprintf(f, "RamMB=%d\n", g_vms[i].ram_mb);
@@ -289,12 +364,13 @@ static BOOL save_vm_list(void) {
             fprintf(f, "SshDeployKey=1\n");
         if (g_vms[i].ssh_pubkey[0])
             fprintf(f, "SshPubKey=%s\n", g_vms[i].ssh_pubkey);
-        if (g_vms[i].install_complete)
-            fprintf(f, "InstallComplete=1\n");
-        if (g_vms[i].disk_built)
-            fprintf(f, "DiskBuilt=1\n");
-        if (g_vms[i].mac_provisioning_pending)
-            fprintf(f, "MacProvisioningPending=1\n");
+        if (g_vms[i].legacy_state_pending) {
+            if (g_vms[i].is_template) fprintf(f, "TemplateReady=%d\n", g_vms[i].template_ready);
+            if (g_vms[i].disk_resize_supported) fprintf(f, "DiskResizeSupported=1\n");
+            if (g_vms[i].install_complete) fprintf(f, "InstallComplete=1\n");
+            if (g_vms[i].disk_built || g_vms[i].install_complete) fprintf(f, "DiskBuilt=%d\n", g_vms[i].disk_built);
+            if (g_vms[i].mac_provisioning_pending) fprintf(f, "MacProvisioningPending=1\n");
+        }
         fprintf(f, "\n");
     }
 
@@ -314,6 +390,33 @@ static BOOL refresh_vm_disk_size(AsbVmMac *vm) {
     if (gb > INT_MAX) return NO;
     vm->hdd_gb = (int)gb;
     return YES;
+}
+
+static void migrate_vm_states(BOOL rewrite_config) {
+    dispatch_group_t group = dispatch_group_create();
+    __block BOOL remove_legacy = rewrite_config;
+    for (int i = 0; i < g_vm_count; ++i) {
+        AsbVmMac *vm = &g_vms[i];
+        if (!vm->state_save_pending) continue;
+        AsbVmId vm_id = vm->unique_id;
+        NSURL *url = vm_state_url(vm);
+        NSData *data = vm_state_data(vm);
+        BOOL legacy = vm->legacy_state_pending;
+        vm->state_migrating = YES;
+        dispatch_group_async(group, g_vm_state_queue, ^{
+            BOOL ok = write_vm_state(url, data);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                int idx = vm_index_of(vm_id);
+                if (idx < 0) return;
+                AsbVmMac *current = &g_vms[idx];
+                if (current->state_migrating) finish_vm_state_save(current, ok);
+                if (legacy && !current->legacy_state_pending) remove_legacy = YES;
+            });
+        });
+    }
+    dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+        if (remove_legacy && g_initialized) save_vm_list();
+    });
 }
 
 static void load_vm_list(void) {
@@ -373,16 +476,16 @@ static void load_vm_list(void) {
             strlcpy(vm->os_type, line + 7, sizeof(vm->os_type));
         else if (strncmp(line, "IsTemplate=", 11) == 0)
             vm->is_template = atoi(line + 11) != 0;
-        else if (strncmp(line, "TemplateReady=", 14) == 0)
+        else if (strncmp(line, "TemplateReady=", 14) == 0) {
             vm->template_ready = atoi(line + 14) != 0;
+            vm->legacy_state_pending = YES;
+        }
         else if (strncmp(line, "DiskDirectory=", 14) == 0)
             strlcpy(vm->disk_directory, line + 14, sizeof(vm->disk_directory));
         else if (strncmp(line, "RamMB=", 6) == 0)
             vm->ram_mb = atoi(line + 6);
         else if (strncmp(line, "HddGB=", 6) == 0)
             vm->hdd_gb = atoi(line + 6);
-        else if (strcmp(line, "DiskResizeSupported=1") == 0)
-            vm->disk_resize_supported = YES;
         else if (strncmp(line, "CpuCores=", 9) == 0)
             vm->cpu_cores = atoi(line + 9);
         else if (strncmp(line, "WindowsStorageController=", 25) == 0) {
@@ -414,16 +517,25 @@ static void load_vm_list(void) {
             strlcpy(vm->ssh_pubkey, line + 10, sizeof(vm->ssh_pubkey));
         else if (strncmp(line, "InstallComplete=", 16) == 0) {
             vm->install_complete = (atoi(line + 16) != 0);
+            vm->legacy_state_pending = YES;
             /* Migration: configs written before disk_built existed only stored
                InstallComplete (which then meant "disk built"). A provisioned VM is
                necessarily built, so seed disk_built too — otherwise an existing VM
                would fail the start gate. An explicit DiskBuilt line reaffirms it. */
             if (vm->install_complete) vm->disk_built = YES;
         }
-        else if (strncmp(line, "DiskBuilt=", 10) == 0)
+        else if (strncmp(line, "DiskBuilt=", 10) == 0) {
             vm->disk_built = (atoi(line + 10) != 0);
-        else if (strncmp(line, "MacProvisioningPending=", 23) == 0)
+            vm->legacy_state_pending = YES;
+        }
+        else if (strncmp(line, "MacProvisioningPending=", 23) == 0) {
             vm->mac_provisioning_pending = (atoi(line + 23) != 0);
+            vm->legacy_state_pending = YES;
+        }
+        else if (strcmp(line, "DiskResizeSupported=1") == 0) {
+            vm->disk_resize_supported = YES;
+            vm->legacy_state_pending = YES;
+        }
     }
 
     fclose(f);
@@ -432,22 +544,30 @@ static void load_vm_list(void) {
         ids[i]=asb_resource_id_load(record_ids[i],g_vms[i].is_template,&identities_changed);
     int migrated = asb_vm_ids_ensure(ids, (size_t)g_vm_count);
     if (migrated<0) { g_config_load_failed=YES;g_vm_count=0;return; }
+    BOOL rewrite_config = NO;
     for (int i=0;i<g_vm_count;++i) {
         g_vms[i].unique_id=ids[i];
+        BOOL legacy = g_vms[i].legacy_state_pending;
+        load_vm_state_json(&g_vms[i]);
+        if (legacy && !g_vms[i].legacy_state_pending) rewrite_config = YES;
         if (!g_vms[i].is_template && g_vms[i].disk_built) refresh_vm_disk_size(&g_vms[i]);
     }
     if (migrated || identities_changed) {
         if (!save_vm_list()) {
             g_config_load_failed = YES;
             g_vm_count = 0;
+            return;
         }
+        rewrite_config = NO;
     }
+    migrate_vm_states(rewrite_config);
 }
 
 /* ---- Public: init/cleanup ---- */
 
 void asb_mac_init(void) {
     if (g_initialized) return;
+    if (!g_vm_state_queue) g_vm_state_queue = dispatch_queue_create("com.appsandbox.vm-state", DISPATCH_QUEUE_SERIAL);
     g_initialized = YES;
     memset(g_vms, 0, sizeof(g_vms));
     memset(g_vz_refs, 0, sizeof(g_vz_refs));
@@ -467,7 +587,9 @@ void asb_mac_cleanup(void) {
     if (!g_initialized) return;
     g_initialized = NO;
     [IsoPatchMac stopWorkers];
+    dispatch_sync(g_vm_state_queue, ^{});
     for (int i = 0; i < g_vm_count; i++) {
+        if (g_vms[i].state_save_pending && !g_vms[i].state_migrating) save_vm_state_json(&g_vms[i]);
         if (g_clipboard_refs[i]) [(VmClipboardMac *)g_clipboard_refs[i] stop];
         g_clipboard_refs[i] = nil;
         if (g_ssh_proxy_refs[i]) [(VmSshProxyMac *)g_ssh_proxy_refs[i] stop];
@@ -725,35 +847,42 @@ static void start_agent_for(int idx) {
     agent.sshEnabled = g_vms[idx].ssh_enabled;
     agent.onDiskResizeSupported = ^{
         int i = vm_index_of(vm_id);
-        if (i < 0 || g_vms[i].run_id != runId || !g_vms[i].running || g_vms[i].disk_resize_supported) return;
-        g_vms[i].disk_resize_supported = YES;
-        save_vm_list();
-        post_list_changed();
+        if (i < 0 || g_vms[i].run_id != runId || !g_vms[i].running) return;
+        AsbVmMac *vm = &g_vms[i];
+        BOOL changed = !vm->disk_resize_supported;
+        vm->disk_resize_supported = YES;
+        if (changed || vm->state_save_pending) save_vm_state_json(vm);
+        if (changed) post_list_changed();
     };
-    agent.onOnlineChange = ^(BOOL online) {
+    agent.onOnlineChange = ^(BOOL online, uint32_t version) {
         int i = vm_index_of(vm_id);
         if (i < 0 || g_vms[i].run_id != runId || !g_vms[i].running) return;
-        BOOL support_changed = online && g_vms[i].disk_resize_supported;
-        g_vms[i].agent_online = online;
+        AsbVmMac *vm = &g_vms[i];
+        BOOL install_finished = online && !vm->install_complete;
+        vm->agent_online = online;
         if (online) {
-            g_vms[i].disk_resize_supported = NO;
-            g_vms[i].agent_last_heartbeat_ms = 0;
+            BOOL changed = vm->agent_version != version || vm->disk_resize_supported || install_finished;
+            vm->agent_version = version;
+            vm->disk_resize_supported = NO;
+            vm->agent_last_heartbeat_ms = 0;
+            if (install_finished) {
+                vm->install_complete = YES;
+                vm->mac_provisioning_pending = NO;
+                clear_admin_password(vm);
+                strlcpy(vm->install_status, "Install complete", sizeof(vm->install_status));
+            }
+            if (changed || vm->state_save_pending) save_vm_state_json(vm);
         }
         post_event(CORE_VM_EVENT_AGENT_STATUS, g_vms[i].unique_id, online ? 1 : 0, NULL);
         post_list_changed();
 
         /* Mirror the Windows behavior: first successful agent connection
          * is the strong signal that install actually worked end-to-end. */
-        if (online && !g_vms[i].install_complete) {
-            g_vms[i].install_complete = YES;
-            g_vms[i].mac_provisioning_pending = NO;
-            clear_admin_password(&g_vms[i]);
-            strlcpy(g_vms[i].install_status, "Install complete", sizeof(g_vms[i].install_status));
-            save_vm_list();
+        if (install_finished) {
             post_event(CORE_VM_EVENT_INSTALL_STATUS, vm_id, 100, "Install complete");
             post_list_changed();
             post_log("[%s] Install complete (agent reached).", g_vms[i].name);
-        } else if (support_changed) save_vm_list();
+        }
 
         /* Clipboard is always-on — start when the agent comes up. */
         if (online) start_clipboard_for(i);
@@ -931,7 +1060,7 @@ static void handle_qemu_state_change(int idx, QemuVmState st) {
             g_vms[idx].template_ready = YES;
             g_vms[idx].install_complete = YES;
             strlcpy(g_vms[idx].install_status, "Template ready", sizeof(g_vms[idx].install_status));
-            save_vm_list();
+            save_vm_state_json(&g_vms[idx]);
             post_log("[%s] Template ready.", g_vms[idx].name);
         }
         post_event(CORE_VM_EVENT_STATE_CHANGED, g_vms[idx].unique_id, 0, NULL);
@@ -1037,7 +1166,7 @@ static void finish_install(int idx, NSError *error) {
         g_vms[idx].install_complete = YES;
         g_vms[idx].install_progress = -1;
         strlcpy(g_vms[idx].install_status, "Template ready", sizeof(g_vms[idx].install_status));
-        save_vm_list();
+        save_vm_state_json(&g_vms[idx]);
         post_list_changed();
         post_log("[%s] Template ready.", g_vms[idx].name);
         return;
@@ -1089,7 +1218,10 @@ static void finish_install(int idx, NSError *error) {
         g_vms[i].template_source = 0;
         strlcpy(g_vms[i].install_status, "Configuring macOS",
                 sizeof(g_vms[i].install_status));
-        if (!save_vm_list()) return;
+        if (!save_vm_state_json(&g_vms[i])) {
+            post_alert(vm_id, "Cannot save VM state.");
+            return;
+        }
         post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[i].unique_id, 100, "Configuring macOS");
         post_list_changed();
         autostart_after_install(vm_id, diskURL);   /* boot once the disk is free */
@@ -1210,7 +1342,7 @@ static void start_windows_build_flow(int idx, NSURL *isoURL) {
                 g_vms[j].disk_built = YES;
                 g_vms[j].install_progress = -1;
                 strlcpy(g_vms[j].install_status, "Installing Windows", sizeof(g_vms[j].install_status));
-                save_vm_list();
+                save_vm_state_json(&g_vms[j]);
                 post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[j].unique_id, 0, "Installing Windows");
                 post_list_changed();
                 autostart_after_install(vm_id, [VmDir diskImageURLFor:nsName]);
@@ -1592,6 +1724,7 @@ int asb_mac_vm_create(const char *name, const char *os_type,
         post_list_changed();
         return BACKEND_ERR_FAILED;
     }
+    save_vm_state_json(vm);
 
     if (source) {
         start_template_instance(idx, source);
@@ -1666,6 +1799,7 @@ int asb_mac_vm_start(AsbVmId vm_id) {
         post_alert(vm_id, "Cannot start: disk is not built yet");
         return BACKEND_ERR_FAILED;
     }
+    if (g_vms[idx].state_save_pending && !g_vms[idx].state_migrating) save_vm_state_json(&g_vms[idx]);
     if (!g_vms[idx].is_template && !g_vms[idx].running && !g_vms[idx].starting)
         refresh_vm_disk_size(&g_vms[idx]);
     BOOL needsMac = !g_vms[idx].mac_address[0];
@@ -2143,6 +2277,7 @@ static int delete_instance(AsbVmId vm_id,BOOL template_resource) {
 
     post_log("[%s] Deleting VM...", name);
     NSError *err = nil;
+    if (g_vms[idx].state_migrating) dispatch_sync(g_vm_state_queue, ^{});
     if (![VmDir deleteVm:nsName error:&err]) {
         post_log("[%s] Delete failed: %s", name, err.localizedDescription.UTF8String);
         post_alert(vm_id, "Delete failed: %s", err.localizedDescription.UTF8String);
@@ -2195,26 +2330,30 @@ int asb_mac_vm_edit(AsbVmId vm_id, const char *field, const char *value) {
     int status = vm_config_edit_status(&g_vms[idx]);
     if (status != BACKEND_OK) return status;
 
+    int number = atoi(value);
+    int *setting;
     if (strcmp(field, "ramMb") == 0) {
-        int ram = atoi(value);
-        if (asb_api_validate_ram_mb(ram)) return BACKEND_ERR_INVALID_ARG;
-        g_vms[idx].ram_mb = ram;
+        if (asb_api_validate_ram_mb(number)) return BACKEND_ERR_INVALID_ARG;
+        setting = &g_vms[idx].ram_mb;
     } else if (strcmp(field, "cpuCores") == 0) {
-        int cores = atoi(value);
-        if (cores < 1) return BACKEND_ERR_INVALID_ARG;
-        g_vms[idx].cpu_cores = cores;
+        if (number < 1) return BACKEND_ERR_INVALID_ARG;
+        setting = &g_vms[idx].cpu_cores;
     } else if (strcmp(field, "gpuMode") == 0) {
-        int gpu_mode = atoi(value);
-        if (gpu_mode < 0 || gpu_mode > 1) return BACKEND_ERR_INVALID_ARG;
-        g_vms[idx].gpu_mode = gpu_mode;
+        if (number < 0 || number > 1) return BACKEND_ERR_INVALID_ARG;
+        setting = &g_vms[idx].gpu_mode;
     } else if (strcmp(field, "networkMode") == 0) {
-        if (atoi(value) != 1) return BACKEND_ERR_INVALID_ARG;
-        g_vms[idx].network_mode = 1;
+        if (number != 1) return BACKEND_ERR_INVALID_ARG;
+        setting = &g_vms[idx].network_mode;
     } else {
         return BACKEND_ERR_INVALID_ARG;
     }
 
-    save_vm_list();
+    int previous = *setting;
+    *setting = number;
+    if (!save_vm_list()) {
+        *setting = previous;
+        return BACKEND_ERR_FAILED;
+    }
     post_event(CORE_VM_EVENT_STATE_CHANGED, g_vms[idx].unique_id, 0, NULL);
     post_list_changed();
     return BACKEND_OK;
@@ -2275,10 +2414,6 @@ int asb_mac_template_delete(AsbTemplateId template_id)
 
 /* ---- Public: persistence / callbacks ---- */
 
-void asb_mac_save(void) {
-    save_vm_list();
-}
-
 int asb_mac_get_api_port(void) {
     return g_api_port;
 }
@@ -2302,6 +2437,8 @@ const char *asb_mac_vm_state(const AsbVmMac *vm) {
 
 NSDictionary *asb_mac_vm_snapshot(const AsbVmMac *vm) {
     BOOL isWindows = strcasecmp(vm->os_type, "Windows") == 0;
+    char version[ASB_AGENT_VERSION_TEXT_SIZE];
+    asb_agent_version_format(vm->agent_version, version);
     char id[ASB_TEMPLATE_ID_TEXT_SIZE];
     asb_resource_id_format(vm->unique_id,vm->is_template,id);
     char template_id[ASB_TEMPLATE_ID_TEXT_SIZE]={0};
@@ -2321,6 +2458,7 @@ NSDictionary *asb_mac_vm_snapshot(const AsbVmMac *vm) {
         @"starting":        @(vm->starting),
         @"shuttingDown":    @(vm->shutting_down),
         @"agentOnline":     @(vm->agent_online),
+        @"agentVersion":    @(version),
         @"diskResizeSupported": @(vm->disk_resize_supported),
         @"diskResizeAgentError": vm->disk_resize_supported ? @"" : @(ASB_DISK_GROW_AGENT_ERROR),
         @"ramMb":           @(vm->ram_mb),
