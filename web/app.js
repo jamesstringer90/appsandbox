@@ -1074,6 +1074,8 @@ function buildRowCells(vm, i, statusTd) {
             : (vm.agentOnline
                 ? 'In-VM agent is connected — host can manage the guest'
                 : 'In-VM agent is not connected'));
+    if (!vm.isTemplate)
+        agentTd.title += '\nAgent version: ' + (vm.agentVersion || 'Unknown');
 
     var bld = vm.buildingVhdx || vm.starting;
 
@@ -1176,6 +1178,7 @@ function renderVmTable() {
         var sig = [
             i, i === selectedVm, vm.name,
             vm.running, vm.starting, vm.buildingVhdx, vm.shuttingDown, vm.agentOnline,
+            vm.agentVersion,
             vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort,
             vm.osType, vm.osName, vm.ramMb, vm.hddGb, vm.cpuCores,

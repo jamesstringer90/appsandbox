@@ -19,7 +19,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 #define VM_AGENT_MAC_PORT 1     /* == ASB_CH_AGENT for the ivshmem path */
 
-typedef void (^VmAgentOnlineChange)(BOOL online);
+typedef void (^VmAgentOnlineChange)(BOOL online, uint32_t version);
 typedef void (^VmAgentLog)(NSString *line);
 /* Mirrors Windows ssh_state: 0=disabled, 1=installing, 2=ready, 3=failed. */
 typedef void (^VmAgentSshStateChange)(int state);

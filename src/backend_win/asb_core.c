@@ -9,7 +9,9 @@
 #include <winsock2.h>
 #include "asb_core.h"
 #include "asb_events.h"
+#include "agent_version.h"
 #include "api_contract.h"
+#include "api_json.h"
 #include "headless_vm.h"
 #include "hcs_vm.h"
 #include "gpu_enum.h"
@@ -529,40 +531,76 @@ ASB_API VmInstance *asb_find_vm_by_id(UINT64 id)
 
 /* ---- Per-VM state JSON (beside disk.vhdx) ---- */
 
-static void get_state_json_path(const wchar_t *vhdx_path, wchar_t *out, size_t out_len)
+static BOOL get_state_json_path(const wchar_t *vhdx_path, wchar_t *out, size_t out_len)
 {
     wchar_t dir[MAX_PATH];
-    const wchar_t *last_slash;
-    wcscpy_s(dir, MAX_PATH, vhdx_path);
-    last_slash = wcsrchr(dir, L'\\');
-    if (last_slash) dir[last_slash - dir] = L'\0';
-    swprintf_s(out, out_len, L"%s\\vm_state.json", dir);
+    return get_vm_disk_root(vhdx_path, dir) &&
+        swprintf_s(out, out_len, L"%s\\vm_state.json", dir) > 0;
 }
 
-ASB_API void vm_save_state_json(const wchar_t *vhdx_path, BOOL install_complete)
+void vm_save_state_json(VmInstance *vm)
 {
-    wchar_t path[MAX_PATH];
+    wchar_t path[MAX_PATH], temporary[MAX_PATH];
     FILE *f;
-    get_state_json_path(vhdx_path, path, MAX_PATH);
-    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
-    fprintf(f, "{\"installComplete\":%d}\n", install_complete ? 1 : 0);
-    fclose(f);
-}
+    vm->state_save_pending = TRUE;
+    if (!get_state_json_path(vm->vhdx_path, path, ARRAYSIZE(path)) ||
+        swprintf_s(temporary, ARRAYSIZE(temporary), L"%s.tmp", path) < 0) return;
 
-ASB_API BOOL vm_load_state_json(const wchar_t *vhdx_path)
-{
-    wchar_t path[MAX_PATH];
-    FILE *f;
-    char buf[256];
-    BOOL result = FALSE;
-    get_state_json_path(vhdx_path, path, MAX_PATH);
-    if (_wfopen_s(&f, path, L"r") != 0 || !f) return FALSE;
-    if (fgets(buf, sizeof(buf), f)) {
-        if (strstr(buf, "\"installComplete\":1"))
-            result = TRUE;
+    BOOL ok = _wfopen_s(&f, temporary, L"w") == 0 && f;
+    if (ok) {
+        char version[ASB_AGENT_VERSION_TEXT_SIZE];
+        asb_agent_version_format((uint32_t)vm->agent_version, version);
+        ok = fprintf(f, "{\"installComplete\":%d,\"diskResizeSupported\":%d,\"agentVersion\":\"%s\"}\n",
+                     vm->install_complete != 0, vm->disk_resize_supported != 0, version) > 0 && !ferror(f);
+        if (fclose(f) != 0) ok = FALSE;
+        if (ok) ok = MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     }
+    if (ok) {
+        vm->state_save_pending = FALSE;
+        InterlockedExchange(&vm->legacy_disk_resize_supported, FALSE);
+    } else {
+        DeleteFileW(temporary);
+        asb_log(L"Could not save VM state for \"%s\".", vm->name);
+    }
+}
+
+static BOOL read_vm_state_json(const wchar_t *path, wchar_t *buf, size_t count)
+{
+    FILE *f;
+    if (_wfopen_s(&f, path, L"r,ccs=UTF-8") != 0 || !f) return FALSE;
+    BOOL ok = fgetws(buf, (int)count, f) != NULL;
     fclose(f);
-    return result;
+    return ok;
+}
+
+static void load_vm_state_json(VmInstance *vm)
+{
+    wchar_t path[MAX_PATH], buf[256];
+    int installed = 0;
+    BOOL has_path = get_state_json_path(vm->vhdx_path, path, ARRAYSIZE(path));
+    if (has_path && read_vm_state_json(path, buf, ARRAYSIZE(buf))) {
+        api_json_get_int(buf, L"installComplete", &installed);
+        wchar_t value[ASB_AGENT_VERSION_TEXT_SIZE];
+        int disk_resize;
+        if (api_json_get_int(buf, L"diskResizeSupported", &disk_resize)) {
+            vm->disk_resize_supported = disk_resize != 0;
+            vm->legacy_disk_resize_supported = FALSE;
+        }
+        char text[ASB_AGENT_VERSION_TEXT_SIZE];
+        if (api_json_get_string(buf, L"agentVersion", value, ARRAYSIZE(value)) &&
+            WideCharToMultiByte(CP_UTF8, 0, value, -1, text, sizeof(text), NULL, NULL))
+            vm->agent_version = (LONG)asb_agent_version_parse(text);
+    }
+    if (has_path && !vm->install_complete && installed != 1) {
+        const wchar_t *slash = wcsrchr(vm->vhdx_path, L'\\');
+        wchar_t legacy_path[MAX_PATH];
+        if (slash && swprintf_s(legacy_path, ARRAYSIZE(legacy_path), L"%.*s\\vm_state.json",
+                               (int)(slash - vm->vhdx_path), vm->vhdx_path) > 0 &&
+            _wcsicmp(legacy_path, path) && read_vm_state_json(legacy_path, buf, ARRAYSIZE(buf)))
+            api_json_get_int(buf, L"installComplete", &installed);
+    }
+    if (installed == 1) vm->install_complete = TRUE;
+    if (vm->legacy_disk_resize_supported) vm_save_state_json(vm);
 }
 
 /* ---- Config file path ---- */
@@ -737,8 +775,6 @@ static BOOL save_vm_list(void)
         fwprintf(f, L"OsType=%s\n", VM_AT(i).os_type);
         fwprintf(f, L"ImagePath=%s\n", VM_AT(i).image_path);
         fwprintf(f, L"VhdxPath=%s\n", VM_AT(i).vhdx_path);
-        if (VM_AT(i).disk_resize_supported)
-            fwprintf(f, L"DiskResizeSupported=1\n");
         fwprintf(f, L"RamMB=%lu\n", VM_AT(i).ram_mb);
         fwprintf(f, L"CpuCores=%lu\n", VM_AT(i).cpu_cores);
         fwprintf(f, L"GpuMode=%d\n", VM_AT(i).gpu_mode);
@@ -770,6 +806,8 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"SshPubKey=%s\n", VM_AT(i).ssh_pubkey);
         if (VM_AT(i).install_complete)
             fwprintf(f, L"InstallComplete=1\n");
+        if (VM_AT(i).legacy_disk_resize_supported)
+            fwprintf(f, L"DiskResizeSupported=1\n");
         fwprintf(f, L"\n");
     }
 
@@ -922,8 +960,6 @@ static void load_vm_list(void)
             vm->ram_mb = (DWORD)_wtoi(line + 6);
         else if (wcsncmp(line, L"HddGB=", 6) == 0)
             vm->hdd_gb = (DWORD)_wtoi(line + 6);
-        else if (wcscmp(line, L"DiskResizeSupported=1") == 0)
-            vm->disk_resize_supported = TRUE;
         else if (wcsncmp(line, L"CpuCores=", 9) == 0)
             vm->cpu_cores = (DWORD)_wtoi(line + 9);
         else if (wcsncmp(line, L"GpuMode=", 8) == 0)
@@ -963,6 +999,10 @@ static void load_vm_list(void)
             wcsncpy_s(vm->ssh_pubkey, 512, line + 10, _TRUNCATE);
         else if (wcsncmp(line, L"InstallComplete=", 16) == 0)
             vm->install_complete = (_wtoi(line + 16) != 0);
+        else if (wcscmp(line, L"DiskResizeSupported=1") == 0) {
+            vm->disk_resize_supported = TRUE;
+            vm->legacy_disk_resize_supported = TRUE;
+        }
     }
 
     fclose(f);
@@ -979,8 +1019,7 @@ static void load_vm_list(void)
             VM_AT(i).running = FALSE;
             refresh_disk_size(VM_AT(i).vhdx_path, &VM_AT(i).hdd_gb);
             if (resolve_vm_gpu_selection(&VM_AT(i))) gpu_changed = TRUE;
-            if (vm_load_state_json(VM_AT(i).vhdx_path))
-                VM_AT(i).install_complete = TRUE;
+            load_vm_state_json(&VM_AT(i));
             if (get_vm_disk_root(VM_AT(i).vhdx_path, snap_dir) &&
                 wcslen(snap_dir) + 10 < MAX_PATH) {
                 wcscat_s(snap_dir, MAX_PATH, L"\\snapshots");
@@ -3695,7 +3734,7 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
             g_vm_count++;
 
             if (!is_template_create)
-                vm_save_state_json(cfg.vhdx_path, FALSE);
+                vm_save_state_json(inst);
 
             save_vm_list();
 
@@ -3808,7 +3847,7 @@ build_failed:
               snapshot_init(&SNAP_AT(g_vm_count), sd); }
             g_vm_count++;
 
-            vm_save_state_json(cfg.vhdx_path, FALSE);
+            vm_save_state_json(inst);
             save_vm_list();
 
             args = (LinuxCreateArgs *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(LinuxCreateArgs));
@@ -3928,7 +3967,7 @@ build_failed:
     g_vm_count++;
 
     if (!is_template_create)
-        vm_save_state_json(cfg.vhdx_path, FALSE);
+        vm_save_state_json(inst);
 
     /* Auto-start */
     asb_log(L"Starting VM \"%s\"...", cfg.name);
@@ -4402,8 +4441,12 @@ ASB_API HRESULT asb_vm_set_ram(AsbVm vm, DWORD ram_mb)
     if (idx < 0) return E_INVALIDARG;
     if (!vm_config_editable(&VM_AT(idx))) return E_ACCESSDENIED;
     if (asb_api_validate_ram_mb((int)ram_mb)) return E_INVALIDARG;
+    DWORD previous = VM_AT(idx).ram_mb;
     VM_AT(idx).ram_mb = ram_mb;
-    save_vm_list();
+    if (!save_vm_list()) {
+        VM_AT(idx).ram_mb = previous;
+        return E_FAIL;
+    }
     notify_state(vm, VM_AT(idx).running, g_state_ud);
     return S_OK;
 }
@@ -4414,8 +4457,12 @@ ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores)
     if (idx < 0) return E_INVALIDARG;
     if (!vm_config_editable(&VM_AT(idx))) return E_ACCESSDENIED;
     if (cores < 1) return E_INVALIDARG;
+    DWORD previous = VM_AT(idx).cpu_cores;
     VM_AT(idx).cpu_cores = cores;
-    save_vm_list();
+    if (!save_vm_list()) {
+        VM_AT(idx).cpu_cores = previous;
+        return E_FAIL;
+    }
     notify_state(vm, VM_AT(idx).running, g_state_ud);
     return S_OK;
 }
@@ -4453,12 +4500,21 @@ ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *
     if (idx < 0) return E_INVALIDARG;
     if (!vm_config_editable(&VM_AT(idx))) return E_ACCESSDENIED;
     if (asb_validate_gpu_selection(gpu_mode, gpu_id)) return E_INVALIDARG;
-    VM_AT(idx).gpu_mode = gpu_mode;
-    wcscpy_s(VM_AT(idx).gpu_id, ARRAYSIZE(VM_AT(idx).gpu_id),
+    VmInstance *inst = &VM_AT(idx);
+    int previous_mode = inst->gpu_mode;
+    wchar_t previous_id[ARRAYSIZE(inst->gpu_id)];
+    wcscpy_s(previous_id, ARRAYSIZE(previous_id), inst->gpu_id);
+    inst->gpu_mode = gpu_mode;
+    wcscpy_s(inst->gpu_id, ARRAYSIZE(inst->gpu_id),
         gpu_id && gpu_id[0] ? find_gpu(gpu_id)->interface_path : L"");
-    update_vm_gpu_name(&VM_AT(idx));
-    save_vm_list();
-    notify_state(vm, VM_AT(idx).running, g_state_ud);
+    update_vm_gpu_name(inst);
+    if (!save_vm_list()) {
+        inst->gpu_mode = previous_mode;
+        wcscpy_s(inst->gpu_id, ARRAYSIZE(inst->gpu_id), previous_id);
+        update_vm_gpu_name(inst);
+        return E_FAIL;
+    }
+    notify_state(vm, inst->running, g_state_ud);
     return S_OK;
 }
 
@@ -4474,14 +4530,21 @@ ASB_API HRESULT asb_vm_set_network_selection(AsbVm vm, int mode, const wchar_t *
     VmInstance *inst = &VM_AT(idx);
     if (!vm_config_editable(inst)) return E_ACCESSDENIED;
     if (mode < NET_NONE || mode > NET_INTERNAL || (adapter && mode != NET_EXTERNAL)) return E_INVALIDARG;
+    int previous_mode = inst->network_mode;
+    wchar_t previous_adapter[ARRAYSIZE(inst->net_adapter)];
     if (adapter) {
+        wcscpy_s(previous_adapter, ARRAYSIZE(previous_adapter), inst->net_adapter);
         HRESULT hr = validate_network_selection(adapter);
         if (FAILED(hr)) return hr;
         wcscpy_s(inst->net_adapter, ARRAYSIZE(inst->net_adapter),
                  wcscmp(adapter, L"(Auto)") ? adapter : L"");
     }
     inst->network_mode = mode;
-    save_vm_list();
+    if (!save_vm_list()) {
+        inst->network_mode = previous_mode;
+        if (adapter) wcscpy_s(inst->net_adapter, ARRAYSIZE(inst->net_adapter), previous_adapter);
+        return E_FAIL;
+    }
     notify_state(vm, inst->running, g_state_ud);
     return S_OK;
 }

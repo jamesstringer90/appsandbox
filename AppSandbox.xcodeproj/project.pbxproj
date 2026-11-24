@@ -626,6 +626,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 8032000000000000000000DD /* Build configuration list for PBXNativeTarget "appsandbox-agent" */;
 			buildPhases = (
+				A033000000000000000000DD /* Generate agent build version */,
 				A030000000000000000000DD /* Sources */,
 				A031000000000000000000DD /* Frameworks */,
 			);
@@ -784,6 +785,23 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "\"${SRCROOT}/tools/sign/stamp-version.sh\"\n";
+		};
+		A033000000000000000000DD /* Generate agent build version */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/Directory.Build.props",
+				"$(SRCROOT)/tools/sign/asb-version.sh",
+			);
+			name = "Generate agent build version";
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/asb_agent_build_version.h",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\nversion=$(\"$SRCROOT/tools/sign/asb-version.sh\" short)\nprintf '#define ASB_VERSION_STRING \"%s\"\\n' \"$version\" > \"$SCRIPT_OUTPUT_FILE_0\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -1173,6 +1191,7 @@
 			buildSettings = {
 				ARCHS = arm64;
 				CODE_SIGNING_ALLOWED = YES;
+				HEADER_SEARCH_PATHS = "$(DERIVED_FILE_DIR)";
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				ONLY_ACTIVE_ARCH = NO;
 				PRODUCT_BUNDLE_IDENTIFIER = "com.appsandbox.appsandbox-agent";
@@ -1188,6 +1207,7 @@
 			buildSettings = {
 				ARCHS = arm64;
 				CODE_SIGNING_ALLOWED = YES;
+				HEADER_SEARCH_PATHS = "$(DERIVED_FILE_DIR)";
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				ONLY_ACTIVE_ARCH = NO;
 				PRODUCT_BUNDLE_IDENTIFIER = "com.appsandbox.appsandbox-agent";
