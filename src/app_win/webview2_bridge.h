@@ -17,6 +17,9 @@ void webview2_flush_queue(void);
 /* Resize the WebView2 to fill the parent's client area. */
 void webview2_resize(HWND parent);
 
+/* Synchronize the controller with the native window's visibility. */
+void webview2_sync_visibility(HWND parent);
+
 /* Clean up WebView2 resources. */
 void webview2_cleanup(void);
 

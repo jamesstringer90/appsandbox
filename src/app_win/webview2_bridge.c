@@ -243,6 +243,7 @@ static HRESULT STDMETHODCALLTYPE CtrlH_Invoke(
 
     /* Resize to fill parent */
     webview2_resize(g_parent_hwnd);
+    webview2_sync_visibility(g_parent_hwnd);
 
     /* Navigate to local HTML */
     GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
@@ -409,6 +410,16 @@ void webview2_resize(HWND parent)
         RECT rc;
         GetClientRect(parent, &rc);
         g_controller->lpVtbl->put_Bounds(g_controller, rc);
+    }
+}
+
+void webview2_sync_visibility(HWND parent)
+{
+    if (g_controller) {
+        HRESULT hr = g_controller->lpVtbl->put_IsVisible(
+            g_controller, IsWindowVisible(parent));
+        if (FAILED(hr))
+            ui_log(L"WebView2: Failed to synchronize visibility (0x%08X)", hr);
     }
 }
 

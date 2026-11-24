@@ -796,6 +796,13 @@ static void tray_add(HWND hwnd)
 
 static void tray_remove(void) { Shell_NotifyIconW(NIM_DELETE, &g_nid); }
 
+static void tray_restore_main_window(HWND hwnd)
+{
+    ShowWindow(hwnd, SW_RESTORE);
+    webview2_sync_visibility(hwnd);
+    SetForegroundWindow(hwnd);
+}
+
 #ifndef DWMWA_BORDER_COLOR
 #define DWMWA_BORDER_COLOR 34
 #endif
@@ -1000,8 +1007,7 @@ static void tray_show_menu(HWND hwnd)
     DestroyMenu(menu);
 
     if (cmd == TRAY_CMD_SHOW) {
-        ShowWindow(hwnd, SW_RESTORE);
-        SetForegroundWindow(hwnd);
+        tray_restore_main_window(hwnd);
     } else if (cmd == TRAY_CMD_EXIT) {
         DestroyWindow(hwnd);
     } else if (cmd >= TRAY_CMD_STOP_BASE) {
@@ -1802,8 +1808,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TRAYICON:
         if (g_command_depth || asb_api_busy()) return 0;
         if (lp == WM_LBUTTONDBLCLK) {
-            ShowWindow(hwnd, SW_RESTORE);
-            SetForegroundWindow(hwnd);
+            tray_restore_main_window(hwnd);
         } else if (lp == WM_LBUTTONUP || lp == WM_RBUTTONUP) {
             ++g_command_depth;
             tray_show_menu(hwnd);
@@ -1855,6 +1860,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 }
             }
             ShowWindow(hwnd, SW_HIDE);
+            webview2_sync_visibility(hwnd);
             return 0;
         }
         DestroyWindow(hwnd);
