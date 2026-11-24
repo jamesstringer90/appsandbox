@@ -289,28 +289,21 @@ static uint32_t screenshot_capture_frame(void *context,const AsbScreenshotReques
     uint32_t error=1460;
     display_gpu_capture_begin(capture->gpu);
     while (!g_stop && screenshot_time()<deadline) {
-        const void *pixels=NULL;
-        uint32_t width=0,height=0,stride=0;
-        uint64_t sequence=0;
-        int shared=0;
-        int result=display_gpu_capture_poll(capture->gpu,&pixels,&width,&height,&stride,&sequence,&shared);
-        if (result<0) { error=21;break; }
-        if (result==2) {
-            if (drm_acquire_fb(&capture->cpu)==0) {
-                pixels=capture->cpu.mem;width=capture->cpu.width;height=capture->cpu.height;
-                stride=capture->cpu.stride;sequence=++capture->sequence;result=1;
-            } else result=0;
+        unsigned char *copy=NULL;
+        int result=display_gpu_capture_poll(capture->gpu,reply,&copy);
+        if (result<0) { error=result==-1?21:(uint32_t)-result;break; }
+        if (result==2 && drm_acquire_fb(&capture->cpu)==0) {
+            reply->width=capture->cpu.width;reply->height=capture->cpu.height;
+            reply->frame_seq=++capture->sequence;reply->flags=0;
+            error=asb_capture_pack(capture->cpu.mem,capture->cpu.stride,reply,&copy);
+            if (error) break;
+            result=1;
         }
         if (result==1) {
-            reply->width=width;reply->height=height;
-            unsigned char *copy=NULL;
-            error=asb_capture_pack(pixels,stride,reply,&copy);
-            if (error) break;
             if (!display_gpu_capture_valid(capture->gpu)) {
                 free(copy);display_gpu_capture_begin(capture->gpu);continue;
             }
-            reply->frame_seq=sequence;
-            reply->capture_time_ms=screenshot_time();reply->flags=shared?ASB_SCREENSHOT_GPU_SHARED:0;
+            reply->capture_time_ms=screenshot_time();
             *output=copy;error=0;break;
         }
         struct timespec delay={.tv_nsec=2000000};
@@ -727,24 +720,6 @@ have_card:
     return ctx.fd;
 }
 
-static void capture_size(int fd, uint32_t *width, uint32_t *height)
-{
-    *width = *height = 0;
-    drmModeRes *resources = drmModeGetResources(fd);
-    if (!resources) return;
-    for (int i = 0; i < resources->count_crtcs; ++i) {
-        drmModeCrtc *crtc = drmModeGetCrtc(fd, resources->crtcs[i]);
-        if (!crtc) continue;
-        if (crtc->mode_valid && crtc->buffer_id) {
-            *width = crtc->width;
-            *height = crtc->height;
-        }
-        drmModeFreeCrtc(crtc);
-        if (*width && *height) break;
-    }
-    drmModeFreeResources(resources);
-}
-
 struct display_config {
     int supported;
     struct drm_asb_display_config current, fallback, previous;
@@ -801,7 +776,7 @@ static int display_config_expire(int fd, struct display_config *config, int clie
     }
     if (config->resize_until && now >= config->resize_until) {
         agent_log("display resize timed out; restoring previous mode");
-        config->previous.flags = ASB_DRM_DISPLAY_SHARED;
+        config->previous.flags &= ~ASB_DRM_DISPLAY_MATCH_WINDOW;
         display_config_set(fd, config, config->previous);
         config->resize_until = 0;
         config->request.status = ETIMEDOUT;
@@ -826,7 +801,8 @@ static int display_resize(int fd, int client_fd, struct display_config *config,
         (request->slot == DISPLAY_SIZE_GUEST ||
          (request->width >= DISPLAY_MIN_WIDTH && request->height >= DISPLAY_MIN_HEIGHT))) {
         struct drm_asb_display_config next = {
-            .flags = ASB_DRM_DISPLAY_SHARED, .width = width, .height = height,
+            .flags = ASB_DRM_DISPLAY_SHARED | (config->current.flags & ASB_DRM_DISPLAY_HDR),
+            .width = width, .height = height,
             .refresh = config->current.refresh ?
                 (request->slot == DISPLAY_SIZE_WINDOW && request->handle ? (uint32_t)request->handle : 60) : 0,
         };
@@ -898,33 +874,34 @@ static void capture_loop(int client_fd, int drm_fd, struct display_gpu **gpu,
             } else if (query.type != DISPLAY_GPU_QUERY) {
                 break;
             } else if (!*gpu || display_gpu_active(*gpu)) {
-                capture_size(ctx.fd, &width, &height);
-                if (*gpu && (!width || !height)) {
+                resize = config->supported && (query.reserved & DISPLAY_GPU_CAP_RESIZE);
+                uint32_t size_mode = resize && (config->current.flags & ASB_DRM_DISPLAY_MATCH_WINDOW)
+                    ? DISPLAY_SIZE_WINDOW : DISPLAY_SIZE_GUEST;
+                int result = display_gpu_connect(*gpu, client_fd, &query, &width, &height, resize, size_mode,
+                                             config->current.refresh);
+                if (result == -2) {
                     struct pollfd wait = {.fd = display_gpu_event(*gpu), .events = POLLIN};
                     poll(&wait, 1, 16);
                     continue;
                 }
-                resize = config->supported && (query.reserved & DISPLAY_GPU_CAP_RESIZE);
-                uint32_t size_mode = resize && (config->current.flags & ASB_DRM_DISPLAY_MATCH_WINDOW)
-                    ? DISPLAY_SIZE_WINDOW : DISPLAY_SIZE_GUEST;
-                shared = display_gpu_connect(*gpu, client_fd, &query, width, height, resize, size_mode,
-                                             config->current.refresh);
-                if (shared < 0) {
-                    shared = 0;
+                if (result < 0) {
                     display_config_fallback(drm_fd, config);
                     break;
                 }
+                shared = result;
                 session = query.session;
                 queried = 1;
                 query_bytes = 0;
                 agent_log("display transport: %s", shared ? "shared GPU textures" : "socket frames");
                 if (shared) {
                     struct drm_asb_display_config mode = config->current;
+                    mode.flags &= ~ASB_DRM_DISPLAY_HDR;
                     if (size_mode == DISPLAY_SIZE_GUEST && mode.flags != ASB_DRM_DISPLAY_SHARED) {
                         mode.flags = ASB_DRM_DISPLAY_SHARED;
                         mode.width = width;
                         mode.height = height;
                     }
+                    if (display_gpu_hdr_ready(*gpu)) mode.flags |= ASB_DRM_DISPLAY_HDR;
                     if (display_config_set(drm_fd, config, mode) < 0) break;
                     if (resize && display_resize_failed(client_fd, session, config) < 0) break;
                     drm_release_fb(&ctx);

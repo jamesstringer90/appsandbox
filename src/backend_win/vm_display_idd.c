@@ -232,6 +232,7 @@ struct VmDisplayIdd {
     ID3D11DeviceContext     *ctx;
     IDXGISwapChain          *swap_chain;
     DXGI_FORMAT              swap_format;
+    BOOL                    swap_pq;
     UINT                    swap_flags;
     HANDLE                  present_event;
     BOOL                    present_ready;
@@ -263,6 +264,7 @@ struct VmDisplayIdd {
     BOOL                    shared_refresh;
     BOOL                    shared_screenshot;
     DXGI_FORMAT              shared_format;
+    BOOL                    shared_pq;
     UINT                    shared_refresh_rate;
     UINT                    shared_width;
     UINT                    shared_height;
@@ -1518,6 +1520,7 @@ static void idd_shared_release(VmDisplayIdd *d)
     d->shared_refresh = FALSE;
     d->shared_screenshot = FALSE;
     d->shared_format = DXGI_FORMAT_UNKNOWN;
+    d->shared_pq = FALSE;
     d->shared_refresh_rate = 0;
     ZeroMemory(&d->size_request, sizeof(d->size_request));
     d->shared_next = 0;
@@ -1730,7 +1733,8 @@ static BOOL idd_shared_start_linux(VmDisplayIdd *d, SOCKET socket,
     if (!d->stop && d->device && d->ctx && d->shared_thread && d->shared_fence_event &&
         !d->shared_disabled && caps->width && caps->height &&
         caps->width <= DISPLAY_MAX_WIDTH && caps->height <= DISPLAY_MAX_HEIGHT &&
-        caps->format == DXGI_FORMAT_B8G8R8A8_UNORM && !caps->status) {
+        (caps->format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+         caps->format == DXGI_FORMAT_R10G10B10A2_UNORM) && !caps->status) {
         hr = d->device->lpVtbl->QueryInterface(d->device, &IID_ID3D11Device5, (void **)&device);
         if (SUCCEEDED(hr)) hr = d->ctx->lpVtbl->QueryInterface(d->ctx,
             &IID_ID3D11DeviceContext4, (void **)&context);
@@ -1750,6 +1754,8 @@ static BOOL idd_shared_start_linux(VmDisplayIdd *d, SOCKET socket,
         context = NULL;
         d->shared_width = caps->width;
         d->shared_height = caps->height;
+        d->shared_format = (DXGI_FORMAT)caps->format;
+        d->shared_pq = (caps->reserved & DISPLAY_GPU_COLOR_PQ) != 0;
         d->shared_resize = (caps->reserved & DISPLAY_GPU_CAP_RESIZE) != 0;
         d->shared_refresh = (caps->reserved & DISPLAY_GPU_CAP_REFRESH) != 0;
         d->shared_refresh_rate = d->shared_refresh ? (UINT)caps->handle : 60;
@@ -1789,12 +1795,12 @@ static BOOL idd_shared_import_linux(VmDisplayIdd *d, SOCKET socket,
     EnterCriticalSection(&d->frame_cs);
     if (!d->stop && !d->shared_disabled && d->device && d->shared_context && !d->shared_ready &&
         offer->slot < DISPLAY_GPU_FENCE_SLOTS && offer->width == d->shared_width &&
-        offer->height == d->shared_height && offer->format == DXGI_FORMAT_B8G8R8A8_UNORM &&
+        offer->height == d->shared_height && offer->format == (UINT)d->shared_format &&
         !(is_fence ? d->shared_slots[index].fence != NULL : d->shared_slots[index].texture != NULL))
         hr = d->device->lpVtbl->QueryInterface(d->device, &IID_ID3D11Device5, (void **)&device);
     LeaveCriticalSection(&d->frame_cs);
     if (SUCCEEDED(hr)) hr = asb_gpu_broker_import(broker, offer->handle, is_fence,
-        offer->width, offer->height, &handle);
+        offer->width, offer->height, offer->format, &handle);
     if (SUCCEEDED(hr)) {
         if (is_fence) hr = ID3D11Device5_OpenSharedFence(device, handle, &IID_ID3D11Fence, (void **)&fence);
         else hr = ID3D11Device5_OpenSharedResource1(device, handle, &IID_ID3D11Texture2D, (void **)&texture);
@@ -2164,6 +2170,7 @@ static BOOL d3d_init(VmDisplayIdd *d)
 
     d->swap_flags = scd.Flags;
     d->swap_format = scd.BufferDesc.Format;
+    d->swap_pq = FALSE;
 
     {
         IDXGISwapChain2 *swap = NULL;
@@ -2285,22 +2292,6 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d, DXGI_FORMAT format)
         ui_log(L"IDD: ResizeBuffers failed (0x%08X)", hr);
         return;
     }
-    if (format != DXGI_FORMAT_UNKNOWN && format != d->swap_format) {
-        IDXGISwapChain3 *swap = NULL;
-        DXGI_COLOR_SPACE_TYPE color_space = format == DXGI_FORMAT_R16G16B16A16_FLOAT
-            ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-        hr = IDXGISwapChain_QueryInterface(d->swap_chain, &IID_IDXGISwapChain3, (void **)&swap);
-        if (SUCCEEDED(hr)) {
-            hr = IDXGISwapChain3_SetColorSpace1(swap, color_space);
-            IDXGISwapChain3_Release(swap);
-        }
-        if (FAILED(hr)) {
-            ui_log(L"IDD: SetColorSpace1 failed (0x%08X)", hr);
-            return;
-        }
-        d->swap_format = format;
-    }
-
     hr = d->swap_chain->lpVtbl->GetBuffer(d->swap_chain, 0,
                                    &IID_ID3D11Texture2D, (void **)&back_buf);
     if (SUCCEEDED(hr)) {
@@ -2405,14 +2396,31 @@ static void d3d_render_frame(VmDisplayIdd *d)
         frame_uploaded = TRUE;
     }
 
-    DXGI_FORMAT format = shared && d->shared_format == DXGI_FORMAT_R16G16B16A16_FLOAT
-        ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
-    if (format != d->swap_format) {
-        d3d_resize_swap_chain(d, format);
-        if (!d->rtv) {
+    DXGI_FORMAT format = shared ? d->shared_format : DXGI_FORMAT_B8G8R8A8_UNORM;
+    BOOL pq = format == DXGI_FORMAT_R10G10B10A2_UNORM && d->shared_pq;
+    if (format != d->swap_format) d3d_resize_swap_chain(d, format);
+    if (!d->rtv) {
+        LeaveCriticalSection(&d->frame_cs);
+        return;
+    }
+    if (format != d->swap_format || pq != d->swap_pq) {
+        IDXGISwapChain3 *swap = NULL;
+        DXGI_COLOR_SPACE_TYPE color_space = pq ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 :
+            format == DXGI_FORMAT_R16G16B16A16_FLOAT ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 :
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        hr = IDXGISwapChain_QueryInterface(d->swap_chain, &IID_IDXGISwapChain3, (void **)&swap);
+        if (SUCCEEDED(hr)) {
+            hr = IDXGISwapChain3_SetColorSpace1(swap, color_space);
+            IDXGISwapChain3_Release(swap);
+        }
+        if (FAILED(hr)) {
+            ui_log(L"IDD: SetColorSpace1 failed (0x%08X)", hr);
             LeaveCriticalSection(&d->frame_cs);
+            d3d_recover(d);
             return;
         }
+        d->swap_format = format;
+        d->swap_pq = pq;
     }
 
     /* Compute letterboxed viewport within client area */
@@ -2831,6 +2839,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             query.version = DISPLAY_GPU_VERSION;
             query.reserved = _wcsicmp(d->os_type, L"windows") == 0
                 ? DISPLAY_GPU_CAP_RESIZE : DISPLAY_GPU_CAP_FENCE | DISPLAY_GPU_CAP_RESIZE;
+            if (query.reserved & DISPLAY_GPU_CAP_FENCE) query.format = DXGI_FORMAT_R10G10B10A2_UNORM;
             query.reserved |= DISPLAY_GPU_CAP_REFRESH;
             query.reserved |= DISPLAY_GPU_CAP_SNAPSHOT;
             query.session = ((UINT64)GetCurrentProcessId() << 32) |

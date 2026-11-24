@@ -41,7 +41,7 @@ appsandbox-display: appsandbox-display.c display-gpu.c display-gpu.h $(CAPTURE_D
 	       -I$(CAPTURE_DIR) -I../../../src/core -I../asb_drm -I../dxgkrnl/.source/src/include/uapi/misc \
 	       -I../asb_drm-src -I../dxgkrnl-src/include/uapi/misc \
 	       -o $@ appsandbox-display.c display-gpu.c $(CAPTURE_DIR)/asb_capture_socket.c $(CAPTURE_DIR)/asb_capture_service.c \
-	       $(LDFLAGS) $(shell pkg-config --libs libdrm) -ldl -lsystemd
+	       $(LDFLAGS) $(shell pkg-config --libs libdrm) -ldl -lsystemd -lm
 
 appsandbox-input: appsandbox-input.c $(wildcard protocol.h ../../../src/core/protocol.h)
 	$(CC) $(CFLAGS) -I../../../src/core -o $@ $< $(LDFLAGS) -lsystemd

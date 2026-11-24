@@ -13,6 +13,7 @@
 
 #include <linux/capability.h>
 
+#include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_drv.h>
@@ -69,14 +70,13 @@ static void asb_fill_dtd(u8 dtd[18], const struct drm_display_mode *m)
 	dtd[17] = 0x18;
 }
 
-void asb_build_edid(struct asb_device *asb)
+static void asb_build_edid(struct asb_device *asb, u8 *e, bool hdr)
 {
-	u8 *e = asb->edid;
 	struct drm_display_mode m;
 	int i, sum = 0;
 	const char *name = "AppSandbox";
 
-	memset(e, 0, ASB_EDID_LEN);
+	memset(e, 0, EDID_LENGTH * 2);
 
 	/* Header (0..7) */
 	e[0] = 0x00;
@@ -97,8 +97,7 @@ void asb_build_edid(struct asb_device *asb)
 	e[18] = 1;          /* EDID major version */
 	e[19] = 4;          /* EDID minor version */
 
-	/* Video input: digital, 8 bpc, DisplayPort interface */
-	e[20] = 0xa5;
+	e[20] = hdr ? 0xb5 : 0xa5;
 	e[21] = 53;         /* horizontal screen size cm */
 	e[22] = 30;         /* vertical screen size cm */
 	e[23] = 120;        /* gamma = (gamma_real * 100) - 100 → 2.2 */
@@ -150,9 +149,22 @@ void asb_build_edid(struct asb_device *asb)
 	for (i = 113; i <= 125; i++) e[i] = 0x00;
 
 	/* Extension block count + checksum */
-	e[126] = 0;
+	e[126] = hdr;
 	for (i = 0; i < 127; i++) sum += e[i];
 	e[127] = (u8)(0x100 - (sum & 0xff));
+
+	if (hdr) {
+		static const u8 cta[] = {
+			0x02, 0x03, 12, 0,
+			0xe3, 0x05, 0x80, 0,
+			0xe3, 0x06, 0x05, 0x01,
+		};
+		sum = 0;
+		for (i = 0; i < ARRAY_SIZE(cta); i++)
+			sum += cta[i];
+		memcpy(e + EDID_LENGTH, cta, sizeof(cta));
+		e[2 * EDID_LENGTH - 1] = (u8)(0x100 - (sum & 0xff));
+	}
 }
 
 /* --------------------------------------------------------------------------
@@ -173,6 +185,7 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 	u32 flags, width, height;
 	unsigned int i, refresh;
 	int count = 0;
+	u8 edid[EDID_LENGTH * 2];
 
 	mutex_lock(&asb->display_lock);
 	flags = asb->display_flags;
@@ -181,8 +194,8 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 	refresh = asb->display_refresh;
 	mutex_unlock(&asb->display_lock);
 
-	drm_connector_update_edid_property(connector,
-	                                   (const struct edid *)asb->edid);
+	asb_build_edid(asb, edid, (flags & ASB_DRM_DISPLAY_HDR) != 0);
+	drm_connector_update_edid_property(connector, (const struct edid *)edid);
 
 	m = drm_cvt_mode(connector->dev, roundup(width, 8), height, refresh,
 	                 false, false, false);
@@ -251,7 +264,9 @@ int asb_display_config_ioctl(struct drm_device *drm, void *data, struct drm_file
 		if (!capable(CAP_SYS_ADMIN))
 			return -EACCES;
 		if (!args->refresh) args->refresh = 60;
-		if (args->flags & ~(ASB_DRM_DISPLAY_SHARED | ASB_DRM_DISPLAY_MATCH_WINDOW) ||
+		if (args->flags & ~(ASB_DRM_DISPLAY_SHARED | ASB_DRM_DISPLAY_MATCH_WINDOW |
+		                    ASB_DRM_DISPLAY_HDR) ||
+		    ((args->flags & ASB_DRM_DISPLAY_HDR) && !(args->flags & ASB_DRM_DISPLAY_SHARED)) ||
 		    args->refresh < 24 || args->refresh > 120 ||
 		    (!(args->flags & ASB_DRM_DISPLAY_MATCH_WINDOW) && args->refresh != 60) ||
 		    args->width < 64 || args->height < 64 ||
@@ -307,7 +322,20 @@ void asb_display_release(struct asb_device *asb, struct drm_file *file)
 		drm_kms_helper_connector_hotplug_event(&asb->connector);
 }
 
+static int asb_connector_atomic_check(struct drm_connector *connector,
+                                      struct drm_atomic_state *state)
+{
+	struct drm_connector_state *old = drm_atomic_get_old_connector_state(state, connector);
+	struct drm_connector_state *new = drm_atomic_get_new_connector_state(state, connector);
+
+	if (old->colorspace != new->colorspace ||
+	    !drm_connector_atomic_hdr_metadata_equal(old, new))
+		return PTR_ERR_OR_ZERO(drm_atomic_get_plane_state(state, &to_asb(connector->dev)->primary_plane));
+	return 0;
+}
+
 static const struct drm_connector_helper_funcs asb_connector_helper_funcs = {
+	.atomic_check = asb_connector_atomic_check,
 	.get_modes = asb_connector_get_modes,
 	.mode_valid = asb_connector_mode_valid,
 };
@@ -329,14 +357,18 @@ int asb_connector_init(struct asb_device *asb)
 	struct drm_device *drm = &asb->drm;
 	int ret;
 
-	asb_build_edid(asb);
-
 	ret = drm_connector_init(drm, &asb->connector,
 	                         &asb_connector_funcs,
 	                         DRM_MODE_CONNECTOR_VIRTUAL);
 	if (ret)
 		return ret;
 	drm_connector_helper_add(&asb->connector, &asb_connector_helper_funcs);
+	drm_connector_attach_edid_property(&asb->connector);
+	ret = drm_mode_create_dp_colorspace_property(&asb->connector, BIT(DRM_MODE_COLORIMETRY_BT2020_RGB));
+	if (ret)
+		return ret;
+	drm_connector_attach_colorspace_property(&asb->connector);
+	drm_connector_attach_hdr_output_metadata_property(&asb->connector);
 
 	asb->connector.status = connector_status_connected;
 	asb->connector.interlace_allowed = false;

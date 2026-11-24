@@ -33,6 +33,7 @@ typedef struct {
     UINT width;
     UINT height;
     UINT fence;
+    UINT format;
 } GpuBrokerRequest;
 
 typedef struct {
@@ -271,7 +272,9 @@ static int broker_worker(void)
                         desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
                         !request.width || request.width > 7680 || !request.height || request.height > 4320 ||
                         desc.Width != request.width || desc.Height != request.height ||
-                        desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc.MipLevels != 1 ||
+                        (UINT)desc.Format != request.format || desc.MipLevels != 1 ||
+                        (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+                         desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM) ||
                         desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 ||
                         !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)))
                         reply.status = E_INVALIDARG;
@@ -460,11 +463,11 @@ done:
 }
 
 HRESULT asb_gpu_broker_import(AsbGpuBroker *broker, UINT64 handle, BOOL fence,
-                             UINT width, UINT height, HANDLE *imported)
+                             UINT width, UINT height, UINT format, HANDLE *imported)
 {
     *imported = NULL;
     if (!broker || !handle) return E_INVALIDARG;
-    GpuBrokerRequest request = {handle, width, height, fence != FALSE};
+    GpuBrokerRequest request = {handle, width, height, fence != FALSE, format};
     GpuBrokerReply reply;
     if (!broker_transfer(broker->pipe, &request, sizeof(request), TRUE, TRUE) ||
         !broker_transfer(broker->pipe, &reply, sizeof(reply), FALSE, TRUE)) return E_FAIL;

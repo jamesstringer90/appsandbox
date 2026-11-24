@@ -3,9 +3,11 @@
 #define INITGUID
 #include <wsl/winadapter.h>
 #include <directx/d3d12.h>
+#include <drm_fourcc.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -18,6 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "display-gpu.h"
+#include "asb_capture_service.h"
 #include "asb_drm_uapi.h"
 #include "d3dkmthk.h"
 
@@ -66,12 +69,19 @@ struct display_gpu {
     uint64_t copied;
     uint64_t sequence;
     uint64_t adapter_luid;
+    DXGI_FORMAT format;
+    bool pq;
+    bool hdr_capable;
     bool connected;
     ID3D12Resource *readback;
     void *pixels;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
     uint32_t readback_width;
     uint32_t readback_height;
+    DXGI_FORMAT readback_format;
+    bool readback_pq;
+    uint32_t *bgra;
+    size_t bgra_capacity;
     struct display_gpu_slot capture_slot;
     bool registered;
     struct display_gpu_capture *capture;
@@ -198,6 +208,7 @@ void display_gpu_destroy(struct display_gpu *gpu)
     if (gpu->drm_fd >= 0) close(gpu->drm_fd);
     if (gpu->d3d12_lib) dlclose(gpu->d3d12_lib);
     if (gpu->dxcore_lib) dlclose(gpu->dxcore_lib);
+    free(gpu->bgra);
     free(gpu);
 }
 
@@ -214,6 +225,7 @@ struct display_gpu *display_gpu_create(int drm_fd)
     }
     struct display_gpu *gpu = calloc(1, sizeof(*gpu));
     if (!gpu) return NULL;
+    gpu->hdr_capable = (query.capabilities & ASB_DRM_GPU_CAP_HDR10) != 0;
     gpu->drm_fd = fcntl(drm_fd, F_DUPFD_CLOEXEC, 0);
     gpu->dxg_fd = open("/dev/dxg", O_RDWR | O_CLOEXEC);
     gpu->event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -334,20 +346,55 @@ int display_gpu_active(struct display_gpu *gpu)
     return (query.capabilities & ASB_DRM_GPU_CAP_SCANOUT) != 0;
 }
 
+int display_gpu_hdr_ready(const struct display_gpu *gpu)
+{
+    return gpu && gpu->connected && gpu->format == DXGI_FORMAT_R10G10B10A2_UNORM;
+}
+
+static int gpu_acquire(struct display_gpu *gpu, struct drm_asb_gpu_acquire *frame);
+
+static DXGI_FORMAT gpu_frame_format(const struct drm_asb_gpu_acquire *frame)
+{
+    switch (frame->format) {
+    case DRM_FORMAT_XRGB8888:
+    case DRM_FORMAT_ARGB8888:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DRM_FORMAT_XBGR2101010:
+    case DRM_FORMAT_ABGR2101010:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 int display_gpu_connect(struct display_gpu *gpu, int socket_fd,
-                        const DisplayGpuPacket *query, uint32_t width, uint32_t height,
+                        const DisplayGpuPacket *query, uint32_t *out_width, uint32_t *out_height,
                         int resize, uint32_t size_mode, uint32_t refresh)
 {
-    if (!gpu || !width || !height || width > DISPLAY_MAX_WIDTH || height > DISPLAY_MAX_HEIGHT ||
-        query->magic != DISPLAY_GPU_MAGIC || query->version != DISPLAY_GPU_VERSION ||
+    if (!gpu || query->magic != DISPLAY_GPU_MAGIC || query->version != DISPLAY_GPU_VERSION ||
         query->type != DISPLAY_GPU_QUERY || !(query->reserved & DISPLAY_GPU_CAP_FENCE)) return 0;
     display_gpu_disconnect(gpu);
+    struct drm_asb_gpu_acquire frame;
+    int acquired = gpu_acquire(gpu, &frame);
+    if (acquired <= 0) return acquired == -1 ? -1 : -2;
+    close(frame.fd);
+    if (FAILED(ID3D12CommandQueue_Signal(gpu->queue, gpu->complete, gpu->copied))) return -1;
+    uint32_t width = frame.width, height = frame.height;
+    DXGI_FORMAT format = gpu_frame_format(&frame);
+    bool pq = (frame.flags & ASB_DRM_GPU_SCANOUT_PQ) != 0;
+    if (format == DXGI_FORMAT_UNKNOWN || !width || !height ||
+        width > DISPLAY_MAX_WIDTH || height > DISPLAY_MAX_HEIGHT ||
+        (format == DXGI_FORMAT_R10G10B10A2_UNORM &&
+         (!gpu->hdr_capable || query->format != DXGI_FORMAT_R10G10B10A2_UNORM)) ||
+        (pq && format != DXGI_FORMAT_R10G10B10A2_UNORM)) return 0;
+
     DisplayGpuPacket packet = {
         .magic = DISPLAY_GPU_MAGIC, .version = DISPLAY_GPU_VERSION, .type = DISPLAY_GPU_CAPS,
         .session = query->session, .reserved = DISPLAY_GPU_CAP_FENCE,
-        .width = width, .height = height, .format = DXGI_FORMAT_B8G8R8A8_UNORM,
+        .width = width, .height = height, .format = format,
         .slot = size_mode,
     };
+    if (pq) packet.reserved |= DISPLAY_GPU_COLOR_PQ;
     if (resize && (query->reserved & DISPLAY_GPU_CAP_RESIZE))
         packet.reserved |= DISPLAY_GPU_CAP_RESIZE;
     if (resize && refresh && (query->reserved & DISPLAY_GPU_CAP_REFRESH)) {
@@ -357,13 +404,14 @@ int display_gpu_connect(struct display_gpu *gpu, int socket_fd,
     if (gpu_transfer(socket_fd, &packet, sizeof(packet), true) < 0 ||
         gpu_transfer(socket_fd, &packet, sizeof(packet), false) < 0) return -1;
     if (packet.magic != DISPLAY_GPU_MAGIC || packet.version != DISPLAY_GPU_VERSION ||
-        packet.session != query->session || packet.type != DISPLAY_GPU_OFFER) return -1;
+        packet.session != query->session || packet.type != DISPLAY_GPU_OFFER ||
+        packet.format != format) return -1;
     if (packet.status) return 0;
     D3D12_HEAP_PROPERTIES heap = {.Type = D3D12_HEAP_TYPE_DEFAULT,
         .CreationNodeMask = 1, .VisibleNodeMask = 1};
     D3D12_RESOURCE_DESC desc = {
         .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D, .Width = width, .Height = height,
-        .DepthOrArraySize = 1, .MipLevels = 1, .Format = DXGI_FORMAT_B8G8R8A8_UNORM,
+        .DepthOrArraySize = 1, .MipLevels = 1, .Format = format,
         .SampleDesc.Count = 1, .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
         .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
     };
@@ -381,7 +429,7 @@ int display_gpu_connect(struct display_gpu *gpu, int socket_fd,
         packet = (DisplayGpuPacket){
             .magic = DISPLAY_GPU_MAGIC, .version = DISPLAY_GPU_VERSION, .type = DISPLAY_GPU_OFFER,
             .session = query->session, .slot = i, .width = width, .height = height,
-            .format = DXGI_FORMAT_B8G8R8A8_UNORM,
+            .format = format,
         };
         if (gpu_export(gpu, object, &packet.handle) < 0 ||
             gpu_transfer(socket_fd, &packet, sizeof(packet), true) < 0 ||
@@ -390,8 +438,10 @@ int display_gpu_connect(struct display_gpu *gpu, int socket_fd,
             packet.session != query->session || packet.type != DISPLAY_GPU_READY ||
             packet.slot != i || packet.status) goto fail;
     }
-    gpu->width = width;
-    gpu->height = height;
+    *out_width = gpu->width = width;
+    *out_height = gpu->height = height;
+    gpu->format = format;
+    gpu->pq = pq;
     gpu->connected = true;
     return 1;
 fail:
@@ -427,10 +477,13 @@ enum { GPU_COPY_VIEWER=1, GPU_COPY_READBACK=2 };
 
 static void capture_changing(struct display_gpu_capture *);
 
-static int gpu_prepare_readback(struct display_gpu *gpu,uint32_t width,uint32_t height)
+static int gpu_prepare_readback(struct display_gpu *gpu, uint32_t width, uint32_t height,
+                                DXGI_FORMAT format)
 {
-    if (!width || !height || width>DISPLAY_MAX_WIDTH || height>DISPLAY_MAX_HEIGHT) return -1;
-    if (gpu->readback && gpu->readback_width==width && gpu->readback_height==height) return 0;
+    if (!width || !height || width>DISPLAY_MAX_WIDTH || height>DISPLAY_MAX_HEIGHT ||
+        format == DXGI_FORMAT_UNKNOWN) return -1;
+    if (gpu->readback && gpu->readback_width==width && gpu->readback_height==height &&
+        gpu->readback_format == format) return 0;
     if (gpu->readback) {
         if (gpu->pixels) ID3D12Resource_Unmap(gpu->readback,0,NULL);
         ID3D12Resource_Release(gpu->readback);
@@ -439,7 +492,7 @@ static int gpu_prepare_readback(struct display_gpu *gpu,uint32_t width,uint32_t 
     }
     D3D12_RESOURCE_DESC image={.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D,
         .Width=width,.Height=height,.DepthOrArraySize=1,.MipLevels=1,
-        .Format=DXGI_FORMAT_B8G8R8A8_UNORM,.SampleDesc.Count=1};
+        .Format=format,.SampleDesc.Count=1};
     UINT64 size;
     ID3D12Device_GetCopyableFootprints(gpu->device,&image,0,1,0,&gpu->footprint,NULL,NULL,&size);
     D3D12_RESOURCE_DESC buffer={.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -455,6 +508,7 @@ static int gpu_prepare_readback(struct display_gpu *gpu,uint32_t width,uint32_t 
     }
     gpu->readback_width=width;
     gpu->readback_height=height;
+    gpu->readback_format=format;
     return 0;
 }
 
@@ -462,7 +516,8 @@ static int gpu_copy(struct display_gpu *gpu, struct display_gpu_slot *slot,
                     const struct drm_asb_gpu_acquire *frame,unsigned targets)
 {
     capture_changing(gpu->capture);
-    if ((targets&GPU_COPY_READBACK) && gpu_prepare_readback(gpu,frame->width,frame->height)<0) return -1;
+    if ((targets&GPU_COPY_READBACK) &&
+        gpu_prepare_readback(gpu,frame->width,frame->height,gpu_frame_format(frame))<0) return -1;
     if (gpu_commands(gpu, slot) < 0) return -1;
     if (frame->adapter_luid != gpu->adapter_luid ||
         FAILED(ID3D12Device_OpenSharedHandle(gpu->device, (HANDLE)(uintptr_t)frame->fd,
@@ -472,6 +527,7 @@ static int gpu_copy(struct display_gpu *gpu, struct display_gpu_slot *slot,
         ID3D12GraphicsCommandList_CopyResource(slot->commands, slot->texture, slot->source);
     }
     if (targets&GPU_COPY_READBACK) {
+        gpu->readback_pq = (frame->flags & ASB_DRM_GPU_SCANOUT_PQ) != 0;
         D3D12_TEXTURE_COPY_LOCATION source = {.pResource = slot->source,
             .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
         D3D12_TEXTURE_COPY_LOCATION target = {.pResource = gpu->readback,
@@ -501,7 +557,9 @@ int display_gpu_frame(struct display_gpu *gpu)
     struct drm_asb_gpu_acquire frame;
     int result=gpu_acquire(gpu,&frame);
     if (result<=0) return result;
-    if (frame.width!=gpu->width || frame.height!=gpu->height) result=-2;
+    if (frame.width != gpu->width || frame.height != gpu->height ||
+        gpu_frame_format(&frame) != gpu->format ||
+        ((frame.flags & ASB_DRM_GPU_SCANOUT_PQ) != 0) != gpu->pq) result=-2;
     else result=gpu_copy(gpu,slot,&frame,GPU_COPY_VIEWER)<0?-1:1;
     close(frame.fd);
     if (result<0) ID3D12CommandQueue_Signal(gpu->queue,gpu->complete,gpu->copied);
@@ -509,7 +567,7 @@ int display_gpu_frame(struct display_gpu *gpu)
     return result;
 }
 
-int display_gpu_readback(struct display_gpu *gpu, const void **pixels,
+static int gpu_readback_raw(struct display_gpu *gpu, const void **pixels,
                          uint32_t *width, uint32_t *height, uint32_t *stride)
 {
     if (!gpu || gpu->connected) return 0;
@@ -533,11 +591,73 @@ fail:
     return -1;
 }
 
+static unsigned srgb_byte(float value)
+{
+    value = fminf(fmaxf(value, 0.0f), 1.0f);
+    float encoded = value <= 0.0031308f ? 12.92f * value :
+                    1.055f * powf(value, 1.0f / 2.4f) - 0.055f;
+    return (unsigned)(encoded * 255.0f + 0.5f);
+}
+
+static void rgb10_to_bgra(uint32_t *output, const void *pixels, uint32_t width,
+                         uint32_t height, uint32_t stride, bool pq)
+{
+    float linear[1024];
+    if (pq) {
+        for (unsigned i = 0; i < 1024; ++i) {
+            float code = powf(i / 1023.0f, 32.0f / 2523.0f);
+            linear[i] = 125.0f * powf(fmaxf(code - 3424.0f / 4096.0f, 0.0f) /
+                (2413.0f / 128.0f - 2392.0f / 128.0f * code), 16384.0f / 2610.0f);
+        }
+    }
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint32_t *src = (const uint32_t *)((const unsigned char *)pixels + (size_t)y * stride);
+        uint32_t *dst = output + (size_t)y * width;
+        for (uint32_t x = 0; x < width; ++x) {
+            unsigned r = src[x] & 1023u, g = (src[x] >> 10) & 1023u, b = (src[x] >> 20) & 1023u;
+            if (pq) {
+                float red = linear[r], green = linear[g], blue = linear[b];
+                r = srgb_byte( 1.660491f * red - 0.587641f * green - 0.072850f * blue);
+                g = srgb_byte(-0.124550f * red + 1.132900f * green - 0.008349f * blue);
+                b = srgb_byte(-0.018151f * red - 0.100579f * green + 1.118730f * blue);
+            } else {
+                r = (r * 255u + 511u) / 1023u;
+                g = (g * 255u + 511u) / 1023u;
+                b = (b * 255u + 511u) / 1023u;
+            }
+            dst[x] = 0xff000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+int display_gpu_readback(struct display_gpu *gpu, const void **pixels,
+                         uint32_t *width, uint32_t *height, uint32_t *stride)
+{
+    int result = gpu_readback_raw(gpu, pixels, width, height, stride);
+    if (result != 1) return result;
+    if (gpu->readback_pq) return 0;
+    if (gpu->readback_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+        size_t count = (size_t)*width * *height;
+        if (count > gpu->bgra_capacity) {
+            uint32_t *next = realloc(gpu->bgra, count * sizeof(*next));
+            if (!next) return -1;
+            gpu->bgra = next;
+            gpu->bgra_capacity = count;
+        }
+        rgb10_to_bgra(gpu->bgra, *pixels, *width, *height, *stride, false);
+        *pixels = gpu->bgra;
+        *stride = *width * sizeof(uint32_t);
+    }
+    return 1;
+}
+
 struct display_gpu_capture {
     pthread_mutex_t lock;
     int wanted,offered,shared,headless,drm_fd,event;
     uint64_t generation,offered_generation,sequence,value;
     uint32_t width,height,stride;
+    DXGI_FORMAT format;
+    bool pq;
     ID3D12Device *device;
     ID3D12Resource *source;
     ID3D12Fence *fence;
@@ -635,10 +755,12 @@ void display_gpu_capture_offer(struct display_gpu *gpu,struct display_gpu_captur
                 unsigned last=(gpu->next+DISPLAY_GPU_SLOTS-1)%DISPLAY_GPU_SLOTS;
                 capture->source=gpu->slots[last].texture;
                 capture->width=gpu->width;capture->height=gpu->height;
+                capture->format=gpu->format;capture->pq=gpu->pq;
             } else if (!capture->headless) {
                 capture->source=gpu->readback;
                 capture->width=gpu->readback_width;capture->height=gpu->readback_height;
                 capture->stride=gpu->footprint.Footprint.RowPitch;
+                capture->format=gpu->readback_format;capture->pq=gpu->readback_pq;
             }
             if (capture->source) ID3D12Resource_AddRef(capture->source);
             if (capture->drm_fd<0 || (!capture->source && !capture->headless)) {
@@ -689,21 +811,46 @@ int display_gpu_capture_valid(struct display_gpu_capture *capture)
     return capture->offered_generation==__atomic_load_n(&capture->generation,__ATOMIC_ACQUIRE);
 }
 
-int display_gpu_capture_poll(struct display_gpu_capture *capture,const void **pixels,
-    uint32_t *width,uint32_t *height,uint32_t *stride,uint64_t *sequence,int *shared)
+static int capture_pack_frame(const void *pixels, uint32_t stride, DXGI_FORMAT format, bool pq,
+                              AsbScreenshotReply *reply, unsigned char **output)
+{
+    if (format != DXGI_FORMAT_R10G10B10A2_UNORM) {
+        uint32_t error = asb_capture_pack(pixels, stride, reply, output);
+        return error ? -(int)error : 1;
+    }
+    reply->stride = reply->width * sizeof(uint32_t);
+    if (!pixels || stride < reply->stride) return -13;
+    reply->data_size = reply->stride * reply->height;
+    *output = malloc(reply->data_size);
+    if (!*output) return -8;
+    rgb10_to_bgra((uint32_t *)*output, pixels, reply->width, reply->height, stride, pq);
+    return 1;
+}
+
+int display_gpu_capture_poll(struct display_gpu_capture *capture, AsbScreenshotReply *reply,
+                             unsigned char **output)
 {
     pthread_mutex_lock(&capture->lock);
     int offered=capture->offered;
     pthread_mutex_unlock(&capture->lock);
     if (!offered) return 0;
     if (!capture->device) return 2;
+    const void *pixels;
+    uint32_t stride;
     if (capture->headless) {
         if (capture_reader(capture)<0) return -1;
-        if (!display_gpu_active(capture->reader)) return 2;
-        capture->reader->sequence=0;
-        int result=display_gpu_readback(capture->reader,pixels,width,height,stride);
-        *sequence=capture->reader->sequence;*shared=0;
-        return result;
+        struct display_gpu *reader = capture->reader;
+        if (!display_gpu_active(reader)) return 2;
+        reader->sequence = 0;
+        uint32_t width, height;
+        int result = gpu_readback_raw(reader, &pixels, &width, &height, &stride);
+        if (result!=1) return result;
+        reply->width = width;
+        reply->height = height;
+        reply->frame_seq = reader->sequence;
+        reply->flags = 0;
+        return capture_pack_frame(pixels, stride, reader->readback_format, reader->readback_pq,
+                                  reply, output);
     }
     uint64_t completed=ID3D12Fence_GetCompletedValue(capture->fence);
     if (completed==UINT64_MAX) return -1;
@@ -713,12 +860,12 @@ int display_gpu_capture_poll(struct display_gpu_capture *capture,const void **pi
             capture->held=capture->source;ID3D12Resource_AddRef(capture->held);
             if (FAILED(ID3D12Resource_Map(capture->held,0,NULL,&capture->mapped))) return -1;
         }
-        *pixels=capture->mapped;*stride=capture->stride;
+        pixels=capture->mapped;stride=capture->stride;
     } else {
         if (capture_reader(capture)<0) return -1;
         struct display_gpu *reader=capture->reader;
         if (!capture->submitted) {
-            if (gpu_prepare_readback(reader,capture->width,capture->height)<0 ||
+            if (gpu_prepare_readback(reader,capture->width,capture->height,capture->format)<0 ||
                 gpu_commands(reader,&reader->capture_slot)<0) return -1;
             D3D12_TEXTURE_COPY_LOCATION source={.pResource=capture->source,
                 .Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
@@ -735,9 +882,10 @@ int display_gpu_capture_poll(struct display_gpu_capture *capture,const void **pi
         completed=ID3D12Fence_GetCompletedValue(reader->complete);
         if (completed==UINT64_MAX) return -1;
         if (completed<reader->copied) return 0;
-        *pixels=reader->pixels;*stride=reader->footprint.Footprint.RowPitch;
+        pixels=reader->pixels;stride=reader->footprint.Footprint.RowPitch;
     }
-    *width=capture->width;*height=capture->height;
-    *sequence=capture->sequence;*shared=capture->shared;
-    return 1;
+    reply->width=capture->width;reply->height=capture->height;
+    reply->frame_seq=capture->sequence;
+    reply->flags=capture->shared?ASB_SCREENSHOT_GPU_SHARED:0;
+    return capture_pack_frame(pixels, stride, capture->format, capture->pq, reply, output);
 }

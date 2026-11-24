@@ -41,9 +41,6 @@
 #define ASB_CURSOR_MAX_W      256
 #define ASB_CURSOR_MAX_H      256
 
-/* EDID is a fixed-size 128-byte block (no extension blocks). */
-#define ASB_EDID_LEN          128
-
 /* --------------------------------------------------------------------------
  * Per-device state. Embedded into drm_device via drm_dev_alloc<>().
  * -------------------------------------------------------------------------- */
@@ -61,6 +58,7 @@ struct asb_device {
 	struct drm_file       *gpu_presenter;
 	struct eventfd_ctx    *gpu_event;
 	struct drm_framebuffer *gpu_scanout;
+	bool                   gpu_scanout_pq;
 	u64                    gpu_sequence;
 	u64                    gpu_adapter_luid;
 
@@ -77,10 +75,6 @@ struct asb_device {
 	unsigned int            width;
 	unsigned int            height;
 	unsigned int            refresh;
-
-	/* Synthesized 128-byte EDID. Built once at probe, served via
-	 * drm_connector_attach_edid_property() → drm_connector_update_edid_property(). */
-	u8                      edid[ASB_EDID_LEN];
 
 	/* vblank pacing. A single hrtimer fires at `refresh` Hz and signals
 	 * vblank to the CRTC. We're a virtual device so we have no real
@@ -123,14 +117,12 @@ int asb_gpu_native_ioctl(struct drm_device *drm, void *data, struct drm_file *fi
 int asb_gpu_present_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
 int asb_gpu_acquire_ioctl(struct drm_device *drm, void *data, struct drm_file *file);
 void asb_gpu_postclose(struct drm_device *drm, struct drm_file *file);
-void asb_gpu_update(struct asb_device *asb, struct drm_framebuffer *fb);
+void asb_gpu_update(struct asb_device *asb, struct drm_framebuffer *fb,
+                    const struct drm_connector_state *connector);
 void asb_gpu_fini(struct asb_device *asb);
 struct drm_framebuffer *asb_fb_create(struct drm_device *drm,
 				    struct drm_file *file,
 				    const struct drm_format_info *info,
 				    const struct drm_mode_fb_cmd2 *cmd);
-
-/* Build the synthesized EDID into asb->edid. Called from connector_init. */
-void asb_build_edid(struct asb_device *asb);
 
 #endif /* _ASB_DRM_H_ */

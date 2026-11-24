@@ -37,10 +37,8 @@
 static const u32 asb_primary_formats[] = {
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_ARGB8888,
-	/* AR30 (ARGB2101010) deliberately omitted for now: the host-side
-	 * AppSandbox renderer is BGRA8888-only, and Mutter picks the
-	 * highest-precision format we advertise. Re-enable when the host
-	 * IDD renderer learns 10-bit. */
+	DRM_FORMAT_XBGR2101010,
+	DRM_FORMAT_ABGR2101010,
 };
 
 static const u32 asb_cursor_formats[] = {
@@ -64,10 +62,9 @@ static const u64 asb_cursor_modifiers[] = {
 static bool asb_primary_format_mod_supported(struct drm_plane *plane,
                                              u32 format, u64 modifier)
 {
-	if (modifier == DRM_FORMAT_MOD_LINEAR)
-		return true;
-	return modifier == ASB_DRM_FORMAT_MOD_D3D12 &&
-	       (format == DRM_FORMAT_XRGB8888 || format == DRM_FORMAT_ARGB8888);
+	if (format == DRM_FORMAT_XBGR2101010 || format == DRM_FORMAT_ABGR2101010)
+		return modifier == ASB_DRM_FORMAT_MOD_D3D12;
+	return modifier == DRM_FORMAT_MOD_LINEAR || modifier == ASB_DRM_FORMAT_MOD_D3D12;
 }
 
 /* --------------------------------------------------------------------------
@@ -101,7 +98,10 @@ static void asb_primary_atomic_update(struct drm_plane *plane,
                                       struct drm_atomic_state *state)
 {
 	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
-	asb_gpu_update(to_asb(plane->dev), new_state->crtc ? new_state->fb : NULL);
+	struct asb_device *asb = to_asb(plane->dev);
+
+	asb_gpu_update(asb, new_state->crtc ? new_state->fb : NULL,
+	               drm_atomic_get_new_connector_state(state, &asb->connector));
 }
 
 static const struct drm_plane_helper_funcs asb_primary_helper_funcs = {

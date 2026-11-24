@@ -2,6 +2,7 @@
 #include <linux/dma-resv.h>
 #include <linux/eventfd.h>
 #include <linux/file.h>
+#include <linux/hdmi.h>
 #include <linux/capability.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -13,6 +14,7 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_prime.h>
+#include <drm/drm_property.h>
 
 #include "asb_drm.h"
 #include "asb_drm_uapi.h"
@@ -79,7 +81,7 @@ int asb_gpu_query_ioctl(struct drm_device *drm, void *data, struct drm_file *fil
 	int (*native)(struct file *, struct file *, u32 *, u32 *, u64 *);
 
 	args->version = ASB_DRM_GPU_VERSION;
-	args->capabilities = ASB_DRM_GPU_CAP_RESIZE;
+	args->capabilities = ASB_DRM_GPU_CAP_RESIZE | ASB_DRM_GPU_CAP_HDR10;
 	args->max_width = ASB_MAX_WIDTH;
 	args->max_height = ASB_MAX_HEIGHT;
 	args->adapter_luid = 0;
@@ -107,7 +109,8 @@ int asb_gpu_query_ioctl(struct drm_device *drm, void *data, struct drm_file *fil
 	return 0;
 }
 
-void asb_gpu_update(struct asb_device *asb, struct drm_framebuffer *fb)
+void asb_gpu_update(struct asb_device *asb, struct drm_framebuffer *fb,
+                    const struct drm_connector_state *connector)
 {
 	struct drm_framebuffer *old;
 
@@ -118,6 +121,13 @@ void asb_gpu_update(struct asb_device *asb, struct drm_framebuffer *fb)
 	mutex_lock(&asb->gpu_lock);
 	old = asb->gpu_scanout;
 	asb->gpu_scanout = fb;
+	if (connector) {
+		const struct drm_property_blob *blob = connector->hdr_output_metadata;
+		const struct hdr_output_metadata *hdr = blob ? blob->data : NULL;
+		asb->gpu_scanout_pq = connector->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB &&
+		                      hdr && blob->length == sizeof(*hdr) &&
+		                      hdr->hdmi_metadata_type1.eotf == HDMI_EOTF_SMPTE_ST2084;
+	}
 	++asb->gpu_sequence;
 	if (asb->gpu_event)
 		eventfd_signal(asb->gpu_event);
@@ -158,7 +168,7 @@ void asb_gpu_fini(struct asb_device *asb)
 		eventfd_signal(event);
 		eventfd_ctx_put(event);
 	}
-	asb_gpu_update(asb, NULL);
+	asb_gpu_update(asb, NULL, NULL);
 }
 
 int asb_gpu_present_ioctl(struct drm_device *drm, void *data, struct drm_file *file)
@@ -261,6 +271,7 @@ int asb_gpu_acquire_ioctl(struct drm_device *drm, void *data, struct drm_file *f
 		args->width = gpu->width;
 		args->height = gpu->height;
 		args->format = gpu->format;
+		args->flags = asb->gpu_scanout_pq ? ASB_DRM_GPU_SCANOUT_PQ : 0;
 		args->pitch = gpu->pitch;
 		args->sequence = asb->gpu_sequence;
 		args->adapter_luid = gpu->adapter_luid;
