@@ -44,6 +44,7 @@
 
 /* ---- Constants ---- */
 
+#define ASB_AGENT_VERSION       "0.1.14"
 #define AGENT_PORT              1
 #define HEARTBEAT_INTERVAL_SEC  5
 #define LINE_BUF_MAX            4096
@@ -1070,7 +1071,8 @@ static void handle_client(int fd)
     g_client_fd = fd;
     agent_log("client connected (fd=%d)", fd);
 
-    if (send_line(fd, "hello") < 0 || send_line(fd, "disk_resize:supported") < 0) {
+    if (send_line(fd, "hello v" ASB_AGENT_VERSION) < 0 ||
+        send_line(fd, "disk_resize:supported") < 0) {
         agent_log("handshake: send failed");
         goto out;
     }

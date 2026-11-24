@@ -8,6 +8,7 @@
 #include "ui.h"
 #include "asb_core.h"
 #include "asb_events.h"
+#include "agent_version.h"
 #include "api_contract.h"
 #include "api_json.h"
 #include "headless.h"
@@ -335,6 +336,11 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"starting", v->starting);
     jb_bool(jb, L"shuttingDown", v->shutdown_requested);
     jb_bool(jb, L"agentOnline", v->agent_online);
+    char version[ASB_AGENT_VERSION_TEXT_SIZE];
+    wchar_t version_w[ASB_AGENT_VERSION_TEXT_SIZE];
+    asb_agent_version_format((uint32_t)v->agent_version, version);
+    swprintf_s(version_w, ARRAYSIZE(version_w), L"%S", version);
+    jb_string(jb, L"agentVersion", version_w);
     jb_string(jb, L"diskResizeAgentError", v->disk_resize_supported ? L"" : L"" ASB_DISK_GROW_AGENT_ERROR);
     jb_int(jb, L"ramMb", (int)v->ram_mb);
     jb_int(jb, L"hddGb", (int)v->hdd_gb);
@@ -1392,7 +1398,6 @@ static void handle_webview2_message(const wchar_t *json)
                     }
                 }
                 if (FAILED(hr) && !error) error = L"VM configuration could not be updated.";
-                if (SUCCEEDED(hr) && !disk_edit) asb_save();
             }
         }
         send_vm_list();

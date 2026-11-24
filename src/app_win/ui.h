@@ -25,11 +25,6 @@ ASB_API void ui_log(const wchar_t *fmt, ...);
    Implemented in asb_core.c (DLL). */
 ASB_API HINSTANCE ui_get_instance(void);
 
-/* Save/load per-VM state JSON file (beside disk.vhdx).
-   Implemented in asb_core.c (DLL). */
-ASB_API void vm_save_state_json(const wchar_t *vhdx_path, BOOL install_complete);
-ASB_API BOOL vm_load_state_json(const wchar_t *vhdx_path);
-
 BOOL ui_command_active(void);
 void ui_refresh_from_core(void);
 BOOL ui_display_is_open(UINT64 id);
