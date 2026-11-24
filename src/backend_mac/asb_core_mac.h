@@ -52,8 +52,9 @@ typedef struct {
     BOOL    agent_online;
     uint32_t agent_version;
     BOOL    disk_resize_supported;
-    BOOL    legacy_disk_resize_supported;
+    BOOL    legacy_state_pending;
     BOOL    state_save_pending;
+    BOOL    state_migrating;
     BOOL    idd_ready;              /* Windows guest: VDD driver up (from the agent's idd_status);
                                        gates display_ready. macOS guests leave this NO. */
     uint64_t agent_last_heartbeat_ms;
