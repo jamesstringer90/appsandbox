@@ -231,6 +231,7 @@ struct VmDisplayIdd {
     ID3D11Device            *device;
     ID3D11DeviceContext     *ctx;
     IDXGISwapChain          *swap_chain;
+    DXGI_FORMAT              swap_format;
     UINT                    swap_flags;
     HANDLE                  present_event;
     BOOL                    present_ready;
@@ -261,6 +262,7 @@ struct VmDisplayIdd {
     BOOL                    shared_resize;
     BOOL                    shared_refresh;
     BOOL                    shared_screenshot;
+    DXGI_FORMAT              shared_format;
     UINT                    shared_refresh_rate;
     UINT                    shared_width;
     UINT                    shared_height;
@@ -352,7 +354,7 @@ struct VmDisplayIdd {
 static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static DWORD WINAPI     idd_window_thread_proc(LPVOID param);
 static DWORD WINAPI     idd_recv_thread_proc(LPVOID param);
-static void d3d_resize_swap_chain(VmDisplayIdd *d);
+static void d3d_resize_swap_chain(VmDisplayIdd *d, DXGI_FORMAT format);
 static void d3d_render_frame(VmDisplayIdd *d);
 static void d3d_recover(VmDisplayIdd *d);
 static void d3d_refresh_gpu(VmDisplayIdd *d);
@@ -1515,6 +1517,7 @@ static void idd_shared_release(VmDisplayIdd *d)
     d->shared_resize = FALSE;
     d->shared_refresh = FALSE;
     d->shared_screenshot = FALSE;
+    d->shared_format = DXGI_FORMAT_UNKNOWN;
     d->shared_refresh_rate = 0;
     ZeroMemory(&d->size_request, sizeof(d->size_request));
     d->shared_next = 0;
@@ -1639,7 +1642,7 @@ static DWORD WINAPI idd_shared_thread_proc(LPVOID parameter)
         }
         if (InterlockedExchange(&d->resize_requested, 0)) {
             EnterCriticalSection(&d->frame_cs);
-            d3d_resize_swap_chain(d);
+            d3d_resize_swap_chain(d, DXGI_FORMAT_UNKNOWN);
             LeaveCriticalSection(&d->frame_cs);
             render = TRUE;
         }
@@ -1692,7 +1695,7 @@ static void idd_request_render(VmDisplayIdd *d, BOOL resize)
 {
     if (!d || d->stop) return;
     if (!d->shared_thread && d->shared_disabled) {
-        if (resize) d3d_resize_swap_chain(d);
+        if (resize) d3d_resize_swap_chain(d, DXGI_FORMAT_UNKNOWN);
         d3d_render_frame(d);
         return;
     }
@@ -1952,7 +1955,8 @@ static BOOL idd_shared_offer(VmDisplayIdd *d, SOCKET s, const DisplayGpuPacket *
     if (d->shared_disabled || !d->device || !d->shared_thread || !duplicate || !caps->process_id ||
         !caps->width || !caps->height || caps->width > DISPLAY_MAX_WIDTH ||
         caps->height > DISPLAY_MAX_HEIGHT ||
-        caps->format != DXGI_FORMAT_B8G8R8A8_UNORM) goto done;
+        (caps->format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+         caps->format != DXGI_FORMAT_R16G16B16A16_FLOAT)) goto done;
 
     hr = d->device->lpVtbl->QueryInterface(d->device, &IID_IDXGIDevice, (void **)&dxgi_device);
     if (FAILED(hr)) goto done;
@@ -2159,6 +2163,7 @@ static BOOL d3d_init(VmDisplayIdd *d)
     }
 
     d->swap_flags = scd.Flags;
+    d->swap_format = scd.BufferDesc.Format;
 
     {
         IDXGISwapChain2 *swap = NULL;
@@ -2240,7 +2245,7 @@ static BOOL d3d_init(VmDisplayIdd *d)
     return TRUE;
 }
 
-static void d3d_resize_swap_chain(VmDisplayIdd *d)
+static void d3d_resize_swap_chain(VmDisplayIdd *d, DXGI_FORMAT format)
 {
     RECT rc;
     HRESULT hr;
@@ -2274,12 +2279,26 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d)
         return;
     }
 
-    hr = d->swap_chain->lpVtbl->ResizeBuffers(d->swap_chain, 0,
-            (UINT)rc.right, (UINT)rc.bottom,
-            DXGI_FORMAT_UNKNOWN, d->swap_flags);
+    hr = IDXGISwapChain_ResizeBuffers(d->swap_chain, 0, (UINT)rc.right, (UINT)rc.bottom,
+                                     format, d->swap_flags);
     if (FAILED(hr)) {
         ui_log(L"IDD: ResizeBuffers failed (0x%08X)", hr);
         return;
+    }
+    if (format != DXGI_FORMAT_UNKNOWN && format != d->swap_format) {
+        IDXGISwapChain3 *swap = NULL;
+        DXGI_COLOR_SPACE_TYPE color_space = format == DXGI_FORMAT_R16G16B16A16_FLOAT
+            ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        hr = IDXGISwapChain_QueryInterface(d->swap_chain, &IID_IDXGISwapChain3, (void **)&swap);
+        if (SUCCEEDED(hr)) {
+            hr = IDXGISwapChain3_SetColorSpace1(swap, color_space);
+            IDXGISwapChain3_Release(swap);
+        }
+        if (FAILED(hr)) {
+            ui_log(L"IDD: SetColorSpace1 failed (0x%08X)", hr);
+            return;
+        }
+        d->swap_format = format;
     }
 
     hr = d->swap_chain->lpVtbl->GetBuffer(d->swap_chain, 0,
@@ -2386,6 +2405,16 @@ static void d3d_render_frame(VmDisplayIdd *d)
         frame_uploaded = TRUE;
     }
 
+    DXGI_FORMAT format = shared && d->shared_format == DXGI_FORMAT_R16G16B16A16_FLOAT
+        ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (format != d->swap_format) {
+        d3d_resize_swap_chain(d, format);
+        if (!d->rtv) {
+            LeaveCriticalSection(&d->frame_cs);
+            return;
+        }
+    }
+
     /* Compute letterboxed viewport within client area */
     GetClientRect(d->render_hwnd, &rc);
     {
@@ -2487,7 +2516,7 @@ static void d3d_refresh_gpu(VmDisplayIdd *d)
         d->shared_disabled = TRUE;
         d->render_retry_at = GetTickCount64() + 1000;
     } else {
-        d3d_resize_swap_chain(d);
+        d3d_resize_swap_chain(d, DXGI_FORMAT_UNKNOWN);
     }
     d->frame_dirty = TRUE;
     InterlockedExchange(&d->gpu_refresh_requested, 0);
@@ -2851,6 +2880,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->shared_resize = (packet.reserved & DISPLAY_GPU_CAP_RESIZE) != 0;
                     d->shared_refresh = (packet.reserved & DISPLAY_GPU_CAP_REFRESH) != 0;
                     d->shared_screenshot = (packet.reserved & DISPLAY_GPU_CAP_SNAPSHOT) != 0;
+                    d->shared_format = (DXGI_FORMAT)packet.format;
                     d->shared_refresh_rate = d->shared_refresh ? (UINT)packet.handle : 60;
                     d->shared_width = packet.width;
                     d->shared_height = packet.height;
