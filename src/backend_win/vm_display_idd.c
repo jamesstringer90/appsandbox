@@ -39,6 +39,7 @@
 #include "vm_display_idd.h"
 #include "asb_core.h"
 #include "../core/protocol.h"
+#include "../core/frame_rle.h"
 #include "../core/api_json.h"
 #include "../../tools/transport/asb_automation.h"
 #include "vm_clipboard.h"
@@ -210,6 +211,13 @@ typedef struct {
     ULONGLONG screenshot_yielded;
 } IddSharedSlot;
 
+typedef enum {
+    IDD_STREAM_UNKNOWN,
+    IDD_STREAM_RAW_ONLY,
+    IDD_STREAM_RLE_CAPABLE,
+    IDD_STREAM_SHARED_GPU
+} IddStreamCompression;
+
 struct VmDisplayIdd {
     AsbInputSession *input;
     UINT64       vm_id;
@@ -275,6 +283,8 @@ struct VmDisplayIdd {
     BOOL                    size_follow_pending;
     BOOL                    size_update_pending;
     SOCKET                  frame_socket;
+    volatile LONG           lossless_compression;
+    volatile LONG           stream_compression; /* Observed transport, published to the menu thread. */
     UINT                    shared_next;
     HANDLE                  shared_thread;
     HANDLE                  shared_wake;
@@ -380,7 +390,12 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUTO_DISPLAYS  0x1050
 #define IDM_SEND_SAS       0x1060
 #define IDM_FULLSCREEN     0x1070
-static const UINT g_viewer_commands[]={IDM_SEND_SAS,IDM_MATCH_WINDOW,IDM_SHARE_CLIPBOARD,IDM_XMIT_HOTKEYS,IDM_AUDIO_MUTE};
+#define IDM_LOSSLESS_COMPRESSION 0x1080
+/* Order matches the data-option indices in the fullscreen viewer menu. */
+static const UINT g_viewer_commands[] = {
+    IDM_SEND_SAS, IDM_MATCH_WINDOW, IDM_SHARE_CLIPBOARD,
+    IDM_XMIT_HOTKEYS, IDM_AUDIO_MUTE, IDM_LOSSLESS_COMPRESSION
+};
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -575,6 +590,40 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
     UpdateWindow(d->log_list_hwnd);
 }
 
+static BOOL idd_can_toggle_compression(VmDisplayIdd *d)
+{
+    return InterlockedCompareExchange(&d->stream_compression, 0, 0) == IDD_STREAM_RLE_CAPABLE;
+}
+
+/* Transport changes are serialized by frame_cs. Refresh open menus on the window thread. */
+static BOOL idd_set_stream_compression(VmDisplayIdd *d, IddStreamCompression stream)
+{
+    LONG previous = d->stream_compression;
+    if (previous == (LONG)stream) return FALSE;
+    InterlockedExchange(&d->stream_compression, stream);
+    if ((previous == IDD_STREAM_RLE_CAPABLE) != (stream == IDD_STREAM_RLE_CAPABLE) && d->hwnd)
+        PostMessageW(d->hwnd, WM_IDD_VIEWER_OPTIONS, (WPARAM)-1, 0);
+    return TRUE;
+}
+
+/* Report the user's preference even if the guest never sends a compressed frame. */
+static void idd_log_compression_setting(VmDisplayIdd *d)
+{
+    if (!d->lossless_compression) {
+        idd_log(d, L"Lossless compression OFF.");
+        return;
+    }
+    LONG stream = InterlockedCompareExchange(&d->stream_compression, 0, 0);
+    if (stream == IDD_STREAM_SHARED_GPU)
+        idd_log(d, L"Lossless compression ON. Shared GPU textures bypass stream compression.");
+    else if (stream == IDD_STREAM_RAW_ONLY)
+        idd_log(d, L"Lossless compression ON. Guest sends raw frames without advertising compression support.");
+    else if (stream == IDD_STREAM_RLE_CAPABLE)
+        idd_log(d, L"Lossless compression ON. The guest supports compression on its display stream.");
+    else
+        idd_log(d, L"Lossless compression ON. Waiting for the guest display.");
+}
+
 /* ---- Send input packet to guest ---- */
 
 static BOOL send_input_locked(VmDisplayIdd *d,UINT32 type,UINT32 p1,UINT32 p2,UINT32 p3)
@@ -716,8 +765,9 @@ static BOOL idd_display_settings_save(VmDisplayIdd *d)
     idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
     if (swprintf_s(temporary, MAX_PATH, L"%s.tmp", path) < 0) return FALSE;
     if (_wfopen_s(&f, temporary, L"w") != 0 || !f) return FALSE;
-    ok = fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"shareClipboard\":%d}\n",
-                 d->transmit_hotkeys ? 1 : 0, d->share_clipboard ? 1 : 0) > 0;
+    ok = fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"shareClipboard\":%d,\"losslessCompression\":%d}\n",
+                 d->transmit_hotkeys ? 1 : 0, d->share_clipboard ? 1 : 0,
+                 d->lossless_compression ? 1 : 0) > 0;
     if (fclose(f) != 0) ok = FALSE;
     if (ok && MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         return TRUE;
@@ -735,6 +785,7 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
 
     d->transmit_hotkeys = FALSE;
     d->share_clipboard = TRUE;
+    d->lossless_compression = FALSE;
     if (!d->vhdx_path[0]) return;
     idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
 
@@ -751,6 +802,9 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
         if (api_json_get_bool(buf, L"shareClipboard", &value) ||
             api_json_get_int(buf, L"shareClipboard", &value))
             d->share_clipboard = value != 0;
+        if (api_json_get_bool(buf, L"losslessCompression", &value) ||
+            api_json_get_int(buf, L"losslessCompression", &value))
+            d->lossless_compression = value != 0;
     }
     fclose(f);
 }
@@ -1499,6 +1553,13 @@ static HRESULT idd_shared_unlock(VmDisplayIdd *d, IddSharedSlot *slot)
     return hr;
 }
 
+static void idd_shared_mark_ready(VmDisplayIdd *d)
+{
+    d->shared_ready = TRUE;
+    idd_set_stream_compression(d, IDD_STREAM_SHARED_GPU);
+    SetEvent(d->shared_wake);
+}
+
 static void idd_shared_release(VmDisplayIdd *d)
 {
     UINT i;
@@ -1514,6 +1575,8 @@ static void idd_shared_release(VmDisplayIdd *d)
     d->shared_front = -1;
     d->shared_pending = -1;
     d->shared_ready = FALSE;
+    if (d->stream_compression == IDD_STREAM_SHARED_GPU)
+        idd_set_stream_compression(d, IDD_STREAM_UNKNOWN);
     d->shared_resize = FALSE;
     d->shared_refresh = FALSE;
     d->shared_screenshot = FALSE;
@@ -1540,6 +1603,7 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
     UINT index;
     UINT64 session, value;
     HRESULT hr;
+    BOOL first_shared_frame = FALSE;
     EnterCriticalSection(&d->frame_cs);
     if (d->stop || !d->shared_ready || d->shared_slots[d->shared_next].acquired ||
         d->shared_slots[d->shared_next].screenshot_yielded) {
@@ -1588,7 +1652,7 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
     if (hr == S_OK && fence)
         hr = ID3D11DeviceContext4_Wait(d->shared_context, fence, value);
     if (hr == S_OK) {
-        BOOL first_frame = d->shared_front < 0 && d->shared_pending < 0;
+        first_shared_frame = d->shared_front < 0 && d->shared_pending < 0;
         d->shared_slots[index].acquired = TRUE;
         if (d->shared_pending >= 0) {
             IddSharedSlot *old = &d->shared_slots[d->shared_pending];
@@ -1597,7 +1661,7 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
         }
         if (hr == S_OK) {
             d->shared_pending = (int)index;
-            if (first_frame) {
+            if (first_shared_frame) {
                 BOOL size_changed = d->display_width != d->shared_width ||
                     d->display_height != d->shared_height;
                 if (d->frame_buf) HeapFree(GetProcessHeap(), 0, d->frame_buf);
@@ -1621,6 +1685,8 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
     LeaveCriticalSection(&d->frame_cs);
     if (mutex) mutex->lpVtbl->Release(mutex);
     if (fence) ID3D11Fence_Release(fence);
+    if (first_shared_frame && d->lossless_compression)
+        idd_log(d, L"Display switched to shared GPU textures. Stream compression is bypassed.");
     return hr;
 }
 
@@ -1818,8 +1884,7 @@ static BOOL idd_shared_import_linux(VmDisplayIdd *d, SOCKET socket,
             d->shared_slots[i].ready = d->shared_slots[i].texture && d->shared_slots[i].fence;
             ready = ready && d->shared_slots[i].ready;
         }
-        d->shared_ready = ready;
-        if (ready) SetEvent(d->shared_wake);
+        if (ready) idd_shared_mark_ready(d);
     }
     LeaveCriticalSection(&d->frame_cs);
     if (handle) CloseHandle(handle);
@@ -2737,19 +2802,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 {
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     WSADATA wsa;
-    BYTE *recv_buf = NULL;
+    AsbFrameBuffer pixels = {0}, encoded = {0};
     AsbGpuBroker *broker = NULL;
     HANDLE input_thread;
-    UINT recv_capacity = DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
-
-    /* Allocate receive buffer for frame pixel data */
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, recv_capacity);
-    if (!recv_buf) {
-        ui_log(L"IDD recv: failed to allocate receive buffer");
-        return 1;
-    }
 
     /* Tell the agent to respawn input helper in console session */
     VmInstance *vm = asb_find_vm_by_id(d->vm_id);
@@ -2761,7 +2818,6 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     input_thread = CreateThread(NULL, 0, idd_input_thread_proc, d, 0, NULL);
     if (!input_thread) {
         ui_log(L"IDD: Failed to create input thread.");
-        HeapFree(GetProcessHeap(), 0, recv_buf);
         WSACleanup();
         PostMessageW(d->hwnd, WM_CLOSE, 0, 0);
         return 1;
@@ -2770,6 +2826,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     while (!d->stop) {
         SOCKET s;
         FrameHeader hdr;
+        BOOL rle_requested = FALSE;
+        BOOL rle_logged = FALSE;
+        BOOL reconnect_for_compression = FALSE;
 
         /* Clipboard module (handles :0005 + :0006 internally) */
         if (!d->clipboard) {
@@ -2802,6 +2861,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             continue;
         }
 
+        const BOOL compression_enabled = InterlockedCompareExchange(&d->lossless_compression, 0, 0);
         vm = asb_find_vm_by_id(d->vm_id);
         EnterCriticalSection(&d->frame_cs);
         if (!d->stop && d->shared_thread && vm && vm->running &&
@@ -2822,10 +2882,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         d->shared_rejected = FALSE;
         d->shared_session = 0;
         LeaveCriticalSection(&d->frame_cs);
+        DWORD send_timeout = 1000;
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&send_timeout, sizeof(send_timeout));
         if (vm && vm->gpu_mode == GPU_DEFAULT && !d->shared_disabled) {
             static volatile LONG gpu_session_id;
             DisplayGpuPacket query = {0};
-            DWORD send_timeout = 1000;
             query.magic = DISPLAY_GPU_MAGIC;
             query.type = DISPLAY_GPU_QUERY;
             query.version = DISPLAY_GPU_VERSION;
@@ -2833,11 +2894,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 ? DISPLAY_GPU_CAP_RESIZE : DISPLAY_GPU_CAP_FENCE | DISPLAY_GPU_CAP_RESIZE;
             query.reserved |= DISPLAY_GPU_CAP_REFRESH;
             query.reserved |= DISPLAY_GPU_CAP_SNAPSHOT;
+            if (compression_enabled) query.reserved |= DISPLAY_GPU_CAP_FRAME_RLE;
             query.session = ((UINT64)GetCurrentProcessId() << 32) |
                             (UINT32)InterlockedIncrement(&gpu_session_id);
             d->shared_session = query.session;
-            setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&send_timeout, sizeof(send_timeout));
             if (!idd_send_gpu(s, &query)) shutdown(s, SD_BOTH);
+            else rle_requested = compression_enabled;
         }
 
         idd_log(d, L"Frame channel connected.");
@@ -2846,10 +2908,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         /* Receive loop — reads magic first to dispatch frame vs cursor */
         while (!d->stop) {
-            RECT dirty_rects[MAX_DIRTY_RECTS];
-            UINT32 data_size;
+            AsbFrameRect dirty_rects[MAX_DIRTY_RECTS];
+            UINT32 wire_size;
             UINT32 rect_count;
-            UINT32 i;
             UINT32 magic;
             BOOL resolution_changed = FALSE;
 
@@ -2910,8 +2971,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->shared_slots[packet.slot].ready = d->shared_slots[packet.slot].texture != NULL;
                     for (slot = 0; slot < DISPLAY_GPU_SLOTS; ++slot)
                         ready = ready && d->shared_slots[slot].ready;
-                    d->shared_ready = ready;
-                    if (ready) SetEvent(d->shared_wake);
+                    if (ready) idd_shared_mark_ready(d);
                     LeaveCriticalSection(&d->frame_cs);
                 } else if (packet.type == DISPLAY_GPU_SNAPSHOT && !broker) {
                     HRESULT status = S_FALSE;
@@ -3007,6 +3067,16 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                             sizeof(FrameHeader) - sizeof(UINT32), FALSE))
                 break;
 
+            /* Compression is negotiated per connection. Only a streaming guest
+             * that supports it needs a fresh handshake after a menu change. */
+            IddStreamCompression stream = (hdr.frame_seq & ASB_FRAME_SEQ_RLE_CAPABLE)
+                ? IDD_STREAM_RLE_CAPABLE : IDD_STREAM_RAW_ONLY;
+            if (stream == IDD_STREAM_RLE_CAPABLE &&
+                compression_enabled != InterlockedCompareExchange(&d->lossless_compression, 0, 0)) {
+                reconnect_for_compression = TRUE;
+                break;
+            }
+
             /* Sanity checks */
             if (hdr.width == 0 || hdr.height == 0 ||
                 hdr.width > 7680 || hdr.height > 4320 ||
@@ -3024,29 +3094,42 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             /* Read dirty rects */
             if (rect_count > 0) {
-                if (!recv_exact(d, s, dirty_rects, (int)(rect_count * sizeof(RECT)), FALSE))
+                if (!recv_exact(d, s, dirty_rects, (int)(rect_count * sizeof(dirty_rects[0])), FALSE))
                     break;
             }
 
-            /* Read data_size */
-            if (!recv_exact(d, s, &data_size, 4, FALSE))
-                break;
-
-            if (data_size > MAX_FRAME_DATA_SIZE) {
-                idd_log(d, L"Frame data too large (%u bytes), reconnecting.", data_size);
+            if (!recv_exact(d, s, &wire_size, sizeof(wire_size), FALSE)) break;
+            UINT32 data_size = asb_frame_payload_bytes(wire_size, hdr.width, hdr.height, hdr.stride,
+                dirty_rects, rect_count, MAX_FRAME_DATA_SIZE);
+            if (!data_size) {
+                idd_log(d, L"Invalid frame payload size 0x%08X for %ux%u (%u rectangles).",
+                        wire_size, hdr.width, hdr.height, rect_count);
                 break;
             }
-            if (data_size > recv_capacity) {
-                BYTE *new_buf = (BYTE *)HeapReAlloc(GetProcessHeap(), 0, recv_buf, data_size);
-                if (!new_buf) break;
-                recv_buf = new_buf;
-                recv_capacity = data_size;
+            if (!asb_frame_reserve(&pixels, data_size)) break;
+            BYTE *recv_buf = pixels.data;
+            if (wire_size & ASB_FRAME_RLE_FLAG) {
+                UINT32 packed = wire_size & ~ASB_FRAME_RLE_FLAG;
+                if (!rle_requested || !asb_frame_reserve(&encoded, packed) ||
+                    !recv_exact(d, s, encoded.data, (int)packed, FALSE) ||
+                    !asb_frame_decode(encoded.data, packed, recv_buf, data_size)) break;
+                if (!rle_logged && d->lossless_compression) {
+                    idd_log(d, L"Lossless frame compression active (%u bytes to %u).", data_size, packed);
+                    rle_logged = TRUE;
+                }
+            } else if (!recv_exact(d, s, recv_buf, (int)data_size, FALSE)) {
+                break;
             }
 
-            /* Read pixel data */
-            if (data_size > 0) {
-                if (!recv_exact(d, s, recv_buf, (int)data_size, FALSE))
-                    break;
+            if (compression_enabled && !rle_requested && stream == IDD_STREAM_RLE_CAPABLE) {
+                DisplayGpuPacket query = {0};
+                query.magic = DISPLAY_GPU_MAGIC;
+                query.type = DISPLAY_GPU_QUERY;
+                query.version = DISPLAY_GPU_VERSION;
+                query.session = 1; /* scoped to this connection, no shared-GPU session */
+                query.reserved = DISPLAY_GPU_CAP_FRAME_RLE;
+                if (!idd_send_gpu(s, &query)) break;
+                rle_requested = TRUE;
             }
 
             /* Update CPU-side frame buffer */
@@ -3072,61 +3155,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 }
             }
 
-            if (rect_count == 0) {
-                /* Full frame update */
-                UINT row;
-                UINT copy_w = hdr.width * 4;
-                BYTE *src = recv_buf;
-                /* Bound source rows by the bytes actually received: width/height/
-                   stride and data_size are independent guest-controlled fields, so
-                   only data_size/stride rows of recv_buf hold valid pixels. */
-                UINT src_rows = hdr.stride ? (UINT)(data_size / hdr.stride) : 0;
-                if (copy_w > d->frame_stride) copy_w = d->frame_stride;
-                if (copy_w > hdr.stride)      copy_w = hdr.stride;
+            asb_frame_apply(d->frame_buf, d->frame_stride, recv_buf, hdr.stride, hdr.width,
+                            hdr.height, dirty_rects, rect_count);
 
-                for (row = 0; row < hdr.height && row < d->frame_height &&
-                              row < src_rows; row++) {
-                    memcpy(d->frame_buf + row * d->frame_stride,
-                           src + row * hdr.stride,
-                           copy_w);
-                }
-            } else {
-                /* Dirty rect updates — pixel data is per-rect rows concatenated */
-                BYTE *src = recv_buf;
-                for (i = 0; i < rect_count; i++) {
-                    LONG left   = dirty_rects[i].left;
-                    LONG top    = dirty_rects[i].top;
-                    LONG right  = dirty_rects[i].right;
-                    LONG bottom = dirty_rects[i].bottom;
-                    UINT rect_w, rect_h, row;
-                    UINT rect_row_bytes;
-
-                    /* Clamp to frame bounds */
-                    if (left < 0) left = 0;
-                    if (top  < 0) top  = 0;
-                    if (right  > (LONG)d->frame_width)  right  = (LONG)d->frame_width;
-                    if (bottom > (LONG)d->frame_height) bottom = (LONG)d->frame_height;
-                    if (left >= right || top >= bottom) continue;
-
-                    rect_w = (UINT)(right - left);
-                    rect_h = (UINT)(bottom - top);
-                    rect_row_bytes = rect_w * 4;
-
-                    /* Refuse to read past the bytes actually received into recv_buf. */
-                    if ((size_t)(src - recv_buf) + (size_t)rect_row_bytes * rect_h >
-                        (size_t)data_size)
-                        break;
-
-                    for (row = 0; row < rect_h; row++) {
-                        UINT dst_y = (UINT)top + row;
-                        memcpy(d->frame_buf + dst_y * d->frame_stride + (UINT)left * 4,
-                               src + row * rect_row_bytes,
-                               rect_row_bytes);
-                    }
-                    src += rect_row_bytes * rect_h;
-                }
-            }
-
+            BOOL stream_changed = !d->shared_ready && idd_set_stream_compression(d, stream);
             d->frame_dirty = TRUE;
             if (d->display_width != d->frame_width || d->display_height != d->frame_height) {
                 d->display_width = d->frame_width;
@@ -3134,6 +3166,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 PostMessageW(d->hwnd, WM_IDD_DISPLAY_SIZE, TRUE, 0);
             }
             LeaveCriticalSection(&d->frame_cs);
+            if (stream_changed && !(wire_size & ASB_FRAME_RLE_FLAG) && d->lossless_compression) {
+                if (stream == IDD_STREAM_RLE_CAPABLE && rle_requested)
+                    idd_log(d, L"Lossless compression requested. Received a raw frame (%u bytes).", data_size);
+                else
+                    idd_log_compression_setting(d);
+            }
             if (resolution_changed) {
                 idd_log(d, L"Frame resolution changed: %ux%u (stride=%u)",
                         hdr.width, hdr.height, hdr.stride);
@@ -3154,6 +3192,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         if (d->shared_ready && !d->shared_disabled)
             d->size_reconnect_until = GetTickCount64() + 10000;
         d->frame_socket = INVALID_SOCKET;
+        idd_set_stream_compression(d, IDD_STREAM_UNKNOWN);
         idd_shared_release(d);
         LeaveCriticalSection(&d->frame_cs);
         asb_gpu_broker_close(broker);
@@ -3167,7 +3206,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         /* Wait before reconnecting frame channel */
         {
             int wait;
-            int delay = GetTickCount64() < d->size_reconnect_until ? 100 : 3000;
+            int delay = (reconnect_for_compression || GetTickCount64() < d->size_reconnect_until) ? 100 : 3000;
             for (wait = 0; wait < delay && !d->stop; wait += 100)
                 Sleep(100);
         }
@@ -3176,8 +3215,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     WaitForSingleObject(input_thread, INFINITE);
     CloseHandle(input_thread);
 
-    if (recv_buf)
-        HeapFree(GetProcessHeap(), 0, recv_buf);
+    free(encoded.data);
+    free(pixels.data);
 
     WSACleanup();
     return 0;
@@ -3238,6 +3277,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
                 AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_AUTO_DISPLAYS,
                             L"Automatically disable non AppSandbox displays");
             AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_MATCH_WINDOW, L"Match window size");
+            AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_LOSSLESS_COMPRESSION, L"Lossless compression");
             if (!_wcsicmp(d->os_type, L"Windows"))
                 AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_SEND_SAS, L"Send Ctrl+Alt+Del");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
@@ -3420,14 +3460,17 @@ static BOOL idd_set_fullscreen(VmDisplayIdd *d,BOOL enabled)
 
 static void idd_viewer_option_state(VmDisplayIdd *d,UINT *enabled,UINT *checked)
 {
-    *enabled=28;*checked=0;
+    *enabled = 4 | 8 | 16;  /* clipboard, hotkeys, audio */
+    *checked = 0;
     if (asb_vm_sas_supported((AsbVm)asb_find_vm_by_id(d->vm_id))) *enabled|=1;
     if (d->shared_ready && d->shared_resize && !d->shared_disabled &&
         (d->shared_front>=0 || d->shared_pending>=0)) *enabled|=2;
+    if (idd_can_toggle_compression(d)) *enabled|=32;
     if (d->size_mode==DISPLAY_SIZE_WINDOW) *checked|=2;
     if (d->share_clipboard) *checked|=4;
     if (d->transmit_hotkeys) *checked|=8;
     if (d->audio_muted) *checked|=16;
+    if (d->lossless_compression) *checked|=32;
 }
 
 static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -3453,6 +3496,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     switch (msg) {
     case WM_IDD_VIEWER_OPTIONS:
+        if (d && wp == (WPARAM)-1)
+            EnableMenuItem(GetSystemMenu(hwnd, FALSE), IDM_LOSSLESS_COMPRESSION,
+                           MF_BYCOMMAND | (idd_can_toggle_compression(d) ? MF_ENABLED : MF_GRAYED));
         if (d && d->fullscreen) {
             UINT enabled=0,checked=0;
             idd_viewer_option_state(d,&enabled,&checked);
@@ -3518,6 +3564,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (!idd_display_settings_save(d))
                 idd_log(d, L"Could not save viewer settings.");
             idd_log(d, d->share_clipboard ? L"Clipboard sharing: ON." : L"Clipboard sharing: OFF.");
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_LOSSLESS_COMPRESSION) {
+            if (!idd_can_toggle_compression(d)) return 0;
+            InterlockedExchange(&d->lossless_compression, !d->lossless_compression);
+            idd_log_compression_setting(d);
+            if (!idd_display_settings_save(d))
+                idd_log(d, L"Could not save viewer settings.");
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_MATCH_WINDOW) {

@@ -255,6 +255,7 @@ typedef struct _VDD_SWAP_PROC {
     BOOL                bGpuSourceCompatible;
     BOOL                gpuResizeSupported;
     BOOL                gpuScreenshotSupported;
+    BOOL                frameRleSupported;
     BOOL                gpuModeNotified;
     DisplayGpuPacket    gpuControl;
     UINT                gpuControlBytes;
