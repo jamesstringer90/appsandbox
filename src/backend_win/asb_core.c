@@ -1585,7 +1585,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
             args->result = iso_create_instance_resources(args->config.resources_iso_path,
                 args->config.name, args->config.admin_user, args->config.admin_pass,
                 res_dir, args->config.ssh_enabled, args->config.network_mode == NET_NAT,
-                args->language);
+                args->language, &args->config.edid);
         }
         if (FAILED(args->result)) {
             swprintf_s(args->error_msg, 512, L"Template instance preparation failed (0x%08X)", args->result);
@@ -1635,7 +1635,8 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
 
     /* Generate manifest */
     swprintf_s(manifest, MAX_PATH, L"%s\\manifest.txt", staging);
-    manifest_count = generate_vhdx_manifest(manifest, staging, res_dir, &args->config.gpu_shares, args->config.ssh_enabled);
+    manifest_count = generate_vhdx_manifest(manifest, staging, res_dir, &args->config.gpu_shares,
+                                           args->config.ssh_enabled, &args->config.edid);
     if (manifest_count < 0) {
         args->result = E_FAIL;
         wcscpy_s(args->error_msg, 512, L"Failed to generate staging manifest");
@@ -2296,7 +2297,8 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
                                          const char *host_variant,
                                          const char *host_input_method,
                                          const char *host_tz,
-                                         const wchar_t *vm_name)
+                                         const wchar_t *vm_name,
+                                         const AsbEdid *edid)
 {
     wchar_t extras[MAX_PATH];
     if (!admin_user || !admin_user[0] || !admin_pw_hash || !admin_pw_hash[0]) {
@@ -2314,12 +2316,30 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
     }
 
     FILE *f = NULL;
+    if (edid->size) {
+        /* The pinned guest source archive predates monitor EDID support. */
+        wchar_t connector[MAX_PATH], destination[MAX_PATH];
+        swprintf_s(connector, MAX_PATH, L"%s\\linux\\asb_drm_connector.c", res_dir);
+        swprintf_s(destination, MAX_PATH, L"%s\\asb_drm-src\\asb_drm_connector.c", extras);
+        if (!CopyFileW(connector, destination, FALSE)) {
+            asb_log(L"Failed to stage the EDID-capable Linux display driver (error %lu).", GetLastError());
+            return -1;
+        }
+    }
     if (_wfopen_s(&f, manifest_path, L"w, ccs=UTF-8") != 0 || !f) {
         asb_log(L"Failed to open Linux manifest for write: %s", manifest_path);
         return -1;
     }
     /* Walk extras\ -> /opt/appsandbox/ */
     int n = write_manifest_walk_dir(f, extras, "/opt/appsandbox");
+    if (edid->size) {
+        if (!stage_marker_file(f, staging, L"monitor.edid", (const char *)edid->bytes,
+                               edid->size, L"/usr/lib/firmware/appsandbox/monitor.edid")) {
+            fclose(f);
+            return -1;
+        }
+        n++;
+    }
 
     /* Both account markers are required; do not build a guest that would use
        firstboot's placeholder credentials because either marker is missing. */
@@ -2890,7 +2910,7 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
                                                   args->host_locale, args->host_xkb,
                                                   args->host_variant, args->host_input_method,
                                                   args->host_tz,
-                                                  args->config.name);
+                                                  args->config.name, &args->config.edid);
     SecureZeroMemory(admin_pw_hash, sizeof(admin_pw_hash));
     if (n_staged < 0) {
         args->result = E_FAIL;
@@ -3442,6 +3462,12 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
 ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *created_id)
 {
+    return asb_vm_create_with_edid(config, created_id, NULL);
+}
+
+ASB_API HRESULT asb_vm_create_with_edid(const AsbVmConfig *config, AsbVmId *created_id,
+                                        const AsbEdid *edid)
+{
     if (created_id) *created_id = 0;
     if (g_config_load_failed) return E_FAIL;
     VmConfig cfg;
@@ -3515,6 +3541,11 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     ZeroMemory(&cfg, sizeof(cfg));
 
     /* Copy config strings into local VmConfig */
+    if (edid) {
+        if (!asb_edid_valid(edid->bytes, edid->size)) return E_INVALIDARG;
+        cfg.edid.size = edid->size;
+        memcpy(cfg.edid.bytes, edid->bytes, edid->size);
+    }
     wcscpy_s(cfg.name, 256, config->name);
     if (effective_os) wcscpy_s(cfg.os_type, 32, effective_os);
     if (config->image_path) wcscpy_s(cfg.image_path, MAX_PATH, config->image_path);
@@ -3903,7 +3934,7 @@ build_failed:
             if (_wcsicmp(cfg.os_type, L"Windows") == 0 && cfg.image_path[0] != L'\0') {
                 hr = iso_create_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
                                            res_dir_buf, TRUE, cfg.test_mode, cfg.ssh_enabled,
-                                           cfg.network_mode == NET_NAT, L"en-US");
+                                           cfg.network_mode == NET_NAT, L"en-US", &cfg.edid);
                 if (SUCCEEDED(hr)) wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                 else asb_log(L"Warning: Failed to create template resources ISO (0x%08X).", hr);
             }
@@ -3912,7 +3943,7 @@ build_failed:
                 cfg.admin_pass[0] != L'\0') {
                 hr = iso_create_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
                                            res_dir_buf, FALSE, cfg.test_mode, cfg.ssh_enabled,
-                                           cfg.network_mode == NET_NAT, L"en-US");
+                                           cfg.network_mode == NET_NAT, L"en-US", &cfg.edid);
                 if (SUCCEEDED(hr)) wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                 else asb_log(L"Warning: Failed to create resources ISO (0x%08X).", hr);
             }

@@ -19,6 +19,7 @@
 #include "vm_display_idd.h"
 #include "vm_agent.h"
 #include "webview2_bridge.h"
+#include "monitor_edid.h"
 #include "prereq.h"
 #include <dwmapi.h>
 #include <commdlg.h>
@@ -492,6 +493,30 @@ static void send_host_info(void)
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"hostInfo");
     build_host_info_json(&jb);
+    jb_object_end(&jb);
+    webview2_post(buf);
+}
+
+static void append_edid_source(const wchar_t *path, const wchar_t *name, void *context)
+{
+    JsonBuilder *jb = context;
+    if (jb->count) jb_append(jb, L",");
+    jb_object_begin(jb);
+    jb_string(jb, L"id", path);
+    jb_string(jb, L"name", name);
+    jb_object_end(jb);
+}
+
+static void send_edid_sources(void)
+{
+    wchar_t buf[32768];
+    JsonBuilder jb;
+    jb_init(&jb, buf, ARRAYSIZE(buf));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"edidSources");
+    jb_array_begin(&jb, L"monitors");
+    enum_monitor_edid_sources(append_edid_source, &jb);
+    jb_array_end(&jb);
     jb_object_end(&jb);
     webview2_post(buf);
 }
@@ -1086,6 +1111,8 @@ static void handle_webview2_message(const wchar_t *json)
         if (!asb_api_start(g_hInstance, g_hwnd_main))
             ui_show_alert(L"The local API could not start. See headless.log for details.");
         send_full_state();
+    } else if (wcscmp(action, L"getEdidSources") == 0) {
+        send_edid_sources();
     } else if (wcscmp(action, L"getAdapters") == 0) {
         send_adapters();
     } else if (wcscmp(action, L"createVm") == 0) {
@@ -1188,7 +1215,16 @@ static void handle_webview2_message(const wchar_t *json)
                 return;
             }
         }
-        asb_vm_create(&cfg);
+        wchar_t edid_source[128] = {0}; /* DISPLAYCONFIG_TARGET_DEVICE_NAME.monitorDevicePath */
+        AsbEdid edid;
+        if (json_has_key(json, L"edidSource") &&
+            (!json_get_string(json, L"edidSource", edid_source, ARRAYSIZE(edid_source)) ||
+             (edid_source[0] && !read_monitor_edid(edid_source, &edid)))) {
+            SecureZeroMemory(pass_buf, sizeof(pass_buf));
+            ui_show_alert(L"Could not read the selected monitor's EDID. Reopen New Sandbox to refresh the display list.");
+            return;
+        }
+        asb_vm_create_with_edid(&cfg, NULL, edid_source[0] ? &edid : NULL);
         SecureZeroMemory(pass_buf, sizeof(pass_buf));
         send_vm_list();
     } else if (wcscmp(action, L"startVm") == 0) {

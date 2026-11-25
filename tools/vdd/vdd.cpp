@@ -172,11 +172,30 @@ static UINT VddBuildEdid(BYTE* edid, const ResolutionEntry* modes, UINT count, B
     return (edid[126] + 1) * 128;
 }
 
+/* IddCx supplies only the descriptor to its parse callbacks. A physical EDID
+ * doesn't contain the virtual timings chosen for this single-monitor adapter. */
+static SRWLOCK g_monitorModesLock = SRWLOCK_INIT;
+static AsbEdid g_monitorEdid;
+static ResolutionEntry g_monitorModes[VDD_MAX_MODES];
+static UINT g_monitorModeCount;
+static BOOL g_monitorHdr;
+
 static UINT VddReadModes(const IDDCX_MONITOR_DESCRIPTION* description, ResolutionEntry* modes,
     BOOL* hdr = NULL)
 {
     if (hdr) *hdr = FALSE;
-    if (!description->pData || description->DataSize < 256) return 0;
+    if (!description->pData) return 0;
+    AcquireSRWLockShared(&g_monitorModesLock);
+    UINT monitorCount = 0;
+    if (g_monitorEdid.size && description->DataSize == g_monitorEdid.size &&
+        !memcmp(description->pData, g_monitorEdid.bytes, g_monitorEdid.size)) {
+        monitorCount = g_monitorModeCount;
+        memcpy(modes, g_monitorModes, monitorCount * sizeof(*modes));
+        if (hdr) *hdr = g_monitorHdr;
+    }
+    ReleaseSRWLockShared(&g_monitorModesLock);
+    if (monitorCount) return monitorCount;
+    if (description->DataSize < 256) return 0;
     const BYTE* edid = (const BYTE*)description->pData;
     if ((UINT)(edid[126] + 1) * 128 > description->DataSize) return 0;
     UINT count = 0;
@@ -1588,10 +1607,49 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
 /*  Device context init/cleanup                                              */
 /* ========================================================================= */
 
+static void VddLoadMonitorEdid(AsbEdid* edid)
+{
+    wchar_t path[MAX_PATH];
+    UINT length = GetWindowsDirectoryW(path, ARRAYSIZE(path));
+    if (!length || length >= ARRAYSIZE(path) ||
+        wcscat_s(path, ARRAYSIZE(path), L"\\AppSandbox\\monitor.edid")) return;
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size;
+    DWORD read;
+    if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= sizeof(edid->bytes) &&
+        ReadFile(file, edid->bytes, size.LowPart, &read, NULL) && read == size.LowPart &&
+        asb_edid_valid(edid->bytes, read)) edid->size = read;
+    CloseHandle(file);
+    VddLog("Provisioned monitor EDID: %u bytes", edid->size);
+}
+
+static BOOL VddEdidSupportsHdr10(const AsbEdid* edid)
+{
+    BOOL pq = FALSE, bt2020 = FALSE;
+    for (UINT block = 128; block < edid->size; block += 128) {
+        const BYTE* cta = edid->bytes + block;
+        if (cta[0] != 0x02 || cta[2] > 127) continue;
+        UINT end = cta[2] ? cta[2] : 127;
+        for (UINT pos = 4; pos < end;) {
+            UINT length = cta[pos] & 31;
+            if (pos + 1 + length > end) break;
+            if ((cta[pos] >> 5) == 7 && length >= 2) {
+                if (cta[pos + 1] == 5 && (cta[pos + 2] & 0xc0)) bt2020 = TRUE;
+                if (cta[pos + 1] == 6 && length >= 3 && (cta[pos + 2] & 4)) pq = TRUE;
+            }
+            pos += length + 1;
+        }
+    }
+    return pq && bt2020;
+}
+
 static void VddContextInit(VDD_DEVICE_CONTEXT* ctx, WDFDEVICE device)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->wdfDevice = device;
+    VddLoadMonitorEdid(&ctx->monitorEdid);
 
     InitializeSRWLock(&ctx->swapLock);
     InitializeSRWLock(&ctx->displayLock);
@@ -1645,7 +1703,8 @@ static void VddInitAdapter(VDD_DEVICE_CONTEXT* ctx)
 
     adapterCaps.MaxMonitorsSupported = 1;
     adapterCaps.Flags = IDDCX_ADAPTER_FLAGS_USE_SMALLEST_MODE;
-    ctx->hdrSupported = IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxMonitorSetGammaRamp) &&
+    ctx->hdrSupported = (!ctx->monitorEdid.size || VddEdidSupportsHdr10(&ctx->monitorEdid)) &&
+        IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxMonitorSetGammaRamp) &&
         IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2) &&
         IDD_IS_FUNCTION_AVAILABLE(IddCxMonitorQueryHardwareCursor3) &&
         IDD_IS_FUNCTION_AVAILABLE(IddCxMonitorUpdateModes2);
@@ -1735,8 +1794,20 @@ static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx,
 
     monitorInfo.MonitorDescription.Size     = sizeof(monitorInfo.MonitorDescription);
     monitorInfo.MonitorDescription.Type     = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    monitorInfo.MonitorDescription.DataSize = VddBuildEdid(edid, modes, modeCount, hdr);
-    monitorInfo.MonitorDescription.pData    = edid;
+    if (ctx->monitorEdid.size) {
+        monitorInfo.MonitorDescription.DataSize = ctx->monitorEdid.size;
+        monitorInfo.MonitorDescription.pData = ctx->monitorEdid.bytes;
+        AcquireSRWLockExclusive(&g_monitorModesLock);
+        g_monitorEdid.size = ctx->monitorEdid.size;
+        memcpy(g_monitorEdid.bytes, ctx->monitorEdid.bytes, g_monitorEdid.size);
+        g_monitorHdr = hdr;
+        g_monitorModeCount = modeCount;
+        memcpy(g_monitorModes, modes, modeCount * sizeof(*modes));
+        ReleaseSRWLockExclusive(&g_monitorModesLock);
+    } else {
+        monitorInfo.MonitorDescription.DataSize = VddBuildEdid(edid, modes, modeCount, hdr);
+        monitorInfo.MonitorDescription.pData = edid;
+    }
 
     VddLog("CreateMonitor: EDID checksum byte=0x%02X, IDDCX_MONITOR_INFO.Size=%u",
            ((const BYTE*)monitorInfo.MonitorDescription.pData)[127],

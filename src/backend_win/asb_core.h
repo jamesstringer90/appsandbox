@@ -13,6 +13,7 @@
 #include <windows.h>
 #include "asb_vm_id.h"
 #include "asb_template_id.h"
+#include "edid.h"
 
 #ifdef ASB_BUILDING_DLL
 #define ASB_API __declspec(dllexport)
@@ -133,6 +134,8 @@ ASB_API void asb_set_vm_removed_callback(AsbVmRemovedCallback cb, void *user_dat
    Depending on config, this may start a background VHDX creation thread. */
 ASB_API HRESULT asb_vm_create(const AsbVmConfig *config);
 ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *created_id);
+ASB_API HRESULT asb_vm_create_with_edid(const AsbVmConfig *config, AsbVmId *created_id,
+                                        const AsbEdid *edid);
 
 ASB_API const wchar_t *asb_validate_username(const wchar_t *os_type,
     const wchar_t *username, const wchar_t *vm_name, BOOL is_template);

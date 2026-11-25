@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include "gpu_enum.h"
+#include "edid.h"
 
 /* DLL export/import */
 #ifndef ASB_API
@@ -45,6 +46,7 @@ typedef struct {
     wchar_t resources_iso_path[MAX_PATH]; /* ISO with autounattend + agent + helpers */
     GpuDriverShareList gpu_shares;         /* Plan9 shares for GPU driver files */
     BOOL    is_template;              /* TRUE = template creation (no GPU/network) */
+    AsbEdid edid;                     /* Snapshot staged into the guest at creation. */
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
     BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
