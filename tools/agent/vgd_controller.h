@@ -22,9 +22,14 @@ typedef struct VgdBackendOps {
     void (*set_slot_name)(void *ctx, uint8_t slot, const char *utf8_name);
 } VgdBackendOps;
 
+#define VGD_MIN_BTN_HOLD_MS 28u
+
 typedef struct VgdControllerMgr {
     uint8_t      plugged[GAMEPAD_MAX_SLOTS];
     GamepadState last_state[GAMEPAD_MAX_SLOTS];
+    GamepadState raw_state[GAMEPAD_MAX_SLOTS];
+    uint64_t     btn_press_ms[GAMEPAD_MAX_SLOTS][16];
+    uint16_t     held_buttons[GAMEPAD_MAX_SLOTS];
     char         product_name[GAMEPAD_MAX_SLOTS][GAMEPAD_NAME_MAX_LEN];
     uint8_t      name_chunks_mask[GAMEPAD_MAX_SLOTS];
     uint8_t      name_total_chunks[GAMEPAD_MAX_SLOTS];
@@ -33,6 +38,9 @@ typedef struct VgdControllerMgr {
 /* Pure-C testable controller slot state machine */
 void vgd_ctrl_init(VgdControllerMgr *mgr);
 int  vgd_ctrl_handle_packet(VgdControllerMgr *mgr, const GamepadPacket *pkt, const VgdBackendOps *ops);
+int  vgd_ctrl_apply_state_timed(VgdControllerMgr *mgr, uint8_t slot, const GamepadState *raw_state,
+                                uint64_t now_ms, const VgdBackendOps *ops);
+int  vgd_ctrl_tick(VgdControllerMgr *mgr, uint64_t now_ms, const VgdBackendOps *ops);
 void vgd_ctrl_unplug_all(VgdControllerMgr *mgr, const VgdBackendOps *ops);
 int  vgd_ctrl_encode_rumble(uint8_t slot, uint8_t large_motor, uint8_t small_motor,
                             uint32_t seq, GamepadPacket *out);
@@ -67,6 +75,7 @@ int  vgd_win_plug_slot(void *ctx, uint8_t slot);
 int  vgd_win_unplug_slot(void *ctx, uint8_t slot);
 int  vgd_win_write_state(void *ctx, uint8_t slot, const GamepadState *state);
 void vgd_win_set_slot_name(void *ctx, uint8_t slot, const char *utf8_name);
+void vgd_win_sync_oem_names_if_needed(VgdWinBackend *b);
 
 /* Blocks until rumble arrives on slot's doorbell event or stop_event is signaled.
  * Returns 1 if rumble updated, 0 if stopped/unplugged, -1 on error. */

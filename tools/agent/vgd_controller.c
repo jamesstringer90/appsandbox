@@ -4,8 +4,18 @@
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-003::REQ-009 */
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-007::REQ-019 */
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-010::REQ-024 */
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-025 */
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-027 */
 #include "vgd_controller.h"
 #include <string.h>
+
+static void vgd_ctrl_reset_slot_latch(VgdControllerMgr *mgr, uint8_t slot)
+{
+    memset(&mgr->last_state[slot], 0, sizeof(mgr->last_state[slot]));
+    memset(&mgr->raw_state[slot], 0, sizeof(mgr->raw_state[slot]));
+    memset(mgr->btn_press_ms[slot], 0, sizeof(mgr->btn_press_ms[slot]));
+    mgr->held_buttons[slot] = 0u;
+}
 
 void vgd_ctrl_init(VgdControllerMgr *mgr)
 {
@@ -51,14 +61,14 @@ int vgd_ctrl_handle_packet(VgdControllerMgr *mgr, const GamepadPacket *pkt, cons
         if (mgr->plugged[slot]) return 1;
         if (!ops->plug_slot || !ops->plug_slot(ops->ctx, slot)) return 0;
         mgr->plugged[slot] = 1u;
-        memset(&mgr->last_state[slot], 0, sizeof(mgr->last_state[slot]));
+        vgd_ctrl_reset_slot_latch(mgr, slot);
         return 1;
 
     case GAMEPAD_PKT_UNPLUG:
         if (!mgr->plugged[slot]) return 1;
         if (ops->unplug_slot) (void)ops->unplug_slot(ops->ctx, slot);
         mgr->plugged[slot] = 0u;
-        memset(&mgr->last_state[slot], 0, sizeof(mgr->last_state[slot]));
+        vgd_ctrl_reset_slot_latch(mgr, slot);
         memset(mgr->product_name[slot], 0, sizeof(mgr->product_name[slot]));
         mgr->name_chunks_mask[slot] = 0u;
         mgr->name_total_chunks[slot] = 0u;
@@ -68,9 +78,12 @@ int vgd_ctrl_handle_packet(VgdControllerMgr *mgr, const GamepadPacket *pkt, cons
         if (!mgr->plugged[slot]) {
             if (!ops->plug_slot || !ops->plug_slot(ops->ctx, slot)) return 0;
             mgr->plugged[slot] = 1u;
+            vgd_ctrl_reset_slot_latch(mgr, slot);
         }
         if (!ops->write_state || !ops->write_state(ops->ctx, slot, &pkt->state)) return 0;
+        mgr->raw_state[slot] = pkt->state;
         mgr->last_state[slot] = pkt->state;
+        mgr->held_buttons[slot] = 0u;
         return 1;
 
     case GAMEPAD_PKT_HELLO:
@@ -82,6 +95,81 @@ int vgd_ctrl_handle_packet(VgdControllerMgr *mgr, const GamepadPacket *pkt, cons
     }
 }
 
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-025 */
+int vgd_ctrl_apply_state_timed(VgdControllerMgr *mgr, uint8_t slot, const GamepadState *raw_state,
+                               uint64_t now_ms, const VgdBackendOps *ops)
+{
+    GamepadState eff;
+    unsigned b;
+
+    if (!mgr || !raw_state || !ops || slot >= GAMEPAD_MAX_SLOTS) return 0;
+    if (!mgr->plugged[slot]) {
+        if (!ops->plug_slot || !ops->plug_slot(ops->ctx, slot)) return 0;
+        mgr->plugged[slot] = 1u;
+        vgd_ctrl_reset_slot_latch(mgr, slot);
+    }
+
+    mgr->raw_state[slot] = *raw_state;
+    eff = *raw_state;
+
+    for (b = 0; b < 16u; b++) {
+        uint16_t mask = (uint16_t)(1u << b);
+        int raw_down = (raw_state->buttons & mask) != 0u;
+        int prev_down = (mgr->last_state[slot].buttons & mask) != 0u;
+        if (raw_down) {
+            if (!prev_down) {
+                mgr->btn_press_ms[slot][b] = now_ms;
+            }
+            mgr->held_buttons[slot] &= (uint16_t)~mask;
+            eff.buttons |= mask;
+        } else if (prev_down &&
+                   now_ms >= mgr->btn_press_ms[slot][b] &&
+                   (now_ms - mgr->btn_press_ms[slot][b]) < (uint64_t)VGD_MIN_BTN_HOLD_MS) {
+            /* Keep short tap asserted for at least VGD_MIN_BTN_HOLD_MS so 60 Hz / joy.cpl see it. */
+            eff.buttons |= mask;
+            mgr->held_buttons[slot] |= mask;
+        } else {
+            mgr->held_buttons[slot] &= (uint16_t)~mask;
+        }
+    }
+
+    if (!ops->write_state || !ops->write_state(ops->ctx, slot, &eff)) return 0;
+    mgr->last_state[slot] = eff;
+    return 1;
+}
+
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-025 */
+int vgd_ctrl_tick(VgdControllerMgr *mgr, uint64_t now_ms, const VgdBackendOps *ops)
+{
+    uint8_t s;
+    int flushed = 0;
+    if (!mgr || !ops || !ops->write_state) return 0;
+
+    for (s = 0; s < GAMEPAD_MAX_SLOTS; s++) {
+        GamepadState eff;
+        unsigned b;
+        if (!mgr->plugged[s] || mgr->held_buttons[s] == 0u) continue;
+        eff = mgr->raw_state[s];
+        for (b = 0; b < 16u; b++) {
+            uint16_t mask = (uint16_t)(1u << b);
+            if ((mgr->held_buttons[s] & mask) == 0u) continue;
+            if (now_ms >= mgr->btn_press_ms[s][b] &&
+                (now_ms - mgr->btn_press_ms[s][b]) < (uint64_t)VGD_MIN_BTN_HOLD_MS) {
+                eff.buttons |= mask;
+            } else {
+                mgr->held_buttons[s] &= (uint16_t)~mask;
+            }
+        }
+        if (!asb_gamepad_state_equal(&eff, &mgr->last_state[s])) {
+            if (ops->write_state(ops->ctx, s, &eff)) {
+                mgr->last_state[s] = eff;
+                flushed++;
+            }
+        }
+    }
+    return flushed;
+}
+
 void vgd_ctrl_unplug_all(VgdControllerMgr *mgr, const VgdBackendOps *ops)
 {
     uint8_t s;
@@ -90,7 +178,7 @@ void vgd_ctrl_unplug_all(VgdControllerMgr *mgr, const VgdBackendOps *ops)
         if (mgr->plugged[s]) {
             if (ops && ops->unplug_slot) (void)ops->unplug_slot(ops->ctx, s);
             mgr->plugged[s] = 0u;
-            memset(&mgr->last_state[s], 0, sizeof(mgr->last_state[s]));
+            vgd_ctrl_reset_slot_latch(mgr, s);
         }
         memset(mgr->product_name[s], 0, sizeof(mgr->product_name[s]));
         mgr->name_chunks_mask[s] = 0u;
@@ -257,16 +345,30 @@ static void vgd_win_remove_devnode_by_hwid(VgdWinBackend *b, const wchar_t *targ
     SetupDiDestroyDeviceInfoList(devs);
 }
 
-static void vgd_win_write_reg_sz(HKEY root, const wchar_t *subkey, const wchar_t *val_name, const wchar_t *val)
+static int vgd_win_write_reg_sz_if_changed(HKEY root, const wchar_t *subkey, const wchar_t *val_name, const wchar_t *val)
 {
     HKEY hkey = NULL;
-    if (!subkey || !val_name || !val) return;
+    wchar_t cur[128];
+    DWORD cur_bytes = sizeof(cur);
+    DWORD reg_type = 0;
+    int changed = 0;
+
+    if (!subkey || !val_name || !val) return 0;
     if (RegCreateKeyExW(root, subkey, 0, NULL, REG_OPTION_NON_VOLATILE,
-                        KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &hkey, NULL) == ERROR_SUCCESS) {
-        DWORD bytes = (DWORD)((wcslen(val) + 1u) * sizeof(wchar_t));
-        (void)RegSetValueExW(hkey, val_name, 0, REG_SZ, (const BYTE *)val, bytes);
+                        KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
+                        NULL, &hkey, NULL) == ERROR_SUCCESS) {
+        memset(cur, 0, sizeof(cur));
+        if (RegQueryValueExW(hkey, val_name, NULL, &reg_type, (LPBYTE)cur, &cur_bytes) != ERROR_SUCCESS ||
+            reg_type != REG_SZ ||
+            wcscmp(cur, val) != 0) {
+            DWORD bytes = (DWORD)((wcslen(val) + 1u) * sizeof(wchar_t));
+            if (RegSetValueExW(hkey, val_name, 0, REG_SZ, (const BYTE *)val, bytes) == ERROR_SUCCESS) {
+                changed = 1;
+            }
+        }
         RegCloseKey(hkey);
     }
+    return changed;
 }
 
 static int wcs_ends_with_ci(const wchar_t *str, const wchar_t *suffix)
@@ -279,8 +381,84 @@ static int wcs_ends_with_ci(const wchar_t *str, const wchar_t *suffix)
     return _wcsicmp(str + (slen - suflen), suffix) == 0;
 }
 
+static int wcs_contains_ci_ctrl(const wchar_t *haystack, const wchar_t *needle)
+{
+    size_t nlen, i;
+    if (!haystack || !needle || !needle[0]) return 0;
+    nlen = wcslen(needle);
+    for (; *haystack; haystack++) {
+        int match = 1;
+        for (i = 0; i < nlen; i++) {
+            wchar_t a = haystack[i];
+            wchar_t b = needle[i];
+            if (a == L'\0') return 0;
+            if (a >= L'A' && a <= L'Z') a = (wchar_t)(a - L'A' + L'a');
+            if (b >= L'A' && b <= L'Z') b = (wchar_t)(b - L'A' + L'a');
+            if (a != b) { match = 0; break; }
+        }
+        if (match) return 1;
+    }
+    return 0;
+}
+
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-027 */
+static int vgd_win_apply_child_hid_friendly_name(VgdWinBackend *b, const wchar_t *friendly_w)
+{
+    HDEVINFO devs;
+    SP_DEVINFO_DATA dev_info;
+    DWORD idx;
+    int updated = 0;
+
+    if (!friendly_w || friendly_w[0] == L'\0') return 0;
+    devs = SetupDiGetClassDevsW(NULL, L"HID", NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+    if (devs == INVALID_HANDLE_VALUE) return 0;
+
+    dev_info.cbSize = sizeof(dev_info);
+    for (idx = 0; SetupDiEnumDeviceInfo(devs, idx, &dev_info); idx++) {
+        wchar_t hwids[512];
+        DWORD reg_type = 0, req = 0;
+        memset(hwids, 0, sizeof(hwids));
+        if (!SetupDiGetDeviceRegistryPropertyW(devs, &dev_info, SPDRP_HARDWAREID,
+                                               &reg_type, (PBYTE)hwids,
+                                               sizeof(hwids) - sizeof(wchar_t), &req)) {
+            continue;
+        }
+        {
+            const wchar_t *p = hwids;
+            int is_our_hid = 0;
+            while (*p != L'\0') {
+                if (wcs_contains_ci_ctrl(p, L"VID_045E&PID_028E&IG_00")) {
+                    is_our_hid = 1;
+                    break;
+                }
+                p += wcslen(p) + 1;
+            }
+            if (is_our_hid) {
+                wchar_t cur_name[128];
+                memset(cur_name, 0, sizeof(cur_name));
+                if (!SetupDiGetDeviceRegistryPropertyW(devs, &dev_info, SPDRP_FRIENDLYNAME,
+                                                       &reg_type, (PBYTE)cur_name,
+                                                       sizeof(cur_name) - sizeof(wchar_t), &req) ||
+                    wcscmp(cur_name, friendly_w) != 0) {
+                    DWORD bytes = (DWORD)((wcslen(friendly_w) + 1u) * sizeof(wchar_t));
+                    if (SetupDiSetDeviceRegistryPropertyW(devs, &dev_info, SPDRP_FRIENDLYNAME,
+                                                          (const BYTE *)friendly_w, bytes)) {
+                        updated++;
+                    }
+                }
+            }
+        }
+    }
+    SetupDiDestroyDeviceInfoList(devs);
+    if (updated > 0) {
+        vgd_log(b, "VGD: set SPDRP_FRIENDLYNAME='%ls' on %d child HID devnode(s)", friendly_w, updated);
+    }
+    return updated;
+}
+
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-010::REQ-024 */
-static void vgd_win_apply_oem_name_registry(VgdWinBackend *b, const wchar_t *name_w)
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-027 */
+static int vgd_win_apply_oem_name_registry(VgdWinBackend *b, const wchar_t *name_w)
 {
     static const wchar_t k_di_subkey[] =
         L"SYSTEM\\CurrentControlSet\\Control\\MediaProperties\\PrivateProperties\\DirectInput\\VID_045E&PID_028E\\OEM";
@@ -290,9 +468,10 @@ static void vgd_win_apply_oem_name_registry(VgdWinBackend *b, const wchar_t *nam
         ? name_w
         : L"Controller (XBOX 360 For Windows)";
     DWORD idx;
+    int changes = 0;
 
-    vgd_win_write_reg_sz(HKEY_LOCAL_MACHINE, k_di_subkey, L"OEM Name", eff);
-    vgd_win_write_reg_sz(HKEY_LOCAL_MACHINE, k_joy_subkey, L"OEMName", eff);
+    changes += vgd_win_write_reg_sz_if_changed(HKEY_LOCAL_MACHINE, k_di_subkey, L"OEM Name", eff);
+    changes += vgd_win_write_reg_sz_if_changed(HKEY_LOCAL_MACHINE, k_joy_subkey, L"OEMName", eff);
 
     /* Update loaded interactive user hives under HKEY_USERS since appsandbox-gamepad runs as SYSTEM */
     for (idx = 0; ; idx++) {
@@ -306,11 +485,14 @@ static void vgd_win_apply_oem_name_registry(VgdWinBackend *b, const wchar_t *nam
             wchar_t user_joy[384], user_di[384];
             swprintf_s(user_joy, ARRAYSIZE(user_joy), L"%ls\\%ls", sid, k_joy_subkey);
             swprintf_s(user_di, ARRAYSIZE(user_di), L"%ls\\%ls", sid, k_di_subkey);
-            vgd_win_write_reg_sz(HKEY_USERS, user_joy, L"OEMName", eff);
-            vgd_win_write_reg_sz(HKEY_USERS, user_di, L"OEM Name", eff);
+            changes += vgd_win_write_reg_sz_if_changed(HKEY_USERS, user_joy, L"OEMName", eff);
+            changes += vgd_win_write_reg_sz_if_changed(HKEY_USERS, user_di, L"OEM Name", eff);
         }
     }
-    vgd_log(b, "VGD: updated VID_045E&PID_028E OEMName/OEM Name to '%ls'", eff);
+    if (changes > 0) {
+        vgd_log(b, "VGD: updated %d VID_045E&PID_028E OEMName/OEM Name registry entries to '%ls'", changes, eff);
+    }
+    return changes;
 }
 
 static void vgd_win_set_devnode_friendly_name(VgdWinBackend *b, const GUID *class_guid,
@@ -621,6 +803,20 @@ void vgd_win_set_slot_name(void *ctx, uint8_t slot, const char *utf8_name)
     }
 }
 
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-027 */
+void vgd_win_sync_oem_names_if_needed(VgdWinBackend *b)
+{
+    uint32_t s;
+    if (!b) return;
+    for (s = 0; s < GAMEPAD_MAX_SLOTS; s++) {
+        if (b->slots[s].active && b->slots[s].product_name_w[0] != L'\0') {
+            (void)vgd_win_apply_oem_name_registry(b, b->slots[s].product_name_w);
+            (void)vgd_win_apply_child_hid_friendly_name(b, b->slots[s].product_name_w);
+            return;
+        }
+    }
+}
+
 int vgd_win_plug_slot(void *ctx, uint8_t slot)
 {
     VgdWinBackend *b = (VgdWinBackend *)ctx;
@@ -628,7 +824,7 @@ int vgd_win_plug_slot(void *ctx, uint8_t slot)
 
     if (!b || slot >= GAMEPAD_MAX_SLOTS) return 0;
     vgd_win_ensure_xinputhid_service(b);
-    vgd_win_apply_oem_name_registry(b, b->slots[slot].product_name_w);
+    (void)vgd_win_apply_oem_name_registry(b, b->slots[slot].product_name_w);
     if (!vgd_win_create_slot_ipc(b, slot)) return 0;
 
     xusb_ok = vgd_win_create_devnode(b, slot, 1, b->xusb_inf_path);
@@ -637,6 +833,10 @@ int vgd_win_plug_slot(void *ctx, uint8_t slot)
         vgd_log(b, "VGD: slot %u failed to create both XUSB and HID devnodes", slot);
         vgd_win_close_slot_ipc(b, slot);
         return 0;
+    }
+    if (b->slots[slot].product_name_w[0] != L'\0') {
+        (void)vgd_win_apply_oem_name_registry(b, b->slots[slot].product_name_w);
+        (void)vgd_win_apply_child_hid_friendly_name(b, b->slots[slot].product_name_w);
     }
     vgd_log(b, "VGD: slot %u plugged (xusb=%d, hid=%d)", slot, xusb_ok, hid_ok);
     return 1;

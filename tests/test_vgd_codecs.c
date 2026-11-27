@@ -29,6 +29,9 @@
 /* @verifies spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-009::REQ-022 */
 /* @verifies spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-010::REQ-023 */
 /* @verifies spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-010::REQ-024 */
+/* @verifies spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-025 */
+/* @verifies spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-026 */
+/* @verifies spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-027 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -607,18 +610,18 @@ static void test_shm_ring_preserves_short_taps_and_split_doorbells(void)
     EXPECT_EQ_I32(out.thumb_lx, 5000);
     EXPECT_EQ_I32(vgd_shm_read_next_state(&blk, &cur, &last_btn, &out, &gen), 0);
 
-    /* Overflow (>16 writes without reading) resyncs cleanly without hanging */
-    for (i = 0; i < 24; i++) {
+    /* Overflow (>64 writes without reading) resyncs cleanly without hanging */
+    for (i = 0; i < 80; i++) {
         memset(&s, 0, sizeof(s));
         s.thumb_ry = (int16_t)(i * 100);
-        if (i == 22) s.buttons = GAMEPAD_BTN_A;
+        if (i == 78) s.buttons = GAMEPAD_BTN_A;
         EXPECT_EQ_I32(vgd_shm_write_state(&blk, &s), 0);
     }
     EXPECT_EQ_I32(vgd_shm_read_next_state(&blk, &cur, &last_btn, &out, &gen), 1);
     EXPECT_EQ_U32(out.buttons, GAMEPAD_BTN_A);
     EXPECT_EQ_I32(vgd_shm_read_next_state(&blk, &cur, &last_btn, &out, &gen), 1);
     EXPECT_EQ_U32(out.buttons, 0u);
-    EXPECT_EQ_I32(out.thumb_ry, 2300);
+    EXPECT_EQ_I32(out.thumb_ry, 7900);
 }
 
 static void test_dynamic_controller_name_chunking_and_shm(void)
@@ -635,7 +638,7 @@ static void test_dynamic_controller_name_chunking_and_shm(void)
     uint8_t ci;
 
     EXPECT_EQ_U32((uint32_t)sizeof(GamepadPacket), 24u);
-    EXPECT_EQ_U32((uint32_t)sizeof(VgdShmBlock), 448u);
+    EXPECT_EQ_U32((uint32_t)sizeof(VgdShmBlock), 1024u);
     EXPECT_EQ_U32(total_chunks, 3u);
 
     /* Reject malformed chunk metadata */
@@ -704,6 +707,98 @@ static void test_dynamic_controller_name_chunking_and_shm(void)
     }
 }
 
+static void test_short_tap_pulse_hold_and_64_ring(void)
+{
+    VgdControllerMgr mgr;
+    MockVgdBackend mock;
+    VgdBackendOps ops;
+    GamepadState raw, read_back;
+    uint32_t gen = 0;
+
+    EXPECT_EQ_U32(VGD_RING_CAP, 64u);
+    EXPECT_EQ_U32(VGD_SHM_BLOCK_SIZE, 1024u);
+    EXPECT_EQ_U32(VGD_MIN_BTN_HOLD_MS, 28u);
+
+    memset(&mock, 0, sizeof(mock));
+    memset(&ops, 0, sizeof(ops));
+    vgd_ctrl_init(&mgr);
+    ops.ctx = &mock;
+    ops.plug_slot = mock_plug;
+    ops.unplug_slot = mock_unplug;
+    ops.write_state = mock_write_state;
+    ops.set_slot_name = mock_set_slot_name;
+
+    /* 1. Press B at t=1000 -> delivered immediately (0 ms latency) */
+    memset(&raw, 0, sizeof(raw));
+    raw.buttons = GAMEPAD_BTN_B;
+    raw.thumb_lx = 4000;
+    EXPECT_EQ_I32(vgd_ctrl_apply_state_timed(&mgr, 0, &raw, 1000, &ops), 1);
+    EXPECT_EQ_I32(vgd_shm_read_state(&mock.shm[0], &read_back, &gen), 0);
+    EXPECT_EQ_U32(read_back.buttons, GAMEPAD_BTN_B);
+    EXPECT_EQ_I32(read_back.thumb_lx, 4000);
+
+    /* 2. Release B just 6 ms later (t=1006) while moving stick -> stick updates immediately,
+     *    but B remains latched HIGH until t >= 1028 so 60 Hz / joy.cpl cannot miss it (REQ-025). */
+    raw.buttons = 0;
+    raw.thumb_lx = 9000;
+    EXPECT_EQ_I32(vgd_ctrl_apply_state_timed(&mgr, 0, &raw, 1006, &ops), 1);
+    EXPECT_EQ_I32(vgd_shm_read_state(&mock.shm[0], &read_back, &gen), 0);
+    EXPECT_EQ_U32(read_back.buttons, GAMEPAD_BTN_B);
+    EXPECT_EQ_I32(read_back.thumb_lx, 9000);
+
+    /* 3. Tick at t=1020 (still < 28 ms) -> B remains latched */
+    EXPECT_EQ_I32(vgd_ctrl_tick(&mgr, 1020, &ops), 0);
+    EXPECT_EQ_I32(vgd_shm_read_state(&mock.shm[0], &read_back, &gen), 0);
+    EXPECT_EQ_U32(read_back.buttons, GAMEPAD_BTN_B);
+
+    /* 4. Tick at t=1028 (>= 28 ms) -> B releases automatically */
+    EXPECT_EQ_I32(vgd_ctrl_tick(&mgr, 1028, &ops), 1);
+    EXPECT_EQ_I32(vgd_shm_read_state(&mock.shm[0], &read_back, &gen), 0);
+    EXPECT_EQ_U32(read_back.buttons, 0u);
+    EXPECT_EQ_I32(read_back.thumb_lx, 9000);
+
+    /* 5. Normal hold (>= 28 ms): press A at t=2000, release at t=2040 -> releases immediately (0 ms delay) */
+    raw.buttons = GAMEPAD_BTN_A;
+    EXPECT_EQ_I32(vgd_ctrl_apply_state_timed(&mgr, 0, &raw, 2000, &ops), 1);
+    raw.buttons = 0;
+    EXPECT_EQ_I32(vgd_ctrl_apply_state_timed(&mgr, 0, &raw, 2040, &ops), 1);
+    EXPECT_EQ_I32(vgd_shm_read_state(&mock.shm[0], &read_back, &gen), 0);
+    EXPECT_EQ_U32(read_back.buttons, 0u);
+    EXPECT_EQ_U32(mgr.held_buttons[0], 0u);
+
+    /* 6. Source checks for REQ-025, REQ-026, REQ-027 */
+    {
+        char *gp_src = read_text_file("tools\\agent\\appsandbox-gamepad.c");
+        char *ctrl_src = read_text_file("tools\\agent\\vgd_controller.c");
+        char *xusb_src = read_text_file("tools\\vgd\\xusb\\vgd_xusb.c");
+        char *host_src = read_text_file("src\\backend_win\\vm_gamepad.c");
+        EXPECT_TRUE(gp_src != NULL);
+        if (gp_src) {
+            EXPECT_TRUE(strstr(gp_src, "HIGH_PRIORITY_CLASS") != NULL);
+            EXPECT_TRUE(strstr(gp_src, "vgd_ctrl_apply_state_timed") != NULL);
+            EXPECT_TRUE(strstr(gp_src, "vgd_ctrl_tick") != NULL);
+            EXPECT_TRUE(strstr(gp_src, "vgd_win_sync_oem_names_if_needed") != NULL);
+            free(gp_src);
+        }
+        EXPECT_TRUE(ctrl_src != NULL);
+        if (ctrl_src) {
+            EXPECT_TRUE(strstr(ctrl_src, "vgd_win_sync_oem_names_if_needed") != NULL);
+            EXPECT_TRUE(strstr(ctrl_src, "vgd_win_apply_child_hid_friendly_name") != NULL);
+            free(ctrl_src);
+        }
+        EXPECT_TRUE(xusb_src != NULL);
+        if (xusb_src) {
+            EXPECT_TRUE(strstr(xusb_src, "XusbReadCurrentStateLocked") != NULL);
+            free(xusb_src);
+        }
+        EXPECT_TRUE(host_src != NULL);
+        if (host_src) {
+            EXPECT_TRUE(strstr(host_src, "THREAD_PRIORITY_ABOVE_NORMAL") != NULL);
+            free(host_src);
+        }
+    }
+}
+
 int main(void)
 {
     test_shm_xusb_and_hid_codecs();
@@ -712,6 +807,7 @@ int main(void)
     test_pnp_identity_and_retail_hid_layout();
     test_shm_ring_preserves_short_taps_and_split_doorbells();
     test_dynamic_controller_name_chunking_and_shm();
+    test_short_tap_pulse_hold_and_64_ring();
     if (g_failures > 0) {
         fprintf(stderr, "FAILED: %d assertion(s) failed\n", g_failures);
         return 1;

@@ -8,6 +8,7 @@
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-008::REQ-020 */
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-008::REQ-021 */
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-009::REQ-021 */
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-026 */
 /*
  * AppSandboxVGD_XUSB — First-party UMDF2 Virtual Xbox 360 XUSB Function Driver.
  *
@@ -395,10 +396,9 @@ VOID XusbEvtIoDeviceControl(
     case IOCTL_XUSB_GET_STATE: {
         GamepadState st;
         uint32_t gen = 0;
+        /* Serve snapshot directly so polling XInputGetState never steals WAIT_FOR_INPUT ring entries (REQ-026). */
         EnterCriticalSection(&ctx->Lock);
-        if (!XusbTryPopForRequestLocked(ctx, Request, &st, &gen)) {
-            XusbReadCurrentStateLocked(ctx, &st, &gen);
-        }
+        XusbReadCurrentStateLocked(ctx, &st, &gen);
         LeaveCriticalSection(&ctx->Lock);
         XusbCompleteStateRequest(Request, &st, gen);
         return;

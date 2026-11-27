@@ -578,18 +578,36 @@ static void win_on_log(void *ctx, const wchar_t *msg)
         gp->log_fn(gp->log_ctx, msg);
 }
 
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-026 */
 static DWORD WINAPI gamepad_rx_thread(LPVOID param)
 {
     VmGamepad *gp = (VmGamepad *)param;
     while (!InterlockedCompareExchange(&gp->stop, 0, 0)) {
         GamepadPacket pkt;
         SOCKET s = gp->sock;
+        int do_rumble = 0;
+        uint8_t rslot = 0, rlarge = 0, rsmall = 0;
+
         if (s == INVALID_SOCKET) break;
         if (!recv_all(s, &pkt, (int)sizeof(pkt)))
             break;
+
         EnterCriticalSection(&gp->lock);
-        vm_gamepad_core_handle_rx(&gp->core, &pkt, &gp->ops);
+        if (asb_gamepad_packet_validate(&pkt) &&
+            pkt.type == GAMEPAD_PKT_RUMBLE &&
+            gp->core.forwarding_enabled &&
+            gp->core.connected[pkt.slot]) {
+            do_rumble = 1;
+            rslot = pkt.slot;
+            rlarge = pkt.large_motor;
+            rsmall = pkt.small_motor;
+        }
         LeaveCriticalSection(&gp->lock);
+
+        /* Execute synchronous XInputSetState outside gp->lock so active rumble never stalls polling. */
+        if (do_rumble) {
+            win_set_rumble(gp, rslot, rlarge, rsmall);
+        }
     }
     InterlockedExchange(&gp->connected_flag, 0);
     return 0;
@@ -600,6 +618,7 @@ static DWORD WINAPI gamepad_worker_thread(LPVOID param)
     VmGamepad *gp = (VmGamepad *)param;
     GUID svc_guid;
 
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     gamepad_service_guid(gp->os_type, &svc_guid);
 
     while (!InterlockedCompareExchange(&gp->stop, 0, 0)) {

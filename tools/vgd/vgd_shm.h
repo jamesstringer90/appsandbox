@@ -3,6 +3,7 @@
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-007::REQ-020 */
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-009::REQ-020 */
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-010::REQ-024 */
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-026 */
 #ifndef APPSANDBOX_VGD_SHM_H
 #define APPSANDBOX_VGD_SHM_H
 
@@ -18,10 +19,10 @@ extern "C" {
 #define VGD_SHM_VERSION      1u          /* Backward-compatible 64-byte header */
 #define VGD_RING_MAGIC       0x52474456u /* 'VDGR' little-endian */
 #define VGD_MAX_SLOTS        GAMEPAD_MAX_SLOTS
-#define VGD_RING_CAP         16u
+#define VGD_RING_CAP         64u
 #define VGD_RING_MASK        (VGD_RING_CAP - 1u)
 #define VGD_PRODUCT_NAME_MAX 64u
-#define VGD_SHM_BLOCK_SIZE   448u
+#define VGD_SHM_BLOCK_SIZE   1024u
 
 #define VGD_XBOX360_VID      0x045Eu
 #define VGD_XBOX360_PID      0x028Eu
@@ -38,13 +39,13 @@ typedef struct {
     volatile uint8_t  large_motor;
     volatile uint8_t  small_motor;
     uint8_t           reserved[26];
-    /* Extended lock-free 16-entry input ring preserving button edges (REQ-020) */
+    /* Extended lock-free 64-entry input ring preserving button edges (REQ-020, REQ-026) */
     volatile uint32_t ring_write_idx;
     uint32_t          ring_magic;
-    GamepadState      ring[VGD_RING_CAP]; /* 16 * 12 = 192 bytes */
-    uint8_t           tail_pad[56];       /* ring section = 64 + 8 + 192 + 56 = 320 bytes */
+    GamepadState      ring[VGD_RING_CAP]; /* 64 * 12 = 768 bytes */
+    uint8_t           tail_pad[56];       /* 64 + 8 + 768 + 56 = 896 bytes */
     /* Dynamic UTF-16LE NUL-terminated product name forwarded from host (REQ-024) */
-    uint16_t          product_name[VGD_PRODUCT_NAME_MAX]; /* 128 bytes -> total = 448 bytes */
+    uint16_t          product_name[VGD_PRODUCT_NAME_MAX]; /* 128 bytes -> total = 1024 bytes */
 } VgdShmBlock;
 #pragma pack(pop)
 

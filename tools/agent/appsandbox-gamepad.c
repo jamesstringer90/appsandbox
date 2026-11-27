@@ -3,6 +3,8 @@
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-003::REQ-008 */
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-003::REQ-009 */
 /* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-003::REQ-014 */
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-025 */
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-011::REQ-027 */
 /*
  * appsandbox-gamepad.c -- Guest-side virtual Xbox 360 gamepad helper.
  *
@@ -19,9 +21,12 @@
 #include "../transport/asb_transport.h"
 #include "vgd_controller.h"
 #include <windows.h>
+#include <mmsystem.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+
+#pragma comment(lib, "winmm.lib")
 
 static void gamepad_log(const char *fmt, ...)
 {
@@ -79,12 +84,43 @@ typedef struct RumbleWorker {
 } RumbleWorker;
 
 typedef struct GuestGamepadCtx {
-    VgdWinBackend   *backend;
-    AsbConn         *conn;
-    CRITICAL_SECTION send_cs;
-    volatile LONG    rumble_seq;
-    RumbleWorker     workers[GAMEPAD_MAX_SLOTS];
+    VgdWinBackend    *backend;
+    VgdControllerMgr *mgr;
+    VgdBackendOps    *ops;
+    AsbConn          *conn;
+    CRITICAL_SECTION  send_cs;
+    CRITICAL_SECTION  mgr_cs;
+    HANDLE            flush_stop_evt;
+    HANDLE            flush_thread;
+    volatile LONG     rumble_seq;
+    RumbleWorker      workers[GAMEPAD_MAX_SLOTS];
 } GuestGamepadCtx;
+
+/* Flushes deferred short-tap button releases on a 2 ms tick (REQ-025) and syncs
+ * newly mounted interactive user hives' joy.cpl OEMName entries every 2 s (REQ-027). */
+static DWORD WINAPI flush_thread_proc(LPVOID param)
+{
+    GuestGamepadCtx *g = (GuestGamepadCtx *)param;
+    uint64_t last_oem_sync_ms = 0;
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    for (;;) {
+        uint64_t now_ms;
+        if (WaitForSingleObject(g->flush_stop_evt, 2) == WAIT_OBJECT_0)
+            break;
+        now_ms = (uint64_t)GetTickCount64();
+
+        EnterCriticalSection(&g->mgr_cs);
+        (void)vgd_ctrl_tick(g->mgr, now_ms, g->ops);
+        LeaveCriticalSection(&g->mgr_cs);
+
+        if (now_ms >= last_oem_sync_ms + 2000u) {
+            last_oem_sync_ms = now_ms;
+            vgd_win_sync_oem_names_if_needed(g->backend);
+        }
+    }
+    return 0;
+}
 
 static DWORD WINAPI rumble_thread_proc(LPVOID param)
 {
@@ -155,8 +191,11 @@ int main(void)
     wchar_t *slash;
 
     gamepad_log("appsandbox-gamepad (UMDF2 VGD) starting.");
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    timeBeginPeriod(1);
     if (asb_transport_init() != 0) {
         gamepad_log("asb_transport_init failed.");
+        timeEndPeriod(1);
         return 1;
     }
 
@@ -203,10 +242,6 @@ int main(void)
             }
 
             memset(&ctx, 0, sizeof(ctx));
-            ctx.backend = &backend;
-            ctx.conn = conn;
-            InitializeCriticalSection(&ctx.send_cs);
-
             vgd_ctrl_init(&mgr);
             memset(&ops, 0, sizeof(ops));
             ops.ctx = &backend;
@@ -215,8 +250,22 @@ int main(void)
             ops.write_state = vgd_win_write_state;
             ops.set_slot_name = vgd_win_set_slot_name;
 
+            ctx.backend = &backend;
+            ctx.mgr = &mgr;
+            ctx.ops = &ops;
+            ctx.conn = conn;
+            InitializeCriticalSection(&ctx.send_cs);
+            InitializeCriticalSection(&ctx.mgr_cs);
+            ctx.flush_stop_evt = CreateEventW(NULL, TRUE, FALSE, NULL);
+            if (ctx.flush_stop_evt) {
+                ctx.flush_thread = CreateThread(NULL, 0, flush_thread_proc, &ctx, 0, NULL);
+            }
+
             for (;;) {
                 GamepadPacket pkt;
+                int ok = 0;
+                int start_rumble = 0;
+
                 if (gp_recv_all(conn, &pkt, (int)sizeof(pkt)) != 0)
                     break;
                 if (!asb_gamepad_packet_validate(&pkt))
@@ -225,22 +274,45 @@ int main(void)
                 if (pkt.type == GAMEPAD_PKT_UNPLUG && mgr.plugged[pkt.slot])
                     stop_rumble_worker(&ctx, pkt.slot);
 
-                if (vgd_ctrl_handle_packet(&mgr, &pkt, &ops)) {
-                    if ((pkt.type == GAMEPAD_PKT_PLUG || pkt.type == GAMEPAD_PKT_STATE) &&
-                        mgr.plugged[pkt.slot] && !ctx.workers[pkt.slot].thread) {
-                        start_rumble_worker(&ctx, pkt.slot);
-                    }
+                EnterCriticalSection(&ctx.mgr_cs);
+                if (pkt.type == GAMEPAD_PKT_STATE) {
+                    ok = vgd_ctrl_apply_state_timed(&mgr, pkt.slot, &pkt.state,
+                                                    (uint64_t)GetTickCount64(), &ops);
+                } else {
+                    ok = vgd_ctrl_handle_packet(&mgr, &pkt, &ops);
+                }
+                if (ok && (pkt.type == GAMEPAD_PKT_PLUG || pkt.type == GAMEPAD_PKT_STATE) &&
+                    mgr.plugged[pkt.slot] && !ctx.workers[pkt.slot].thread) {
+                    start_rumble = 1;
+                }
+                LeaveCriticalSection(&ctx.mgr_cs);
+
+                if (start_rumble) {
+                    start_rumble_worker(&ctx, pkt.slot);
                 }
             }
 
             gamepad_log("Host disconnected; unplugging active virtual controllers.");
+            if (ctx.flush_stop_evt) SetEvent(ctx.flush_stop_evt);
+            if (ctx.flush_thread) {
+                WaitForSingleObject(ctx.flush_thread, 2000);
+                CloseHandle(ctx.flush_thread);
+                ctx.flush_thread = NULL;
+            }
+            if (ctx.flush_stop_evt) {
+                CloseHandle(ctx.flush_stop_evt);
+                ctx.flush_stop_evt = NULL;
+            }
             for (s = 0; s < GAMEPAD_MAX_SLOTS; s++)
                 stop_rumble_worker(&ctx, s);
+            EnterCriticalSection(&ctx.mgr_cs);
             vgd_ctrl_unplug_all(&mgr, &ops);
+            LeaveCriticalSection(&ctx.mgr_cs);
 
             EnterCriticalSection(&ctx.send_cs);
             ctx.conn = NULL;
             LeaveCriticalSection(&ctx.send_cs);
+            DeleteCriticalSection(&ctx.mgr_cs);
             DeleteCriticalSection(&ctx.send_cs);
             asb_close(conn);
         }
