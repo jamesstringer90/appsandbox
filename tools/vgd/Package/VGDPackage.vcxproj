@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|ARM64">
+      <Configuration>Debug</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64">
+      <Configuration>Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{C1A2B3D4-E5F6-4789-A0B1-C2D3E4F50003}</ProjectGuid>
+    <TemplateGuid>{26FAD2BA-3F47-466E-8378-9B804AB631C8}</TemplateGuid>
+    <MinimumVisualStudioVersion>12.0</MinimumVisualStudioVersion>
+    <Configuration>Debug</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <RootNamespace>AppSandboxVGDPackage</RootNamespace>
+    <DriverType>Package</DriverType>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>WindowsUserModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Utility</ConfigurationType>
+    <SignMode>TestSign</SignMode>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>WindowsUserModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Utility</ConfigurationType>
+    <SignMode>TestSign</SignMode>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <DebuggerFlavor>DbgengRemoteDebugger</DebuggerFlavor>
+    <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\xusb\AppSandboxVGD_XUSB.vcxproj">
+      <Project>{C1A2B3D4-E5F6-4789-A0B1-C2D3E4F50001}</Project>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <Private>false</Private>
+    </ProjectReference>
+    <ProjectReference Include="..\hid\AppSandboxVGD_HID.vcxproj">
+      <Project>{C1A2B3D4-E5F6-4789-A0B1-C2D3E4F50002}</Project>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <Private>false</Private>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(Platform)'=='ARM64'">
+    <PostBuildEvent>
+      <Command>if not exist "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\" mkdir "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
+copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVGD_XUSB\AppSandboxVGD_XUSB.dll" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
+copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVGD_XUSB\AppSandboxVGD_XUSB.inf" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
+copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVGD_XUSB\appsandboxvgd_xusb.cat" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVGD_XUSB.cat"
+powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)ARM64\$(Configuration)\AppSandboxVGD_XUSB\appsandboxvgd_xusb.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVGD_XUSB.cer', $sig.SignerCertificate.RawData) }"
+copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVGD_HID\AppSandboxVGD_HID.dll" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
+copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVGD_HID\AppSandboxVGD_HID.inf" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
+copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVGD_HID\appsandboxvgd_hid.cat" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVGD_HID.cat"
+powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)ARM64\$(Configuration)\AppSandboxVGD_HID\appsandboxvgd_hid.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVGD_HID.cer', $sig.SignerCertificate.RawData) }"</Command>
+      <Message>Copying VGD (XUSB + HID) driver files to bin\$(Configuration)-ARM64\drivers\...</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Platform)'=='x64'">
+    <PostBuildEvent>
+      <Command>if not exist "$(SolutionDir)bin\$(Configuration)\drivers\" mkdir "$(SolutionDir)bin\$(Configuration)\drivers\"
+copy /Y "$(SolutionDir)x64\$(Configuration)\AppSandboxVGD_XUSB\AppSandboxVGD_XUSB.dll" "$(SolutionDir)bin\$(Configuration)\drivers\"
+copy /Y "$(SolutionDir)x64\$(Configuration)\AppSandboxVGD_XUSB\AppSandboxVGD_XUSB.inf" "$(SolutionDir)bin\$(Configuration)\drivers\"
+copy /Y "$(SolutionDir)x64\$(Configuration)\AppSandboxVGD_XUSB\appsandboxvgd_xusb.cat" "$(SolutionDir)bin\$(Configuration)\drivers\AppSandboxVGD_XUSB.cat"
+powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)x64\$(Configuration)\AppSandboxVGD_XUSB\appsandboxvgd_xusb.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)\drivers\AppSandboxVGD_XUSB.cer', $sig.SignerCertificate.RawData) }"
+copy /Y "$(SolutionDir)x64\$(Configuration)\AppSandboxVGD_HID\AppSandboxVGD_HID.dll" "$(SolutionDir)bin\$(Configuration)\drivers\"
+copy /Y "$(SolutionDir)x64\$(Configuration)\AppSandboxVGD_HID\AppSandboxVGD_HID.inf" "$(SolutionDir)bin\$(Configuration)\drivers\"
+copy /Y "$(SolutionDir)x64\$(Configuration)\AppSandboxVGD_HID\appsandboxvgd_hid.cat" "$(SolutionDir)bin\$(Configuration)\drivers\AppSandboxVGD_HID.cat"
+powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)x64\$(Configuration)\AppSandboxVGD_HID\appsandboxvgd_hid.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)\drivers\AppSandboxVGD_HID.cer', $sig.SignerCertificate.RawData) }"</Command>
+      <Message>Copying VGD (XUSB + HID) driver files to bin\$(Configuration)\drivers\...</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

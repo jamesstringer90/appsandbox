@@ -184,6 +184,7 @@
     <ClCompile Include="tools\nvidia\cuda_package.c" />
     <ClCompile Include="src\core\win_file_hash.c" />
     <ClCompile Include="src\backend_win\disk_util.c" />
+    <ClCompile Include="src\backend_win\gamepad_provision.c" />
     <ClCompile Include="tools\provision\win_provision.c" />
     <ClCompile Include="src\backend_win\d3dlayers.c" />
     <ClCompile Include="src\backend_win\snapshot.c" />
@@ -212,6 +213,7 @@
     <ClInclude Include="src\backend_win\cuda_update.h" />
     <ClInclude Include="tools\nvidia\cuda_package.h" />
     <ClInclude Include="src\backend_win\disk_util.h" />
+    <ClInclude Include="src\backend_win\gamepad_provision.h" />
     <ClInclude Include="tools\provision\win_provision.h" />
     <ClInclude Include="src\backend_win\d3dlayers.h" />
     <ClInclude Include="src\backend_win\fe3_templates.h" />

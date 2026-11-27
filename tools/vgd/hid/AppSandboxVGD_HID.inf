@@ -1,0 +1,77 @@
+;
+; AppSandboxVGD_HID.inf — UMDF2 Virtual Xbox 360 HID Minidriver
+;
+; Installs AppSandboxVGD_HID.dll as a UMDF2 lower filter under inbox
+; MsHidUmdf.sys in Class = HIDClass so joy.cpl, DirectInput, and RawInput
+; enumerate each active Controller Slot (0..3).
+;
+
+[Version]
+PnpLockdown = 1
+Signature   = "$Windows NT$"
+Class       = HIDClass
+ClassGuid   = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider    = %ManufacturerName%
+CatalogFile = AppSandboxVGD_HID.cat
+DriverVer   = ; stamped at build time by StampInf
+
+[DestinationDirs]
+UMDriverCopy = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+AppSandboxVGD_HID.dll = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...22000
+
+[Standard.NT$ARCH$.10.0...22000]
+%DeviceName% = AppSandboxVGD_HID_Install, root\AppSandboxVGD_HID_0
+%DeviceName% = AppSandboxVGD_HID_Install, root\AppSandboxVGD_HID_1
+%DeviceName% = AppSandboxVGD_HID_Install, root\AppSandboxVGD_HID_2
+%DeviceName% = AppSandboxVGD_HID_Install, root\AppSandboxVGD_HID_3
+
+[AppSandboxVGD_HID_Install.NT]
+Include   = MsHidUmdf.inf, WUDFRD.inf
+Needs     = MsHidUmdf.NT, WUDFRD_LowerFilter.NT
+CopyFiles = UMDriverCopy
+
+[UMDriverCopy]
+AppSandboxVGD_HID.dll
+
+[AppSandboxVGD_HID_Install.NT.HW]
+Include = MsHidUmdf.inf, WUDFRD.inf
+Needs   = MsHidUmdf.NT.HW, WUDFRD_LowerFilter.NT.HW
+AddReg  = HID_HW_AddReg
+
+[HID_HW_AddReg]
+HKR,, Security,, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)"
+
+[AppSandboxVGD_HID_Install.NT.Filters]
+Include = WUDFRD.inf
+Needs   = WUDFRD_LowerFilter.NT.Filters
+
+[AppSandboxVGD_HID_Install.NT.Services]
+Include = MsHidUmdf.inf, WUDFRD.inf
+Needs   = MsHidUmdf.NT.Services, WUDFRD_LowerFilter.NT.Services
+
+[AppSandboxVGD_HID_Install.NT.Wdf]
+UmdfService                = AppSandboxVGD_HID, AppSandboxVGD_HID_WdfInstall
+UmdfServiceOrder           = AppSandboxVGD_HID
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfFileObjectPolicy       = AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction    = Copy
+UmdfFsContextUsePolicy     = CanUseFsContext2
+UmdfHostProcessSharing     = ProcessSharingDisabled
+UmdfHostPriority           = PriorityHigh
+
+[AppSandboxVGD_HID_WdfInstall]
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary      = %13%\AppSandboxVGD_HID.dll
+
+[Strings]
+ManufacturerName = "AppSandbox"
+DiskName         = "AppSandbox Virtual Gamepad HID Driver Disk"
+DeviceName       = "Controller (XBOX 360 For Windows)"
