@@ -114,6 +114,7 @@ typedef struct {
     volatile LONG agent_version;
     volatile LONG legacy_disk_resize_supported;
     BOOL        state_save_pending;
+    char        gamepad_sync_hash[65];   /* SHA-256 hex of last synced guest gamepad payload */
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.

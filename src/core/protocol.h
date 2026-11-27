@@ -97,4 +97,62 @@ typedef struct {
 } DisplayGpuPacket;
 #pragma pack(pop)
 
+/* ---- Gamepad wire protocol (ASB_CH_GAMEPAD = 8) ----
+ * Bidirectional fixed 24-byte little-endian frames, following the GRDY greeting.
+ * OS-agnostic Xbox 360 / XInput layout (usable by Windows UMDF2 VGD, Linux uinput, macOS).
+ */
+#define GAMEPAD_MAGIC            0x44475341u /* ASGD, little-endian */
+#define GAMEPAD_READY_MAGIC      0x59445247u /* GRDY, little-endian */
+#define GAMEPAD_PROTOCOL_VERSION 1u
+#define GAMEPAD_MAX_SLOTS        4u
+
+#define GAMEPAD_PKT_HELLO        1u
+#define GAMEPAD_PKT_PLUG         2u
+#define GAMEPAD_PKT_UNPLUG       3u
+#define GAMEPAD_PKT_STATE        4u
+#define GAMEPAD_PKT_RUMBLE       5u
+#define GAMEPAD_PKT_NAME         6u
+
+#define GAMEPAD_NAME_CHUNK_BYTES 12u
+#define GAMEPAD_NAME_MAX_CHUNKS  5u
+#define GAMEPAD_NAME_MAX_LEN     64u
+
+#define GAMEPAD_BTN_DPAD_UP        0x0001u
+#define GAMEPAD_BTN_DPAD_DOWN      0x0002u
+#define GAMEPAD_BTN_DPAD_LEFT      0x0004u
+#define GAMEPAD_BTN_DPAD_RIGHT     0x0008u
+#define GAMEPAD_BTN_START          0x0010u
+#define GAMEPAD_BTN_BACK           0x0020u
+#define GAMEPAD_BTN_LEFT_THUMB     0x0040u
+#define GAMEPAD_BTN_RIGHT_THUMB    0x0080u
+#define GAMEPAD_BTN_LEFT_SHOULDER  0x0100u
+#define GAMEPAD_BTN_RIGHT_SHOULDER 0x0200u
+#define GAMEPAD_BTN_GUIDE          0x0400u
+#define GAMEPAD_BTN_A              0x1000u
+#define GAMEPAD_BTN_B              0x2000u
+#define GAMEPAD_BTN_X              0x4000u
+#define GAMEPAD_BTN_Y              0x8000u
+
+#pragma pack(push, 1)
+typedef struct {
+    uint16_t buttons;
+    uint8_t  left_trigger;
+    uint8_t  right_trigger;
+    int16_t  thumb_lx;
+    int16_t  thumb_ly;
+    int16_t  thumb_rx;
+    int16_t  thumb_ry;
+} GamepadState;
+
+typedef struct {
+    uint32_t     magic;
+    uint8_t      type;
+    uint8_t      slot;
+    uint8_t      large_motor;
+    uint8_t      small_motor;
+    GamepadState state;
+    uint32_t     seq;
+} GamepadPacket;
+#pragma pack(pop)
+
 #endif

@@ -405,7 +405,9 @@ $required = @(
     'drivers\AppSandboxVDD.dll', 'drivers\AppSandboxVDD.inf', 'drivers\AppSandboxVDD.cat',
     'drivers\AppSandboxVAD.sys', 'drivers\AppSandboxVAD.inf', 'drivers\AppSandboxVAD.cat',
     'drivers\AppSandboxSHM.sys', 'drivers\AppSandboxSHM.inf', 'drivers\AppSandboxSHM.cat',
-    'drivers\devcon.exe', 'resources', 'web',
+    'drivers\AppSandboxVGD_XUSB.dll', 'drivers\AppSandboxVGD_XUSB.inf', 'drivers\AppSandboxVGD_XUSB.cat',
+    'drivers\AppSandboxVGD_HID.dll', 'drivers\AppSandboxVGD_HID.inf', 'drivers\AppSandboxVGD_HID.cat',
+    'drivers\devcon.exe', 'resources', 'resources\appsandbox-gamepad.exe', 'web',
     'headless-api\asb.py', 'headless-api\README.md', 'headless-api\examples', 'headless-api\tests'
 )
 if ($Platform -eq 'x64') {

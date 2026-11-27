@@ -1416,6 +1416,242 @@ static void stop_audio_monitor(void)
     }
 }
 
+/* ---- Gamepad helper monitor (SYSTEM, :0008 + AppSandboxVGD UMDF2 registration) ---- */
+
+static HANDLE        g_gamepad_process = NULL;
+static HANDLE        g_gamepad_monitor_thread = NULL;
+static volatile BOOL g_gamepad_monitor_running = FALSE;
+
+static void kill_gamepad_helper(void)
+{
+    if (g_gamepad_process) {
+        TerminateProcess(g_gamepad_process, 0);
+        WaitForSingleObject(g_gamepad_process, 2000);
+        CloseHandle(g_gamepad_process);
+        g_gamepad_process = NULL;
+    }
+}
+
+static void run_vgd_tool_cmd(const wchar_t *label, wchar_t *cmd, DWORD timeout_ms)
+{
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD exit_code = 0;
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        agent_log("VGD: %ls CreateProcessW failed (%lu).", label, GetLastError());
+        return;
+    }
+    if (WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_TIMEOUT) {
+        agent_log("VGD: %ls timed out.", label);
+        TerminateProcess(pi.hProcess, 1);
+    } else {
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+        agent_log("VGD: %ls exited with code %lu.", label, exit_code);
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+}
+
+static BOOL inf_bytes_contain_marker(const unsigned char *buf, size_t len, const char *marker)
+{
+    size_t mlen = strlen(marker);
+    size_t i, j;
+    if (len < mlen || mlen == 0) return FALSE;
+    /* Match ASCII / UTF-8 */
+    for (i = 0; i + mlen <= len; i++) {
+        BOOL ok = TRUE;
+        for (j = 0; j < mlen; j++) {
+            unsigned char a = buf[i + j];
+            unsigned char b = (unsigned char)marker[j];
+            if (a >= 'A' && a <= 'Z') a = (unsigned char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (unsigned char)(b - 'A' + 'a');
+            if (a != b) { ok = FALSE; break; }
+        }
+        if (ok) return TRUE;
+    }
+    /* Match UTF-16LE */
+    if (len >= mlen * 2u) {
+        for (i = 0; i + mlen * 2u <= len; i += 2u) {
+            BOOL ok = TRUE;
+            for (j = 0; j < mlen; j++) {
+                unsigned char a = buf[i + j * 2u];
+                unsigned char hi = buf[i + j * 2u + 1u];
+                unsigned char b = (unsigned char)marker[j];
+                if (hi != 0) { ok = FALSE; break; }
+                if (a >= 'A' && a <= 'Z') a = (unsigned char)(a - 'A' + 'a');
+                if (b >= 'A' && b <= 'Z') b = (unsigned char)(b - 'A' + 'a');
+                if (a != b) { ok = FALSE; break; }
+            }
+            if (ok) return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-009::REQ-022 */
+static void evict_stale_vgd_oem_drivers(void)
+{
+    wchar_t inf_dir[MAX_PATH], pattern[MAX_PATH], full_path[MAX_PATH], cmd[MAX_PATH + 96];
+    WIN32_FIND_DATAW fd;
+    HANDLE hf;
+
+    if (!GetWindowsDirectoryW(inf_dir, ARRAYSIZE(inf_dir))) return;
+    swprintf_s(pattern, ARRAYSIZE(pattern), L"%s\\INF\\oem*.inf", inf_dir);
+    hf = FindFirstFileW(pattern, &fd);
+    if (hf == INVALID_HANDLE_VALUE) return;
+
+    do {
+        FILE *f = NULL;
+        unsigned char buf[8192];
+        size_t nread = 0;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        swprintf_s(full_path, ARRAYSIZE(full_path), L"%s\\INF\\%s", inf_dir, fd.cFileName);
+        if (_wfopen_s(&f, full_path, L"rb") == 0 && f) {
+            nread = fread(buf, 1, sizeof(buf), f);
+            fclose(f);
+        }
+        if (nread > 0 && inf_bytes_contain_marker(buf, nread, "AppSandboxVGD_")) {
+            agent_log("VGD: evicting stale Driver Store package %ls", fd.cFileName);
+            swprintf_s(cmd, ARRAYSIZE(cmd), L"pnputil.exe /delete-driver %s /uninstall /force", fd.cFileName);
+            run_vgd_tool_cmd(L"pnputil delete-driver", cmd, 60000);
+        }
+    } while (FindNextFileW(hf, &fd));
+
+    FindClose(hf);
+}
+
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-003::REQ-010 */
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-003::REQ-014 */
+/* @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-009::REQ-022 */
+static void ensure_vgd_drivers_installed(void)
+{
+    static const wchar_t *k_certs[2] = {
+        L"AppSandboxVGD_XUSB.cer",
+        L"AppSandboxVGD_HID.cer"
+    };
+    static const wchar_t *k_infs[2] = {
+        L"AppSandboxVGD_XUSB.inf",
+        L"AppSandboxVGD_HID.inf"
+    };
+    wchar_t exe_dir[MAX_PATH], path[MAX_PATH], xusb_inf[MAX_PATH], hid_inf[MAX_PATH], cmd[MAX_PATH * 2 + 64];
+    wchar_t *slash;
+    int i;
+
+    GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
+    slash = wcsrchr(exe_dir, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+
+    swprintf_s(xusb_inf, MAX_PATH, L"%sdrivers\\%s", exe_dir, k_infs[0]);
+    swprintf_s(hid_inf,  MAX_PATH, L"%sdrivers\\%s", exe_dir, k_infs[1]);
+    if (GetFileAttributesW(xusb_inf) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(hid_inf)  != INVALID_FILE_ATTRIBUTES) {
+        evict_stale_vgd_oem_drivers();
+    }
+
+    for (i = 0; i < 2; i++) {
+        swprintf_s(path, MAX_PATH, L"%sdrivers\\%s", exe_dir, k_certs[i]);
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            swprintf_s(cmd, ARRAYSIZE(cmd), L"certutil.exe -addstore -f Root \"%s\"", path);
+            run_vgd_tool_cmd(L"certutil Root", cmd, 30000);
+            swprintf_s(cmd, ARRAYSIZE(cmd), L"certutil.exe -addstore -f TrustedPublisher \"%s\"", path);
+            run_vgd_tool_cmd(L"certutil TrustedPublisher", cmd, 30000);
+        }
+    }
+
+    for (i = 0; i < 2; i++) {
+        swprintf_s(path, MAX_PATH, L"%sdrivers\\%s", exe_dir, k_infs[i]);
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+            agent_log("VGD: staged INF not found (%ls); continuing without blocking boot.", path);
+            continue;
+        }
+        swprintf_s(cmd, ARRAYSIZE(cmd), L"pnputil.exe /add-driver \"%s\"", path);
+        run_vgd_tool_cmd(k_infs[i], cmd, 60000);
+    }
+}
+
+static BOOL spawn_gamepad_helper(void)
+{
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t exe_path[MAX_PATH];
+    wchar_t *slash;
+
+    GetModuleFileNameW(NULL, exe_path, MAX_PATH);
+    slash = wcsrchr(exe_path, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    wcscat_s(exe_path, MAX_PATH, L"appsandbox-gamepad.exe");
+
+    if (GetFileAttributesW(exe_path) == INVALID_FILE_ATTRIBUTES) {
+        agent_log("Gamepad helper: %ls not found.", exe_path);
+        return FALSE;
+    }
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessW(exe_path, NULL, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        agent_log("Gamepad helper: CreateProcessW failed (%lu).", GetLastError());
+        return FALSE;
+    }
+
+    agent_log("Gamepad helper: spawned PID %lu.", pi.dwProcessId);
+    g_gamepad_process = pi.hProcess;
+    CloseHandle(pi.hThread);
+    return TRUE;
+}
+
+static DWORD WINAPI gamepad_monitor_thread(LPVOID param)
+{
+    (void)param;
+    agent_log("Gamepad monitor: started.");
+
+    ensure_vgd_drivers_installed();
+
+    while (g_gamepad_monitor_running) {
+        BOOL helper_alive = g_gamepad_process &&
+            WaitForSingleObject(g_gamepad_process, 0) != WAIT_OBJECT_0;
+
+        if (!helper_alive) {
+            if (g_gamepad_process) {
+                CloseHandle(g_gamepad_process);
+                g_gamepad_process = NULL;
+                agent_log("Gamepad monitor: helper exited, respawning.");
+            }
+            spawn_gamepad_helper();
+        }
+
+        {
+            int i;
+            for (i = 0; i < 6 && g_gamepad_monitor_running; i++)
+                Sleep(500);
+        }
+    }
+
+    kill_gamepad_helper();
+    agent_log("Gamepad monitor: stopped.");
+    return 0;
+}
+
+static void start_gamepad_monitor(void)
+{
+    g_gamepad_monitor_running = TRUE;
+    g_gamepad_monitor_thread = CreateThread(NULL, 0, gamepad_monitor_thread, NULL, 0, NULL);
+}
+
+static void stop_gamepad_monitor(void)
+{
+    g_gamepad_monitor_running = FALSE;
+    if (g_gamepad_monitor_thread) {
+        WaitForSingleObject(g_gamepad_monitor_thread, 5000);
+        CloseHandle(g_gamepad_monitor_thread);
+        g_gamepad_monitor_thread = NULL;
+    }
+}
+
 /* ---- IDD driver status check ---- */
 
 /* Check the AppSandboxVDD driver state and report "idd_status:<status>" to the host
@@ -2624,6 +2860,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     /* Start audio capture monitor (SYSTEM, :0004) */
     start_audio_monitor();
 
+    /* Start gamepad helper monitor (SYSTEM, :0008 + AppSandboxVGD driver install) */
+    start_gamepad_monitor();
+
     set_service_status(SERVICE_RUNNING, 0);
     agent_log("Service started.");
 
@@ -2643,6 +2882,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     agent_log("Stopping SSH proxy...");
     stop_ssh_proxy();
     agent_log("SSH proxy stopped.");
+    agent_log("Stopping gamepad monitor...");
+    stop_gamepad_monitor();
+    agent_log("Gamepad monitor stopped.");
     agent_log("Stopping audio monitor...");
     stop_audio_monitor();
     agent_log("Audio monitor stopped.");

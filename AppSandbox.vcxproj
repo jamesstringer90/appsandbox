@@ -203,6 +203,8 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClCompile Include="src\app_win\ui.c" />
     <ClCompile Include="src\backend_win\vm_display.c" />
     <ClCompile Include="src\backend_win\vm_display_idd.c" />
+    <ClCompile Include="src\backend_win\vm_gamepad.c" />
+    <ClCompile Include="src\core\gamepad_protocol.c" />
     <ClCompile Include="src\backend_win\agent_overlay.c" />
     <ClCompile Include="src\backend_win\gpu_broker.c" />
     <ClCompile Include="src\app_win\webview2_bridge.c" />
@@ -225,6 +227,8 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClInclude Include="src\backend_win\snapshot.h" />
     <ClInclude Include="src\backend_win\vm_display.h" />
     <ClInclude Include="src\backend_win\vm_display_idd.h" />
+    <ClInclude Include="src\backend_win\vm_gamepad.h" />
+    <ClInclude Include="src\core\gamepad_protocol.h" />
     <ClInclude Include="src\backend_win\agent_overlay.h" />
     <ClInclude Include="src\backend_win\dcomp_c.h" />
     <ClInclude Include="src\backend_win\gpu_broker.h" />

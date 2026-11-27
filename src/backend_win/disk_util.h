@@ -107,6 +107,16 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
    Returns TRUE if the MSI is available at the returned path. */
 BOOL ensure_ssh_msi_cached(wchar_t *msi_path_out, int max_chars);
 
+/* Non-blocking Pre-Boot Guest Sync for existing stopped Windows VMs.
+   Checks combined payload hash against sync_hash_inout; if outdated, attaches
+   active_disk_path without a drive letter, stages updated agent/gamepad helper
+   and first-party AppSandboxVGD UMDF2 drivers, detaches cleanly, and updates
+   sync_hash_inout. Returns TRUE if sync_hash_inout was updated and should be persisted. */
+BOOL vm_sync_guest_gamepad(const wchar_t *active_disk_path,
+                           const wchar_t *res_dir,
+                           char *sync_hash_inout,
+                           size_t sync_hash_cap);
+
 /* Stage the Linux agent ELFs + kernel modules + DKMS sources + systemd
    units + modprobe.d/modules-load.d + wsl-mesa + wsl-deps under
    <staging>/extras/. The direct-ISO->VHDX flow populates this dir (via

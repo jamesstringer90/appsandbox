@@ -1,0 +1,77 @@
+;
+; AppSandboxVGD_XUSB.inf — UMDF2 Virtual Xbox 360 XUSB Function Driver
+;
+; Installs AppSandboxVGD_XUSB.dll under Class = System with the "xinputhid"
+; UpperFilter WGI dispatch tripwire. Registers GUID_DEVINTERFACE_XUSB
+; dynamically inside DeviceAdd so both xinput1_4.dll and Windows.Gaming.Input
+; discover each active Controller Slot (0..3).
+;
+
+[Version]
+PnpLockdown = 1
+Signature   = "$Windows NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ManufacturerName%
+CatalogFile = AppSandboxVGD_XUSB.cat
+DriverVer   = ; stamped at build time by StampInf
+
+[DestinationDirs]
+UMDriverCopy = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+AppSandboxVGD_XUSB.dll = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...22000
+
+[Standard.NT$ARCH$.10.0...22000]
+%DeviceName% = AppSandboxVGD_XUSB_Install, root\VID_045E&PID_028E&XI_00
+%DeviceName% = AppSandboxVGD_XUSB_Install, root\AppSandboxVGD_XUSB_0
+%DeviceName% = AppSandboxVGD_XUSB_Install, root\AppSandboxVGD_XUSB_1
+%DeviceName% = AppSandboxVGD_XUSB_Install, root\AppSandboxVGD_XUSB_2
+%DeviceName% = AppSandboxVGD_XUSB_Install, root\AppSandboxVGD_XUSB_3
+
+[AppSandboxVGD_XUSB_Install.NT]
+Include   = WUDFRD.inf
+Needs     = WUDFRD.NT
+CopyFiles = UMDriverCopy
+
+[UMDriverCopy]
+AppSandboxVGD_XUSB.dll
+
+[AppSandboxVGD_XUSB_Install.NT.HW]
+Include = WUDFRD.inf
+Needs   = WUDFRD.NT.HW
+AddReg  = XUSB_HW_AddReg
+
+[XUSB_HW_AddReg]
+HKR,, "UpperFilters", %REG_MULTI_SZ_APPEND%, "xinputhid"
+HKR,, Security,, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)"
+
+[AppSandboxVGD_XUSB_Install.NT.Services]
+Include = WUDFRD.inf
+Needs   = WUDFRD.NT.Services
+
+[AppSandboxVGD_XUSB_Install.NT.Wdf]
+UmdfService                = AppSandboxVGD_XUSB, AppSandboxVGD_XUSB_WdfInstall
+UmdfServiceOrder           = AppSandboxVGD_XUSB
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfFileObjectPolicy       = AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction    = Copy
+UmdfFsContextUsePolicy     = CanUseFsContext2
+UmdfHostProcessSharing     = ProcessSharingDisabled
+UmdfHostPriority           = PriorityHigh
+
+[AppSandboxVGD_XUSB_WdfInstall]
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary      = %13%\AppSandboxVGD_XUSB.dll
+
+[Strings]
+ManufacturerName     = "AppSandbox"
+DiskName             = "AppSandbox Virtual Gamepad XUSB Driver Disk"
+DeviceName           = "App Sandbox Virtual Xbox 360 Controller (XUSB)"
+REG_MULTI_SZ_APPEND  = 0x00010008

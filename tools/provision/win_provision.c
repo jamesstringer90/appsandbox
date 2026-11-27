@@ -352,6 +352,7 @@ int asb_provision_nat_setup(FILE *f) {
     return ferror(f) ? -1 : 0;
 }
 
+// @implements spec-ft-gamepad-provisioning::TASK-GP-CACHE-001::REQ-003
 int asb_provision_setup_cmd(FILE *f, int nat_network, int from_media) {
     if (!f) return -1;
     fputs(
@@ -370,6 +371,7 @@ int asb_provision_setup_cmd(FILE *f, int nat_network, int from_media) {
             "    if exist \"%~dp0appsandbox-clipboard.exe\" copy /Y \"%~dp0appsandbox-clipboard.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
             "    if exist \"%~dp0appsandbox-clipboard-reader.exe\" copy /Y \"%~dp0appsandbox-clipboard-reader.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
             "    if exist \"%~dp0appsandbox-audio.exe\" copy /Y \"%~dp0appsandbox-audio.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
+            "    if exist \"%~dp0appsandbox-gamepad.exe\" copy /Y \"%~dp0appsandbox-gamepad.exe\" \"%SystemRoot%\\AppSandbox\\\" >> \"%LOG%\" 2>&1\r\n"
             "    \"%SystemRoot%\\AppSandbox\\appsandbox-agent.exe\" --install >> \"%LOG%\" 2>&1\r\n"
             ")\r\n", f);
     } else {
@@ -385,6 +387,7 @@ int asb_provision_setup_cmd(FILE *f, int nat_network, int from_media) {
     return ferror(f) ? -1 : 0;
 }
 
+// @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-004::REQ-011
 int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name, int from_media) {
     if (!f) return -1;
     fputs(
@@ -456,6 +459,28 @@ int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name, int from_medi
         "    echo [NETKVM] Installing virtio-net driver with devcon... >> \"%LOG%\"\r\n"
         "    \"%DRVDIR%\\devcon.exe\" update \"%DRVDIR%\\netkvm.inf\" \"PCI\\VEN_1AF4&DEV_1000&SUBSYS_00011AF4&REV_00\" >> \"%LOG%\" 2>&1\r\n"
         "    echo [NETKVM] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
+        ")\r\n"
+        "\r\n"
+        "REM ---- AppSandboxVGD (First-party UMDF2 virtual Xbox 360 XUSB + HID drivers)\r\n"
+        "if exist \"%DRVDIR%\\AppSandboxVGD_XUSB.cer\" (\r\n"
+        "    echo [VGD] Installing XUSB certificate... >> \"%LOG%\"\r\n"
+        "    certutil -addstore Root \"%DRVDIR%\\AppSandboxVGD_XUSB.cer\" >> \"%LOG%\" 2>&1\r\n"
+        "    certutil -f -addstore TrustedPublisher \"%DRVDIR%\\AppSandboxVGD_XUSB.cer\" >> \"%LOG%\" 2>&1\r\n"
+        ")\r\n"
+        "if exist \"%DRVDIR%\\AppSandboxVGD_HID.cer\" (\r\n"
+        "    echo [VGD] Installing HID certificate... >> \"%LOG%\"\r\n"
+        "    certutil -addstore Root \"%DRVDIR%\\AppSandboxVGD_HID.cer\" >> \"%LOG%\" 2>&1\r\n"
+        "    certutil -f -addstore TrustedPublisher \"%DRVDIR%\\AppSandboxVGD_HID.cer\" >> \"%LOG%\" 2>&1\r\n"
+        ")\r\n"
+        "if exist \"%DRVDIR%\\AppSandboxVGD_XUSB.inf\" (\r\n"
+        "    echo [VGD] Registering AppSandboxVGD_XUSB.inf in Driver Store... >> \"%LOG%\"\r\n"
+        "    pnputil /add-driver \"%DRVDIR%\\AppSandboxVGD_XUSB.inf\" >> \"%LOG%\" 2>&1\r\n"
+        "    echo [VGD] XUSB pnputil exit code: %errorlevel% >> \"%LOG%\"\r\n"
+        ")\r\n"
+        "if exist \"%DRVDIR%\\AppSandboxVGD_HID.inf\" (\r\n"
+        "    echo [VGD] Registering AppSandboxVGD_HID.inf in Driver Store... >> \"%LOG%\"\r\n"
+        "    pnputil /add-driver \"%DRVDIR%\\AppSandboxVGD_HID.inf\" >> \"%LOG%\" 2>&1\r\n"
+        "    echo [VGD] HID pnputil exit code: %errorlevel% >> \"%LOG%\"\r\n"
         ")\r\n"
         "\r\n",
         f);

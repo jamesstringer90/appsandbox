@@ -1,7 +1,10 @@
 #include "disk_util.h"
+#include "gamepad_provision.h"
 #include "ui.h"
+#include "../core/win_file_hash.h"
 #include "../../tools/provision/win_provision.h"
 #include <virtdisk.h>
+#include <winioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wincrypt.h>
@@ -974,6 +977,254 @@ BOOL ensure_ssh_msi_cached(wchar_t *msi_path_out, int max_chars)
     return FALSE;
 }
 
+/* ---- First-party AppSandboxVGD UMDF2 driver staging helpers ---- */
+
+static const wchar_t *k_vgd_driver_files[8] = {
+    L"AppSandboxVGD_XUSB.dll", L"AppSandboxVGD_XUSB.inf",
+    L"AppSandboxVGD_XUSB.cat", L"AppSandboxVGD_XUSB.cer",
+    L"AppSandboxVGD_HID.dll",  L"AppSandboxVGD_HID.inf",
+    L"AppSandboxVGD_HID.cat",  L"AppSandboxVGD_HID.cer"
+};
+
+static BOOL resolve_vgd_drivers_dir(const wchar_t *exe_dir, wchar_t *out_dir, size_t out_chars)
+{
+    wchar_t probe1[MAX_PATH], probe2[MAX_PATH];
+    if (!exe_dir || !out_dir || out_chars == 0) return FALSE;
+
+    swprintf_s(out_dir, out_chars, L"%s\\drivers", exe_dir);
+    swprintf_s(probe1, ARRAYSIZE(probe1), L"%s\\AppSandboxVGD_XUSB.inf", out_dir);
+    swprintf_s(probe2, ARRAYSIZE(probe2), L"%s\\AppSandboxVGD_HID.inf", out_dir);
+    if (GetFileAttributesW(probe1) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(probe2) != INVALID_FILE_ATTRIBUTES) {
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* ---- Pre-Boot Guest Sync for existing stopped Windows VMs ---- */
+
+static BOOL resolve_host_resource_file(const wchar_t *res_dir, const wchar_t *exe_dir,
+                                       const wchar_t *filename, wchar_t *out_path, size_t out_chars)
+{
+    if (res_dir && res_dir[0]) {
+        swprintf_s(out_path, out_chars, L"%s\\%s", res_dir, filename);
+        if (GetFileAttributesW(out_path) != INVALID_FILE_ATTRIBUTES)
+            return TRUE;
+    }
+    swprintf_s(out_path, out_chars, L"%s\\resources\\%s", exe_dir, filename);
+    if (GetFileAttributesW(out_path) != INVALID_FILE_ATTRIBUTES)
+        return TRUE;
+    swprintf_s(out_path, out_chars, L"%s\\%s", exe_dir, filename);
+    return GetFileAttributesW(out_path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static BOOL parse_physical_drive_number(const wchar_t *phys_path, DWORD *out_disk_num)
+{
+    const wchar_t *p;
+    if (!phys_path || !out_disk_num) return FALSE;
+    for (p = phys_path; *p; p++) {
+        if (_wcsnicmp(p, L"PhysicalDrive", 13) == 0) {
+            wchar_t *end = NULL;
+            unsigned long num = wcstoul(p + 13, &end, 10);
+            if (end && end != p + 13) {
+                *out_disk_num = (DWORD)num;
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+static BOOL find_windows_volume_on_disk(DWORD target_disk, wchar_t *vol_out, size_t vol_chars)
+{
+    int attempt;
+    for (attempt = 0; attempt < 20; attempt++) {
+        wchar_t vol[MAX_PATH];
+        HANDLE fv = FindFirstVolumeW(vol, ARRAYSIZE(vol));
+        if (fv != INVALID_HANDLE_VALUE) {
+            do {
+                wchar_t open_name[MAX_PATH];
+                size_t len = wcslen(vol);
+                HANDLE hvol;
+
+                if (len < 5 || len >= ARRAYSIZE(open_name)) continue;
+                wcscpy_s(open_name, ARRAYSIZE(open_name), vol);
+                if (open_name[len - 1] == L'\\')
+                    open_name[len - 1] = L'\0';
+
+                hvol = CreateFileW(open_name, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   NULL, OPEN_EXISTING, 0, NULL);
+                if (hvol != INVALID_HANDLE_VALUE) {
+                    VOLUME_DISK_EXTENTS extents;
+                    DWORD returned = 0;
+                    BOOL matched = FALSE;
+                    if (DeviceIoControl(hvol, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                                        NULL, 0, &extents, sizeof(extents), &returned, NULL) &&
+                        extents.NumberOfDiskExtents >= 1 &&
+                        extents.Extents[0].DiskNumber == target_disk) {
+                        matched = TRUE;
+                    }
+                    CloseHandle(hvol);
+
+                    if (matched) {
+                        wchar_t probe[MAX_PATH];
+                        swprintf_s(probe, ARRAYSIZE(probe), L"%sWindows\\System32\\ntoskrnl.exe", vol);
+                        if (GetFileAttributesW(probe) != INVALID_FILE_ATTRIBUTES) {
+                            wcsncpy_s(vol_out, vol_chars, vol, _TRUNCATE);
+                            FindVolumeClose(fv);
+                            return TRUE;
+                        }
+                    }
+                }
+            } while (FindNextVolumeW(fv, vol, ARRAYSIZE(vol)));
+            FindVolumeClose(fv);
+        }
+        Sleep(150);
+    }
+    return FALSE;
+}
+
+// @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-004::REQ-011
+// @implements spec-ft-gamepad-umdf2-driver::TASK-GP-VGD-004::REQ-014
+BOOL vm_sync_guest_gamepad(const wchar_t *active_disk_path,
+                           const wchar_t *res_dir,
+                           char *sync_hash_inout,
+                           size_t sync_hash_cap)
+{
+    wchar_t exe_dir[MAX_PATH], *slash;
+    wchar_t agent_src[MAX_PATH], gamepad_src[MAX_PATH], drv_dir[MAX_PATH];
+    wchar_t xusb_dll[MAX_PATH], xusb_inf[MAX_PATH], hid_dll[MAX_PATH], hid_inf[MAX_PATH];
+    BYTE d_agent[ASB_SHA256_SIZE], d_gp[ASB_SHA256_SIZE];
+    BYTE d_xdll[ASB_SHA256_SIZE], d_xinf[ASB_SHA256_SIZE], d_hdll[ASB_SHA256_SIZE], d_hinf[ASB_SHA256_SIZE];
+    BYTE combined[ASB_SHA256_SIZE];
+    AsbSha256 hasher;
+    char current_hash[65];
+    VIRTUAL_STORAGE_TYPE storage_type = { VIRTUAL_STORAGE_TYPE_DEVICE_VHDX, VHDX_VENDOR_MS };
+    OPEN_VIRTUAL_DISK_PARAMETERS open_params;
+    ATTACH_VIRTUAL_DISK_PARAMETERS attach_params;
+    HANDLE vhd = INVALID_HANDLE_VALUE;
+    BOOL attached = FALSE;
+    DWORD err;
+    wchar_t phys_path[MAX_PATH];
+    ULONG phys_sz = sizeof(phys_path);
+    DWORD disk_num = 0;
+    wchar_t vol_root[MAX_PATH];
+    wchar_t dst_dir[MAX_PATH], dst_drv[MAX_PATH], dst_file[MAX_PATH], src_file[MAX_PATH];
+    BOOL copied_all = FALSE;
+    int i;
+
+    if (!active_disk_path || !active_disk_path[0] || !sync_hash_inout || sync_hash_cap < 65)
+        return FALSE;
+
+    GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
+    slash = wcsrchr(exe_dir, L'\\');
+    if (slash) *slash = L'\0';
+
+    if (!resolve_host_resource_file(res_dir, exe_dir, L"appsandbox-agent.exe", agent_src, ARRAYSIZE(agent_src)) ||
+        !resolve_host_resource_file(res_dir, exe_dir, L"appsandbox-gamepad.exe", gamepad_src, ARRAYSIZE(gamepad_src))) {
+        ui_log(L"Warning: Pre-Boot Guest Sync skipped (guest agent/gamepad binaries not found).");
+        return FALSE;
+    }
+
+    if (!resolve_vgd_drivers_dir(exe_dir, drv_dir, ARRAYSIZE(drv_dir))) {
+        ui_log(L"Warning: Pre-Boot Guest Sync skipped (AppSandboxVGD UMDF2 drivers not found under drivers\\).");
+        return FALSE;
+    }
+
+    swprintf_s(xusb_dll, ARRAYSIZE(xusb_dll), L"%s\\AppSandboxVGD_XUSB.dll", drv_dir);
+    swprintf_s(xusb_inf, ARRAYSIZE(xusb_inf), L"%s\\AppSandboxVGD_XUSB.inf", drv_dir);
+    swprintf_s(hid_dll,  ARRAYSIZE(hid_dll),  L"%s\\AppSandboxVGD_HID.dll",  drv_dir);
+    swprintf_s(hid_inf,  ARRAYSIZE(hid_inf),  L"%s\\AppSandboxVGD_HID.inf",  drv_dir);
+
+    if (!asb_file_sha256(agent_src, d_agent) ||
+        !asb_file_sha256(gamepad_src, d_gp) ||
+        !asb_file_sha256(xusb_dll, d_xdll) ||
+        !asb_file_sha256(xusb_inf, d_xinf) ||
+        !asb_file_sha256(hid_dll, d_hdll) ||
+        !asb_file_sha256(hid_inf, d_hinf) ||
+        !asb_sha256_begin(&hasher)) {
+        ui_log(L"Warning: Pre-Boot Guest Sync skipped (could not hash AppSandboxVGD payload).");
+        return FALSE;
+    }
+    if (!asb_sha256_update(&hasher, d_agent, sizeof(d_agent)) ||
+        !asb_sha256_update(&hasher, d_gp, sizeof(d_gp)) ||
+        !asb_sha256_update(&hasher, d_xdll, sizeof(d_xdll)) ||
+        !asb_sha256_update(&hasher, d_xinf, sizeof(d_xinf)) ||
+        !asb_sha256_update(&hasher, d_hdll, sizeof(d_hdll)) ||
+        !asb_sha256_update(&hasher, d_hinf, sizeof(d_hinf)) ||
+        !asb_sha256_finish(&hasher, combined)) {
+        asb_sha256_close(&hasher);
+        ui_log(L"Warning: Pre-Boot Guest Sync skipped (hash finalization failed).");
+        return FALSE;
+    }
+    asb_sha256_to_hex(combined, current_hash);
+
+    if (!asb_gamepad_sync_needed(sync_hash_inout, current_hash))
+        return FALSE;
+
+    memset(&open_params, 0, sizeof(open_params));
+    open_params.Version = OPEN_VIRTUAL_DISK_VERSION_1;
+    open_params.Version1.RWDepth = OPEN_VIRTUAL_DISK_RW_DEPTH_DEFAULT;
+
+    err = OpenVirtualDisk(&storage_type, active_disk_path,
+                          VIRTUAL_DISK_ACCESS_ATTACH_RW | VIRTUAL_DISK_ACCESS_GET_INFO,
+                          OPEN_VIRTUAL_DISK_FLAG_NONE, &open_params, &vhd);
+    if (err != ERROR_SUCCESS) {
+        ui_log(L"Warning: Pre-Boot Guest Sync could not open disk %s (error %lu); continuing boot.",
+               active_disk_path, err);
+        return FALSE;
+    }
+
+    memset(&attach_params, 0, sizeof(attach_params));
+    attach_params.Version = ATTACH_VIRTUAL_DISK_VERSION_1;
+    err = AttachVirtualDisk(vhd, NULL, ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, 0, &attach_params, NULL);
+    if (err != ERROR_SUCCESS) {
+        ui_log(L"Warning: Pre-Boot Guest Sync could not attach disk (error %lu); continuing boot.", err);
+        CloseHandle(vhd);
+        return FALSE;
+    }
+    attached = TRUE;
+
+    err = GetVirtualDiskPhysicalPath(vhd, &phys_sz, phys_path);
+    if (err == ERROR_SUCCESS && parse_physical_drive_number(phys_path, &disk_num) &&
+        find_windows_volume_on_disk(disk_num, vol_root, ARRAYSIZE(vol_root))) {
+        swprintf_s(dst_dir, ARRAYSIZE(dst_dir), L"%sWindows\\AppSandbox", vol_root);
+        swprintf_s(dst_drv, ARRAYSIZE(dst_drv), L"%sWindows\\AppSandbox\\drivers", vol_root);
+        CreateDirectoryW(dst_dir, NULL);
+        CreateDirectoryW(dst_drv, NULL);
+
+        copied_all = TRUE;
+        swprintf_s(dst_file, ARRAYSIZE(dst_file), L"%s\\appsandbox-agent.exe", dst_dir);
+        if (!CopyFileW(agent_src, dst_file, FALSE)) copied_all = FALSE;
+        swprintf_s(dst_file, ARRAYSIZE(dst_file), L"%s\\appsandbox-gamepad.exe", dst_dir);
+        if (!CopyFileW(gamepad_src, dst_file, FALSE)) copied_all = FALSE;
+
+        for (i = 0; i < 8; i++) {
+            swprintf_s(src_file, ARRAYSIZE(src_file), L"%s\\%s", drv_dir, k_vgd_driver_files[i]);
+            if (GetFileAttributesW(src_file) != INVALID_FILE_ATTRIBUTES) {
+                swprintf_s(dst_file, ARRAYSIZE(dst_file), L"%s\\%s", dst_drv, k_vgd_driver_files[i]);
+                if (!CopyFileW(src_file, dst_file, FALSE)) copied_all = FALSE;
+            }
+        }
+
+        if (!copied_all)
+            ui_log(L"Warning: Pre-Boot Guest Sync failed copying files (error %lu); continuing boot.", GetLastError());
+    } else {
+        ui_log(L"Warning: Pre-Boot Guest Sync could not locate Windows volume on attached disk; continuing boot.");
+    }
+
+    if (attached)
+        DetachVirtualDisk(vhd, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+    CloseHandle(vhd);
+
+    if (copied_all) {
+        strncpy_s(sync_hash_inout, sync_hash_cap, current_hash, _TRUNCATE);
+        ui_log(L"Pre-Boot Guest Sync updated guest gamepad helper and AppSandboxVGD UMDF2 drivers.");
+        return TRUE;
+    }
+    return FALSE;
+}
+
 HRESULT iso_create_resources(const wchar_t *iso_path,
                               const wchar_t *vm_name,
                               const wchar_t *admin_user,
@@ -1199,6 +1450,27 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
                 ui_log(L"Warning: appsandbox-audio.exe not found at %s", audio_src);
             }
         }
+
+        /* appsandbox-gamepad.exe — same directory as agent */
+        // @implements spec-ft-gamepad-provisioning::TASK-GP-CACHE-001::REQ-004
+        {
+            wchar_t gp_src[MAX_PATH], gp_dst[MAX_PATH];
+            wcscpy_s(gp_src, MAX_PATH, input_src);
+            {
+                wchar_t *s = wcsrchr(gp_src, L'\\');
+                if (s) *(s + 1) = L'\0';
+            }
+            wcscat_s(gp_src, MAX_PATH, L"appsandbox-gamepad.exe");
+            swprintf_s(gp_dst, MAX_PATH, L"%s\\appsandbox-gamepad.exe", staging);
+            if (GetFileAttributesW(gp_src) != INVALID_FILE_ATTRIBUTES) {
+                if (!CopyFileW(gp_src, gp_dst, FALSE))
+                    ui_log(L"Warning: failed to copy appsandbox-gamepad.exe (error %lu)", GetLastError());
+                else
+                    ui_log(L"Staged appsandbox-gamepad.exe for ISO.");
+            } else {
+                ui_log(L"Warning: appsandbox-gamepad.exe not found at %s", gp_src);
+            }
+        }
     } else {
         ui_log(L"Warning: appsandbox-agent.exe not found");
     }
@@ -1313,6 +1585,28 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
                 ui_log(L"Warning: failed to copy SSH MSI (error %lu)", GetLastError());
             else
                 ui_log(L"Staged %s for ISO.", SSH_MSI_NAME);
+        }
+    }
+
+    /* First-party AppSandboxVGD UMDF2 drivers — copy to drivers\ subdirectory */
+    {
+        wchar_t exe_dir[MAX_PATH], *sl, vgd_dir[MAX_PATH], drivers_staging[MAX_PATH], src_file[MAX_PATH];
+        GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
+        sl = wcsrchr(exe_dir, L'\\');
+        if (sl) *sl = L'\0';
+        if (resolve_vgd_drivers_dir(exe_dir, vgd_dir, ARRAYSIZE(vgd_dir))) {
+            int i;
+            swprintf_s(drivers_staging, MAX_PATH, L"%s\\drivers", staging);
+            CreateDirectoryW(drivers_staging, NULL);
+            for (i = 0; i < 8; i++) {
+                swprintf_s(src_file, MAX_PATH, L"%s\\%s", vgd_dir, k_vgd_driver_files[i]);
+                if (GetFileAttributesW(src_file) != INVALID_FILE_ATTRIBUTES) {
+                    swprintf_s(file_path, MAX_PATH, L"%s\\%s", drivers_staging, k_vgd_driver_files[i]);
+                    if (!CopyFileW(src_file, file_path, FALSE))
+                        ui_log(L"Warning: failed to copy %s (error %lu)", k_vgd_driver_files[i], GetLastError());
+                }
+            }
+            ui_log(L"Staged AppSandboxVGD UMDF2 drivers for ISO.");
         }
     }
 
@@ -1599,7 +1893,7 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
 
     /* 2. Agent + input helper executables */
     {
-        const wchar_t *bins[] = { L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-displays.exe", L"appsandbox-clipboard.exe", L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe" };
+        const wchar_t *bins[] = { L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-displays.exe", L"appsandbox-clipboard.exe", L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe", L"appsandbox-gamepad.exe" };
         int bi;
         for (bi = 0; bi < (int)(sizeof(bins) / sizeof(bins[0])); bi++) {
             BOOL found = FALSE;
@@ -1793,6 +2087,24 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
         if (ensure_ssh_msi_cached(msi_path, MAX_PATH)) {
             fwprintf(mf, L"%s\t\\Windows\\AppSandbox\\%s\n", msi_path, SSH_MSI_NAME);
             count++;
+        }
+    }
+
+    /* 3c. First-party AppSandboxVGD UMDF2 virtual gamepad drivers */
+    {
+        wchar_t exe_dir[MAX_PATH], *sl, vgd_dir[MAX_PATH], src_file[MAX_PATH];
+        GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
+        sl = wcsrchr(exe_dir, L'\\');
+        if (sl) *sl = L'\0';
+        if (resolve_vgd_drivers_dir(exe_dir, vgd_dir, ARRAYSIZE(vgd_dir))) {
+            int i;
+            for (i = 0; i < 8; i++) {
+                swprintf_s(src_file, MAX_PATH, L"%s\\%s", vgd_dir, k_vgd_driver_files[i]);
+                if (GetFileAttributesW(src_file) != INVALID_FILE_ATTRIBUTES) {
+                    fwprintf(mf, L"%s\t\\Windows\\AppSandbox\\drivers\\%s\n", src_file, k_vgd_driver_files[i]);
+                    count++;
+                }
+            }
         }
     }
 

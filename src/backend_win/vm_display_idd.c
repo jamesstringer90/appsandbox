@@ -42,6 +42,7 @@
 #include "../core/api_json.h"
 #include "../../tools/transport/asb_automation.h"
 #include "vm_clipboard.h"
+#include "vm_gamepad.h"
 #include "vm_agent.h"
 #include "hcs_vm.h"
 #include "ui.h"
@@ -339,6 +340,10 @@ struct VmDisplayIdd {
     VmClipboard      clipboard;
     BOOL             share_clipboard;
 
+    /* Gamepad forwarding (:0008 — bidirectional XInput + rumble) */
+    VmGamepad       *gamepad;
+    BOOL             share_gamepad;
+
     /* Audio playback channel (:0004 — guest→host render) */
     volatile SOCKET  audio_socket;
     HANDLE           audio_recv_thread;
@@ -380,6 +385,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUTO_DISPLAYS  0x1050
 #define IDM_SEND_SAS       0x1060
 #define IDM_FULLSCREEN     0x1070
+#define IDM_SHARE_GAMEPAD  0x1080
 static const UINT g_viewer_commands[]={IDM_SEND_SAS,IDM_MATCH_WINDOW,IDM_SHARE_CLIPBOARD,IDM_XMIT_HOTKEYS,IDM_AUDIO_MUTE};
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
@@ -716,8 +722,10 @@ static BOOL idd_display_settings_save(VmDisplayIdd *d)
     idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
     if (swprintf_s(temporary, MAX_PATH, L"%s.tmp", path) < 0) return FALSE;
     if (_wfopen_s(&f, temporary, L"w") != 0 || !f) return FALSE;
-    ok = fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"shareClipboard\":%d}\n",
-                 d->transmit_hotkeys ? 1 : 0, d->share_clipboard ? 1 : 0) > 0;
+    // @implements spec-ft-gamepad-protocol-host::TASK-GP-VIEWER-003::REQ-009
+    ok = fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"shareClipboard\":%d,\"shareGamepad\":%d}\n",
+                 d->transmit_hotkeys ? 1 : 0, d->share_clipboard ? 1 : 0,
+                 d->share_gamepad ? 1 : 0) > 0;
     if (fclose(f) != 0) ok = FALSE;
     if (ok && MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         return TRUE;
@@ -733,8 +741,10 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
     size_t length;
     int value;
 
+    // @implements spec-ft-gamepad-protocol-host::TASK-GP-VIEWER-003::REQ-014
     d->transmit_hotkeys = FALSE;
     d->share_clipboard = TRUE;
+    d->share_gamepad = TRUE;
     if (!d->vhdx_path[0]) return;
     idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
 
@@ -751,6 +761,9 @@ static void idd_display_settings_load_or_create(VmDisplayIdd *d)
         if (api_json_get_bool(buf, L"shareClipboard", &value) ||
             api_json_get_int(buf, L"shareClipboard", &value))
             d->share_clipboard = value != 0;
+        if (api_json_get_bool(buf, L"shareGamepad", &value) ||
+            api_json_get_int(buf, L"shareGamepad", &value))
+            d->share_gamepad = value != 0;
     }
     fclose(f);
 }
@@ -2733,6 +2746,14 @@ static void clip_log_callback(const wchar_t *msg, void *user_data)
     idd_log(d, L"%s", msg);
 }
 
+static void gamepad_log_callback(void *ctx, const wchar_t *msg)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)ctx;
+    if (!d || !msg) return;
+    idd_log(d, L"%s", msg);
+    ui_log(L"[%s] %s", d->vm_name, msg);
+}
+
 static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 {
     VmDisplayIdd *d = (VmDisplayIdd *)param;
@@ -2779,6 +2800,15 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 idd_log(d, L"Clipboard module created.");
                 PostMessageW(d->hwnd, WM_IDD_CLIPBOARD_READY, 0, 0);
             }
+        }
+
+        /* Gamepad module (handles :0008 bidirectional XInput + rumble) */
+        if (!d->gamepad) {
+            d->gamepad = vm_gamepad_start(&d->runtime_id, d->os_type,
+                                          d->share_gamepad && d->input_focused,
+                                          gamepad_log_callback, d);
+            if (d->gamepad)
+                idd_log(d, L"Gamepad module created.");
         }
 
         /* Ensure audio recv thread is running (:0004, guest→host).
@@ -3233,6 +3263,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHARE_CLIPBOARD, L"Share clipboard");
+            AppendMenuW(sysmenu, MF_STRING, IDM_SHARE_GAMEPAD, L"Share Xbox Controllers");
             AppendMenuW(sysmenu, MF_STRING, IDM_FULLSCREEN, L"Borderless fullscreen");
             if (!_wcsicmp(d->os_type, L"Windows"))
                 AppendMenuW(sysmenu, MF_STRING | MF_GRAYED, IDM_AUTO_DISPLAYS,
@@ -3245,6 +3276,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
             CheckMenuItem(sysmenu, IDM_SHARE_CLIPBOARD,
                           MF_BYCOMMAND | (d->share_clipboard ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(sysmenu, IDM_SHARE_GAMEPAD,
+                          MF_BYCOMMAND | (d->share_gamepad ? MF_CHECKED : MF_UNCHECKED));
         }
     }
 
@@ -3520,6 +3553,23 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             idd_log(d, d->share_clipboard ? L"Clipboard sharing: ON." : L"Clipboard sharing: OFF.");
             return 0;
         }
+        // @implements spec-ft-gamepad-protocol-host::TASK-GP-VIEWER-003::REQ-007
+        // @implements spec-ft-gamepad-protocol-host::TASK-GP-VIEWER-003::REQ-008
+        // @implements spec-ft-gamepad-protocol-host::TASK-GP-VIEWER-003::REQ-009
+        if (d && (wp & 0xFFF0) == IDM_SHARE_GAMEPAD) {
+            HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
+            d->share_gamepad = !d->share_gamepad;
+            if (sysmenu) {
+                CheckMenuItem(sysmenu, IDM_SHARE_GAMEPAD,
+                              MF_BYCOMMAND | (d->share_gamepad ? MF_CHECKED : MF_UNCHECKED));
+            }
+            if (d->gamepad)
+                vm_gamepad_set_forwarding(d->gamepad, d->share_gamepad && d->input_focused && !IsIconic(hwnd));
+            if (!idd_display_settings_save(d))
+                idd_log(d, L"Could not save viewer settings.");
+            idd_log(d, d->share_gamepad ? L"Xbox controller sharing: ON." : L"Xbox controller sharing: OFF.");
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_MATCH_WINDOW) {
             BOOL enabled;
             enabled = d->shared_ready && d->shared_resize && !d->shared_disabled &&
@@ -3619,6 +3669,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->clipboard) {
                 vm_clipboard_destroy(d->clipboard);
                 d->clipboard = NULL;
+            }
+
+            /* Stop gamepad module */
+            if (d->gamepad) {
+                vm_gamepad_stop(d->gamepad);
+                d->gamepad = NULL;
             }
 
             /* Wait for audio recv thread (:0004) */
@@ -3876,10 +3932,16 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
        e.g. the user clicks another window or Alt+Tabs away with a key held —
        flushes held keys so nothing sticks down in the guest. */
     case WM_ACTIVATE:
+        // @implements spec-ft-gamepad-protocol-host::TASK-GP-VIEWER-003::REQ-007
+        // @implements spec-ft-gamepad-protocol-host::TASK-GP-VIEWER-003::REQ-008
+        // @implements spec-ft-gamepad-protocol-host::TASK-GP-VIEWER-003::REQ-010
+        // @implements spec-ft-gamepad-protocol-host::TASK-GP-VIEWER-003::REQ-011
         if (d) {
             d->input_focused = (LOWORD(wp) != WA_INACTIVE);
             if (d->clipboard)
                 vm_clipboard_set_sync_enabled(d->clipboard, d->share_clipboard && d->input_focused && !IsIconic(hwnd));
+            if (d->gamepad)
+                vm_gamepad_set_forwarding(d->gamepad, d->share_gamepad && d->input_focused && !IsIconic(hwnd));
             if (!d->input_focused) {
                 agent_overlay_cancel_input(d->agent_overlay);
                 idd_flush_held_keys(d);
@@ -4160,6 +4222,12 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     if (display->clipboard) {
         vm_clipboard_destroy(display->clipboard);
         display->clipboard = NULL;
+    }
+
+    /* Gamepad guard */
+    if (display->gamepad) {
+        vm_gamepad_stop(display->gamepad);
+        display->gamepad = NULL;
     }
 
     /* audio_recv_thread guard */

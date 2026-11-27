@@ -550,8 +550,9 @@ void vm_save_state_json(VmInstance *vm)
     if (ok) {
         char version[ASB_AGENT_VERSION_TEXT_SIZE];
         asb_agent_version_format((uint32_t)vm->agent_version, version);
-        ok = fprintf(f, "{\"installComplete\":%d,\"diskResizeSupported\":%d,\"agentVersion\":\"%s\"}\n",
-                     vm->install_complete != 0, vm->disk_resize_supported != 0, version) > 0 && !ferror(f);
+        ok = fprintf(f, "{\"installComplete\":%d,\"diskResizeSupported\":%d,\"agentVersion\":\"%s\",\"gamepadSyncHash\":\"%s\"}\n",
+                     vm->install_complete != 0, vm->disk_resize_supported != 0,
+                     version, vm->gamepad_sync_hash) > 0 && !ferror(f);
         if (fclose(f) != 0) ok = FALSE;
         if (ok) ok = MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     }
@@ -575,12 +576,13 @@ static BOOL read_vm_state_json(const wchar_t *path, wchar_t *buf, size_t count)
 
 static void load_vm_state_json(VmInstance *vm)
 {
-    wchar_t path[MAX_PATH], buf[256];
+    wchar_t path[MAX_PATH], buf[512];
     int installed = 0;
     BOOL has_path = get_state_json_path(vm->vhdx_path, path, ARRAYSIZE(path));
     if (has_path && read_vm_state_json(path, buf, ARRAYSIZE(buf))) {
         api_json_get_int(buf, L"installComplete", &installed);
         wchar_t value[ASB_AGENT_VERSION_TEXT_SIZE];
+        wchar_t sync_w[80];
         int disk_resize;
         if (api_json_get_int(buf, L"diskResizeSupported", &disk_resize)) {
             vm->disk_resize_supported = disk_resize != 0;
@@ -590,6 +592,9 @@ static void load_vm_state_json(VmInstance *vm)
         if (api_json_get_string(buf, L"agentVersion", value, ARRAYSIZE(value)) &&
             WideCharToMultiByte(CP_UTF8, 0, value, -1, text, sizeof(text), NULL, NULL))
             vm->agent_version = (LONG)asb_agent_version_parse(text);
+        if (api_json_get_string(buf, L"gamepadSyncHash", sync_w, ARRAYSIZE(sync_w)))
+            WideCharToMultiByte(CP_UTF8, 0, sync_w, -1, vm->gamepad_sync_hash,
+                                sizeof(vm->gamepad_sync_hash), NULL, NULL);
     }
     if (has_path && !vm->install_complete && installed != 1) {
         const wchar_t *slash = wcsrchr(vm->vhdx_path, L'\\');
@@ -1455,6 +1460,13 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     vm->endpoint_id = args->endpoint_id;
 
     prepare_gpu_driver_shares(&args->config, TRUE);
+
+    /* Non-blocking Pre-Boot Guest Sync for existing installed Windows VMs */
+    if (vm->install_complete && (!vm->os_type[0] || _wcsicmp(vm->os_type, L"Windows") == 0)) {
+        if (vm_sync_guest_gamepad(args->config.vhdx_path, NULL,
+                                  vm->gamepad_sync_hash, sizeof(vm->gamepad_sync_hash)))
+            vm_save_state_json(vm);
+    }
 
     asb_log(L"Re-creating HCS compute system for \"%s\"...", vm->name);
     hr = (endpoint_guid_str[0] != L'\0')
